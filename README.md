@@ -71,6 +71,13 @@ already have:
   available on macOS and Ubuntu Xorg after explicit opt-in. Ubuntu Wayland host control remains disabled while
   issue #345 is resolved.
 
+### Always-on remote client
+
+This fork can keep the harness, bot database, provider CLIs, companion, and virtual computers on an always-on
+Linux host while a small signed macOS shell connects through an SSH or Tailscale tunnel. Closing the Mac app
+does not stop the bots. Reopening it returns to the same server-side conversations, and the shell automatically
+reloads after the remote service or tunnel recovers. See [Remote client deployment](docs/remote-client.md).
+
 ## Features
 
 <table>

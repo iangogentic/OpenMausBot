@@ -23,7 +23,7 @@ import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
-import { resolveRemoteClientURL } from "./remote-client.mjs";
+import { resolveRemoteClientURL, resolveRemoteCompanionURL } from "./remote-client.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -61,6 +61,10 @@ const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REMOTE_SERVER_URL = resolveRemoteClientURL({
   argv: process.argv,
+  env: process.env,
+  userDataDir: app.getPath("userData"),
+});
+const REMOTE_COMPANION_URL = resolveRemoteCompanionURL({
   env: process.env,
   userDataDir: app.getPath("userData"),
 });
@@ -412,7 +416,33 @@ function decorateDesktopCompanionState(state) {
 }
 
 async function desktopCompanionState() {
+  if (REMOTE_COMPANION_URL) return remoteCompanionRequest("GET", "/state");
   return decorateDesktopCompanionState(await companionState());
+}
+
+async function remoteCompanionRequest(method, endpoint) {
+  try {
+    const response = await fetch(`${REMOTE_COMPANION_URL}${endpoint}`, { method });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`);
+    return {
+      enabled: true,
+      keepAwake: true,
+      ...body,
+      managedConnection: { status: "ready", configured: true, ready: true },
+    };
+  } catch (error) {
+    return {
+      enabled: true,
+      keepAwake: true,
+      port: 8810,
+      devices: [],
+      connectedDeviceIds: [],
+      pairing: null,
+      error: `The Razer companion is not responding: ${error?.message ?? error}`,
+      managedConnection: { status: "error", configured: true, ready: false },
+    };
+  }
 }
 
 function companionLaunchOptions(hostedUrl = null) {
@@ -804,6 +834,50 @@ function rendererOrigin() {
   ).origin;
 }
 
+function watchRemoteServer(win) {
+  if (!REMOTE_SERVER_URL) return;
+  let lastReachable = null;
+  let loadFailed = false;
+  let checking = false;
+
+  win.webContents.on("did-fail-load", (_event, _code, _description, url, isMainFrame) => {
+    if (isMainFrame !== false && typeof url === "string" && url.startsWith(REMOTE_SERVER_URL)) {
+      loadFailed = true;
+      lastReachable = false;
+    }
+  });
+
+  const check = async () => {
+    if (checking || win.isDestroyed()) return;
+    checking = true;
+    let reachable = false;
+    try {
+      const response = await fetch(`${REMOTE_SERVER_URL}/api/health`, {
+        signal: AbortSignal.timeout(2_000),
+      });
+      reachable = response.ok;
+    } catch {
+      reachable = false;
+    } finally {
+      checking = false;
+    }
+
+    const recovered = reachable && (lastReachable === false || loadFailed);
+    lastReachable = reachable;
+    if (recovered && !win.isDestroyed()) {
+      loadFailed = false;
+      void win.loadURL(REMOTE_SERVER_URL).catch(() => {
+        loadFailed = true;
+      });
+    }
+  };
+
+  const timer = setInterval(() => void check(), 3_000);
+  timer.unref?.();
+  win.once("closed", () => clearInterval(timer));
+  void check();
+}
+
 function respondToDisplayMediaRequest(callback, response) {
   const error = invokeDisplayMediaCallback(callback, response);
   // An empty response intentionally rejects the renderer request, and Electron
@@ -1139,7 +1213,8 @@ function createWindow() {
   }
 
   if (REMOTE_SERVER_URL) {
-    win.loadURL(REMOTE_SERVER_URL);
+    void win.loadURL(REMOTE_SERVER_URL).catch(() => {});
+    watchRemoteServer(win);
   } else if (app.isPackaged) {
     win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
   } else {
@@ -1352,20 +1427,39 @@ ipcMain.handle("skill-recorder:save", (_event, payload) => saveSkillRecording(pa
 // on and off, look at it, open or cancel a pairing window, and remove a
 // device. It cannot reach the sidecar's control port itself.
 ipcMain.handle("companion:state", () => desktopCompanionState());
-ipcMain.handle("companion:start", () => startDesktopCompanion());
-ipcMain.handle("companion:stop", () => stopDesktopCompanion());
+ipcMain.handle("companion:start", () =>
+  REMOTE_COMPANION_URL ? desktopCompanionState() : startDesktopCompanion(),
+);
+ipcMain.handle("companion:stop", () =>
+  REMOTE_COMPANION_URL ? desktopCompanionState() : stopDesktopCompanion(),
+);
 ipcMain.handle("companion:keep-awake", async (_event, enabled) => {
+  if (REMOTE_COMPANION_URL) return desktopCompanionState();
   rememberCompanionKeepAwake(Boolean(enabled));
   return desktopCompanionState();
 });
 ipcMain.handle("companion:pairing", (_event, open, expectedToken) =>
-  companionPairing(Boolean(open), expectedToken).then(decorateDesktopCompanionState),
+  REMOTE_COMPANION_URL
+    ? remoteCompanionRequest(
+        open ? "POST" : "DELETE",
+        !open && expectedToken
+          ? `/pairing?expectedToken=${encodeURIComponent(String(expectedToken))}`
+          : "/pairing",
+      )
+    : companionPairing(Boolean(open), expectedToken).then(decorateDesktopCompanionState),
 );
 ipcMain.handle("companion:cloud-desktop", (_event, deviceId, allowed) =>
-  companionCloudDesktopAccess(deviceId, Boolean(allowed)).then(() => desktopCompanionState()),
+  REMOTE_COMPANION_URL
+    ? remoteCompanionRequest(
+        allowed ? "POST" : "DELETE",
+        `/devices/${encodeURIComponent(String(deviceId))}/cloud-desktop`,
+      )
+    : companionCloudDesktopAccess(deviceId, Boolean(allowed)).then(() => desktopCompanionState()),
 );
 ipcMain.handle("companion:revoke", (_event, deviceId) =>
-  companionRevoke(deviceId).then(() => desktopCompanionState()),
+  REMOTE_COMPANION_URL
+    ? remoteCompanionRequest("DELETE", `/devices/${encodeURIComponent(String(deviceId))}`)
+    : companionRevoke(deviceId).then(() => desktopCompanionState()),
 );
 
 // Auth and connector credentials never cross this boundary. Every handler

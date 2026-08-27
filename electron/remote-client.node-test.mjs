@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   normalizeRemoteServerURL,
   readRemoteClientConfig,
+  readRemoteCompanionConfig,
+  resolveRemoteCompanionURL,
   resolveRemoteClientURL,
 } from "./remote-client.mjs";
 
@@ -37,5 +39,22 @@ test("CLI overrides environment and durable configuration", () => {
       readFile: () => JSON.stringify({ mode: "remote", serverUrl: "http://127.0.0.1:5000" }),
     }),
     "http://127.0.0.1:3000",
+  );
+});
+
+test("resolves a tunneled companion control plane", () => {
+  const readFile = () => JSON.stringify({
+    mode: "remote",
+    serverUrl: "http://127.0.0.1:18799",
+    companionUrl: "http://127.0.0.1:8811",
+  });
+  assert.equal(readRemoteCompanionConfig("/unused", readFile), "http://127.0.0.1:8811");
+  assert.equal(
+    resolveRemoteCompanionURL({
+      env: { OMB_REMOTE_COMPANION_URL: "http://127.0.0.1:18811" },
+      userDataDir: "/unused",
+      readFile,
+    }),
+    "http://127.0.0.1:18811",
   );
 });

@@ -66,10 +66,28 @@ export function readRemoteClientConfig(userDataDir, readFile = fs.readFileSync) 
   }
 }
 
+export function readRemoteCompanionConfig(userDataDir, readFile = fs.readFileSync) {
+  try {
+    const parsed = JSON.parse(readFile(remoteClientConfigPath(userDataDir), "utf8"));
+    if (parsed?.mode !== "remote") return null;
+    return normalizeRemoteServerURL(parsed.companionUrl);
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
 /** CLI wins for one-off diagnostics, then the environment, then durable setup. */
 export function resolveRemoteClientURL({ argv, env, userDataDir, readFile } = {}) {
   const commandLine = commandLineRemoteURL(argv ?? []);
   if (commandLine !== null) return normalizeRemoteServerURL(commandLine);
   if (env?.OMB_REMOTE_URL?.trim()) return normalizeRemoteServerURL(env.OMB_REMOTE_URL);
   return readRemoteClientConfig(userDataDir, readFile);
+}
+
+export function resolveRemoteCompanionURL({ env, userDataDir, readFile } = {}) {
+  if (env?.OMB_REMOTE_COMPANION_URL?.trim()) {
+    return normalizeRemoteServerURL(env.OMB_REMOTE_COMPANION_URL);
+  }
+  return readRemoteCompanionConfig(userDataDir, readFile);
 }
