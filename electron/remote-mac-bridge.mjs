@@ -10,6 +10,7 @@ const AUTH_PREFIX = "OMB-MAC-BRIDGE/1 ";
 const MAX_AUTH_LINE = 256;
 const AUTH_TIMEOUT_MS = 5_000;
 const MAX_CONNECTIONS = 4;
+const CHILD_STOP_GRACE_MS = 1_000;
 
 export function ensureRemoteMacBridgeToken(userDataDir, fileSystem = fs) {
   fileSystem.mkdirSync(userDataDir, { recursive: true, mode: 0o700 });
@@ -80,6 +81,16 @@ export async function startRemoteMacBridge({
   const sockets = new Set();
   const children = new Set();
 
+  const terminateChild = (child) => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    child.kill("SIGTERM");
+    const force = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, CHILD_STOP_GRACE_MS);
+    force.unref();
+    child.once("exit", () => clearTimeout(force));
+  };
+
   const server = net.createServer((socket) => {
     if (sockets.size >= MAX_CONNECTIONS) {
       socket.end("BUSY\n");
@@ -93,7 +104,7 @@ export async function startRemoteMacBridge({
     let child = null;
 
     const closeChild = () => {
-      if (child && !child.killed) child.kill("SIGTERM");
+      terminateChild(child);
       child = null;
     };
     socket.once("close", () => {
@@ -173,7 +184,7 @@ export async function startRemoteMacBridge({
     async stop() {
       for (const socket of sockets) socket.destroy();
       for (const child of children) {
-        if (!child.killed) child.kill("SIGTERM");
+        terminateChild(child);
       }
       await new Promise((resolve) => server.close(() => resolve()));
     },

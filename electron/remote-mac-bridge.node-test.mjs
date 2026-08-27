@@ -159,3 +159,49 @@ test("the deployed stdio proxy relays through the authenticated bridge", async (
     cleanup();
   }
 });
+
+test("force-reaps a CUA child that ignores graceful shutdown after its socket closes", async () => {
+  const { userDataDir, cleanup } = fixture();
+  const port = await freePort();
+  const stubbornConnection = Promise.resolve({
+    mode: "standalone",
+    mcpCommand: process.execPath,
+    mcpArgs: [
+      "-e",
+      "process.on('SIGTERM',()=>{}); process.stdout.write(String(process.pid)+'\\n'); process.stdin.resume()",
+    ],
+    mcpEnv: {},
+  });
+  const bridge = await startRemoteMacBridge({
+    userDataDir,
+    port,
+    getConnection: () => stubbornConnection,
+    approveConnection: async () => true,
+    log: {},
+  });
+  try {
+    const token = fs.readFileSync(bridge.tokenFile, "utf8").trim();
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let output = "";
+    socket.on("data", (chunk) => { output += String(chunk); });
+    await new Promise((resolve) => socket.once("connect", resolve));
+    socket.write(`OMB-MAC-BRIDGE/1 ${token}\n`);
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("child pid timeout")), 3_000);
+      const check = () => {
+        if (/OK\n\d+\n/.test(output)) {
+          clearTimeout(timeout);
+          resolve();
+        } else setTimeout(check, 10);
+      };
+      check();
+    });
+    const childPid = Number(output.trim().split("\n")[1]);
+    socket.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 1_300));
+    assert.throws(() => process.kill(childPid, 0), /ESRCH/);
+  } finally {
+    await bridge.stop();
+    cleanup();
+  }
+});
