@@ -1,0 +1,51 @@
+appId: com.iangreenberg.openmaus.razer
+productName: OpenMaus Razer
+artifactName: OpenMaus-Razer-${version}-${arch}.${ext}
+
+directories:
+  buildResources: build
+  output: release-remote
+
+# The remote shell deliberately carries no harness, provider keys, database,
+# CUA daemon or companion listener. Those remain on the always-on server.
+files:
+  - electron/**
+  - "!electron/**/*.test.*"
+  - "!electron/resources/speech-helper"
+  - "!electron/resources/speech-helper.swift"
+  - "!electron/resources/speech-helper-Info.plist"
+  - "!electron/resources/OpenMausBot Speech.app/**"
+  - "!electron/resources/recorder-helper"
+  - "!electron/resources/recorder-helper.swift"
+  - "!electron/resources/recorder-helper-Info.plist"
+  - "!electron/resources/OpenMausBot Recorder.app/**"
+  - "!**/node_modules/**"
+  - package.json
+
+asar: true
+
+publish:
+  - provider: github
+    owner: iangogentic
+    repo: OpenMausBot
+
+mac:
+  target:
+    - target: dir
+      arch: [arm64]
+  icon: build/icon.icns
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+  extraResources:
+    - from: electron/resources/OpenMausBot Speech.app
+      to: OpenMausBot Speech.app
+    - from: electron/resources/OpenMausBot Recorder.app
+      to: OpenMausBot Recorder.app
+  extendInfo:
+    NSMicrophoneUsageDescription: OpenMaus Razer uses the microphone for voice dictation into the composer.
+    NSSpeechRecognitionUsageDescription: OpenMaus Razer transcribes your voice on-device to type messages for you.
+    NSScreenCaptureUsageDescription: OpenMaus Razer can capture this Mac only after an explicit local-computer approval.

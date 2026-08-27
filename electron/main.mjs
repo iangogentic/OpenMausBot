@@ -23,6 +23,7 @@ import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
+import { resolveRemoteClientURL } from "./remote-client.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -58,6 +59,11 @@ const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.
 const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("./window-state.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REMOTE_SERVER_URL = resolveRemoteClientURL({
+  argv: process.argv,
+  env: process.env,
+  userDataDir: app.getPath("userData"),
+});
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
 // resolve to ::1 and paint a black window
 const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
@@ -793,7 +799,9 @@ const displayMediaGuard = createDisplayMediaGuard();
 let displayMediaRequestCount = 0;
 
 function rendererOrigin() {
-  return new URL(app.isPackaged ? `http://127.0.0.1:${SERVER_PORT}` : DEV_URL).origin;
+  return new URL(
+    REMOTE_SERVER_URL ?? (app.isPackaged ? `http://127.0.0.1:${SERVER_PORT}` : DEV_URL),
+  ).origin;
 }
 
 function respondToDisplayMediaRequest(callback, response) {
@@ -1081,7 +1089,7 @@ function createWindow() {
             };
           })()
         `);
-        const expectedLocation = `http://127.0.0.1:${SERVER_PORT}/`;
+        const expectedLocation = `${rendererOrigin()}/`;
         if (result.location !== expectedLocation) {
           throw new Error(
             `unexpected packaged renderer URL: ${result.location} (expected ${expectedLocation})`,
@@ -1130,7 +1138,9 @@ function createWindow() {
     });
   }
 
-  if (app.isPackaged) {
+  if (REMOTE_SERVER_URL) {
+    win.loadURL(REMOTE_SERVER_URL);
+  } else if (app.isPackaged) {
     win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
   } else {
     win.loadURL(DEV_URL);
@@ -1370,6 +1380,11 @@ ipcMain.handle("companion-account:verify-code", (_event, email, code) =>
 ipcMain.handle("companion-account:retry", () => ensureCompanionAccountService().retry());
 ipcMain.handle("companion-account:sign-out", () => ensureCompanionAccountService().signOut());
 
+ipcMain.handle("desktop:connection", () => ({
+  mode: REMOTE_SERVER_URL ? "remote" : "local",
+  serverUrl: rendererOrigin(),
+}));
+
 ipcMain.handle("desktop:capabilities", async () =>
   desktopCapabilities({
     platform: process.platform,
@@ -1415,7 +1430,7 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
   if (!patchFor || typeof value !== "string") {
     throw new Error("Unsupported credential");
   }
-  if (app.isPackaged && !(await safeStorage.isAsyncEncryptionAvailable())) {
+  if (!REMOTE_SERVER_URL && app.isPackaged && !(await safeStorage.isAsyncEncryptionAvailable())) {
     throw new Error("The operating-system credential store is unavailable");
   }
   const secret = value.trim();
@@ -1423,8 +1438,8 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     // In development the server is a separately launched process, so it
     // cannot receive credentials from Electron at boot. Keep its established
     // local config path there; production always uses the encrypted store.
-    const secretStorage = app.isPackaged ? "?secretStorage=external" : "";
-    const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config${secretStorage}`, {
+    const secretStorage = app.isPackaged && !REMOTE_SERVER_URL ? "?secretStorage=external" : "";
+    const response = await fetch(`${rendererOrigin()}/api/config${secretStorage}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(patchFor(secret)),
@@ -1433,7 +1448,7 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);
     return body;
   };
-  if (!app.isPackaged) return applyToHarness();
+  if (!app.isPackaged || REMOTE_SERVER_URL) return applyToHarness();
 
   // Commit the encrypted value before the server makes it live. The shared
   // state rolls credentials.bin back if validation/reload fails, while also
@@ -1541,26 +1556,29 @@ app.whenReady().then(async () => {
   // connection descriptor on first render. Never blocks window creation on
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
-    process.platform === "darwin" || process.platform === "linux"
+    !REMOTE_SERVER_URL && (process.platform === "darwin" || process.platform === "linux")
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
           return { mode: "unavailable", reason: String(e) };
         })
-      : Promise.resolve({ mode: "unavailable", reason: "unsupported-platform" });
-  if (app.isPackaged) serverReady = await startServerPackaged();
+      : Promise.resolve({
+          mode: "unavailable",
+          reason: REMOTE_SERVER_URL ? "remote-client" : "unsupported-platform",
+        });
+  if (app.isPackaged && !REMOTE_SERVER_URL) serverReady = await startServerPackaged();
   // The companion the user left on comes back without anyone finding the
   // toggle again — one attempt, after the harness port is settled, with the
   // exact options the IPC handler uses. A failure surfaces in companionState
   // (the panel shows the error) rather than retrying; and it never delays
   // the window.
-  if (serverReady && companionEnabledAtRest()) {
+  if (!REMOTE_SERVER_URL && serverReady && companionEnabledAtRest()) {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
   // Reconcile incomplete setup and resume interrupted sign-out only after the
   // local app is usable. This background network work never gates LAN pairing
   // or the first window.
-  void hostedAccount.restore().catch(() => {});
+  if (!REMOTE_SERVER_URL) void hostedAccount.restore().catch(() => {});
   // Registration is optional network work. Start it only after the local
   // server and first window are usable, then update the server child over its
   // private parent port so Connected Apps becomes available without restart.
@@ -1570,7 +1588,7 @@ app.whenReady().then(async () => {
   if (credentialStoreUnavailable) {
     slog("skipping connected-apps registration: the credential store was unreadable this launch");
   }
-  if (app.isPackaged && composioBrokerUrl() && !credentialStoreUnavailable) {
+  if (app.isPackaged && !REMOTE_SERVER_URL && composioBrokerUrl() && !credentialStoreUnavailable) {
     void updateSecureCredentialDocument(async (credentials) => {
       await ensureManagedComposioCredentials({
         brokerUrl: composioBrokerUrl(),

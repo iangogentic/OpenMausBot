@@ -13,6 +13,8 @@ ipcRenderer.on("package:install", (_event, url) => {
 contextBridge.exposeInMainWorld("ogb", {
   /** Host platform ("darwin" | "win32" | "linux") — for platform-aware UI. */
   platform: process.platform,
+  /** Whether this shell owns an embedded harness or controls an existing one. */
+  connection: () => ipcRenderer.invoke("desktop:connection"),
   getCapabilities: () => ipcRenderer.invoke("desktop:capabilities"),
   onCapabilitiesChanged: (cb) => {
     const handler = (_event, capabilities) => cb(capabilities);
