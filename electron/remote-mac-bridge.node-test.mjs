@@ -205,3 +205,45 @@ test("force-reaps a CUA child that ignores graceful shutdown after its socket cl
     cleanup();
   }
 });
+
+test("does not spawn CUA when the client disconnects while local approval is pending", async () => {
+  const { userDataDir, cleanup } = fixture();
+  const port = await freePort();
+  let finishApproval;
+  let spawnCount = 0;
+  const bridge = await startRemoteMacBridge({
+    userDataDir,
+    port,
+    getConnection: () => echoConnection,
+    approveConnection: () => new Promise((resolve) => { finishApproval = resolve; }),
+    spawnProcess: (...args) => {
+      spawnCount += 1;
+      return spawn(...args);
+    },
+    log: {},
+  });
+  try {
+    const token = fs.readFileSync(bridge.tokenFile, "utf8").trim();
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    await new Promise((resolve) => socket.once("connect", resolve));
+    socket.write(`OMB-MAC-BRIDGE/1 ${token}\n`);
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("approval did not start")), 1_000);
+      const check = () => {
+        if (finishApproval) {
+          clearTimeout(timeout);
+          resolve();
+        } else setTimeout(check, 10);
+      };
+      check();
+    });
+    socket.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    finishApproval(true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(spawnCount, 0);
+  } finally {
+    await bridge.stop();
+    cleanup();
+  }
+});

@@ -142,8 +142,13 @@ export async function startRemoteMacBridge({
         socket.end("DENIED\n");
         return;
       }
+      // The native prompt is asynchronous. The tunneled client may time out
+      // or disconnect while a person is deciding; never create a CUA child
+      // for a socket that is already gone.
+      if (socket.destroyed) return;
 
       const connection = await getConnection();
+      if (socket.destroyed) return;
       if (!usableCuaConnection(connection)) {
         socket.end("UNAVAILABLE\n");
         return;
