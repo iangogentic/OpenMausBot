@@ -1133,8 +1133,10 @@ function createWindow() {
                 });
               });
             }
-            const [initialCapabilities, healthResponse] = await Promise.all([
+            const [initialCapabilities, connection, companion, healthResponse] = await Promise.all([
               window.ogb.getCapabilities(),
+              window.ogb.connection(),
+              window.ogb.companion.state(),
               fetch("/api/health"),
             ]);
             if (!healthResponse.ok) {
@@ -1155,6 +1157,8 @@ function createWindow() {
             return {
               initialCapabilities,
               capabilities,
+              connection,
+              companion,
               cuaCrashReason,
               cuaRetryStatus,
               health,
