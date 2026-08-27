@@ -13,6 +13,8 @@ import {
 } from "lucide-react";
 import { Card, CommandLine } from "./SettingsPrimitives";
 import { cn } from "@/lib/cn";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { computerLocationCopy } from "@/lib/computer-location";
 
 type Action = "pull" | "run" | "start" | "stop" | "remove" | "recreate";
 
@@ -101,6 +103,8 @@ function ActionButton({
 }
 
 export function LocalComputerSection() {
+  const { capabilities } = useDesktopCapabilities();
+  const computerCopy = computerLocationCopy(capabilities);
   const [status, setStatus] = useState<Status | null>(null);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<Action | null>(null);
@@ -216,7 +220,9 @@ export function LocalComputerSection() {
         status?.persistence === "unsafe"),
   );
   const unavailable = !loading && !status;
-  const host = status?.platform === "darwin" ? "Mac" : "computer";
+  const host = computerCopy.remote
+    ? computerCopy.serverName
+    : status?.platform === "darwin" ? "Mac" : "computer";
   const perBot = status?.mode === "per-bot";
   const perBotRuntimeUnsupported = perBot && status?.runtime === "container";
   const headerReady = perBot ? Boolean(status?.daemonUp && status?.image && !perBotRuntimeUnsupported) : ready;
@@ -224,10 +230,10 @@ export function LocalComputerSection() {
   return (
     <>
       <Card
-        title="Local VM"
+        title={computerCopy.vmLabel}
         subtitle={perBot
-          ? `Private Cua Linux desktops on this ${host}, with one container and durable workspace per bot. Distinct bots can work concurrently and idle desktops stop after 8 hours.`
-          : `A shared Cua Linux sandbox on this ${host} for bots to browse and work in — isolated, backed by one durable workspace, and automatically recycled after 8 hours without activity.`}
+          ? `Private Cua Linux desktops on ${computerCopy.remote ? host : `this ${host}`}, with one container and durable workspace per bot. Distinct bots can work concurrently and idle desktops stop after 8 hours.`
+          : `A shared Cua Linux sandbox on ${computerCopy.remote ? host : `this ${host}`} for bots to browse and work in — isolated, backed by one durable workspace, and automatically recycled after 8 hours without activity.`}
       >
         <div className="flex flex-wrap items-center gap-2">
           <span

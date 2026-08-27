@@ -59,6 +59,12 @@ type SkillRecordingPayload = {
 };
 
   type DesktopCapabilities = {
+    connection?: {
+      /** Local means this desktop shell owns the harness. Remote means the
+       * shell controls an always-on OpenMaus server somewhere else. */
+      mode: "local" | "remote" | "browser";
+      serverName?: string;
+    };
     host: {
       platform: "darwin" | "linux" | "win32" | "other";
       /** The user's home folder, for showing paths as ~/… */

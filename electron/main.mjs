@@ -23,7 +23,12 @@ import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
-import { readRemoteMacBridgeConfig, resolveRemoteClientURL, resolveRemoteCompanionURL } from "./remote-client.mjs";
+import {
+  readRemoteMacBridgeConfig,
+  readRemoteServerName,
+  resolveRemoteClientURL,
+  resolveRemoteCompanionURL,
+} from "./remote-client.mjs";
 import { startRemoteMacBridge } from "./remote-mac-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -78,6 +83,7 @@ const REMOTE_COMPANION_URL = resolveRemoteCompanionURL({
   userDataDir: app.getPath("userData"),
 });
 const REMOTE_MAC_BRIDGE = readRemoteMacBridgeConfig(app.getPath("userData"));
+const REMOTE_SERVER_NAME = readRemoteServerName(app.getPath("userData")) ?? "Remote server";
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
 // resolve to ::1 and paint a black window
 const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
@@ -1495,13 +1501,22 @@ ipcMain.handle("desktop:connection", () => ({
   serverUrl: rendererOrigin(),
 }));
 
+function desktopCapabilitiesForRenderer(localConnection) {
+  const connection = { mode: REMOTE_SERVER_URL ? "remote" : "local" };
+  if (REMOTE_SERVER_URL) connection.serverName = REMOTE_SERVER_NAME;
+  return {
+    ...desktopCapabilities({
+      platform: process.platform,
+      env: process.env,
+      packaged: app.isPackaged,
+      localConnection,
+    }),
+    connection,
+  };
+}
+
 ipcMain.handle("desktop:capabilities", async () =>
-  desktopCapabilities({
-    platform: process.platform,
-    env: process.env,
-    packaged: app.isPackaged,
-    localConnection: await cuaReady,
-  }),
+  desktopCapabilitiesForRenderer(await cuaReady),
 );
 
 ipcMain.handle("assemblyai:status", () => ({
@@ -1574,12 +1589,7 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
 });
 
 async function broadcastDesktopCapabilities() {
-  const capabilities = desktopCapabilities({
-    platform: process.platform,
-    env: process.env,
-    packaged: app.isPackaged,
-    localConnection: await cuaReady,
-  });
+  const capabilities = desktopCapabilitiesForRenderer(await cuaReady);
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) window.webContents.send("desktop:capabilities-changed", capabilities);
   }

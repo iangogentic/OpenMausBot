@@ -1,4 +1,5 @@
 const browserCapabilities: DesktopCapabilities = {
+  connection: { mode: "browser" },
   host: {
     platform: "other",
     label: "Browser",
@@ -45,6 +46,7 @@ export function initialDesktopCapabilities(): DesktopCapabilities {
   if (!isMac) dictation.reasonCode = "unsupported-platform";
   return {
     ...browserCapabilities,
+    connection: { mode: "local" },
     host: {
       ...browserCapabilities.host,
       platform: platform === "darwin" || platform === "linux" || platform === "win32" ? platform : "other",

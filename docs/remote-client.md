@@ -11,7 +11,9 @@ Closing the Mac app does not stop work on the Linux host. The client checks serv
 
 Keep the harness and companion control ports bound to loopback on the server. Carry them through an encrypted SSH tunnel or put an HTTPS reverse proxy with authentication in front of the harness. The client rejects cleartext HTTP origins unless they are loopback addresses.
 
-The Linux host remains the default computer the bots control. Physical-Mac control is optional and uses a separate loopback-only, authenticated, approval-gated bridge. The Linux server cannot reach it when the Mac app, Mac, or SSH tunnel is offline.
+The bot runtime and the computer-control destination are separate. The harness, model CLI, shell, files, conversations, and routines stay on the Linux server. A bot can independently target a server-hosted Local VM, an external cloud computer, the physical Mac, or no graphical computer. For an always-on deployment, explicitly select the server-hosted Local VM instead of leaving the bot on Auto: Auto may fall back to the physical Mac when no cloud box exists.
+
+Physical-Mac control is optional and uses a separate loopback-only, authenticated, approval-gated bridge. The Linux server cannot reach it when the Mac app, Mac, or SSH tunnel is offline.
 
 ## Server
 
@@ -46,6 +48,7 @@ Place `remote-client.json` in the app's Electron user-data directory:
 ```json
 {
   "mode": "remote",
+  "serverName": "Razer",
   "serverUrl": "http://127.0.0.1:18799",
   "companionUrl": "http://127.0.0.1:8811",
   "macBridge": {
@@ -64,6 +67,8 @@ corepack pnpm package:remote:mac
 ```
 
 The result is `release-remote/mac-arm64/OpenMaus Razer.app`. The remote package omits the harness, server database, and companion server. It includes the pinned macOS CUA runtime because that runtime controls the Mac and must run inside the Mac app's local security boundary.
+
+The remote UI uses `serverName` to keep the topology explicit: **Razer VM** means the isolated Linux desktop hosted on the Razer, while **This Mac** means the user's physical Mac through the attended bridge. Neither option changes where the bot's model, shell, or files run.
 
 ## Optional physical-Mac bridge
 

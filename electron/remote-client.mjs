@@ -92,6 +92,23 @@ export function readRemoteMacBridgeConfig(userDataDir, readFile = fs.readFileSyn
   }
 }
 
+export function readRemoteServerName(userDataDir, readFile = fs.readFileSync) {
+  try {
+    const parsed = JSON.parse(readFile(remoteClientConfigPath(userDataDir), "utf8"));
+    if (parsed?.mode !== "remote") return null;
+    if (parsed.serverName === undefined) return null;
+    if (Object.prototype.toString.call(parsed.serverName) !== "[object String]") {
+      throw new Error("The remote OpenMausBot server name is invalid");
+    }
+    const name = parsed.serverName.trim();
+    if (!name || name.length > 80) throw new Error("The remote OpenMausBot server name is invalid");
+    return name;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
 /** CLI wins for one-off diagnostics, then the environment, then durable setup. */
 export function resolveRemoteClientURL({ argv, env, userDataDir, readFile } = {}) {
   const commandLine = commandLineRemoteURL(argv ?? []);

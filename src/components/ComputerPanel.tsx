@@ -40,6 +40,7 @@ import {
   localComputerSelectable,
 } from "@/lib/local-computer";
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
+import { computerLocationCopy } from "@/lib/computer-location";
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(path, { headers: { "content-type": "application/json" }, ...init });
@@ -111,6 +112,7 @@ function nextRunLabel(at: number | null) {
 export function ComputerPanel({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
   const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
+  const computerCopy = computerLocationCopy(capabilities);
   const localAvailable = capabilities.localComputer.available;
   const isLinux = capabilities.host.platform === "linux";
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
@@ -198,14 +200,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     bot.computer === "cloud"
       ? cloudBackend === "vps" ? "this self-hosted VPS" : "this cloud box"
       : bot.computer === "vm"
-        ? "the Local VM"
+        ? computerCopy.vmDestination
       : bot.computer === "local"
-        ? "this computer"
+        ? computerCopy.localDestination
         : bot.computer === "off"
           ? null
           : phase === "ready"
             ? cloudBackend === "vps" ? "the self-hosted VPS selected by Auto" : "the cloud box selected by Auto"
-            : "this computer selected by Auto";
+            : `${computerCopy.localDestination} selected by Auto`;
 
   // resolve the mode on open; box endpoints are only ever hit on the
   // cloud path, so local/off can never render a JSON error as an image
@@ -768,8 +770,8 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           {/* Screen preview */}
           <div className="mb-1.5 mt-2 flex items-center justify-between text-[13px] text-ink-secondary">
             <span>{bot.name}'s screen</span>
-            {phase === "local" && <span className="text-[11px]">this computer</span>}
-            {phase === "vm" && <span className="text-[11px]">Local VM</span>}
+            {phase === "local" && <span className="text-[11px]">{computerCopy.localLabel}</span>}
+            {phase === "vm" && <span className="text-[11px]">{computerCopy.vmLabel}</span>}
             {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && <span className="text-[11px]">self-hosted VPS</span>}
         </div>
         <div className="flex aspect-[16/10] w-full items-center justify-center overflow-hidden rounded-xl bg-card">
@@ -1040,7 +1042,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
 
         {/* Computer source */}
           <div className="mt-4 rounded-xl bg-card p-4">
-            <div className="text-[15px] font-medium text-ink">Runs on</div>
+            <div className="text-[15px] font-medium text-ink">Computer tools act on</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
               {!bot.computer &&
                 (isLinux || !localSelectable
@@ -1048,18 +1050,19 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
                     ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off. "
                     : `${linuxAutoDescription()} `
                   : cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one exists, otherwise this computer. "
-                    : "Auto uses a cloud box when one exists, otherwise this computer. ")}
-              Pick where this bot's computer lives. <b className="text-ink">Local VM</b> is a Cua-controlled Linux desktop
-              in a container on this machine — free and separate from your own desktop. Set it up in App
+                    ? `Auto reuses a ready VPS when one exists, otherwise ${computerCopy.localDestination}. `
+                    : `Auto uses a cloud box when one exists, otherwise ${computerCopy.localDestination}. `)}
+              {computerCopy.remote && `${bot.name}'s model, shell, and files remain on ${computerCopy.serverName}. `}
+              Pick where browser and computer-control tools act. <b className="text-ink">{computerCopy.vmLabel}</b> is a Cua-controlled Linux desktop
+              on {computerCopy.remote ? computerCopy.serverName : "this computer"} — isolated from your physical desktop. Set it up in App
               Settings → Local VM.
           </div>
           <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
             {(
               [
                 ["cloud", "Cloud"],
-                ["vm", "Local VM"],
-                ["local", "This computer"],
+                ["vm", computerCopy.vmLabel],
+                ["local", computerCopy.localLabel],
                 ["off", "Off"],
               ] as const
             ).map(([mode, label], i) => (

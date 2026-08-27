@@ -5,6 +5,7 @@ import {
   readRemoteClientConfig,
   readRemoteCompanionConfig,
   readRemoteMacBridgeConfig,
+  readRemoteServerName,
   resolveRemoteCompanionURL,
   resolveRemoteClientURL,
 } from "./remote-client.mjs";
@@ -76,5 +77,17 @@ test("enables the physical Mac bridge only through explicit durable configuratio
       JSON.stringify({ mode: "remote", macBridge: { enabled: true, port: 80 } }),
     ),
     /port is invalid/,
+  );
+});
+
+test("reads a short display name for the remote server", () => {
+  assert.equal(
+    readRemoteServerName("/unused", () => JSON.stringify({ mode: "remote", serverName: " Razer " })),
+    "Razer",
+  );
+  assert.equal(readRemoteServerName("/unused", () => JSON.stringify({ mode: "remote" })), null);
+  assert.throws(
+    () => readRemoteServerName("/unused", () => JSON.stringify({ mode: "remote", serverName: "" })),
+    /name is invalid/,
   );
 });

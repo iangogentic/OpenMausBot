@@ -14,6 +14,7 @@ import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import { VoiceSettings } from "./VoiceSettings";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
+import { computerLocationCopy } from "@/lib/computer-location";
 
 function Field({
   label,
@@ -317,6 +318,7 @@ function MemoryCard({ bot }: { bot: Bot }) {
 export function SettingsPanel({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
   const { capabilities } = useDesktopCapabilities();
+  const computerCopy = computerLocationCopy(capabilities);
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
   const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | null>(null);
@@ -592,15 +594,18 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           )}
 
           <div className="rounded-xl bg-card p-4">
-            <div className="text-[15px] font-medium text-ink">Computer</div>
+            <div className="text-[15px] font-medium text-ink">Computer tools</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
-              Where this bot's computer runs{bot.computer ? "" : " (currently: auto)"}
+              {computerCopy.remote
+                ? `${bot.name}'s model, shell, and files run on ${computerCopy.serverName}. Choose where its browser and computer-control tools act`
+                : "Choose where this bot's browser and computer-control tools act"}
+              {bot.computer ? "." : " (currently: Auto)."}
             </div>
             <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
               {([
                 ["cloud", "Cloud"],
-                ["vm", "Local VM"],
-                ["local", "This computer"],
+                ["vm", computerCopy.vmLabel],
+                ["local", computerCopy.localLabel],
                 ["off", "Off"],
               ] as const).map(([mode, label], i) => (
                 <button
