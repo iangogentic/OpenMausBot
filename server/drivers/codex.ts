@@ -151,6 +151,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       const launchAttempt = async (attempt: number): Promise<void> => {
         const env = childEnv();
         const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
+        const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
+        const effectiveFullAuto = config.fullAuto && !controlsHost;
         if (turn.integrations?.composio) {
           mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
         }
@@ -257,7 +259,6 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       // Host-scope tagging mirrors claude.ts: when this turn mounts the real
       // Mac (not a VM), every card carries approvalScope so the harness's
       // local-computer-block backstop applies to remembered always-allows.
-      const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
       const handleServerRequest = (msg: any) => {
         const method = msg.method as string;
         const params = msg.params ?? {};
@@ -280,7 +281,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // Full-auto belongs to the harness workspace/VM boundary. It must
         // never silently widen into the user's physical computer merely
         // because a local-computer MCP mount is present.
-        if (config.fullAuto && !isQuestion && !controlsHost) {
+        if (effectiveFullAuto && !isQuestion) {
           return send({
             jsonrpc: "2.0",
             id: msg.id,
@@ -516,8 +517,8 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             cwd: turn.cwd ?? homedir(),
             model: selection.model,
             ...(selection.modelProvider ? { modelProvider: selection.modelProvider } : {}),
-            sandbox: config.fullAuto ? "danger-full-access" : "workspace-write",
-            approvalPolicy: config.fullAuto ? "never" : "on-request",
+            sandbox: effectiveFullAuto ? "danger-full-access" : "workspace-write",
+            approvalPolicy: effectiveFullAuto ? "never" : "on-request",
             ephemeral: false,
           });
           codexThreadId = started?.thread?.id ?? null;

@@ -416,6 +416,8 @@ describe("CodexDriver turns (fake app-server)", () => {
 
   it("never lets fullAuto bypass a physical-computer approval", async () => {
     await create({ mode: "approval", fullAuto: true });
+    const dump = join(scratch, "full-auto-host-dump.json");
+    process.env.FAKE_CODEX_DUMP = dump;
     await instance.adapter.sendTurn({
       threadId: "t-auto-host",
       text: "inspect the Mac",
@@ -433,6 +435,10 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(opened).toMatchObject({ approvalScope: "local-computer" });
     await instance.adapter.respondToRequest("t-auto-host", opened.requestId!, { behavior: "allow" });
     await recorder.until((e) => e.type === "turn.completed");
+    const threadStart = JSON.parse(readFileSync(dump, "utf8")).calls.find(
+      (call: { method: string }) => call.method === "thread/start",
+    );
+    expect(threadStart.params).toMatchObject({ sandbox: "workspace-write", approvalPolicy: "on-request" });
   });
 
   it("rejects a second turn while one is in flight", async () => {
