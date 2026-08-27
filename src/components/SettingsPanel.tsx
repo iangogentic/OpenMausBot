@@ -610,6 +610,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               ] as const).map(([mode, label], i) => (
                 <button
                   key={mode}
+                  aria-pressed={bot.computer === mode}
                   disabled={mode === "local" && !localSelectable}
                   title={mode === "local" && !localSelectable ? localDisabledReason ?? undefined : undefined}
                   onClick={() => {

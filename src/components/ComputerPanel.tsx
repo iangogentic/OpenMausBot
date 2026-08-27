@@ -1082,6 +1082,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
                 return (
               <button
                 key={mode}
+                aria-pressed={bot.computer === mode}
                 disabled={disabled}
                 title={unavailableTitle}
                 onClick={() => {
