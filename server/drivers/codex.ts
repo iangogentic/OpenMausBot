@@ -277,7 +277,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             : isQuestion
               ? "ask_user"
               : "shell";
-        if (config.fullAuto && !isQuestion) {
+        // Full-auto belongs to the harness workspace/VM boundary. It must
+        // never silently widen into the user's physical computer merely
+        // because a local-computer MCP mount is present.
+        if (config.fullAuto && !isQuestion && !controlsHost) {
           return send({
             jsonrpc: "2.0",
             id: msg.id,

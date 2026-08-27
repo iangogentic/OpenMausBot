@@ -414,6 +414,27 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
   });
 
+  it("never lets fullAuto bypass a physical-computer approval", async () => {
+    await create({ mode: "approval", fullAuto: true });
+    await instance.adapter.sendTurn({
+      threadId: "t-auto-host",
+      text: "inspect the Mac",
+      integrations: {
+        localComputer: {
+          command: "/cua-driver",
+          args: ["mcp"],
+          env: {},
+          platform: "darwin",
+          scope: "local-computer",
+        },
+      },
+    });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({ approvalScope: "local-computer" });
+    await instance.adapter.respondToRequest("t-auto-host", opened.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+  });
+
   it("rejects a second turn while one is in flight", async () => {
     await create({ mode: "approval" }); // approval mode parks the turn open
     await instance.adapter.sendTurn({ threadId: "t-busy", text: "one" });
