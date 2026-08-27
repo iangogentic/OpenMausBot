@@ -6,8 +6,9 @@ directories:
   buildResources: build
   output: release-remote
 
-# The remote shell deliberately carries no harness, provider keys, database,
-# CUA daemon or companion listener. Those remain on the always-on server.
+# The remote shell carries no harness, provider keys, database, or companion
+# listener. Its CUA daemon stays local and is exposed only through the private,
+# approval-gated reverse-SSH bridge.
 files:
   - electron/**
   - "!electron/**/*.test.*"
@@ -41,11 +42,16 @@ mac:
   entitlementsInherit: build/entitlements.mac.plist
   notarize: false
   extraResources:
+    - from: dist-native/${arch}/cua-driver
+      to: cua-driver
+    - from: dist-native/${arch}/cua-sdk
+      to: cua-sdk
     - from: electron/resources/OpenMausBot Speech.app
       to: OpenMausBot Speech.app
     - from: electron/resources/OpenMausBot Recorder.app
       to: OpenMausBot Recorder.app
   extendInfo:
+    NSAccessibilityUsageDescription: OpenMaus Razer controls this Mac only after explicit local and per-action approvals.
     NSMicrophoneUsageDescription: OpenMaus Razer uses the microphone for voice dictation into the composer.
     NSSpeechRecognitionUsageDescription: OpenMaus Razer transcribes your voice on-device to type messages for you.
     NSScreenCaptureUsageDescription: OpenMaus Razer can capture this Mac only after an explicit local-computer approval.

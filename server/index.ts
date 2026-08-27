@@ -910,9 +910,7 @@ bus.subscribe((event: RuntimeEvent) => {
                 options: ["Allow", "Deny"],
                 requestId,
                 tool,
-                allowKey: event.approvalScope
-                  ? undefined
-                  : approvalKey(tool, summary, event.approvalScope),
+                allowKey: approvalKey(tool, summary, event.approvalScope),
                 held: "Auto mode couldn't answer this one.",
                 approvalScope: event.approvalScope,
               },
@@ -949,10 +947,9 @@ bus.subscribe((event: RuntimeEvent) => {
           tool: permission ? event.tool : undefined,
           // the exact grant "always allow" would remember, decided here so
           // client and server can never derive it differently
-          allowKey:
-            permission && !event.approvalScope
-              ? approvalKey(event.tool, event.summary, event.approvalScope)
-              : undefined,
+          allowKey: permission
+            ? approvalKey(event.tool, event.summary, event.approvalScope)
+            : undefined,
           // in auto mode a card can only mean the guard stopped it — say so
           held:
             permission && asker?.autoApprove

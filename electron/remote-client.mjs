@@ -77,6 +77,21 @@ export function readRemoteCompanionConfig(userDataDir, readFile = fs.readFileSyn
   }
 }
 
+export function readRemoteMacBridgeConfig(userDataDir, readFile = fs.readFileSync) {
+  try {
+    const parsed = JSON.parse(readFile(remoteClientConfigPath(userDataDir), "utf8"));
+    if (parsed?.mode !== "remote" || parsed?.macBridge?.enabled !== true) return null;
+    const port = parsed.macBridge.port ?? 18798;
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      throw new Error("The remote Mac bridge port is invalid");
+    }
+    return { enabled: true, port };
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
 /** CLI wins for one-off diagnostics, then the environment, then durable setup. */
 export function resolveRemoteClientURL({ argv, env, userDataDir, readFile } = {}) {
   const commandLine = commandLineRemoteURL(argv ?? []);

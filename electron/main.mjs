@@ -23,7 +23,8 @@ import { activateExistingWindow } from "./single-instance.mjs";
 import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
-import { resolveRemoteClientURL, resolveRemoteCompanionURL } from "./remote-client.mjs";
+import { readRemoteMacBridgeConfig, resolveRemoteClientURL, resolveRemoteCompanionURL } from "./remote-client.mjs";
+import { startRemoteMacBridge } from "./remote-mac-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -76,6 +77,7 @@ const REMOTE_COMPANION_URL = resolveRemoteCompanionURL({
   env: process.env,
   userDataDir: app.getPath("userData"),
 });
+const REMOTE_MAC_BRIDGE = readRemoteMacBridgeConfig(app.getPath("userData"));
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
 // resolve to ::1 and paint a black window
 const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
@@ -87,6 +89,8 @@ let desktopViewerOwner = null;
 let desktopViewerContextId = null;
 let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
 let mainWindow = null;
+let remoteMacBridge = null;
+let remoteMacAlwaysAllow = false;
 let unreadCount = 0;
 let unreadOverlayIcon = null;
 
@@ -1662,7 +1666,8 @@ app.whenReady().then(async () => {
   // connection descriptor on first render. Never blocks window creation on
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
-    !REMOTE_SERVER_URL && (process.platform === "darwin" || process.platform === "linux")
+    (process.platform === "darwin" && (!REMOTE_SERVER_URL || REMOTE_MAC_BRIDGE?.enabled)) ||
+    (process.platform === "linux" && !REMOTE_SERVER_URL)
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
           return { mode: "unavailable", reason: String(e) };
@@ -1681,6 +1686,34 @@ app.whenReady().then(async () => {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
+  if (REMOTE_SERVER_URL && REMOTE_MAC_BRIDGE?.enabled && process.platform === "darwin") {
+    remoteMacBridge = await startRemoteMacBridge({
+      userDataDir: app.getPath("userData"),
+      getConnection: () => cuaReady,
+      port: REMOTE_MAC_BRIDGE.port,
+      approveConnection: async () => {
+        if (remoteMacAlwaysAllow) return true;
+        const options = {
+          type: "warning",
+          title: "Physical Mac access",
+          message: "Allow the Razer OpenMaus server to control this Mac?",
+          detail: "OpenMaus applies its separate per-action or remembered exact-tool approval in the chat. This connection lasts only for the current agent computer session.",
+          buttons: ["Deny", "Allow Once", "Always Allow While App Is Open"],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        };
+        const result = mainWindow && !mainWindow.isDestroyed()
+          ? await dialog.showMessageBox(mainWindow, options)
+          : await dialog.showMessageBox(options);
+        if (result.response === 2) remoteMacAlwaysAllow = true;
+        return result.response === 1 || result.response === 2;
+      },
+    }).catch((error) => {
+      console.error("[mac-bridge] start failed:", error);
+      return null;
+    });
+  }
   // Reconcile incomplete setup and resume interrupted sign-out only after the
   // local app is usable. This background network work never gates LAN pairing
   // or the first window.
@@ -1755,6 +1788,7 @@ app.on("before-quit", (e) => {
   const cleanup = Promise.race([
     Promise.all([
       stopCua().catch(() => {}),
+      remoteMacBridge?.stop().catch(() => {}),
       // Both listeners reachable from outside the app are owned children.
       // Shut the connector down first, then the sidecar, without changing the
       // remembered toggle the next launch will restore.

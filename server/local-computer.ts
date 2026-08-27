@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import type { Stats } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -34,6 +35,7 @@ type LegacyConnectionDescriptor = {
 };
 
 type LinuxConnectionDescriptor = Record<string, unknown>;
+type RemoteMacConnectionDescriptor = Record<string, unknown>;
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const expected = new Set(keys);
@@ -242,6 +244,58 @@ export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalCo
   };
 }
 
+export function decodeRemoteMacDescriptor(value: RemoteMacConnectionDescriptor): LocalComputerConnection | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (
+    !exactKeys(value, ["schemaVersion", "mode", "platform", "scope", "generation", "bridge", "proxy"]) ||
+    value.schemaVersion !== 1 ||
+    value.mode !== "remote-mac-bridge" ||
+    value.platform !== "darwin" ||
+    value.scope !== "local-computer" ||
+    typeof value.generation !== "string" ||
+    !/^[0-9a-f-]{32,64}$/i.test(value.generation)
+  ) {
+    return null;
+  }
+  const bridge = value.bridge as Record<string, unknown>;
+  const proxy = value.proxy as Record<string, unknown>;
+  if (
+    !bridge ||
+    !proxy ||
+    Array.isArray(bridge) ||
+    Array.isArray(proxy) ||
+    !exactKeys(bridge, ["host", "port", "tokenFile"]) ||
+    !exactKeys(proxy, ["path", "sha256"]) ||
+    bridge.host !== "127.0.0.1" ||
+    !Number.isInteger(bridge.port) ||
+    (bridge.port as number) < 1024 ||
+    (bridge.port as number) > 65535 ||
+    typeof bridge.tokenFile !== "string" ||
+    !isAbsolute(bridge.tokenFile) ||
+    typeof proxy.path !== "string" ||
+    !isAbsolute(proxy.path) ||
+    typeof proxy.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(proxy.sha256)
+  ) {
+    return null;
+  }
+  return {
+    command: proxy.path,
+    args: [
+      "--host",
+      bridge.host,
+      "--port",
+      String(bridge.port),
+      "--token-file",
+      bridge.tokenFile,
+    ],
+    env: {},
+    platform: "darwin",
+    generation: value.generation,
+    scope: "local-computer",
+  };
+}
+
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -253,6 +307,49 @@ function processAlive(pid: number): boolean {
 
 function ownedPrivate(stat: Stats, uid: number): boolean {
   return (stat.uid === uid || stat.uid === 0) && (stat.mode & 0o077) === 0;
+}
+
+export function validateRemoteMacDescriptorRuntime(
+  descriptorFile: string,
+  raw: RemoteMacConnectionDescriptor,
+  { uid = process.getuid?.() ?? -1 }: { uid?: number } = {},
+): boolean {
+  try {
+    const descriptorStat = lstatSync(descriptorFile);
+    const descriptorDirectoryStat = lstatSync(dirname(descriptorFile));
+    const bridge = raw.bridge as Record<string, unknown>;
+    const proxy = raw.proxy as Record<string, unknown>;
+    const proxyPath = proxy.path as string;
+    const tokenFile = bridge.tokenFile as string;
+    const proxyStat = lstatSync(proxyPath);
+    const tokenStat = lstatSync(tokenFile);
+    if (
+      !descriptorStat.isFile() ||
+      descriptorStat.isSymbolicLink() ||
+      !ownedPrivate(descriptorStat, uid) ||
+      !descriptorDirectoryStat.isDirectory() ||
+      descriptorDirectoryStat.isSymbolicLink() ||
+      !ownedPrivate(descriptorDirectoryStat, uid) ||
+      !proxyStat.isFile() ||
+      proxyStat.isSymbolicLink() ||
+      (proxyStat.uid !== uid && proxyStat.uid !== 0) ||
+      (proxyStat.mode & 0o111) === 0 ||
+      (proxyStat.mode & 0o022) !== 0 ||
+      realpathSync(proxyPath) !== proxyPath ||
+      !tokenStat.isFile() ||
+      tokenStat.isSymbolicLink() ||
+      !ownedPrivate(tokenStat, uid) ||
+      realpathSync(tokenFile) !== tokenFile
+    ) {
+      return false;
+    }
+    const token = readFileSync(tokenFile, "utf8").trim();
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return false;
+    const digest = createHash("sha256").update(readFileSync(proxyPath)).digest("hex");
+    return digest === proxy.sha256;
+  } catch {
+    return false;
+  }
 }
 
 export function validateLinuxDescriptorRuntime(
@@ -314,13 +411,16 @@ export function readCuaConnection({
   userData = process.env.OMB_USER_DATA,
   home = homedir(),
   validateLinuxRuntime = validateLinuxDescriptorRuntime,
+  validateRemoteMacRuntime = validateRemoteMacDescriptorRuntime,
 }: {
   platform?: NodeJS.Platform;
   userData?: string;
   home?: string;
   validateLinuxRuntime?: (file: string, raw: LinuxConnectionDescriptor) => boolean;
+  validateRemoteMacRuntime?: (file: string, raw: RemoteMacConnectionDescriptor) => boolean;
 } = {}): LocalComputerConnection | null {
   const candidates = userData ? [join(userData, "cua-connection.json")] : [];
+  if (platform === "linux" && !userData) candidates.push(join(home, ".openmausbot", "cua-connection.json"));
   if (platform === "darwin") {
     // Legacy/dev fallback. Packaged Electron passes its exact userData path.
     for (const directory of ["OpenMausBot", "openmausbot", "OpenGrokBot", "opengrokbot"]) {
@@ -332,6 +432,8 @@ export function readCuaConnection({
     try {
       const raw = JSON.parse(readFileSync(file, "utf8"));
       if (platform === "linux") {
+        const remoteMac = decodeRemoteMacDescriptor(raw);
+        if (remoteMac && validateRemoteMacRuntime(file, raw)) return remoteMac;
         const decoded = decodeLinuxDescriptor(raw);
         if (decoded && validateLinuxRuntime(file, raw)) return decoded;
       } else {

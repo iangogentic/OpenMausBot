@@ -18,8 +18,10 @@ import {
   DRIVER_FILE_IDENTITY_KEYS,
   REQUIRED_LINUX_TOOLS,
   decodeLinuxDescriptor,
+  decodeRemoteMacDescriptor,
   readCuaConnection,
   validateLinuxDescriptorRuntime,
+  validateRemoteMacDescriptorRuntime,
 } from "./local-computer.ts";
 
 const require = createRequire(import.meta.url);
@@ -84,6 +86,23 @@ function linuxDescriptor(userData: string, { session = "x11" }: { session?: "x11
   };
 }
 
+function remoteMacDescriptor(userData: string) {
+  const proxy = join(userData, "remote-mac-mcp-proxy.mjs");
+  const tokenFile = join(userData, "mac-bridge-token");
+  writeFileSync(proxy, "#!/usr/bin/node\n", { mode: 0o700 });
+  writeFileSync(tokenFile, `${"a".repeat(43)}\n`, { mode: 0o600 });
+  const { createHash } = require("node:crypto");
+  return {
+    schemaVersion: 1,
+    mode: "remote-mac-bridge",
+    platform: "darwin",
+    scope: "local-computer",
+    generation: "01234567-89ab-cdef-0123-456789abcdef",
+    bridge: { host: "127.0.0.1", port: 18798, tokenFile },
+    proxy: { path: proxy, sha256: createHash("sha256").update("#!/usr/bin/node\n").digest("hex") },
+  };
+}
+
 describe("local computer descriptor contract", () => {
   it("stays synchronized with the Electron producer", () => {
     expect(DRIVER_FILE_IDENTITY_KEYS).toEqual([...ELECTRON_DRIVER_FILE_IDENTITY_KEYS]);
@@ -110,6 +129,55 @@ afterEach(() => {
 });
 
 describe("local computer descriptor", () => {
+  it("accepts a hash-pinned private remote Mac bridge on the Linux server", () => {
+    const userData = privateUserData("remote-mac-user-data");
+    const descriptor = remoteMacDescriptor(userData);
+    const file = join(userData, "cua-connection.json");
+    writeFileSync(file, JSON.stringify(descriptor), { mode: 0o600 });
+    expect(decodeRemoteMacDescriptor(descriptor)).toEqual({
+      command: descriptor.proxy.path,
+      args: [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18798",
+        "--token-file",
+        descriptor.bridge.tokenFile,
+      ],
+      env: {},
+      platform: "darwin",
+      generation: descriptor.generation,
+      scope: "local-computer",
+    });
+    expect(validateRemoteMacDescriptorRuntime(file, descriptor)).toBe(true);
+    expect(readCuaConnection({ platform: "linux", userData })).not.toBeNull();
+  });
+
+  it("rejects remote Mac bridge tampering, cleartext exposure, and non-loopback hosts", () => {
+    const userData = privateUserData("remote-mac-invalid");
+    const descriptor = remoteMacDescriptor(userData);
+    const file = join(userData, "cua-connection.json");
+    writeFileSync(file, JSON.stringify(descriptor), { mode: 0o600 });
+    expect(decodeRemoteMacDescriptor({ ...descriptor, extra: true })).toBeNull();
+    expect(
+      decodeRemoteMacDescriptor({ ...descriptor, bridge: { ...descriptor.bridge, host: "0.0.0.0" } }),
+    ).toBeNull();
+    chmodSync(descriptor.bridge.tokenFile, 0o644);
+    expect(validateRemoteMacDescriptorRuntime(file, descriptor)).toBe(false);
+    chmodSync(descriptor.bridge.tokenFile, 0o600);
+    appendFileSync(descriptor.proxy.path, "tampered\n");
+    expect(validateRemoteMacDescriptorRuntime(file, descriptor)).toBe(false);
+  });
+
+  it("discovers the standalone server descriptor from ~/.openmausbot", () => {
+    const home = privateUserData("home");
+    const userData = join(home, ".openmausbot");
+    mkdirSync(userData, { mode: 0o700 });
+    const descriptor = remoteMacDescriptor(userData);
+    writeFileSync(join(userData, "cua-connection.json"), JSON.stringify(descriptor), { mode: 0o600 });
+    expect(readCuaConnection({ platform: "linux", home, userData: undefined })).not.toBeNull();
+  });
+
   it("accepts only the exact certified Linux X11 descriptor", () => {
     const userData = privateUserData("linux-user-data");
     const descriptor = linuxDescriptor(userData);

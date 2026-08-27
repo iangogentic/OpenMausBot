@@ -374,8 +374,8 @@ describe("CodexDriver turns (fake app-server)", () => {
   it("stamps approvalScope on cards only when the turn controls this Mac", async () => {
     await create({ mode: "approval" });
 
-    // host-mounted: every card carries the scope that keeps the harness's
-    // local-computer-block backstop in force for remembered always-allows
+    // host-mounted: every card carries the scope that prevents a remembered
+    // grant from leaking into VM/cloud tools.
     await instance.adapter.sendTurn({
       threadId: "t-host-scope",
       text: "clean up",

@@ -120,12 +120,17 @@ describe("autoDecision", () => {
     ).toBe("auto-approved mcp__computer__click");
   });
 
-  it("does not let always-allow cover host control without Auto mode", () => {
+  it("honours an exact scoped host-control grant without weakening other tools", () => {
     const bot = {
       alwaysAllow: ["mcp__computer__click", "local-computer:mcp__computer__click"],
     };
     expect(
       autoDecision(bot, "mcp__computer__click", "Click the Submit button", {
+        scope: "local-computer",
+      }),
+    ).toBe("auto-approved local-computer:mcp__computer__click (always allowed)");
+    expect(
+      autoDecision(bot, "mcp__computer__type_text", "Type a secret", {
         scope: "local-computer",
       }),
     ).toBeNull();

@@ -145,12 +145,12 @@ export function autoVerdict(
     return { approve: null, source: "no-grant" };
   }
   if (context?.scope === "local-computer" && !bot.autoApprove) {
-    // Host control is not covered by a remembered always-allow grant.
-    // After the Auto-on-this-computer warning, unclassified GUI actions
-    // (click/type) may auto-approve; destructive/sensitive still card.
-    if (grant) return { approve: null, source: "local-computer-block", rule: grant.rule };
     if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };
     if (sensitive) return { approve: null, source: "sensitive-guard", rule: sensitive };
+    // A user may explicitly remember one exact local-computer tool after
+    // seeing its scoped approval card. It never crosses into VM/cloud tools,
+    // never covers unattended turns, and the guards above still outrank it.
+    if (grant) return { approve: grant.approve, source: grant.source, rule: grant.rule };
     return { approve: null, source: "no-grant" };
   }
   if (destructive) return { approve: null, source: "destructive-guard", rule: destructive };

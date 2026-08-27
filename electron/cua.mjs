@@ -41,7 +41,11 @@ const STANDALONE_SOCKET = path.join(
   app.getPath("home"),
   "Library/Caches/cua-driver/cua-driver.sock",
 );
-const HOST_BUNDLE_ID = "com.openmausbot.app";
+const packagedExecutableName = path.basename(process.execPath, path.extname(process.execPath));
+const HOST_BUNDLE_ID =
+  app.isPackaged && packagedExecutableName === "OpenMaus Razer"
+    ? "com.iangreenberg.openmaus.razer"
+    : "com.openmausbot.app";
 const CUA_ENV = { CUA_DRIVER_RS_TELEMETRY_ENABLED: "0" };
 process.env.CUA_DRIVER_RS_TELEMETRY_ENABLED ??= "0";
 

@@ -4,6 +4,7 @@ import {
   normalizeRemoteServerURL,
   readRemoteClientConfig,
   readRemoteCompanionConfig,
+  readRemoteMacBridgeConfig,
   resolveRemoteCompanionURL,
   resolveRemoteClientURL,
 } from "./remote-client.mjs";
@@ -56,5 +57,24 @@ test("resolves a tunneled companion control plane", () => {
       readFile,
     }),
     "http://127.0.0.1:18811",
+  );
+});
+
+test("enables the physical Mac bridge only through explicit durable configuration", () => {
+  assert.deepEqual(
+    readRemoteMacBridgeConfig("/unused", () =>
+      JSON.stringify({ mode: "remote", macBridge: { enabled: true, port: 18798 } }),
+    ),
+    { enabled: true, port: 18798 },
+  );
+  assert.equal(
+    readRemoteMacBridgeConfig("/unused", () => JSON.stringify({ mode: "remote" })),
+    null,
+  );
+  assert.throws(
+    () => readRemoteMacBridgeConfig("/unused", () =>
+      JSON.stringify({ mode: "remote", macBridge: { enabled: true, port: 80 } }),
+    ),
+    /port is invalid/,
   );
 });

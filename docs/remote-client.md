@@ -11,7 +11,7 @@ Closing the Mac app does not stop work on the Linux host. The client checks serv
 
 Keep the harness and companion control ports bound to loopback on the server. Carry them through an encrypted SSH tunnel or put an HTTPS reverse proxy with authentication in front of the harness. The client rejects cleartext HTTP origins unless they are loopback addresses.
 
-The Linux host remains the computer the bots control. Remote-client mode deliberately does not grant the Linux harness access to the physical Mac. Adding that requires a separate authenticated, approval-gated local-computer bridge.
+The Linux host remains the default computer the bots control. Physical-Mac control is optional and uses a separate loopback-only, authenticated, approval-gated bridge. The Linux server cannot reach it when the Mac app, Mac, or SSH tunnel is offline.
 
 ## Server
 
@@ -33,6 +33,7 @@ ssh -NT \
   -L 18799:127.0.0.1:8799 \
   -L 8811:127.0.0.1:8811 \
   -L 6080:127.0.0.1:6080 \
+  -R 127.0.0.1:18798:127.0.0.1:18798 \
   user@server-tailnet-name
 ```
 
@@ -46,7 +47,11 @@ Place `remote-client.json` in the app's Electron user-data directory:
 {
   "mode": "remote",
   "serverUrl": "http://127.0.0.1:18799",
-  "companionUrl": "http://127.0.0.1:8811"
+  "companionUrl": "http://127.0.0.1:8811",
+  "macBridge": {
+    "enabled": true,
+    "port": 18798
+  }
 }
 ```
 
@@ -58,7 +63,38 @@ Build the remote-only Apple silicon bundle with:
 corepack pnpm package:remote:mac
 ```
 
-The result is `release-remote/mac-arm64/OpenMaus Razer.app`. The remote package omits the harness, server database, CUA daemon, and companion server.
+The result is `release-remote/mac-arm64/OpenMaus Razer.app`. The remote package omits the harness, server database, and companion server. It includes the pinned macOS CUA runtime because that runtime controls the Mac and must run inside the Mac app's local security boundary.
+
+## Optional physical-Mac bridge
+
+The Mac app creates a 32-byte token at `mac-bridge-token` in its private Electron user-data directory. Copy that file to `~/.openmausbot/mac-bridge-token` on the Linux server without printing it, and keep both copies mode `0600`.
+
+Install `scripts/remote-mac-mcp-proxy.mjs` on the Linux server at a private, executable path such as `~/.local/lib/openmaus/remote-mac-mcp-proxy.mjs`. Publish `~/.openmausbot/cua-connection.json` with mode `0600`:
+
+```json
+{
+  "schemaVersion": 1,
+  "mode": "remote-mac-bridge",
+  "platform": "darwin",
+  "scope": "local-computer",
+  "generation": "01234567-89ab-cdef-0123-456789abcdef",
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 18798,
+    "tokenFile": "/home/user/.openmausbot/mac-bridge-token"
+  },
+  "proxy": {
+    "path": "/home/user/.local/lib/openmaus/remote-mac-mcp-proxy.mjs",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
+```
+
+Generate a fresh UUID and replace the all-zero hash with the real SHA-256 of the installed proxy.
+
+The server rejects unknown descriptor fields, non-loopback hosts, unsafe file ownership or modes, symlinks, invalid tokens, and proxy hash mismatches. The Mac rejects invalid tokens before showing a prompt and closes the CUA child when the tunneled connection closes.
+
+At connection time the Mac offers **Deny**, **Allow once**, and **Always allow while app is open**. OpenMaus separately gates individual computer tools in chat. **Always allow** on a chat approval remembers only that exact `local-computer:<tool>` key; it does not cover VM/cloud tools, unattended turns, or destructive/sensitive actions.
 
 ## What survives a closed client
 
@@ -67,4 +103,4 @@ The result is `release-remote/mac-arm64/OpenMaus Razer.app`. The remote package 
 - Provider CLI sessions and API-key configuration
 - Companion and virtual-computer services
 
-Mac-only dictation remains local to the client. Physical-Mac control is intentionally unavailable from the remote harness until a dedicated authenticated bridge exists.
+Mac-only dictation remains local to the client. Physical-Mac control becomes unavailable immediately when the Mac app quits or the reverse tunnel drops; this does not interrupt server-side work.
