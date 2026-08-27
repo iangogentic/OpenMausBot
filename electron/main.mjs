@@ -59,6 +59,14 @@ const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.
 const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("./window-state.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// electron-builder changes the bundle/executable name for the remote shell,
+// but Electron still derives userData from package.json unless we override it.
+// Keep its cookies and remote-client.json separate from a normal OpenMausBot
+// installation on the same Mac.
+const packagedExecutableName = path.basename(process.execPath, path.extname(process.execPath));
+if (app.isPackaged && packagedExecutableName === "OpenMaus Razer") {
+  app.setPath("userData", path.join(app.getPath("appData"), "OpenMaus Razer"));
+}
 const REMOTE_SERVER_URL = resolveRemoteClientURL({
   argv: process.argv,
   env: process.env,
