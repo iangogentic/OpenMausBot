@@ -68,6 +68,7 @@ import {
 } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
+import { recoverSelectedLocalVm } from "./local-vm-recovery.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
 import { buildNotification, type Notification } from "./notify.ts";
 import { isEffortLevel, type RequestOutcome, type RuntimeEvent } from "./contracts.ts";
@@ -1567,7 +1568,24 @@ async function startTurn(
         localVmThreadTargets.set(threadId, localVmTarget);
         localVmActiveThreads.set(localVmTarget.key, threadId);
         localVmIdleFor(localVmTarget).touch();
-        const localVm = await containerComputerStatus(undefined, undefined, localVmTarget);
+        let lifecycleStarted = false;
+        let localVm: Awaited<ReturnType<typeof containerComputerStatus>>;
+        try {
+          localVm = await recoverSelectedLocalVm({
+            inspect: () => containerComputerStatus(undefined, undefined, localVmTarget),
+            act: async (action) => {
+              if (!lifecycleStarted) {
+                localVmLifecycleBusy.add(localVmTarget.key);
+                lifecycleStarted = true;
+              }
+              const recovered = await containerComputerAction(action, undefined, undefined, localVmTarget);
+              if (action === "run") localVmIdleFor(localVmTarget).touch();
+              return recovered;
+            },
+          });
+        } finally {
+          if (lifecycleStarted) localVmLifecycleBusy.delete(localVmTarget.key);
+        }
         if (!localVm.ready || !localVm.runtime) {
           throw new Error(`${localVm.problem ?? "the Local VM is not ready"} (App Settings → Local VM)`);
         }

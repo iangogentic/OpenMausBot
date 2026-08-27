@@ -70,6 +70,8 @@ The result is `release-remote/mac-arm64/OpenMaus Razer.app`. The remote package 
 
 The remote UI uses `serverName` to keep the topology explicit: **Razer VM** means the isolated Linux desktop hosted on the Razer, while **This Mac** means the user's physical Mac through the attended bridge. Neither option changes where the bot's model, shell, or files run.
 
+An explicitly selected server VM recovers on demand. Idle cleanup removes only its disposable container, and a host reboot may leave that managed container stopped; the next bot turn recreates it from the already prepared image while preserving the durable workspace. OpenMaus never removes an unowned stopped container or downloads/builds an image implicitly.
+
 ## Optional physical-Mac bridge
 
 The Mac app creates a 32-byte token at `mac-bridge-token` in its private Electron user-data directory. Copy that file to `~/.openmausbot/mac-bridge-token` on the Linux server without printing it, and keep both copies mode `0600`.
