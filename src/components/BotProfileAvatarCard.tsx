@@ -4,13 +4,8 @@ import { Check, ImagePlus, Loader2, Sparkles, Trash2 } from "lucide-react";
 import { api, useStore, type Bot, type ConfigStatus } from "@/state/store";
 import { imageAttachmentFromFile } from "@/lib/composer-attachments";
 import { cn } from "@/lib/cn";
-import {
-  PICKABLE_STATES,
-  MAUS_COLORS,
-  MAUS_COLOR_NAMES,
-  type MausMotion,
-  type MausState,
-} from "@/lib/mascot";
+import { type MausMotion, type MausState } from "@/lib/mascot";
+import { GPU_CAT_CHARACTERS, GPU_CAT_PICKABLE_MOODS } from "@/lib/gpucats";
 import {
   BOT_AVATAR_CROPS,
   botAvatarUrlFromStoredPath,
@@ -23,7 +18,7 @@ type AvatarPatch = Partial<
 >;
 
 const CROP_LABEL = {
-  mascot: "Mascot",
+  mascot: "GPU Cat",
   circle: "Circle",
   rounded: "Rounded",
   square: "Square",
@@ -134,7 +129,7 @@ export function BotProfileAvatarCard({
           onClick={() => onPatch({ avatarCrop: "mascot", color: "green", mascotExpression: null })}
           className="rounded-md px-2 py-1.5 text-[13px] text-ink-secondary hover:bg-control hover:text-ink"
         >
-          Reset mascot
+          Reset to Miso
         </button>
       </div>
 
@@ -205,10 +200,35 @@ export function BotProfileAvatarCard({
         {crop === "mascot" && (
           <>
             <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-              Expression
+              Character
             </div>
-            <div className="grid grid-cols-5 gap-2">
-              {PICKABLE_STATES.map((expression) => (
+            <div className="grid grid-cols-4 gap-2">
+              {GPU_CAT_CHARACTERS.map((character) => (
+                <button
+                  key={character.id}
+                  type="button"
+                  aria-pressed={bot.color === character.color}
+                  onClick={() => onPatch({ color: character.color })}
+                  className={cn(
+                    "flex h-[76px] min-w-0 flex-col items-center justify-center rounded-xl bg-inset px-1 transition-colors hover:bg-control",
+                    bot.color === character.color && "ring-2 ring-accent-border",
+                  )}
+                  title={character.label}
+                  aria-label={`Use ${character.label} GPU Cat`}
+                >
+                  <MausAvatar color={character.color} state="idle" size={48} animated={false} />
+                  <span className="w-full truncate text-center text-[10.5px] text-ink-secondary">
+                    {character.label}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              Mood
+            </div>
+            <div className="grid grid-cols-6 gap-2">
+              {GPU_CAT_PICKABLE_MOODS.map((expression) => (
                 <button
                   key={expression}
                   type="button"
@@ -219,33 +239,13 @@ export function BotProfileAvatarCard({
                     activeState === expression && "ring-2 ring-accent-border",
                   )}
                   title={expression}
-                  aria-label={`Use ${expression} expression`}
+                  aria-label={`Use ${expression} mood`}
                 >
                   <MausAvatar color={bot.color} state={expression} size={42} animated={false} />
                 </button>
               ))}
             </div>
 
-            <div className="mb-2 mt-4 text-[12px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-              Color
-            </div>
-            <div className="flex flex-wrap gap-2.5">
-              {MAUS_COLOR_NAMES.map((color) => (
-                <button
-                  key={color}
-                  type="button"
-                  aria-pressed={bot.color === color}
-                  onClick={() => onPatch({ color })}
-                  className={cn(
-                    "size-10 rounded-full border-2 border-transparent transition-transform hover:scale-110",
-                    bot.color === color && "ring-2 ring-accent-border ring-offset-2 ring-offset-card",
-                  )}
-                  style={{ backgroundColor: MAUS_COLORS[color] }}
-                  title={color}
-                  aria-label={`Use ${color} mascot color`}
-                />
-              ))}
-            </div>
           </>
         )}
 

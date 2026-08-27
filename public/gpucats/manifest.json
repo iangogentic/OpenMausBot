@@ -1,0 +1,751 @@
+{
+  "version": 1,
+  "source": "GPU Cats Assets/animations",
+  "sourceFrame": {
+    "width": 788,
+    "height": 504
+  },
+  "outputSize": 256,
+  "frameDurationsMs": {
+    "idle": 90,
+    "sleeping": 140,
+    "thinking": 90,
+    "typing": 70,
+    "happy": 60,
+    "confused": 70,
+    "walking": 55,
+    "fly": 70
+  },
+  "characters": {
+    "miso": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 154,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 226,
+          "y": 81,
+          "size": 384
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 154,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 208,
+          "y": 70,
+          "size": 392
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 244,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 67,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 248,
+          "y": 144,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 238,
+          "y": 17,
+          "size": 416
+        }
+      }
+    },
+    "devcat1": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 154,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 222,
+          "y": 78,
+          "size": 388
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 154,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 207,
+          "y": 70,
+          "size": 392
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 241,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 72,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 248,
+          "y": 144,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 238,
+          "y": 17,
+          "size": 416
+        }
+      }
+    },
+    "devcat2": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 237,
+          "y": 93,
+          "size": 372
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 216,
+          "y": 86,
+          "size": 376
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 249,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 78,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 248,
+          "y": 152,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 238,
+          "y": 17,
+          "size": 416
+        }
+      }
+    },
+    "devcat3": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 176,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 258,
+          "y": 127,
+          "size": 352
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 176,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 235,
+          "y": 118,
+          "size": 344
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 249,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 91,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 248,
+          "y": 172,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 238,
+          "y": 17,
+          "size": 416
+        }
+      }
+    },
+    "devcat4": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 176,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 261,
+          "y": 129,
+          "size": 348
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 176,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 235,
+          "y": 117,
+          "size": 344
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 249,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 91,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 248,
+          "y": 171,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 238,
+          "y": 17,
+          "size": 416
+        }
+      }
+    },
+    "orange_tabby": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 176,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 261,
+          "y": 129,
+          "size": 348
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 176,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 235,
+          "y": 117,
+          "size": 344
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 249,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 91,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 248,
+          "y": 171,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 238,
+          "y": 17,
+          "size": 416
+        }
+      }
+    },
+    "project_pm": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 157,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 223,
+          "y": 80,
+          "size": 388
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 244,
+          "y": 157,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 206,
+          "y": 75,
+          "size": 388
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 243,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 75,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 248,
+          "y": 147,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 238,
+          "y": 17,
+          "size": 416
+        }
+      }
+    },
+    "room_manager": {
+      "idle": {
+        "animated": "idle.webp",
+        "poster": "idle.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 233,
+          "y": 155,
+          "size": 320
+        }
+      },
+      "typing": {
+        "animated": "typing.webp",
+        "poster": "typing.png",
+        "frames": 40,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 190,
+          "y": 59,
+          "size": 420
+        }
+      },
+      "thinking": {
+        "animated": "thinking.webp",
+        "poster": "thinking.png",
+        "frames": 20,
+        "frameDurationMs": 90,
+        "crop": {
+          "x": 233,
+          "y": 155,
+          "size": 320
+        }
+      },
+      "happy": {
+        "animated": "happy.webp",
+        "poster": "happy.png",
+        "frames": 20,
+        "frameDurationMs": 60,
+        "crop": {
+          "x": 176,
+          "y": 71,
+          "size": 392
+        }
+      },
+      "confused": {
+        "animated": "confused.webp",
+        "poster": "confused.png",
+        "frames": 24,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 239,
+          "y": 162,
+          "size": 320
+        }
+      },
+      "sleeping": {
+        "animated": "sleeping.webp",
+        "poster": "sleeping.png",
+        "frames": 12,
+        "frameDurationMs": 140,
+        "crop": {
+          "x": 76,
+          "y": 184,
+          "size": 320
+        }
+      },
+      "walking": {
+        "animated": "walking.webp",
+        "poster": "walking.png",
+        "frames": 20,
+        "frameDurationMs": 55,
+        "crop": {
+          "x": 231,
+          "y": 146,
+          "size": 320
+        }
+      },
+      "fly": {
+        "animated": "fly.webp",
+        "poster": "fly.png",
+        "frames": 20,
+        "frameDurationMs": 70,
+        "crop": {
+          "x": 220,
+          "y": 17,
+          "size": 416
+        }
+      }
+    }
+  },
+  "actions": [
+    "idle",
+    "typing",
+    "thinking",
+    "happy",
+    "confused",
+    "sleeping",
+    "walking",
+    "fly"
+  ]
+}
