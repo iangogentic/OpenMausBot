@@ -51,7 +51,7 @@ describe("inject ids", () => {
     const desktop2 = LOCAL_HOSTS.find((host) => host.id === "desktop2_qwen");
     expect(desktop2).toEqual({
       id: "desktop2_qwen",
-      label: "desktop2 · Qwen 27B",
+      label: "desktop2 · Qwen 3.8 27B Abliterated",
       baseUrl: "http://127.0.0.1:18011/v1",
       apiKey: "local",
     });
