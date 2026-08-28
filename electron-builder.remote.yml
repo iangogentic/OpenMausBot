@@ -55,3 +55,15 @@ mac:
     NSMicrophoneUsageDescription: OpenMaus Razer uses the microphone for voice dictation into the composer.
     NSSpeechRecognitionUsageDescription: OpenMaus Razer transcribes your voice on-device to type messages for you.
     NSScreenCaptureUsageDescription: OpenMaus Razer can capture this Mac only after an explicit local-computer approval.
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+
+nsis:
+  oneClick: true
+  perMachine: false
+  shortcutName: OpenMaus Razer
+  artifactName: OpenMaus-Razer-${version}-setup.${ext}

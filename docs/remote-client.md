@@ -68,6 +68,17 @@ corepack pnpm package:remote:mac
 
 The result is `release-remote/mac-arm64/OpenMaus Razer.app`. The remote package omits the harness, server database, and companion server. It includes the pinned macOS CUA runtime because that runtime controls the Mac and must run inside the Mac app's local security boundary.
 
+Build the Windows x64 remote client on Windows with:
+
+```powershell
+corepack pnpm package:remote:win
+```
+
+The result is `release-remote/OpenMaus-Razer-<version>-setup.exe`. Put the same
+`remote-client.json` in `%APPDATA%\OpenMaus Razer`. The Windows client is a
+controller for the remote harness and server-hosted computers; the optional
+physical-device bridge documented below is currently macOS-only.
+
 The remote UI uses `serverName` to keep the topology explicit: **Razer VM** means the isolated Linux desktop hosted on the Razer, while **This Mac** means the user's physical Mac through the attended bridge. Neither option changes where the bot's model, shell, or files run.
 
 An explicitly selected server VM recovers on demand. Idle cleanup removes only its disposable container, and a host reboot may leave that managed container stopped; the next bot turn recreates it from the already prepared image while preserving the durable workspace. OpenMaus never removes an unowned stopped container or downloads/builds an image implicitly.

@@ -46,6 +46,20 @@ describe("inject ids", () => {
     expect(decodeInjectId("claude-sonnet-5")).toBeNull();
     expect(decodeInjectId("gpt-5.6-sol")).toBeNull();
   });
+
+  it("exposes the desktop2 Qwen service as a named local harness target", () => {
+    const desktop2 = LOCAL_HOSTS.find((host) => host.id === "desktop2_qwen");
+    expect(desktop2).toEqual({
+      id: "desktop2_qwen",
+      label: "desktop2 · Qwen 27B",
+      baseUrl: "http://127.0.0.1:18011/v1",
+      apiKey: "local",
+    });
+    expect(decodeInjectId("desktop2_qwen::qwen3.8-27b")).toEqual({
+      host: "desktop2_qwen",
+      model: "qwen3.8-27b",
+    });
+  });
 });
 
 describe("contextWindowsFromPs", () => {

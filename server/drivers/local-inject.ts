@@ -17,6 +17,12 @@ export interface LocalHost {
 }
 
 export const LOCAL_HOSTS: LocalHost[] = [
+  {
+    id: "desktop2_qwen",
+    label: "desktop2 · Qwen 27B",
+    baseUrl: process.env.OPENMAUSBOT_DESKTOP2_QWEN_URL || "http://127.0.0.1:18011/v1",
+    apiKey: "local",
+  },
   { id: "omlx", label: "oMLX", baseUrl: "http://127.0.0.1:8080/v1", apiKey: "omlx" },
   { id: "ollama", label: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", apiKey: "ollama" },
   { id: "local_ollama", label: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", apiKey: "ollama" },
