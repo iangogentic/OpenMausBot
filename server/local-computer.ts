@@ -35,7 +35,8 @@ type LegacyConnectionDescriptor = {
 };
 
 type LinuxConnectionDescriptor = Record<string, unknown>;
-type RemoteMacConnectionDescriptor = Record<string, unknown>;
+type RemoteDeviceConnectionDescriptor = Record<string, unknown>;
+type RemoteMacConnectionDescriptor = RemoteDeviceConnectionDescriptor;
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const expected = new Set(keys);
@@ -245,12 +246,25 @@ export function decodeLinuxDescriptor(value: LinuxConnectionDescriptor): LocalCo
 }
 
 export function decodeRemoteMacDescriptor(value: RemoteMacConnectionDescriptor): LocalComputerConnection | null {
+  return decodeRemoteBridgeDescriptor(value, { legacyMacOnly: true });
+}
+
+export function decodeRemoteDeviceDescriptor(value: RemoteDeviceConnectionDescriptor): LocalComputerConnection | null {
+  return decodeRemoteBridgeDescriptor(value, { legacyMacOnly: false });
+}
+
+function decodeRemoteBridgeDescriptor(
+  value: RemoteDeviceConnectionDescriptor,
+  { legacyMacOnly }: { legacyMacOnly: boolean },
+): LocalComputerConnection | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const expectedMode = legacyMacOnly ? "remote-mac-bridge" : "remote-device-bridge";
+  const supportedPlatform = value.platform === "darwin" || value.platform === "win32";
   if (
     !exactKeys(value, ["schemaVersion", "mode", "platform", "scope", "generation", "bridge", "proxy"]) ||
     value.schemaVersion !== 1 ||
-    value.mode !== "remote-mac-bridge" ||
-    value.platform !== "darwin" ||
+    value.mode !== expectedMode ||
+    (legacyMacOnly ? value.platform !== "darwin" : !supportedPlatform) ||
     value.scope !== "local-computer" ||
     typeof value.generation !== "string" ||
     !/^[0-9a-f-]{32,64}$/i.test(value.generation)
@@ -290,7 +304,7 @@ export function decodeRemoteMacDescriptor(value: RemoteMacConnectionDescriptor):
       bridge.tokenFile,
     ],
     env: {},
-    platform: "darwin",
+    platform: value.platform as "darwin" | "win32",
     generation: value.generation,
     scope: "local-computer",
   };
@@ -313,6 +327,22 @@ export function validateRemoteMacDescriptorRuntime(
   descriptorFile: string,
   raw: RemoteMacConnectionDescriptor,
   { uid = process.getuid?.() ?? -1 }: { uid?: number } = {},
+): boolean {
+  return validateRemoteBridgeDescriptorRuntime(descriptorFile, raw, { uid });
+}
+
+export function validateRemoteDeviceDescriptorRuntime(
+  descriptorFile: string,
+  raw: RemoteDeviceConnectionDescriptor,
+  { uid = process.getuid?.() ?? -1 }: { uid?: number } = {},
+): boolean {
+  return validateRemoteBridgeDescriptorRuntime(descriptorFile, raw, { uid });
+}
+
+function validateRemoteBridgeDescriptorRuntime(
+  descriptorFile: string,
+  raw: RemoteDeviceConnectionDescriptor,
+  { uid }: { uid: number },
 ): boolean {
   try {
     const descriptorStat = lstatSync(descriptorFile);
@@ -412,12 +442,14 @@ export function readCuaConnection({
   home = homedir(),
   validateLinuxRuntime = validateLinuxDescriptorRuntime,
   validateRemoteMacRuntime = validateRemoteMacDescriptorRuntime,
+  validateRemoteDeviceRuntime = validateRemoteDeviceDescriptorRuntime,
 }: {
   platform?: NodeJS.Platform;
   userData?: string;
   home?: string;
   validateLinuxRuntime?: (file: string, raw: LinuxConnectionDescriptor) => boolean;
   validateRemoteMacRuntime?: (file: string, raw: RemoteMacConnectionDescriptor) => boolean;
+  validateRemoteDeviceRuntime?: (file: string, raw: RemoteDeviceConnectionDescriptor) => boolean;
 } = {}): LocalComputerConnection | null {
   const candidates = userData ? [join(userData, "cua-connection.json")] : [];
   if (platform === "linux" && !userData) candidates.push(join(home, ".openmausbot", "cua-connection.json"));
@@ -432,6 +464,8 @@ export function readCuaConnection({
     try {
       const raw = JSON.parse(readFileSync(file, "utf8"));
       if (platform === "linux") {
+        const remoteDevice = decodeRemoteDeviceDescriptor(raw);
+        if (remoteDevice && validateRemoteDeviceRuntime(file, raw)) return remoteDevice;
         const remoteMac = decodeRemoteMacDescriptor(raw);
         if (remoteMac && validateRemoteMacRuntime(file, raw)) return remoteMac;
         const decoded = decodeLinuxDescriptor(raw);

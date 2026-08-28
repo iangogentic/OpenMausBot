@@ -61,6 +61,15 @@ win:
     - target: nsis
       arch: [x64]
   icon: build/icon.ico
+  extraResources:
+    - from: dist-native/win32-x64/cua-driver.exe
+      to: cua-driver.exe
+    - from: dist-native/win32-x64/cua-driver-uia.exe
+      to: cua-driver-uia.exe
+    - from: dist-native/win32-x64/cua-cursor-theme.exe
+      to: cua-cursor-theme.exe
+    - from: dist-native/win32-x64/cua-sdk
+      to: cua-sdk
 
 nsis:
   oneClick: true

@@ -5,6 +5,7 @@ import {
   readRemoteClientConfig,
   readRemoteCompanionConfig,
   readRemoteMacBridgeConfig,
+  readRemoteDeviceBridgeConfig,
   readRemoteServerName,
   resolveRemoteCompanionURL,
   resolveRemoteClientURL,
@@ -75,6 +76,25 @@ test("enables the physical Mac bridge only through explicit durable configuratio
   assert.throws(
     () => readRemoteMacBridgeConfig("/unused", () =>
       JSON.stringify({ mode: "remote", macBridge: { enabled: true, port: 80 } }),
+    ),
+    /port is invalid/,
+  );
+});
+
+test("enables the cross-platform physical-device bridge only through explicit durable configuration", () => {
+  assert.deepEqual(
+    readRemoteDeviceBridgeConfig("/unused", () =>
+      JSON.stringify({ mode: "remote", deviceBridge: { enabled: true, port: 18797 } }),
+    ),
+    { enabled: true, port: 18797 },
+  );
+  assert.equal(
+    readRemoteDeviceBridgeConfig("/unused", () => JSON.stringify({ mode: "remote" })),
+    null,
+  );
+  assert.throws(
+    () => readRemoteDeviceBridgeConfig("/unused", () =>
+      JSON.stringify({ mode: "remote", deviceBridge: { enabled: true, port: 80 } }),
     ),
     /port is invalid/,
   );

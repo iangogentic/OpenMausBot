@@ -117,7 +117,10 @@ function persistAndNotify(next) {
 export function resolveDriverBinary() {
   if (process.env.CUA_DRIVER_PATH) return process.env.CUA_DRIVER_PATH;
   if (app.isPackaged) {
-    const bundled = path.join(process.resourcesPath, "cua-driver");
+    const bundled = path.join(
+      process.resourcesPath,
+      process.platform === "win32" ? "cua-driver.exe" : "cua-driver",
+    );
     if (fs.existsSync(bundled)) return bundled;
   }
   if (fs.existsSync(INSTALLED_DRIVER)) return INSTALLED_DRIVER;
@@ -150,7 +153,7 @@ async function loadEmbeddedSdk() {
     process.resourcesPath,
     "cua-sdk",
     "native",
-    "libcua_driver_sdk.dylib",
+    process.platform === "win32" ? "cua_driver_sdk.dll" : "libcua_driver_sdk.dylib",
   );
   return import(pathToFileURL(path.join(process.resourcesPath, "cua-sdk", "cua-sdk.mjs")).href);
 }
@@ -185,13 +188,15 @@ async function startEmbedded(binary) {
   // CUA's embedding contract requires grants before the child daemon starts;
   // these SDK calls execute in Electron main so macOS attributes them to
   // OpenMausBot rather than to a terminal or helper process.
-  const permissionStatus = sdk.requestMacOSPermissions();
-  if (!sdk.hasRequiredMacOSPermissions(permissionStatus)) {
-    const missing = [
-      !permissionStatus.accessibility && "Accessibility",
-      !permissionStatus.screenRecording && "Screen Recording",
-    ].filter(Boolean).join(" and ");
-    throw new Error(`${missing || "macOS permissions"} required; grant access in System Settings and restart OpenMausBot`);
+  if (process.platform === "darwin") {
+    const permissionStatus = sdk.requestMacOSPermissions();
+    if (!sdk.hasRequiredMacOSPermissions(permissionStatus)) {
+      const missing = [
+        !permissionStatus.accessibility && "Accessibility",
+        !permissionStatus.screenRecording && "Screen Recording",
+      ].filter(Boolean).join(" and ");
+      throw new Error(`${missing || "macOS permissions"} required; grant access in System Settings and restart OpenMausBot`);
+    }
   }
   const host = new sdk.EmbeddedCuaDriverHost(binary, HOST_BUNDLE_ID);
   try {
@@ -217,6 +222,9 @@ async function startEmbedded(binary) {
 
 export async function startCua() {
   if (process.platform === "linux") return ensureLinuxRuntime().initialize();
+  if (process.platform !== "darwin" && process.platform !== "win32") {
+    return persistAndNotify({ mode: "unavailable", reason: "unsupported platform" });
+  }
   const binary = resolveDriverBinary();
   if (!binary) {
     return persistAndNotify({

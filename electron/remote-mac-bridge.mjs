@@ -2,29 +2,52 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 export const REMOTE_MAC_BRIDGE_PORT = 18798;
 export const REMOTE_MAC_BRIDGE_TOKEN_FILE = "mac-bridge-token";
-const AUTH_PREFIX = "OMB-MAC-BRIDGE/1 ";
+export const REMOTE_DEVICE_BRIDGE_PORT = 18798;
+export const REMOTE_DEVICE_BRIDGE_TOKEN_FILE = "device-bridge-token";
+const MAC_AUTH_PREFIX = "OMB-MAC-BRIDGE/1 ";
+const DEVICE_AUTH_PREFIX = "OMB-DEVICE-BRIDGE/1 ";
 const MAX_AUTH_LINE = 256;
 const AUTH_TIMEOUT_MS = 5_000;
 const MAX_CONNECTIONS = 4;
 const CHILD_STOP_GRACE_MS = 1_000;
 
-export function ensureRemoteMacBridgeToken(userDataDir, fileSystem = fs) {
+function secureWindowsToken(file, { spawnSyncImpl = spawnSync, env = process.env } = {}) {
+  const account = env.USERNAME?.trim();
+  if (!account) throw new Error("Windows bridge could not identify the current user");
+  const result = spawnSyncImpl(
+    "icacls.exe",
+    [file, "/inheritance:r", "/grant:r", `${account}:(F)`],
+    { encoding: "utf8", windowsHide: true },
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error("Windows bridge token ACL could not be secured");
+  }
+}
+
+function ensureBridgeToken(
+  userDataDir,
+  tokenFileName,
+  fileSystem = fs,
+  { platform = process.platform, secureWindowsFile = secureWindowsToken } = {},
+) {
   fileSystem.mkdirSync(userDataDir, { recursive: true, mode: 0o700 });
   try {
     fileSystem.chmodSync(userDataDir, 0o700);
   } catch {}
-  const tokenFile = path.join(userDataDir, REMOTE_MAC_BRIDGE_TOKEN_FILE);
+  const tokenFile = path.join(userDataDir, tokenFileName);
   try {
     const stat = fileSystem.lstatSync(tokenFile);
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
-      throw new Error("Mac bridge token file is not a private regular file");
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("Bridge token file is not a private regular file");
     }
+    if (platform === "win32") secureWindowsFile(tokenFile);
+    else if ((stat.mode & 0o077) !== 0) throw new Error("Bridge token file is not private");
     const token = fileSystem.readFileSync(tokenFile, "utf8").trim();
-    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Mac bridge token is invalid");
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error("Bridge token is invalid");
     return { token, tokenFile };
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
@@ -34,6 +57,7 @@ export function ensureRemoteMacBridgeToken(userDataDir, fileSystem = fs) {
   const temporary = `${tokenFile}.${process.pid}.tmp`;
   const handle = fileSystem.openSync(temporary, "wx", 0o600);
   try {
+    if (platform === "win32") secureWindowsFile(temporary);
     fileSystem.writeFileSync(handle, `${token}\n`, "utf8");
     fileSystem.fsyncSync(handle);
   } finally {
@@ -43,7 +67,16 @@ export function ensureRemoteMacBridgeToken(userDataDir, fileSystem = fs) {
   try {
     fileSystem.chmodSync(tokenFile, 0o600);
   } catch {}
+  if (platform === "win32") secureWindowsFile(tokenFile);
   return { token, tokenFile };
+}
+
+export function ensureRemoteMacBridgeToken(userDataDir, fileSystem = fs) {
+  return ensureBridgeToken(userDataDir, REMOTE_MAC_BRIDGE_TOKEN_FILE, fileSystem);
+}
+
+export function ensureRemoteDeviceBridgeToken(userDataDir, fileSystem = fs, options = {}) {
+  return ensureBridgeToken(userDataDir, REMOTE_DEVICE_BRIDGE_TOKEN_FILE, fileSystem, options);
 }
 
 function tokenMatches(candidate, expected) {
@@ -64,20 +97,23 @@ function usableCuaConnection(connection) {
   );
 }
 
-export async function startRemoteMacBridge({
+async function startBridge({
   userDataDir,
   getConnection,
   approveConnection,
-  port = REMOTE_MAC_BRIDGE_PORT,
+  port,
   host = "127.0.0.1",
+  authPrefix,
+  ensureToken,
+  logPrefix,
   spawnProcess = spawn,
   log = console,
 } = {}) {
-  if (host !== "127.0.0.1") throw new Error("The Mac bridge may listen only on IPv4 loopback");
-  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Invalid Mac bridge port");
-  if (typeof approveConnection !== "function") throw new Error("Mac bridge requires local approval");
-  if (typeof getConnection !== "function") throw new Error("Mac bridge requires a CUA connection provider");
-  const { token, tokenFile } = ensureRemoteMacBridgeToken(userDataDir);
+  if (host !== "127.0.0.1") throw new Error("The device bridge may listen only on IPv4 loopback");
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Invalid device bridge port");
+  if (typeof approveConnection !== "function") throw new Error("Device bridge requires local approval");
+  if (typeof getConnection !== "function") throw new Error("Device bridge requires a CUA connection provider");
+  const { token, tokenFile } = ensureToken(userDataDir);
   const sockets = new Set();
   const children = new Set();
 
@@ -111,7 +147,7 @@ export async function startRemoteMacBridge({
       sockets.delete(socket);
       closeChild();
     });
-    socket.once("error", (error) => log.warn?.("[mac-bridge] socket closed:", error.message));
+    socket.once("error", (error) => log.warn?.(`[${logPrefix}] socket closed:`, error.message));
 
     socket.on("data", async function authenticate(chunk) {
       if (authenticated) return;
@@ -126,7 +162,7 @@ export async function startRemoteMacBridge({
       socket.removeListener("data", authenticate);
       const line = authBuffer.subarray(0, newline).toString("utf8").replace(/\r$/, "");
       const remainder = authBuffer.subarray(newline + 1);
-      const candidate = line.startsWith(AUTH_PREFIX) ? line.slice(AUTH_PREFIX.length) : "";
+      const candidate = line.startsWith(authPrefix) ? line.slice(authPrefix.length) : "";
       if (!tokenMatches(candidate, token)) {
         socket.end("DENIED\n");
         return;
@@ -136,7 +172,7 @@ export async function startRemoteMacBridge({
       try {
         approved = await approveConnection();
       } catch (error) {
-        log.error?.("[mac-bridge] local approval failed:", error);
+        log.error?.(`[${logPrefix}] local approval failed:`, error);
       }
       if (!approved) {
         socket.end("DENIED\n");
@@ -163,10 +199,10 @@ export async function startRemoteMacBridge({
         if (!socket.destroyed) socket.end();
       });
       child.once("error", (error) => {
-        log.error?.("[mac-bridge] CUA MCP failed:", error);
+        log.error?.(`[${logPrefix}] CUA MCP failed:`, error);
         if (!socket.destroyed) socket.destroy();
       });
-      child.stderr?.on("data", (data) => log.warn?.(`[mac-bridge:cua] ${String(data).trim()}`));
+      child.stderr?.on("data", (data) => log.warn?.(`[${logPrefix}:cua] ${String(data).trim()}`));
       socket.write("OK\n");
       child.stdout.pipe(socket);
       socket.pipe(child.stdin);
@@ -193,5 +229,25 @@ export async function startRemoteMacBridge({
       }
       await new Promise((resolve) => server.close(() => resolve()));
     },
+  });
+}
+
+export function startRemoteMacBridge(options = {}) {
+  return startBridge({
+    ...options,
+    port: options.port ?? REMOTE_MAC_BRIDGE_PORT,
+    authPrefix: MAC_AUTH_PREFIX,
+    ensureToken: ensureRemoteMacBridgeToken,
+    logPrefix: "mac-bridge",
+  });
+}
+
+export function startRemoteDeviceBridge(options = {}) {
+  return startBridge({
+    ...options,
+    port: options.port ?? REMOTE_DEVICE_BRIDGE_PORT,
+    authPrefix: DEVICE_AUTH_PREFIX,
+    ensureToken: (userDataDir) => ensureRemoteDeviceBridgeToken(userDataDir),
+    logPrefix: "device-bridge",
   });
 }

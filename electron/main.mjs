@@ -24,12 +24,13 @@ import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
+  readRemoteDeviceBridgeConfig,
   readRemoteMacBridgeConfig,
   readRemoteServerName,
   resolveRemoteClientURL,
   resolveRemoteCompanionURL,
 } from "./remote-client.mjs";
-import { startRemoteMacBridge } from "./remote-mac-bridge.mjs";
+import { startRemoteDeviceBridge, startRemoteMacBridge } from "./remote-mac-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -83,6 +84,7 @@ const REMOTE_COMPANION_URL = resolveRemoteCompanionURL({
   userDataDir: app.getPath("userData"),
 });
 const REMOTE_MAC_BRIDGE = readRemoteMacBridgeConfig(app.getPath("userData"));
+const REMOTE_DEVICE_BRIDGE = readRemoteDeviceBridgeConfig(app.getPath("userData"));
 const REMOTE_SERVER_NAME = readRemoteServerName(app.getPath("userData")) ?? "Remote server";
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
 // resolve to ::1 and paint a black window
@@ -97,6 +99,8 @@ let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
 let mainWindow = null;
 let remoteMacBridge = null;
 let remoteMacAlwaysAllow = false;
+let remoteDeviceBridge = null;
+let remoteDeviceAlwaysAllow = false;
 let unreadCount = 0;
 let unreadOverlayIcon = null;
 
@@ -1677,6 +1681,7 @@ app.whenReady().then(async () => {
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
     (process.platform === "darwin" && (!REMOTE_SERVER_URL || REMOTE_MAC_BRIDGE?.enabled)) ||
+    ((process.platform === "darwin" || process.platform === "win32") && REMOTE_DEVICE_BRIDGE?.enabled) ||
     (process.platform === "linux" && !REMOTE_SERVER_URL)
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
@@ -1696,7 +1701,45 @@ app.whenReady().then(async () => {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
-  if (REMOTE_SERVER_URL && REMOTE_MAC_BRIDGE?.enabled && process.platform === "darwin") {
+  if (
+    REMOTE_SERVER_URL &&
+    REMOTE_DEVICE_BRIDGE?.enabled &&
+    (process.platform === "darwin" || process.platform === "win32")
+  ) {
+    const deviceName = process.platform === "win32" ? "Windows PC" : "Mac";
+    remoteDeviceBridge = await startRemoteDeviceBridge({
+      userDataDir: app.getPath("userData"),
+      getConnection: () => cuaReady,
+      port: REMOTE_DEVICE_BRIDGE.port,
+      approveConnection: async () => {
+        if (remoteDeviceAlwaysAllow) return true;
+        const options = {
+          type: "warning",
+          title: `Physical ${deviceName} access`,
+          message: `Allow the Razer OpenMaus server to control this ${deviceName}?`,
+          detail: "OpenMaus applies its separate per-action or remembered exact-tool approval in the chat. This connection lasts only for the current agent computer session.",
+          buttons: ["Deny", "Allow Once", "Always Allow While App Is Open"],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        };
+        const result = mainWindow && !mainWindow.isDestroyed()
+          ? await dialog.showMessageBox(mainWindow, options)
+          : await dialog.showMessageBox(options);
+        if (result.response === 2) remoteDeviceAlwaysAllow = true;
+        return result.response === 1 || result.response === 2;
+      },
+    }).catch((error) => {
+      console.error("[device-bridge] start failed:", error);
+      return null;
+    });
+  }
+  if (
+    REMOTE_SERVER_URL &&
+    !REMOTE_DEVICE_BRIDGE?.enabled &&
+    REMOTE_MAC_BRIDGE?.enabled &&
+    process.platform === "darwin"
+  ) {
     remoteMacBridge = await startRemoteMacBridge({
       userDataDir: app.getPath("userData"),
       getConnection: () => cuaReady,
@@ -1798,6 +1841,7 @@ app.on("before-quit", (e) => {
   const cleanup = Promise.race([
     Promise.all([
       stopCua().catch(() => {}),
+      remoteDeviceBridge?.stop().catch(() => {}),
       remoteMacBridge?.stop().catch(() => {}),
       // Both listeners reachable from outside the app are owned children.
       // Shut the connector down first, then the sidecar, without changing the

@@ -41,13 +41,31 @@ describe("desktop capabilities", () => {
     });
   });
 
-  it.each(["win32", "freebsd"])("fails closed on %s", (platform) => {
+  it("enables Windows local control only with a ready embedded driver", () => {
     const capabilities = desktopCapabilities({
-      platform,
+      platform: "win32",
+      packaged: true,
+      localConnection: { mode: "embedded" },
+    });
+
+    expect(capabilities).toMatchObject({
+      host: { platform: "win32", label: "Windows", packaged: true },
+      windowChrome: "native",
+      screenPreview: { available: true, interaction: "direct" },
+      dictation: { available: false },
+      localComputer: { available: true, support: "supported", enabled: true, status: "ready" },
+    });
+    expect(localComputerReady("win32", { mode: "unavailable" })).toBe(false);
+  });
+
+  it("fails closed on unknown desktop platforms", () => {
+    const capabilities = desktopCapabilities({
+      platform: "freebsd",
       env: { DISPLAY: ":0" },
       localConnection: { mode: "embedded" },
     });
 
+    expect(capabilities.host.platform).toBe("other");
     expect(capabilities.windowChrome).toBe("native");
     expect(capabilities.screenPreview.available).toBe(false);
     expect(capabilities.dictation.available).toBe(false);

@@ -18,9 +18,11 @@ import {
   DRIVER_FILE_IDENTITY_KEYS,
   REQUIRED_LINUX_TOOLS,
   decodeLinuxDescriptor,
+  decodeRemoteDeviceDescriptor,
   decodeRemoteMacDescriptor,
   readCuaConnection,
   validateLinuxDescriptorRuntime,
+  validateRemoteDeviceDescriptorRuntime,
   validateRemoteMacDescriptorRuntime,
 } from "./local-computer.ts";
 
@@ -103,6 +105,23 @@ function remoteMacDescriptor(userData: string) {
   };
 }
 
+function remoteWindowsDescriptor(userData: string) {
+  const proxy = join(userData, "remote-device-mcp-proxy.mjs");
+  const tokenFile = join(userData, "device-bridge-token");
+  writeFileSync(proxy, "#!/usr/bin/node\n", { mode: 0o700 });
+  writeFileSync(tokenFile, `${"b".repeat(43)}\n`, { mode: 0o600 });
+  const { createHash } = require("node:crypto");
+  return {
+    schemaVersion: 1,
+    mode: "remote-device-bridge",
+    platform: "win32",
+    scope: "local-computer",
+    generation: "11234567-89ab-cdef-0123-456789abcdef",
+    bridge: { host: "127.0.0.1", port: 18797, tokenFile },
+    proxy: { path: proxy, sha256: createHash("sha256").update("#!/usr/bin/node\n").digest("hex") },
+  };
+}
+
 describe("local computer descriptor contract", () => {
   it("stays synchronized with the Electron producer", () => {
     expect(DRIVER_FILE_IDENTITY_KEYS).toEqual([...ELECTRON_DRIVER_FILE_IDENTITY_KEYS]);
@@ -151,6 +170,40 @@ describe("local computer descriptor", () => {
     });
     expect(validateRemoteMacDescriptorRuntime(file, descriptor)).toBe(true);
     expect(readCuaConnection({ platform: "linux", userData })).not.toBeNull();
+  });
+
+  it("accepts a hash-pinned private Windows bridge on the Linux server", () => {
+    const userData = privateUserData("remote-windows-user-data");
+    const descriptor = remoteWindowsDescriptor(userData);
+    const file = join(userData, "cua-connection.json");
+    writeFileSync(file, JSON.stringify(descriptor), { mode: 0o600 });
+    expect(decodeRemoteDeviceDescriptor(descriptor)).toEqual({
+      command: descriptor.proxy.path,
+      args: [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18797",
+        "--token-file",
+        descriptor.bridge.tokenFile,
+      ],
+      env: {},
+      platform: "win32",
+      generation: descriptor.generation,
+      scope: "local-computer",
+    });
+    expect(validateRemoteDeviceDescriptorRuntime(file, descriptor)).toBe(true);
+    expect(readCuaConnection({ platform: "linux", userData })).toMatchObject({ platform: "win32" });
+  });
+
+  it("rejects a Windows bridge with legacy mode, an unsupported platform, or a non-loopback host", () => {
+    const userData = privateUserData("remote-windows-invalid");
+    const descriptor = remoteWindowsDescriptor(userData);
+    expect(decodeRemoteDeviceDescriptor({ ...descriptor, mode: "remote-mac-bridge" })).toBeNull();
+    expect(decodeRemoteDeviceDescriptor({ ...descriptor, platform: "linux" })).toBeNull();
+    expect(
+      decodeRemoteDeviceDescriptor({ ...descriptor, bridge: { ...descriptor.bridge, host: "0.0.0.0" } }),
+    ).toBeNull();
   });
 
   it("rejects remote Mac bridge tampering, cleartext exposure, and non-loopback hosts", () => {

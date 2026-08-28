@@ -92,6 +92,21 @@ export function readRemoteMacBridgeConfig(userDataDir, readFile = fs.readFileSyn
   }
 }
 
+export function readRemoteDeviceBridgeConfig(userDataDir, readFile = fs.readFileSync) {
+  try {
+    const parsed = JSON.parse(readFile(remoteClientConfigPath(userDataDir), "utf8"));
+    if (parsed?.mode !== "remote" || parsed?.deviceBridge?.enabled !== true) return null;
+    const port = parsed.deviceBridge.port ?? 18798;
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      throw new Error("The remote device bridge port is invalid");
+    }
+    return { enabled: true, port };
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
 export function readRemoteServerName(userDataDir, readFile = fs.readFileSync) {
   try {
     const parsed = JSON.parse(readFile(remoteClientConfigPath(userDataDir), "utf8"));

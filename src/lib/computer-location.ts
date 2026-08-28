@@ -16,13 +16,23 @@ export interface ComputerLocationCopy {
 export function computerLocationCopy(capabilities: DesktopCapabilities): ComputerLocationCopy {
   const remote = capabilities.connection?.mode === "remote";
   const serverName = capabilities.connection?.serverName?.trim() || "Remote server";
-  const localLabel = capabilities.host.platform === "darwin" ? "This Mac" : "This computer";
+  const localLabel =
+    capabilities.host.platform === "darwin"
+      ? "This Mac"
+      : capabilities.host.platform === "win32"
+        ? "This Windows PC"
+        : "This computer";
   return {
     remote,
     serverName,
     vmLabel: remote ? `${serverName} VM` : "Local VM",
     localLabel,
-    localDestination: capabilities.host.platform === "darwin" ? "this Mac" : "this computer",
+    localDestination:
+      capabilities.host.platform === "darwin"
+        ? "this Mac"
+        : capabilities.host.platform === "win32"
+          ? "this Windows PC"
+          : "this computer",
     vmDestination: remote ? `the ${serverName} VM` : "the Local VM",
   };
 }

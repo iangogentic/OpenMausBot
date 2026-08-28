@@ -5,7 +5,11 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { startRemoteMacBridge } from "./remote-mac-bridge.mjs";
+import {
+  ensureRemoteDeviceBridgeToken,
+  startRemoteDeviceBridge,
+  startRemoteMacBridge,
+} from "./remote-mac-bridge.mjs";
 
 async function freePort() {
   const server = net.createServer();
@@ -32,6 +36,65 @@ const echoConnection = Promise.resolve({
   mcpCommand: process.execPath,
   mcpArgs: ["-e", "process.stdin.on('data',d=>process.stdout.write(d))"],
   mcpEnv: {},
+});
+
+test("secures a durable Windows device token before reuse", () => {
+  const { userDataDir, cleanup } = fixture();
+  const secured = [];
+  try {
+    const first = ensureRemoteDeviceBridgeToken(userDataDir, fs, {
+      platform: "win32",
+      secureWindowsFile: (file) => secured.push(file),
+    });
+    const second = ensureRemoteDeviceBridgeToken(userDataDir, fs, {
+      platform: "win32",
+      secureWindowsFile: (file) => secured.push(file),
+    });
+    assert.equal(first.token, second.token);
+    assert.match(first.token, /^[A-Za-z0-9_-]{43}$/);
+    assert.ok(secured.some((file) => file.endsWith(".tmp")));
+    assert.ok(secured.filter((file) => file === first.tokenFile).length >= 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("authenticates and relays the cross-platform physical-device protocol", async () => {
+  const { userDataDir, cleanup } = fixture();
+  const port = await freePort();
+  const bridge = await startRemoteDeviceBridge({
+    userDataDir,
+    port,
+    getConnection: () => echoConnection,
+    approveConnection: async () => true,
+    log: {},
+  });
+  try {
+    const token = fs.readFileSync(bridge.tokenFile, "utf8").trim();
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let output = "";
+    socket.on("data", (chunk) => { output += String(chunk); });
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    socket.write(`OMB-DEVICE-BRIDGE/1 ${token}\nwindows-round-trip\n`);
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("device relay timeout")), 3_000);
+      const check = () => {
+        if (output.includes("windows-round-trip")) {
+          clearTimeout(timeout);
+          resolve();
+        } else setTimeout(check, 10);
+      };
+      check();
+    });
+    assert.equal(output, "OK\nwindows-round-trip\n");
+    socket.destroy();
+  } finally {
+    await bridge.stop();
+    cleanup();
+  }
 });
 
 test("authenticates, asks locally, and relays MCP bytes without exposing the token", async () => {

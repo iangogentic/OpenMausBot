@@ -39,4 +39,23 @@ describe("computer location copy", () => {
       localLabel: "This computer",
     });
   });
+
+  it("names a remote Windows controller without moving the Razer runtime", () => {
+    const capabilities: DesktopCapabilities = {
+      ...browserDesktopCapabilities(),
+      connection: { mode: "remote", serverName: "Razer" },
+      host: {
+        ...browserDesktopCapabilities().host,
+        platform: "win32",
+        label: "Windows",
+      },
+    };
+    expect(computerLocationCopy(capabilities)).toMatchObject({
+      remote: true,
+      serverName: "Razer",
+      vmLabel: "Razer VM",
+      localLabel: "This Windows PC",
+      localDestination: "this Windows PC",
+    });
+  });
 });
