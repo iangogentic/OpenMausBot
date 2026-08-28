@@ -1,0 +1,20 @@
+[Unit]
+Description=Private tunnel from Razer OpenMaus to Ian Brain on desktop2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T \
+  -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes \
+  -L 127.0.0.1:15050:127.0.0.1:5050 \
+  iandesktop2@100.117.161.121
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
