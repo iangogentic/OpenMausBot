@@ -60,6 +60,20 @@ describe("inject ids", () => {
       model: "qwen3.8-27b",
     });
   });
+
+  it("exposes the dual-Spark GLM service as a named local harness target", () => {
+    const spark = LOCAL_HOSTS.find((host) => host.id === "spark_glm");
+    expect(spark).toEqual({
+      id: "spark_glm",
+      label: "DGX Sparks · GLM 5.3 Flash Abliterated",
+      baseUrl: "http://127.0.0.1:18002/v1",
+      apiKey: "local",
+    });
+    expect(decodeInjectId("spark_glm::glm53-ablit-dflash2-k7-b4096-ms1-1m")).toEqual({
+      host: "spark_glm",
+      model: "glm53-ablit-dflash2-k7-b4096-ms1-1m",
+    });
+  });
 });
 
 describe("contextWindowsFromPs", () => {

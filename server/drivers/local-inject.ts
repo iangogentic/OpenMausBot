@@ -23,6 +23,12 @@ export const LOCAL_HOSTS: LocalHost[] = [
     baseUrl: process.env.OPENMAUSBOT_DESKTOP2_QWEN_URL || "http://127.0.0.1:18011/v1",
     apiKey: "local",
   },
+  {
+    id: "spark_glm",
+    label: "DGX Sparks · GLM 5.3 Flash Abliterated",
+    baseUrl: process.env.OPENMAUSBOT_SPARK_GLM_URL || "http://127.0.0.1:18002/v1",
+    apiKey: "local",
+  },
   { id: "omlx", label: "oMLX", baseUrl: "http://127.0.0.1:8080/v1", apiKey: "omlx" },
   { id: "ollama", label: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", apiKey: "ollama" },
   { id: "local_ollama", label: "Ollama", baseUrl: "http://127.0.0.1:11434/v1", apiKey: "ollama" },
