@@ -1169,6 +1169,32 @@ const COMPUTER_OPERATOR_CONTEXTS = new Map<string, ComputerOperatorTurnContext>(
 const COMPUTER_OPERATOR_CHILD_TARGETS = new Map<string, ComputerOperatorTargetCapability>();
 const ACTIVE_COMPUTER_OPERATORS = new Map<string, ActiveComputerOperator>();
 
+function activeComputerOperatorForTarget(botId: string, targetKey: string): ActiveComputerOperator | null {
+  for (const active of ACTIVE_COMPUTER_OPERATORS.values()) {
+    if (active.parent.botId !== botId) continue;
+    const record = COMPUTER_SUBAGENT_MANAGER.get(active.handle.childId);
+    if (record?.targetKey === targetKey && record.leaseHeld) return active;
+  }
+  return null;
+}
+
+async function pauseComputerOperatorForHuman(botId: string, targetKey: string): Promise<ActiveComputerOperator | null> {
+  const active = activeComputerOperatorForTarget(botId, targetKey);
+  if (!active) return null;
+  const record = COMPUTER_SUBAGENT_MANAGER.get(active.handle.childId);
+  if (record?.status === "waiting-on-human") return active;
+  if (record?.status !== "running") return null;
+  await COMPUTER_SUBAGENT_RUNTIME.markWaitingOnHuman(active.handle, active.parent);
+  return active;
+}
+
+async function resumeComputerOperatorAfterHuman(active: ActiveComputerOperator | null): Promise<void> {
+  if (!active) return;
+  const record = COMPUTER_SUBAGENT_MANAGER.get(active.handle.childId);
+  if (record?.status !== "waiting-on-human") return;
+  await COMPUTER_SUBAGENT_RUNTIME.resumeAfterHuman(active.handle, active.parent);
+}
+
 function computerOperatorTarget(context: ComputerOperatorTurnContext): { targetKey: string; targetGeneration: string } {
   return context.kind === "local-vm"
     ? { targetKey: context.target.key, targetGeneration: context.vmGeneration }
@@ -2997,6 +3023,9 @@ const localVmViewerProxy = new LocalVmViewerProxy({
 computerControl.onRevoked((event) => {
   localVmViewerProxy.revokeBot(event.botId);
   if (event.targetKey.startsWith("vps:")) vps.closeVpsDesktopTunnel(event.botId);
+  void resumeComputerOperatorAfterHuman(
+    activeComputerOperatorForTarget(event.botId, event.targetKey),
+  ).catch(() => {});
 });
 
 function revokeLocalVmViewers(target: LocalVmTarget): void {
@@ -10043,6 +10072,12 @@ const server = createServer(async (req, res) => {
         }
         if (action === "take") {
           const expectedAuthorityVersion = takeAuthorityAfter!.version;
+          let pausedOperator: ActiveComputerOperator | null = null;
+          try {
+            pausedOperator = await pauseComputerOperatorForHuman(bot.id, resolvedTargetKey);
+          } catch {
+            return json(res, 409, { error: "the visual operator changed while control was being requested; refresh and try again" });
+          }
           const taken = await computerControl.takeLease({
             botId: bot.id,
             targetKey: resolvedTargetKey,
@@ -10050,6 +10085,7 @@ const server = createServer(async (req, res) => {
             stillAuthoritative: () =>
               publicComputerControlAuthority(bot.id)?.version === expectedAuthorityVersion,
           });
+          if (!taken.ok) void resumeComputerOperatorAfterHuman(pausedOperator).catch(() => {});
           return taken.ok
             ? json(res, 200, {
                 ...taken.snapshot,
