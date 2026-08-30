@@ -33,6 +33,12 @@ describe("production computer operator wiring", () => {
 
   it("fences final and preview images to the exact VM generation", () => {
     expect(source).toContain("computer operator VM generation changed before final screenshot");
+    expect(source).toContain("computer operator VM generation changed during final screenshot");
+    expect(source.match(/currentContainerComputerGeneration\(capability\.runtime, capability\.target\)/g)).toHaveLength(2);
+    expect(source).toContain("computer operator parent turn changed before final screenshot publication");
+    expect(source).toContain("const captureAction = computerControl.beginAction(parent.botId, target.targetKey, capability.bridgeId)");
+    expect(source).toContain("computer operator human control began during final screenshot");
+    expect(source).toContain("computerControl.endAction(parent.botId, target.targetKey, capability.bridgeId, captureAction.actionId)");
     expect(source).toContain("the Local VM generation changed before preview capture");
     expect(source).toContain('createHash("sha256").update(bytes).digest("hex")');
     expect(source).toContain("imageDimensions(bytes, mimeType)");
@@ -44,6 +50,7 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("registration.executorGeneration !== context.executorGeneration");
     expect(source).toContain("PHYSICAL_BRIDGES.captureScreenshot(");
     expect(source).toContain("computer operator physical generation changed before final screenshot");
+    expect(source).toContain("computer operator physical generation changed during final screenshot");
     expect(source).toContain("isolationKey: `computer-operator:${input.parent.botId}:${input.target.targetKey}`");
     expect(source).toContain("providerPrivateCwd: true");
     expect(source).not.toContain("cwd: ensureWorkspace(input.parent.botId)");
@@ -57,6 +64,11 @@ describe("production computer operator wiring", () => {
 
   it("rejects an already-active parent before starting another child", () => {
     expect(source).toContain("reserveComputerOperator(ACTIVE_COMPUTER_OPERATORS, parentKey, () => {");
+  });
+
+  it("retires every deterministic hidden operator home with its bot", () => {
+    expect(source).toContain("const operatorTargets = [perBotLocalVmTarget(botId).key, SHARED_LOCAL_VM_TARGET.key, \"physical:host\"]");
+    expect(source).toContain("retireProviderOwnerState(`computer-operator:${botId}:${targetKey}`)");
   });
 
   it("pauses the delegated child on the global target even when takeover comes through another bot", () => {

@@ -343,7 +343,7 @@ export function prepareProviderSandboxEnvironment(
   }
 }
 
-function providerIsolationConfigured(startup: NodeJS.ProcessEnv = process.env): boolean {
+export function providerIsolationConfigured(startup: NodeJS.ProcessEnv = process.env): boolean {
   return startup.OMB_REQUIRE_PROVIDER_ISOLATION === "1" || Boolean(startup.OMB_PROVIDER_LAUNCHER?.trim());
 }
 

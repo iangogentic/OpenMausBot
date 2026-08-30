@@ -670,6 +670,7 @@ describe("ComputerSubagentRuntime", () => {
     const completion = await handle.done;
     expect(completion).toMatchObject({ status: "completed", finalScreenshotCaptured: true });
     expect(h.screenshots).toEqual(["stale-before-callback"]);
+    expect(h.events).not.toContain("final-frame");
     expect(h.completions).toEqual([]);
   });
 

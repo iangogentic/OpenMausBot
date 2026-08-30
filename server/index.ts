@@ -1534,42 +1534,74 @@ const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
     if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn is stale");
     const capability = COMPUTER_OPERATOR_CHILD_TARGETS.get(childId);
     if (!capability || capability !== target.opaqueCapability) throw new Error("computer operator screenshot authority is unavailable");
-    let mimeType: "image/png" | "image/jpeg";
-    let dataBase64: string;
-    if (capability.kind === "local-vm") {
-      if (await currentContainerComputerGeneration(capability.runtime, capability.target) !== target.targetGeneration) {
-        throw new Error("computer operator VM generation changed before final screenshot");
-      }
-      const dataUrl = await containerComputerAgentScreenshot(undefined, undefined, capability.target);
-      const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/]+={0,2})$/.exec(dataUrl);
-      if (!match) throw new Error("computer operator returned an unsupported final screenshot");
-      mimeType = match[1] as "image/png" | "image/jpeg";
-      dataBase64 = match[2]!;
-    } else {
-      if (`${capability.registrationId}:${capability.executorGeneration}` !== target.targetGeneration) {
-        throw new Error("computer operator physical generation changed before final screenshot");
-      }
-      const captured = await PHYSICAL_BRIDGES.captureScreenshot(
-        capability.registrationId,
-        capability.executorGeneration,
-        signal,
-      );
-      mimeType = captured.mimeType;
-      dataBase64 = captured.dataBase64;
+    const running = COMPUTER_SUBAGENT_MANAGER.get(childId);
+    if (running?.status !== "running" || computerControl.targetReservedForHuman(target.targetKey)) {
+      throw new Error("computer operator final screenshot is unavailable during human control");
     }
-    signal.throwIfAborted();
-    const bytes = Buffer.from(dataBase64, "base64");
-    if (bytes.byteLength <= 0 || bytes.byteLength > MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES) {
-      throw new Error("computer operator final screenshot exceeded its bounded size");
+    // Final capture is itself an action on the shared target. Claim it before
+    // the first capture await so Take must drain it instead of letting a human
+    // type into pixels that could later be returned to the model.
+    const captureAction = computerControl.beginAction(parent.botId, target.targetKey, capability.bridgeId);
+    if (!captureAction.allowed) throw new Error("computer operator final screenshot target is busy");
+    try {
+      let mimeType: "image/png" | "image/jpeg";
+      let dataBase64: string;
+      if (capability.kind === "local-vm") {
+        if (await currentContainerComputerGeneration(capability.runtime, capability.target) !== target.targetGeneration) {
+          throw new Error("computer operator VM generation changed before final screenshot");
+        }
+        const dataUrl = await containerComputerAgentScreenshot(undefined, undefined, capability.target);
+        signal.throwIfAborted();
+        if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn changed during final screenshot");
+        if (await currentContainerComputerGeneration(capability.runtime, capability.target) !== target.targetGeneration) {
+          throw new Error("computer operator VM generation changed during final screenshot");
+        }
+        const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/]+={0,2})$/.exec(dataUrl);
+        if (!match) throw new Error("computer operator returned an unsupported final screenshot");
+        mimeType = match[1] as "image/png" | "image/jpeg";
+        dataBase64 = match[2]!;
+      } else {
+        if (`${capability.registrationId}:${capability.executorGeneration}` !== target.targetGeneration) {
+          throw new Error("computer operator physical generation changed before final screenshot");
+        }
+        const captured = await PHYSICAL_BRIDGES.captureScreenshot(
+          capability.registrationId,
+          capability.executorGeneration,
+          signal,
+        );
+        signal.throwIfAborted();
+        if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn changed during final screenshot");
+        const registration = physicalRegistration();
+        if (
+          registration?.registrationId !== capability.registrationId ||
+          registration.executorGeneration !== capability.executorGeneration
+        ) {
+          throw new Error("computer operator physical generation changed during final screenshot");
+        }
+        mimeType = captured.mimeType;
+        dataBase64 = captured.dataBase64;
+      }
+      signal.throwIfAborted();
+      if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn changed before final screenshot publication");
+      const finalRecord = COMPUTER_SUBAGENT_MANAGER.get(childId);
+      if (finalRecord?.status !== "running" || computerControl.targetReservedForHuman(target.targetKey)) {
+        throw new Error("computer operator human control began during final screenshot");
+      }
+      const bytes = Buffer.from(dataBase64, "base64");
+      if (bytes.byteLength <= 0 || bytes.byteLength > MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES) {
+        throw new Error("computer operator final screenshot exceeded its bounded size");
+      }
+      const dimensions = imageDimensions(bytes, mimeType);
+      return {
+        mimeType,
+        dataBase64,
+        byteLength: bytes.byteLength,
+        ...dimensions,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+    } finally {
+      computerControl.endAction(parent.botId, target.targetKey, capability.bridgeId, captureAction.actionId);
     }
-    const dimensions = imageDimensions(bytes, mimeType);
-    return {
-      mimeType,
-      dataBase64,
-      byteLength: bytes.byteLength,
-      ...dimensions,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-    };
   },
   isParentCurrent: isComputerOperatorParentCurrent,
   quarantineChild: async (childId) => closeComputerOperatorChildTarget(childId, "computer operator quarantined"),
@@ -2161,7 +2193,17 @@ store.seedIfEmpty();
 const botDeletionJournal = new BotDeletionJournal(join(DATA_DIR, "bot-deletions"));
 const botDeletionCleanup: BotDeletionCleanup = {
   logicalDelete: (botId) => { store.deleteBot(botId); },
-  provider: (botId) => retireProviderOwnerState(botId),
+  provider: async (botId) => {
+    // The main provider and both deterministic hidden-operator targets own
+    // distinct persistent homes. Retire every one on bot deletion so neither
+    // private state nor the supervisor's bounded home slots leak.
+    const operatorTargets = [perBotLocalVmTarget(botId).key, SHARED_LOCAL_VM_TARGET.key, "physical:host"];
+    await Promise.all([
+      retireProviderOwnerState(botId),
+      ...operatorTargets.map((targetKey) =>
+        retireProviderOwnerState(`computer-operator:${botId}:${targetKey}`)),
+    ]);
+  },
   checkpoints: (botId) => checkpoints.deleteBotCheckpoints(botId),
   vm: (botId) => deletePerBotLocalVmWorkspace(botId),
   workspace: (botId) => retireStorageLeaf("workspace", botId),

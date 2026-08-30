@@ -20,6 +20,7 @@ import { applyModelRelayEnvironment, decodeInjectId } from "../local-inject.ts";
 import {
   describeSpawnFailure,
   execCli,
+  providerIsolationConfigured,
   spawnCli,
   terminateCliTree,
   type ProviderRuntimePath,
@@ -355,18 +356,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const turnId = turn.turnId ?? newId();
         const env = childEnv();
         const privateProviderHome = env.OMB_PROVIDER_INSTANCE_HOME?.trim();
-        if (
-          turn.providerPrivateCwd &&
-          privateProviderHome &&
-          (!isAbsolute(privateProviderHome) || /[\0\r\n]/.test(privateProviderHome))
-        ) {
-          throw new Error("private provider cwd must be an absolute directory path");
+        if (turn.providerPrivateCwd) {
+          if (!providerIsolationConfigured() || !privateProviderHome) {
+            throw new Error("private provider cwd requires configured OS isolation");
+          }
+          if (!isAbsolute(privateProviderHome) || /[\0\r\n]/.test(privateProviderHome)) {
+            throw new Error("private provider cwd must be an absolute directory path");
+          }
         }
         // With OS isolation, omitting the spawn cwd makes spawnCli select the
         // exact supervisor-validated provider HOME. ACP still needs an
         // explicit cwd in session/new, so give it the same trusted path.
         const cwd = turn.providerPrivateCwd
-          ? resolve(privateProviderHome || homedir())
+          ? resolve(privateProviderHome!)
           : turn.cwd ?? config.workspace ?? homedir();
         const spawnCwd = turn.providerPrivateCwd && privateProviderHome ? undefined : cwd;
         applyModelRelayEnvironment(env, turn.model, turn.integrations?.modelRelay);

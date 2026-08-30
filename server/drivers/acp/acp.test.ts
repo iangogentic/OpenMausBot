@@ -371,10 +371,11 @@ describe("ACP turns (fake CLI)", () => {
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
   });
 
-  it("uses the exact trusted provider home for a private ACP session", async () => {
+  it("fails closed when a private ACP session lacks configured OS isolation", async () => {
     const privateHome = join(scratch, "provider-home");
     mkdirSync(privateHome);
-    process.env.FAKE_ACP_DUMP = join(scratch, "private-cwd.json");
+    const dump = join(scratch, "private-cwd.json");
+    process.env.FAKE_ACP_DUMP = dump;
     instance = await GrokAgentDriver.create({
       instanceId: "private-cwd-test",
       displayName: "Private Cwd Test",
@@ -384,15 +385,12 @@ describe("ACP turns (fake CLI)", () => {
     });
     recorder = recordEvents(instance.adapter);
 
-    await instance.adapter.sendTurn({
+    await expect(instance.adapter.sendTurn({
       threadId: "t-private-cwd",
       text: "go",
       providerPrivateCwd: true,
-    });
-    await recorder.until((e) => e.type === "turn.completed");
-
-    const seen = JSON.parse(readFileSync(process.env.FAKE_ACP_DUMP, "utf8"));
-    expect(seen.sessionCwd).toBe(privateHome);
+    })).rejects.toThrow("private provider cwd requires configured OS isolation");
+    expect(() => readFileSync(dump, "utf8")).toThrow();
   });
 
   // ACP session/new accepts stdio MCP entries, so connected apps use the

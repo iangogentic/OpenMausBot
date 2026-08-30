@@ -8,12 +8,18 @@ import { findCliCandidates } from "./env-path.ts";
 
 import {
   prepareProviderSandboxEnvironment,
+  providerIsolationConfigured,
   resolveProviderSpawn,
   spawnCli,
   terminateCliTree,
 } from "./procs.ts";
 
 describe("provider OS identity boundary", () => {
+  it("reports isolation only from trusted startup configuration", () => {
+    expect(providerIsolationConfigured({})).toBe(false);
+    expect(providerIsolationConfigured({ OMB_REQUIRE_PROVIDER_ISOLATION: "1" })).toBe(true);
+    expect(providerIsolationConfigured({ OMB_PROVIDER_LAUNCHER: "/trusted/launcher" })).toBe(true);
+  });
   it("fails closed when a deployment requires isolation without a trusted launcher", () => {
     expect(() => resolveProviderSpawn(
       { command: "/usr/bin/provider", args: ["run"] },

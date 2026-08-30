@@ -496,7 +496,9 @@ export class ComputerSubagentRuntime {
         }), this.operationTimeoutMs);
         if (!captured.ok) throw new Error(captured.error ?? captured.reason);
         finalScreenshot = validateScreenshot(captured.value);
-        if (this.onFinalScreenshot) {
+        // Parent cancellation can race the capture callback. Never publish
+        // terminal pixels for a generation that became stale after capture.
+        if (this.onFinalScreenshot && await this.parentCurrent(execution.input.parent)) {
           await this.bounded(Promise.resolve().then(() => this.onFinalScreenshot!({
             childId: execution.handle.childId,
             parent: cloneParent(execution.input.parent),
