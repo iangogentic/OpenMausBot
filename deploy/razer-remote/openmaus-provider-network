@@ -41,6 +41,12 @@ table inet openmaus_provider {{
   }}
   chain input {{
     type filter hook input priority -150; policy accept;
+    # The paired-device socket listens on all addresses so it survives
+    # Tailscale address changes, but its authority is Tailnet-only. Reject the
+    # same port on LAN/Wi-Fi/Docker before the host's permissive input policy
+    # can expose the authenticated surface to adjacent networks.
+    iifname \"tailscale0\" tcp dport 8810 accept comment \"companion-tailscale-only-v1\"
+    tcp dport 8810 reject with icmpx type admin-prohibited comment \"companion-nontailnet-deny-v1\"
     iifname \"ombvm*\" ct state established,related accept comment \"vm-host-return-v1\"
     iifname \"ombvm*\" drop comment \"vm-host-deny-v1\"
   }}

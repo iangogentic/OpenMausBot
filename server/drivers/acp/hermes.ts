@@ -109,6 +109,14 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
     ...modelConfig,
     default: model,
     provider: `custom:${hostId}`,
+    // The Spark GLM endpoint has been observed returning finish_reason=length
+    // at Hermes' 4K default after it already emitted a complete post-tool
+    // answer. Stock Hermes then injects its own continuation prompt, which
+    // makes this model narrate the recovery instructions into the visible
+    // answer. Keep the correction scoped to the exact affected host: 16K is
+    // above Hermes' 4K/8K/12K continuation ladder and avoids changing Qwen's
+    // latency or genuine long-answer behavior.
+    ...(hostId === "spark_glm" ? { max_tokens: 16_384 } : {}),
   };
   return stringifyYaml(config);
 }
@@ -490,6 +498,9 @@ const support: AcpSupport = {
     // restricted; mounted MCPs are the only computer/Ian Brain authorities.
     const restricted = true;
     const computerMounted = Boolean(turn.integrations?.computer || turn.integrations?.localComputer);
+    const injected = decodeInjectId(turn.model);
+    if (injected?.host === "spark_glm") env.OPENMAUSBOT_HERMES_SPARK_IMPLICIT_THINK = "1";
+    else delete env.OPENMAUSBOT_HERMES_SPARK_IMPLICIT_THINK;
     // The Ian Brain credential deny applies even when Computer is Off. The
     // official Hermes launcher strips PYTHONPATH, so every turn must bypass it
     // through the managed interpreter when one can be verified.

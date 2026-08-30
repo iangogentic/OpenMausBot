@@ -76,9 +76,15 @@ export function deriveComputerSessions({
       // An expired frame is historical, not a live-session thumbnail. The
       // full Computer panel owns explicitly-labelled historical fallbacks.
       const screen = recentFrame && (computerEnabled || held) ? candidateScreen : undefined;
-      return { bot, screen, selected, held, busy, recentScreen, inputIndex };
+      return { bot, screen, selected, held, busy, recentScreen, computerEnabled, inputIndex };
     })
-    .filter((session) => session.selected || session.held || session.busy || session.recentScreen)
+    // A configured desktop remains a session even while the bot is idle and
+    // its last SSE frame has expired. Otherwise two always-on per-bot VMs
+    // collapse back to one tile after five minutes, which makes the multi-
+    // computer surface lie about what is still available. Idle sessions use
+    // the safe monitor placeholder until a fresh, generation-fenced frame
+    // arrives.
+    .filter((session) => session.selected || session.held || session.computerEnabled)
     .sort((left, right) => {
       if (left.selected !== right.selected) return left.selected ? -1 : 1;
       if (left.held !== right.held) return left.held ? -1 : 1;
@@ -86,7 +92,7 @@ export function deriveComputerSessions({
       const frameOrder = (right.screen?.at ?? 0) - (left.screen?.at ?? 0);
       return frameOrder || left.inputIndex - right.inputIndex;
     })
-    .map(({ inputIndex: _inputIndex, ...session }) => session);
+    .map(({ inputIndex: _inputIndex, computerEnabled: _computerEnabled, ...session }) => session);
 }
 
 export function computerSessionStatus(session: ComputerSession): string {

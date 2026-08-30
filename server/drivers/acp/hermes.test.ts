@@ -477,6 +477,63 @@ mcp_servers:
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });
 
+  it.runIf(process.platform !== "win32")("hides Spark's orphan-close reasoning prefix but preserves no-tag answers", () => {
+    const root = scratch();
+    const source = join(root, "source");
+    const runtime = join(root, "runtime");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(runtime, { recursive: true });
+    const env: Record<string, string | undefined> = {
+      OPENMAUSBOT_HERMES_SPARK_IMPLICIT_THINK: "1",
+    };
+    const proof = prepareHermesPolicyEnvironment({
+      env,
+      sourceHome: source,
+      dataDir: runtime,
+      isolationKey: "spark-scrubber",
+      restricted: true,
+    })!;
+    const fakeModules = join(root, "fake-modules");
+    mkdirSync(join(fakeModules, "agent"), { recursive: true });
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    writeFileSync(join(fakeModules, "agent", "__init__.py"), "");
+    writeFileSync(
+      join(fakeModules, "agent", "think_scrubber.py"),
+      [
+        "class StreamingThinkScrubber:",
+        " _CLOSE_TAGS = ('</think>', '</thinking>', '</reasoning>', '</thought>', '</REASONING_SCRATCHPAD>')",
+        " def __init__(self): self.tail = ''",
+        " def reset(self): self.tail = ''",
+        " def feed(self, text): return text",
+        " def flush(self): return self.tail",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(fakeModules, "model_tools.py"), "def get_tool_definitions(*args, **kwargs): return []\ndef handle_function_call(*args, **kwargs): return None\n");
+    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs):\n  self.tools = []\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const script = [
+      "import json",
+      "from agent.think_scrubber import StreamingThinkScrubber",
+      "split = StreamingThinkScrubber()",
+      "hidden = split.feed('private planning') + split.feed('</thi') + split.feed('nk>FINAL_OK') + split.flush()",
+      "plain = StreamingThinkScrubber()",
+      "fallback = plain.feed('ordinary answer without tags') + plain.flush()",
+      "print(json.dumps({'hidden': hidden, 'fallback': fallback}))",
+    ].join("\n");
+    const executed = spawnSync("python3", ["-c", script], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status, executed.stderr).toBe(0);
+    expect(JSON.parse(executed.stdout.trim())).toEqual({
+      hidden: "FINAL_OK",
+      fallback: "ordinary answer without tags",
+    });
+    expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
+  });
+
   it("rejects a proof from any other process/turn nonce", () => {
     const root = scratch();
     const path = join(root, "proof.json");

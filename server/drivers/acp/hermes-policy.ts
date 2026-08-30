@@ -73,6 +73,7 @@ import traceback
 
 _ACTIVE = os.environ.get("OPENMAUSBOT_HERMES_POLICY") == "1"
 _RESTRICT_NATIVE = os.environ.get("OPENMAUSBOT_HERMES_RESTRICT_NATIVE") == "1"
+_SPARK_IMPLICIT_THINK = os.environ.get("OPENMAUSBOT_HERMES_SPARK_IMPLICIT_THINK") == "1"
 _ALLOWED_NATIVE = frozenset({
     "web_search", "todo",
     "tool_search", "tool_describe", "tool_call",
@@ -142,6 +143,67 @@ def _filter_definitions(definitions):
 
 
 def _install():
+    # The reviewed Spark GLM chat template sometimes emits Qwen-style hidden
+    # reasoning without the opening <think>, followed by </think> and the real
+    # answer. Upstream Hermes deliberately removes only the orphan close tag,
+    # exposing the preceding reasoning as assistant text. Scope a stateful
+    # repair to this exact model route: buffer only the initial stream, discard
+    # it when a recognized close arrives, and preserve it unchanged at flush
+    # when the model emitted no close tag at all.
+    if _SPARK_IMPLICIT_THINK:
+        from agent import think_scrubber as think_scrubber_module
+        original_scrubber = think_scrubber_module.StreamingThinkScrubber
+
+        class OpenMausSparkThinkScrubber:
+            _BUFFER_LIMIT = 1024 * 1024
+
+            def __init__(self):
+                self._delegate = original_scrubber()
+                self._probing = True
+                self._prefix = ""
+
+            def reset(self):
+                self._delegate.reset()
+                self._probing = True
+                self._prefix = ""
+
+            def feed(self, text):
+                if not self._probing:
+                    return self._delegate.feed(text)
+                if not text:
+                    return ""
+                self._prefix += text
+                lowered = self._prefix.lower()
+                matches = [
+                    (lowered.find(tag.lower()), len(tag))
+                    for tag in original_scrubber._CLOSE_TAGS
+                    if lowered.find(tag.lower()) >= 0
+                ]
+                if matches:
+                    index, length = min(matches, key=lambda match: match[0])
+                    suffix = self._prefix[index + length:]
+                    self._prefix = ""
+                    self._probing = False
+                    self._delegate.reset()
+                    return self._delegate.feed(suffix)
+                if len(self._prefix) > self._BUFFER_LIMIT:
+                    visible = self._prefix
+                    self._prefix = ""
+                    self._probing = False
+                    self._delegate.reset()
+                    return visible
+                return ""
+
+            def flush(self):
+                if self._probing:
+                    visible = self._prefix
+                    self._prefix = ""
+                    self._probing = False
+                    return visible
+                return self._delegate.flush()
+
+        think_scrubber_module.StreamingThinkScrubber = OpenMausSparkThinkScrubber
+
     import model_tools
 
     # Keep a compact everyday MCP rail visible while Hermes progressively

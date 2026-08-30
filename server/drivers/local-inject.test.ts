@@ -1046,6 +1046,33 @@ describe("ensureHermesInjectProvider", () => {
     });
   });
 
+  it("raises only Spark GLM's isolated output cap above Hermes' broken continuation ladder", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-hermes-spark-cap-"));
+    scratchDirs.push(home);
+    const spark = join(home, "spark");
+    const qwen = join(home, "qwen");
+    mkdirSync(spark, { recursive: true });
+    mkdirSync(qwen, { recursive: true });
+
+    ensureHermesInjectProvider("spark_glm::glm53-ablit-dflash2-k7-b4096-ms1-1m", {
+      HERMES_HOME: spark,
+      OPENMAUSBOT_HERMES_POLICY: "1",
+    });
+    ensureHermesInjectProvider("desktop2_qwen::qwen3.8-27b-abliterated", {
+      HERMES_HOME: qwen,
+      OPENMAUSBOT_HERMES_POLICY: "1",
+    });
+
+    const sparkConfig = parseYaml(readFileSync(join(spark, "config.yaml"), "utf8")) as {
+      model: { max_tokens?: number };
+    };
+    const qwenConfig = parseYaml(readFileSync(join(qwen, "config.yaml"), "utf8")) as {
+      model: { max_tokens?: number };
+    };
+    expect(sparkConfig.model.max_tokens).toBe(16_384);
+    expect(qwenConfig.model.max_tokens).toBeUndefined();
+  });
+
   it("replaces a nested provider block without leaving orphan YAML lines", () => {
     const home = mkdtempSync(join(tmpdir(), "omb-hermes-nested-"));
     scratchDirs.push(home);

@@ -558,6 +558,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   // before the new target can render.
   useEffect(() => {
     setPolledFrame(null);
+    setVmFrame(null);
   }, [bot.id, controlTargetKey, controlTargetGeneration]);
   const [sseFlowing, setSseFlowing] = useState(false);
   useEffect(() => {
@@ -655,7 +656,15 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [phase, bot.id, pageVisible, bot.busy, viewerOpen]);
+  }, [
+    phase,
+    bot.id,
+    pageVisible,
+    bot.busy,
+    viewerOpen,
+    controlTargetKey,
+    controlTargetGeneration,
+  ]);
 
   // local preview: frames from the Electron main process. The FIRST capture
   // attempt is what makes macOS show the Screen Recording prompt (there is

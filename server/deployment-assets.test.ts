@@ -68,6 +68,8 @@ describe("Razer hostile-provider deployment assets", () => {
       "vm-host-output-deny-v1",
       "vm-host-return-v1",
       "vm-host-deny-v1",
+      "companion-tailscale-only-v1",
+      "companion-nontailnet-deny-v1",
       "vm-bandwidth-v1",
       "vm-cross-deny-v1",
       "vm-private-v4-v1",

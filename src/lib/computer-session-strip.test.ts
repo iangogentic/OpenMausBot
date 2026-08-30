@@ -58,7 +58,7 @@ describe("computer session derivation", () => {
     expect(sessions).toHaveLength(COMPUTER_SESSION_DIRECT_LIMIT);
   });
 
-  it("includes selected, held, busy, and recent-screen bots but drops unrelated and expired peers", () => {
+  it("keeps every configured bot desktop visible while dropping only unrelated off peers", () => {
     const sessions = deriveComputerSessions({
       bots: [
         bot("selected"),
@@ -78,7 +78,16 @@ describe("computer session derivation", () => {
       now,
     });
 
-    expect(sessions.map((session) => session.bot.id)).toEqual(["selected", "held", "busy", "recent"]);
+    expect(sessions.map((session) => session.bot.id)).toEqual([
+      "selected",
+      "held",
+      "busy",
+      "recent",
+      "expired",
+      "unrelated",
+    ]);
+    expect(sessions.find((session) => session.bot.id === "expired")?.screen).toBeUndefined();
+    expect(sessions.some((session) => session.bot.id === "off-busy")).toBe(false);
   });
 
   it("builds only fenced raster data URLs", () => {
