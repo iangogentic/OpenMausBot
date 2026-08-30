@@ -46,8 +46,18 @@ import { TeamLibraryPanel, type TeamImportResult } from "./TeamLibraryPanel";
 import { RenameTitle } from "./RenameTitle";
 import { BotPickerList } from "./BotPickerList";
 import {
+  SIDEBAR_COMFORTABLE_WIDTH,
+  SIDEBAR_COMPACT_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  clampSidebarWidth,
+  loadLastExpandedSidebarDensity,
   loadSidebarDensity,
+  loadSidebarWidth,
+  saveLastExpandedSidebarDensity,
   saveSidebarDensity,
+  saveSidebarWidth,
+  sidebarWidthForKey,
   type SidebarDensity,
 } from "@/lib/sidebar-preferences";
 import { phoneSettingsAction, SidebarPhoneButton } from "./SidebarPhoneButton";
@@ -1100,13 +1110,27 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const [density, setDensityState] = useState<SidebarDensity>(() => loadSidebarDensity());
   const [lastExpandedDensity, setLastExpandedDensity] = useState<Exclude<SidebarDensity, "icons">>(() => {
     const saved = loadSidebarDensity();
-    return saved === "icons" ? "comfortable" : saved;
+    return saved === "icons" ? loadLastExpandedSidebarDensity() : saved;
   });
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const savedDensity = loadSidebarDensity();
+    const expandedDensity = savedDensity === "icons" ? loadLastExpandedSidebarDensity() : savedDensity;
+    return loadSidebarWidth(
+      undefined,
+      expandedDensity === "compact" ? SIDEBAR_COMPACT_WIDTH : SIDEBAR_COMFORTABLE_WIDTH,
+    );
+  });
+  const [resizing, setResizing] = useState(false);
+  const resizeStart = useRef<{ clientX: number; width: number } | null>(null);
+  const resizeWidth = useRef(sidebarWidth);
   const [densityOpen, setDensityOpen] = useState(false);
 
   const setDensity = (next: SidebarDensity) => {
     setDensityState(next);
-    if (next !== "icons") setLastExpandedDensity(next);
+    if (next !== "icons") {
+      setLastExpandedDensity(next);
+      saveLastExpandedSidebarDensity(next);
+    }
     // Search is hidden in avatar-only mode. Keeping its value would silently
     // filter bots, rooms, and message results with no visible way to clear it.
     else setQuery("");
@@ -1120,6 +1144,12 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       setLastExpandedDensity(density);
       setDensity("icons");
     }
+  };
+
+  const commitSidebarWidth = (width: number) => {
+    const next = clampSidebarWidth(width);
+    setSidebarWidth(next);
+    saveSidebarWidth(next);
   };
 
   // Esc closes the drawer, mirroring ApiKeys.tsx:75-85. Bound only while the
@@ -1327,8 +1357,8 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     <aside
       aria-label="Bots and navigation"
       className={cn(
-        "flex h-full shrink-0 flex-col border-r border-hairline/40 bg-panel transition-[width] duration-200",
-        density === "icons" ? "w-[80px]" : density === "compact" ? "w-[272px]" : "w-[320px]",
+        "relative flex h-full shrink-0 flex-col border-r border-hairline/40 bg-panel",
+        !resizing && "transition-[width] duration-200",
         // Below md only: the sidebar leaves the flow and slides in over the chat.
         // Scoped with max-md: rather than cancelled with md: on purpose — Tailwind
         // v4 emits the native `translate` property, and any value other than
@@ -1340,7 +1370,58 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         "max-md:transition-transform max-md:duration-200",
         open ? "max-md:translate-x-0" : "max-md:-translate-x-full",
       )}
+      style={{ width: density === "icons" ? 80 : sidebarWidth }}
     >
+      {density !== "icons" && (
+        <div
+          role="separator"
+          aria-label="Resize bot sidebar"
+          aria-orientation="vertical"
+          aria-valuemin={SIDEBAR_MIN_WIDTH}
+          aria-valuemax={SIDEBAR_MAX_WIDTH}
+          aria-valuenow={sidebarWidth}
+          tabIndex={0}
+          title="Drag to resize. Use Left and Right arrow keys when focused."
+          className={cn(
+            "absolute inset-y-0 -right-1 z-20 hidden w-2 cursor-col-resize touch-none outline-none md:block",
+            "after:absolute after:inset-y-0 after:left-1/2 after:w-px after:-translate-x-1/2 after:bg-transparent",
+            "hover:after:bg-accent/50 focus-visible:after:w-0.5 focus-visible:after:bg-accent",
+            resizing && "after:w-0.5 after:bg-accent",
+          )}
+          onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            resizeStart.current = { clientX: event.clientX, width: sidebarWidth };
+            resizeWidth.current = sidebarWidth;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            setResizing(true);
+          }}
+          onPointerMove={(event) => {
+            const start = resizeStart.current;
+            if (!start || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+            const next = clampSidebarWidth(start.width + event.clientX - start.clientX);
+            resizeWidth.current = next;
+            setSidebarWidth(next);
+          }}
+          onPointerUp={(event) => {
+            if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+            event.currentTarget.releasePointerCapture(event.pointerId);
+            resizeStart.current = null;
+            setResizing(false);
+            saveSidebarWidth(resizeWidth.current);
+          }}
+          onPointerCancel={() => {
+            resizeStart.current = null;
+            setResizing(false);
+            saveSidebarWidth(resizeWidth.current);
+          }}
+          onKeyDown={(event) => {
+            const next = sidebarWidthForKey(sidebarWidth, event.key, event.shiftKey);
+            if (next == null) return;
+            event.preventDefault();
+            commitSidebarWidth(next);
+          }}
+        />
+      )}
       {/* macOS owns inset traffic lights; Linux/Windows use native chrome. */}
       <div
         className={cn("flex items-center pt-3.5 pb-1", density === "icons" ? "flex-col gap-1 px-2" : "justify-between px-4")}
