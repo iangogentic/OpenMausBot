@@ -195,8 +195,11 @@ export function attachLocalVmMcpBroker(options: {
   beginAction: () => ActionPermit | Promise<ActionPermit>;
   /** Authoritative child-runtime budget hook. It is invoked only after a
    * control ticket is acquired and before any mechanical action is reserved
-   * or forwarded. Omission or an exception denies the action. */
+   * or forwarded. A configured hook that throws always denies the action. */
   onActions?: (amount: number) => number;
+  /** Dedicated hidden computer children set this true. Direct parent turns
+   * omit it for backwards-compatible broker-local action enforcement. */
+  requireActionAccounting?: boolean;
   endAction: (actionId: string) => boolean | Promise<boolean>;
   quarantine: () => void | Promise<void>;
   requestHelp: (reason: string) => Promise<{ text: string; isError?: boolean }>;
@@ -334,7 +337,12 @@ export function attachLocalVmMcpBroker(options: {
     amount: number,
   ): Promise<ActionPermit> => {
     try {
-      if (!options.onActions) throw new Error("computer child action authority is unavailable");
+      if (!options.onActions) {
+        if (options.requireActionAccounting === true) {
+          throw new Error("computer child action authority is unavailable");
+        }
+        return permit;
+      }
       options.onActions(amount);
       return permit;
     } catch {

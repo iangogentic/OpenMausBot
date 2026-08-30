@@ -104,7 +104,6 @@ function baseOptions(socket: FakeSocket, overrides: Record<string, unknown> = {}
     stillAuthorized: () => true,
     verifyCurrentGeneration: () => true,
     beginAction: () => ({ allowed: true as const, actionId: "action-a" }),
-    onActions: () => 1,
     endAction: () => true,
     quarantine: vi.fn(),
     requestHelp: async () => ({ text: "done" }),
@@ -163,6 +162,27 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await handle.closed;
   });
 
+  it("preserves direct parent mutations when child accounting is not requested", async () => {
+    const socket = new FakeSocket();
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "direct-parent-ticket" }));
+    const endAction = vi.fn(() => true);
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { beginAction, endAction }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 100,
+      method: "tools/call",
+      params: { name: "click", arguments: { x: 10, y: 20 } },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    const response = JSON.parse(socket.sent[0]!.toString());
+    expect(response).toMatchObject({ id: 100, result: { content: [] } });
+    expect(response.result.isError).toBeUndefined();
+    expect(beginAction).toHaveBeenCalledOnce();
+    expect(endAction).toHaveBeenCalledExactlyOnceWith("direct-parent-ticket");
+    handle.close("direct parent compatibility complete");
+    await handle.closed;
+  });
+
   it("runs a validated batch sequentially under one ticket and returns only one final screen", async () => {
     const socket = new FakeSocket();
     const accountingOrder: string[] = [];
@@ -176,6 +196,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     const handle = attachLocalVmMcpBroker(baseOptions(socket, {
       beginAction,
       onActions,
+      requireActionAccounting: true,
       endAction,
       captureAfterAction,
       maxToolCalls: 3,
@@ -221,6 +242,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
       beginAction,
       endAction,
       onActions,
+      requireActionAccounting: true,
       captureAfterAction,
     }));
     socket.receive(JSON.stringify({
@@ -240,10 +262,14 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await handle.closed;
   });
 
-  it("fails closed when no authoritative child action accountant is installed", async () => {
+  it("fails a required child closed when its action accountant is missing", async () => {
     const socket = new FakeSocket();
     const endAction = vi.fn(() => true);
-    const handle = attachLocalVmMcpBroker(baseOptions(socket, { onActions: undefined, endAction }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      requireActionAccounting: true,
+      onActions: undefined,
+      endAction,
+    }));
     socket.receive(JSON.stringify({
       jsonrpc: "2.0",
       id: 106,
@@ -263,7 +289,13 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     const endAction = vi.fn(() => true);
     const onActions = vi.fn(() => { throw new Error("child action budget exhausted"); });
     const captureAfterAction = vi.fn(async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }));
-    const handle = attachLocalVmMcpBroker(baseOptions(socket, { beginAction, endAction, onActions, captureAfterAction }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      endAction,
+      onActions,
+      requireActionAccounting: true,
+      captureAfterAction,
+    }));
     socket.receive(JSON.stringify({
       jsonrpc: "2.0",
       id: 105,
@@ -619,8 +651,11 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
   it("does not add redundant captures to read-only computer inspection", async () => {
     const socket = new FakeSocket();
     const captureAfterAction = vi.fn(async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }));
-    const onActions = vi.fn(() => 1);
-    const handle = attachLocalVmMcpBroker(baseOptions(socket, { captureAfterAction, onActions }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction,
+      requireActionAccounting: true,
+      onActions: undefined,
+    }));
 
     socket.receive(JSON.stringify({
       jsonrpc: "2.0",
@@ -631,7 +666,6 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
 
     await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
     expect(captureAfterAction).not.toHaveBeenCalled();
-    expect(onActions).not.toHaveBeenCalled();
 
     handle.close("read-only observation test complete");
     await handle.closed;
@@ -982,7 +1016,6 @@ rl.on("line", (line) => {
         verifyCurrentGeneration: async () =>
           await currentContainerComputerGeneration("docker", target) === authority.vmGeneration,
         beginAction,
-        onActions: () => 1,
         endAction,
         quarantine: vi.fn(),
         requestHelp: async () => ({ text: "not needed" }),
