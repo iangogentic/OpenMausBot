@@ -20,7 +20,7 @@ ReadWritePaths=/var/lib/openmaus-provider/state /var/lib/openmausbot-workspaces 
 CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_SYS_ADMIN
 AmbientCapabilities=
 LockPersonality=yes
-RestrictSUIDSGID=yes
+RestrictSUIDSGID=no
 RestrictAddressFamilies=AF_UNIX
 
 [Install]

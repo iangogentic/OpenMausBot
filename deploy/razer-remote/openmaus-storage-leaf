@@ -19,6 +19,7 @@ from dataclasses import dataclass
 SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 BTRFS = "/usr/bin/btrfs"
 GETFACL = "/usr/bin/getfacl"
+FINDMNT = "/usr/bin/findmnt"
 SERVER_USER = "openmaus-server"
 VM_GUEST_USER = "openmaus-vm-guest"
 
@@ -87,6 +88,19 @@ def btrfs_probe(argv: list[str]) -> bool:
     ).returncode == 0
 
 
+def btrfs_probe_fd(directory_fd: int) -> bool:
+    """Probe the inode pinned by an fd that remains open in the child."""
+    return subprocess.run(
+        [BTRFS, "subvolume", "show", f"/proc/self/fd/{directory_fd}"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=SAFE_ENV,
+        pass_fds=(directory_fd,),
+    ).returncode == 0
+
+
 def checked_root(kind: LeafClass) -> tuple[int, int, int]:
     owner = pwd.getpwnam(kind.root_owner).pw_uid
     group = grp.getgrnam(kind.root_group).gr_gid
@@ -144,22 +158,33 @@ def valid_leaf_mode_acl(path: str, kind: LeafClass, owner: int, mode: int) -> bo
     return exact_acl(path) == expected
 
 
-def checked_leaf(path: str, kind: LeafClass, owner: int, group: int, device: int) -> None:
+def checked_leaf(path: str, kind: LeafClass, owner: int, group: int) -> int:
     info = os.lstat(path)
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or stat.S_ISLNK(info.st_mode)
-        or os.path.realpath(path) != path
-        or info.st_dev != device
-        or info.st_uid != owner
-        or info.st_gid != group
-        or not valid_leaf_mode_acl(path, kind, owner, stat.S_IMODE(info.st_mode))
-        or not btrfs_probe(["subvolume", "show", path])
-    ):
-        raise RuntimeError("unsafe storage leaf")
+    is_mount = subprocess.run(
+        [FINDMNT, "-n", "--mountpoint", path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=SAFE_ENV,
+    ).returncode == 0
+    checks = {
+        "directory": stat.S_ISDIR(info.st_mode),
+        "not-symlink": not stat.S_ISLNK(info.st_mode),
+        "canonical": os.path.realpath(path) == path,
+        "not-mount": not is_mount,
+        "owner": info.st_uid == owner,
+        "group": info.st_gid == group,
+        "mode-acl": valid_leaf_mode_acl(path, kind, owner, stat.S_IMODE(info.st_mode)),
+        "subvolume": btrfs_probe(["subvolume", "show", path]),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(f"unsafe storage leaf ({','.join(failed)})")
+    return info.st_dev
 
 
-def ensure_leaf(path: str, kind: LeafClass, owner: int, group: int, device: int) -> None:
+def ensure_leaf(path: str, kind: LeafClass, owner: int, group: int) -> None:
     if not os.path.lexists(path):
         run([BTRFS, "subvolume", "create", path])
         try:
@@ -169,7 +194,7 @@ def ensure_leaf(path: str, kind: LeafClass, owner: int, group: int, device: int)
         except BaseException:
             subprocess.run([BTRFS, "subvolume", "delete", path], env=SAFE_ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             raise
-    checked_leaf(path, kind, owner, group, device)
+    checked_leaf(path, kind, owner, group)
     # Reapply on every open so an administrative qgroup change cannot silently
     # leave a previously created bot unbounded.
     run([BTRFS, "qgroup", "limit", str(kind.limit), path])
@@ -202,7 +227,7 @@ def empty_tree_fd(directory_fd: int, expected_device: int, budget: list[int], de
                     raise RuntimeError("storage leaf directory changed during cleanup")
                 # A guest cannot create subvolumes. Refuse an unexpected one
                 # instead of handing a pathname to a recursive root command.
-                if btrfs_probe(["subvolume", "show", f"/proc/self/fd/{child_fd}"]):
+                if btrfs_probe_fd(child_fd):
                     raise RuntimeError("storage leaf contains an unexpected nested subvolume")
                 empty_tree_fd(child_fd, expected_device, budget, depth + 1)
             finally:
@@ -237,7 +262,7 @@ def finish_quarantine(quarantine: str, device: int) -> None:
         if (
             info.st_dev != device
             or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
-            or not btrfs_probe(["subvolume", "show", f"/proc/self/fd/{fd}"])
+            or not btrfs_probe_fd(fd)
         ):
             raise RuntimeError("storage retirement quarantine is unsafe")
         empty_tree_fd(fd, device, [100_000])
@@ -249,13 +274,13 @@ def finish_quarantine(quarantine: str, device: int) -> None:
 def retire_leaf(path: str, key: str, kind: LeafClass, owner: int, group: int, device: int) -> None:
     quarantines = retirement_quarantines(kind, key)
     if quarantines:
-        finish_quarantine(quarantines[0], device)
+        finish_quarantine(quarantines[0], os.lstat(quarantines[0]).st_dev)
     if not os.path.lexists(path):
         return
-    checked_leaf(path, kind, owner, group, device)
+    leaf_device = checked_leaf(path, kind, owner, group)
     quarantine = os.path.join(kind.root, f".retired-{key}-{uuid.uuid4().hex}")
     os.rename(path, quarantine)
-    finish_quarantine(quarantine, device)
+    finish_quarantine(quarantine, leaf_device)
 
 
 def checked_lock(kind: LeafClass, device: int) -> int:
@@ -297,6 +322,8 @@ def integration_test() -> None:
         run(["/usr/bin/mkfs.btrfs", "-q", "-f", image])
         run(["/usr/bin/mount", "-o", "loop,nodev,nosuid,noatime", image, mountpoint])
         mounted = True
+        os.chown(mountpoint, 0, 0, follow_symlinks=False)
+        os.chmod(mountpoint, 0o700, follow_symlinks=False)
         run([BTRFS, "quota", "enable", mountpoint])
         run([BTRFS, "quota", "rescan", "-w", mountpoint])
         kind = LeafClass(
@@ -313,8 +340,8 @@ def integration_test() -> None:
         owner, group, device = checked_root(kind)
         first = os.path.join(mountpoint, "1111111111111111")
         sibling = os.path.join(mountpoint, "2222222222222222")
-        ensure_leaf(first, kind, owner, group, device)
-        ensure_leaf(sibling, kind, owner, group, device)
+        ensure_leaf(first, kind, owner, group)
+        ensure_leaf(sibling, kind, owner, group)
         fill = subprocess.run(
             ["/usr/bin/dd", "if=/dev/zero", f"of={first}/bomb", "bs=1M", "count=96", "conv=fsync"],
             stdin=subprocess.DEVNULL,
@@ -369,7 +396,7 @@ def main() -> int:
             if operation == "ensure":
                 if retirement_quarantines(kind, key):
                     raise RuntimeError("storage leaf retirement is incomplete")
-                ensure_leaf(path, kind, owner, group, device)
+                ensure_leaf(path, kind, owner, group)
             else:
                 retire_leaf(path, key, kind, owner, group, device)
         finally:

@@ -170,7 +170,7 @@ const startOuterUnit = (unitName, manifestPath, argv) => {
     "--property=ProtectHome=yes",
     `--property=ReadWritePaths=${workspaceBase} ${runtimeBase} ${serverState} ${providerStateRoot}`,
     "--property=RestrictNamespaces=~cgroup",
-    "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+    "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
     "--property=TimeoutStopSec=10",
     `--working-directory=${root}`,
     `--setenv=OMB_PROVIDER_LAUNCH_MANIFEST=${manifestPath}`,
@@ -421,7 +421,7 @@ try {
     '  tailscaleDenied: tcp("100.100.100.100", 443) !== 0,',
     '  ipv4MappedPrivateDenied: tcp("::ffff:100.100.100.100", 443) !== 0,',
     '  publicHttpsReachable: tcp("1.1.1.1", 443) === 0,',
-    '  sparseFileBombDenied: spawnSync(process.execPath, ["-e", "const fs=require(\"node:fs\"); const p=process.env.HOME+\"/sparse-bomb\"; fs.writeFileSync(p,\"x\"); fs.truncateSync(p,9*1024**3)"], { stdio: "ignore", timeout: 1500 }).status !== 0,',
+    '  sparseFileBombDenied: spawnSync(process.execPath, ["-e", `const fs=require("node:fs"); const p=process.env.HOME+"/sparse-bomb"; fs.writeFileSync(p,"x"); fs.truncateSync(p,9*1024**3)`], { stdio: "ignore", timeout: 1500 }).status !== 0,',
     '  siblingHomeHidden: !fs.existsSync(siblingHome),',
     '  symlinkEscapeDenied: denied(() => fs.readFileSync(escapeLink)),',
     '  mountRenameDenied: denied(() => fs.renameSync(declared, `${declared}-renamed`)),',
@@ -632,7 +632,7 @@ try {
       resourcePidsBeforeSignal,
     })}`);
   }
-  const leaks = hostPids.filter(alive);
+  const leaks = resourcePidsBeforeSignal.map(Number).filter(alive);
   if (leaks.length) throw new Error(`provider descendants survived: ${leaks.join(",")}`);
   if (readFileSync(homeBaseline, "utf8") !== "baseline" || existsSync(homePrivate)) {
     throw new Error("per-turn provider HOME writes escaped the private tmpfs copy");
@@ -815,7 +815,12 @@ try {
   chownMode(poisonedHome, provider.uid, runtimeGid, 0o700);
   execFileSync("/usr/bin/truncate", ["-s", "9G", join(poisonedHome, "sparse")]);
   execFileSync("/usr/bin/mkfifo", [join(poisonedHome, "fifo")]);
-  execFileSync("/usr/bin/python3", ["-c", `import socket; s=socket.socket(socket.AF_UNIX); s.bind(${JSON.stringify(join(poisonedHome, "socket"))}); s.close()`]);
+  // AF_UNIX names are capped at 108 bytes; bind relative to the intentionally
+  // long, isolated state path so this fixture tests the inode policy rather
+  // than the kernel pathname limit.
+  execFileSync("/usr/bin/python3", ["-c", 'import socket; s=socket.socket(socket.AF_UNIX); s.bind("socket"); s.close()'], {
+    cwd: poisonedHome,
+  });
   symlinkSync("sparse", join(poisonedHome, "link"));
   const poisonedScope = join(runtimeBase, `spawn-poisoned-${suffix}`);
   mkdirSync(poisonedScope, { mode: 0o2750 });
@@ -859,7 +864,10 @@ try {
   writeManifest(bombManifest, [{ path: bombScope, writable: true }], {}, {
     parentUnit: bombUnit,
     limits: {
-      memoryHigh: 64 * 1024 ** 2,
+      // Keep reclaim throttling from masking the hard-limit proof. Aggregate
+      // pressure is tested separately below; this fixture must reach max and
+      // produce an observable kernel OOM kill within its bounded deadline.
+      memoryHigh: 128 * 1024 ** 2,
       memoryMax: 128 * 1024 ** 2,
       memorySwapMax: 0,
       cpuQuotaPercent: 100,
@@ -900,13 +908,16 @@ try {
   execFileSync("/usr/bin/systemctl", ["start", aggregateSlice], { stdio: "ignore" });
   execFileSync("/usr/bin/systemctl", [
     "set-property", "--runtime", aggregateSlice,
-    `MemoryHigh=${128 * 1024 ** 2}`,
+    // As above, keep MemoryHigh equal to the hard ceiling so reclaim
+    // throttling cannot prevent the aggregate OOM proof from reaching max.
+    `MemoryHigh=${192 * 1024 ** 2}`,
     `MemoryMax=${192 * 1024 ** 2}`,
     "MemorySwapMax=0",
     "TasksMax=64",
   ], { stdio: "ignore" });
   const aggregateCgroup = cgroupPathFor(aggregateSlice);
-  if (!unitProperty(aggregateSlice, "ControlGroup").startsWith(`/${providerSlice}/`)) {
+  const expectedAggregateCgroup = `/openmaus.slice/${providerSlice}/${aggregateSlice}`;
+  if (unitProperty(aggregateSlice, "ControlGroup") !== expectedAggregateCgroup) {
     throw new Error("aggregate pressure fixture escaped the production provider slice");
   }
   if (readFileSync(join(aggregateCgroup, "memory.max"), "utf8").trim() !== String(192 * 1024 ** 2)) {
@@ -932,7 +943,14 @@ try {
   if (aggregateOomKills < 1) {
     throw new Error("simultaneous provider children escaped their aggregate memory ceiling");
   }
-  execFileSync("/usr/bin/systemctl", ["stop", aggregateBombA, aggregateBombB], { stdio: "ignore" });
+  // The OOM-killed transient may already have been collected, which makes a
+  // combined `systemctl stop` return 5 even when it stops the surviving peer.
+  for (const aggregateUnit of [aggregateBombA, aggregateBombB]) {
+    spawnSync("/usr/bin/systemctl", ["stop", aggregateUnit], { stdio: "ignore" });
+    if (unitActive(aggregateUnit)) {
+      throw new Error(`aggregate pressure child stayed active: ${aggregateUnit}`);
+    }
+  }
 
   // A pre-existing symlink is rejected before target exec, even when the
   // hostile path was named in a trusted manifest.
@@ -1002,8 +1020,19 @@ try {
   if (!unitProperty(bindsResourceUnit, "BindsTo").split(/\s+/).includes(lifecycleParentUnit)) {
     throw new Error("provider transient unit omitted its exact parent BindsTo");
   }
-  const bindsPid = Number(readFileSync(bindsReady, "utf8"));
-  if (!Number.isSafeInteger(bindsPid) || !alive(bindsPid)) throw new Error("BindsTo fixture PID is invalid");
+  const bindsNamespacePid = Number(readFileSync(bindsReady, "utf8"));
+  if (!Number.isSafeInteger(bindsNamespacePid) || bindsNamespacePid < 1) {
+    throw new Error("BindsTo fixture namespace PID is invalid");
+  }
+  // The provider reports its private PID-namespace value. Capture host PIDs
+  // from the exact resource cgroup; probing the namespace number on the host
+  // could accidentally target an unrelated process such as kthreadd (PID 2).
+  const bindsCgroup = cgroupPathFor(bindsResourceUnit);
+  const bindsHostPids = readFileSync(join(bindsCgroup, "cgroup.procs"), "utf8")
+    .trim().split("\n").filter(Boolean).map(Number);
+  if (!bindsHostPids.length || !bindsHostPids.every(alive)) {
+    throw new Error("BindsTo fixture host cgroup PIDs are invalid");
+  }
   execFileSync("/usr/bin/systemctl", ["stop", lifecycleParentUnit], { stdio: "ignore" });
   await waitFor(
     () => !unitActive(bindsResourceUnit) && !unitActive(bindsOuterUnit),
@@ -1011,7 +1040,10 @@ try {
     "stopping the trusted parent did not collect its provider tree",
     25,
   );
-  if (alive(bindsPid)) throw new Error("BindsTo provider survived trusted parent stop");
+  const bindsLeaks = bindsHostPids.filter(alive);
+  if (bindsLeaks.length) {
+    throw new Error(`BindsTo provider survived trusted parent stop: ${bindsLeaks.join(",")}`);
+  }
 
   console.log(JSON.stringify({
     ok: true,

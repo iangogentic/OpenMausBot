@@ -50,7 +50,7 @@ table inet openmaus_provider {{
 """
 
 
-def semantic_objects(document: object) -> list[dict]:
+def semantic_objects(document: object, *, table_alias: tuple[str, str] | None = None) -> list[dict]:
     if not isinstance(document, dict) or not isinstance(document.get("nftables"), list):
         raise RuntimeError("nft JSON output is invalid")
     objects: list[dict] = []
@@ -83,6 +83,12 @@ def semantic_objects(document: object) -> list[dict]:
         # future semantic properties cannot be added without failing equality.
         normalized.pop("handle", None)
         normalized.pop("index", None)
+        if table_alias is not None:
+            source, target = table_alias
+            if kind == "table" and normalized.get("name") == source:
+                normalized["name"] = target
+            if kind in ("chain", "rule") and normalized.get("table") == source:
+                normalized["table"] = target
         objects.append({kind: normalized})
     if not objects or list(objects[0]) != ["table"] or sum("table" in item for item in objects) != 1:
         raise RuntimeError("nft JSON output omitted the policy table")
@@ -113,14 +119,33 @@ def validate_loaded(uid: int) -> None:
     # object stream to the live kernel table. This attests chain hooks,
     # priorities, policies, expression trees, verdicts, rule order, UID,
     # CIDR sets, rates, and comments; handles/counters alone are volatile.
-    expected = json_command(
-        [NFT, "--json", "--numeric", "--check", "--echo", "--file", "-"],
-        input_text=rules(uid),
-    )
+    # nft 1.1.x emits no JSON for `--check --echo`. Compile the policy through
+    # the running kernel under a unique temporary table instead, capture the
+    # complete echoed semantic stream, and remove it in a mandatory cleanup.
+    # The temporary hooks enforce the same policy for only this bounded probe.
+    probe_table = f"openmaus_provider_probe_{os.getpid()}"
+    expected = None
+    try:
+        expected = json_command(
+            [NFT, "--json", "--numeric", "--echo", "--file", "-"],
+            input_text=rules(uid).replace("openmaus_provider", probe_table),
+        )
+    finally:
+        cleanup = subprocess.run(
+            [NFT, "destroy", "table", "inet", probe_table],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=SAFE_ENV,
+            text=True,
+        )
+        if cleanup.returncode != 0:
+            raise RuntimeError("could not remove provider firewall validation table")
     loaded = json_command(
         [NFT, "--json", "--numeric", "--stateless", "list", "table", "inet", "openmaus_provider"],
     )
-    if semantic_objects(expected) != semantic_objects(loaded):
+    if semantic_objects(expected, table_alias=(probe_table, "openmaus_provider")) != semantic_objects(loaded):
         raise RuntimeError("provider firewall semantic JSON does not match this release")
 
 

@@ -35,7 +35,10 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(service).toContain("/usr/bin/slirp4netns");
     expect(service).toContain('Environment="OMB_PROVIDER_HARNESS_HOST=10.0.2.2"');
     expect(service).toContain('Environment="OMB_REQUIRE_LOCAL_VM_NETWORK_ISOLATION=1"');
-    expect(supervisor).toContain('"--unshare-net", "--block-fd"');
+    expect(supervisor).toContain('"--unshare-net",');
+    expect(supervisor).toContain('"--block-fd", str(block_read)');
+    expect(supervisor).toContain('"--info-fd", str(info_write)');
+    expect(supervisor).toContain("metadata_deadline = time.monotonic() + 5.0");
     expect(supervisor).toContain('"--property=RestrictNamespaces=~cgroup"');
     expect(supervisor).toContain('"--property=LimitCORE=0"');
     expect(supervisor).not.toContain('"--property=RestrictNamespaces=~cgroup net"');
@@ -66,7 +69,7 @@ describe("Razer hostile-provider deployment assets", () => {
       "vm-return-v1",
       "vm-unsolicited-inbound-deny-v1",
     ]) expect(network).toContain(marker);
-    expect(network).toContain("semantic_objects(expected) != semantic_objects(loaded)");
+    expect(network).toContain('semantic_objects(expected, table_alias=(probe_table, "openmaus_provider")) != semantic_objects(loaded)');
     expect(network).toContain("Preserve every other present field");
     expect(network).toContain('kind not in ("table", "chain", "rule")');
     expect(network).toContain("nft semantic normalizer accepted policy drift");

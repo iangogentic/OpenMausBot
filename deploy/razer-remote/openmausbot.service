@@ -96,7 +96,7 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # bubblewrap must create user/mount/PID/IPC/UTS namespaces for each hostile
 # turn, including a private network namespace connected only by the bounded
 # slirp gateway. Nested user namespaces are disabled inside the sandbox.

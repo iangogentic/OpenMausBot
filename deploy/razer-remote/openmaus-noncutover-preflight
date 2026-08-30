@@ -144,8 +144,16 @@ def require_identities() -> None:
         raise RuntimeError("Local VM guest identity is not the reserved uid/gid 61000")
     server_groups = group_ids(server)
     provider_groups = group_ids(provider)
-    if not {runtime_gid, workspace_gid, docker_gid}.issubset(server_groups):
-        raise RuntimeError("trusted server lacks an exact runtime/workspace/Docker grant")
+    if not {runtime_gid, workspace_gid}.issubset(server_groups):
+        raise RuntimeError("trusted server lacks its runtime/workspace grants")
+    if {docker_gid, guest_gid} & server_groups:
+        raise RuntimeError("trusted server has a permanent Docker or VM-guest grant")
+    service_groups = set(run(
+        ["/usr/bin/systemctl", "show", "openmausbot.service", "--property=SupplementaryGroups", "--value"],
+        capture=True,
+    ).split())
+    if service_groups != {"openmaus-workspace", "docker"}:
+        raise RuntimeError("trusted server service lacks its exact scoped workspace/Docker grants")
     if not {workspace_gid, runtime_gid}.issubset(provider_groups):
         raise RuntimeError("provider lacks only the required shared runtime/workspace groups")
     if {docker_gid, guest_gid} & provider_groups:

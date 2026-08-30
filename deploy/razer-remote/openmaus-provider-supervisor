@@ -161,6 +161,19 @@ def signal_descendants(sig: int) -> None:
             pass
 
 
+def signal_sandbox_descendants(sig: int) -> None:
+    """Signal only processes that entered the private provider PID namespace."""
+    for pid in reversed(descendants(os.getpid())):
+        try:
+            with open(f"/proc/{pid}/status", "r", encoding="ascii", errors="ignore") as status_file:
+                nspid = next((line for line in status_file if line.startswith("NSpid:")), "")
+            if len(nspid.split()) <= 2:
+                continue
+            os.kill(pid, sig)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+
+
 def unit_active(unit: str) -> bool:
     result = subprocess.run(
         [SYSTEMCTL, "is-active", "--quiet", unit],
@@ -185,8 +198,7 @@ def signal_unit(unit: str, sig: str) -> None:
 def drain(main_pid: int, main_status: int | None, unit: str) -> int | None:
     deadline = time.monotonic() + TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
-        signal_unit(unit, "TERM")
-        signal_descendants(signal.SIGTERM)
+        signal_sandbox_descendants(signal.SIGTERM)
         main_status = reap(main_pid, main_status)
         if not unit_active(unit) and not descendants(os.getpid()):
             return main_status
@@ -232,12 +244,17 @@ def btrfs_checked(args: list[str]) -> None:
         [BTRFS, *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         check=False,
         env=ROOT_EXEC_ENV,
+        text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError("provider persistent state requires enforced btrfs qgroups")
+        detail = (result.stderr or "").replace("\n", " ").replace("\r", " ")[:256]
+        operation = " ".join(args[:2])
+        raise RuntimeError(
+            f"provider persistent state requires enforced btrfs qgroups ({operation}: {detail})"
+        )
 
 
 def btrfs_output(args: list[str]) -> str:
@@ -245,13 +262,17 @@ def btrfs_output(args: list[str]) -> str:
         [BTRFS, *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         check=False,
         env=ROOT_EXEC_ENV,
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError("provider persistent state requires enforced btrfs qgroups")
+        detail = (result.stderr or "").replace("\n", " ").replace("\r", " ")[:256]
+        operation = " ".join(args[:2])
+        raise RuntimeError(
+            f"provider persistent state requires enforced btrfs qgroups ({operation}: {detail})"
+        )
     return result.stdout
 
 
@@ -260,7 +281,10 @@ def qgroup_exclusive_bytes(path: str) -> int:
     if not root_id.isdigit():
         raise RuntimeError("provider state subvolume id is invalid")
     expected = f"0/{root_id}"
-    output = btrfs_output(["qgroup", "show", "--raw", "--no-sync", path])
+    # Trixie's btrfs-progs does not expose the newer --no-sync flag. The
+    # bounded provider-state filesystem is small enough that the compatible
+    # exact qgroup read remains deterministic here.
+    output = btrfs_output(["qgroup", "show", "--raw", path])
     for line in output.splitlines():
         fields = line.split()
         if len(fields) >= 3 and fields[0] == expected and fields[1].isdigit() and fields[2].isdigit():
@@ -410,6 +434,7 @@ def validate_persistent_home(
     runtime_gid: int,
     workspace_gid: int,
 ) -> tuple[int, int]:
+    provider_gid = pwd.getpwuid(provider_uid).pw_gid
     pending = [path]
     count = 0
     total_bytes = 0
@@ -422,10 +447,17 @@ def validate_persistent_home(
         if (
             stat.S_ISLNK(info.st_mode)
             or info.st_uid != provider_uid
-            or info.st_gid not in (runtime_gid, workspace_gid)
+            # Provider-created files inherit its primary group. Seeded and
+            # imported files use the deployment runtime/workspace groups.
+            # All three remain owner-only below, so none grants group access.
+            or info.st_gid not in (provider_gid, runtime_gid, workspace_gid)
             or info.st_mode & 0o077
         ):
-            raise RuntimeError("provider persistent home contains an unsafe inode")
+            relative = os.path.relpath(current, path)
+            raise RuntimeError(
+                "provider persistent home contains an unsafe inode "
+                f"({relative}: uid={info.st_uid} gid={info.st_gid} mode={stat.S_IMODE(info.st_mode):04o})"
+            )
         if stat.S_ISDIR(info.st_mode):
             with os.scandir(current) as entries:
                 pending.extend(entry.path for entry in entries)
@@ -742,37 +774,98 @@ def sandbox_network_exec(argv: list[str]) -> int:
         return 64
     if os.geteuid() != provider_uid or not argv or argv[0] != BWRAP:
         return 64
+    required_fds: set[int] = set()
+    for index, value in enumerate(argv[:-1]):
+        if value not in ("--ro-bind-fd", "--bind-fd", "--ro-bind-data"):
+            continue
+        try:
+            descriptor = int(argv[index + 1])
+        except ValueError:
+            return 64
+        if descriptor < 3 or descriptor > 1024:
+            return 64
+        required_fds.add(descriptor)
+    try:
+        for descriptor in required_fds:
+            os.fstat(descriptor)
+            os.set_inheritable(descriptor, True)
+    except OSError:
+        return 69
     block_read, block_write = os.pipe2(os.O_CLOEXEC)
     ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
+    info_read, info_write = os.pipe2(os.O_CLOEXEC)
     os.set_inheritable(block_read, True)
+    os.set_inheritable(info_write, True)
     child = os.fork()
     if child == 0:
         try:
             os.close(block_write)
             os.close(ready_read)
             os.close(ready_write)
+            os.close(info_read)
             os.execve(
                 BWRAP,
-                [BWRAP, "--unshare-net", "--block-fd", str(block_read), *argv[1:]],
+                [
+                    BWRAP,
+                    "--unshare-net",
+                    "--block-fd", str(block_read),
+                    "--info-fd", str(info_write),
+                    *argv[1:],
+                ],
                 ROOT_EXEC_ENV,
             )
         except BaseException:
             os._exit(126)
     os.close(block_read)
+    os.close(info_write)
+    info_write = -1
     slirp = None
     try:
+        # A pipe read is not message-framed: bwrap's small JSON document may
+        # arrive in more than one read under load. Accumulate only until a
+        # complete bounded document parses, while retaining the startup
+        # deadline and refusing oversized metadata.
+        metadata_deadline = time.monotonic() + 5.0
+        raw_info = b""
+        metadata = None
+        while metadata is None:
+            remaining = metadata_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("private provider sandbox did not report its namespace PID")
+            readable, _, _ = select.select([info_read], [], [], remaining)
+            if not readable:
+                raise RuntimeError("private provider sandbox did not report its namespace PID")
+            chunk = os.read(info_read, 4097 - len(raw_info))
+            if not chunk:
+                break
+            raw_info += chunk
+            if len(raw_info) > 4096:
+                raise RuntimeError("private provider sandbox returned oversized namespace metadata")
+            try:
+                candidate = json.loads(raw_info)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(candidate, dict):
+                metadata = candidate
+        if metadata is None:
+            raise RuntimeError("private provider sandbox returned invalid namespace metadata")
+        sandbox_pid = metadata.get("child-pid")
+        if not isinstance(sandbox_pid, int) or sandbox_pid <= 1:
+            raise RuntimeError("private provider sandbox returned an invalid namespace PID")
         slirp = subprocess.Popen(
             [
                 SLIRP4NETNS,
                 "--configure",
                 "--mtu=65520",
+                "--netns-type=path",
+                f"--userns-path=/proc/{sandbox_pid}/ns/user",
                 f"--ready-fd={ready_write}",
-                str(child),
+                f"/proc/{sandbox_pid}/ns/net",
                 "tap0",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             close_fds=True,
             pass_fds=(ready_write,),
             env=ROOT_EXEC_ENV,
@@ -787,7 +880,15 @@ def sandbox_network_exec(argv: list[str]) -> int:
         block_write = -1
         _pid, status = os.waitpid(child, 0)
         return exit_code(status, None)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as error:
+        detail = ""
+        if slirp is not None and slirp.poll() is not None and slirp.stderr is not None:
+            detail = slirp.stderr.read(4096).decode("utf-8", "replace").strip()
+        print(
+            f"openmaus provider network sandbox refused: {error}"
+            + (f": {detail}" if detail else ""),
+            file=sys.stderr,
+        )
         try:
             os.kill(child, signal.SIGKILL)
         except ProcessLookupError:
@@ -802,6 +903,9 @@ def sandbox_network_exec(argv: list[str]) -> int:
             os.close(block_write)
         if ready_write >= 0:
             os.close(ready_write)
+        if info_write >= 0:
+            os.close(info_write)
+        os.close(info_read)
         os.close(ready_read)
         if slirp is not None:
             slirp.terminate()
@@ -1177,7 +1281,6 @@ def sandbox_argv(sandbox: dict, argv: list[str]) -> list[str]:
         "--unshare-uts",
         "--hostname", "openmaus-provider",
         "--ro-bind", "/", "/",
-        "--proc", "/proc",
         "--dev", "/dev",
         "--size", str(512 * 1024 * 1024), "--tmpfs", "/tmp",
         "--size", str(256 * 1024 * 1024), "--tmpfs", "/var/tmp",
@@ -1186,7 +1289,7 @@ def sandbox_argv(sandbox: dict, argv: list[str]) -> list[str]:
         "--tmpfs", WORKSPACE_BASE,
         "--tmpfs", PROVIDER_ROOT,
     ]
-    args.extend(("--ro-bind-fd", str(sandbox["environment_service_fd"]), SANDBOX_ENV_PATH))
+    args.extend(("--perms", "0400", "--ro-bind-data", str(sandbox["environment_service_fd"]), SANDBOX_ENV_PATH))
     args.extend(("--dir", PROVIDER_INSTANCES))
     for parent in parent_directories(PROVIDER_INSTANCES, provider_home):
         args.extend(("--dir", parent))
@@ -1220,6 +1323,9 @@ def sandbox_argv(sandbox: dict, argv: list[str]) -> list[str]:
         if os.path.exists(runtime_client):
             args.extend(("--ro-bind", "/dev/null", runtime_client))
     args.extend((
+        # Resolve every fd-backed bind through the host /proc before replacing
+        # it with the sandbox's PID-namespace procfs.
+        "--proc", "/proc",
         "--gid", str(sandbox["workspace_gid"]),
         "--cap-drop", "ALL",
         "--disable-userns",
@@ -1300,7 +1406,7 @@ def systemd_run_argv(account: pwd.struct_passwd, sandbox: dict, argv: list[str])
         "--property=RestrictSUIDSGID=yes",
         "--property=LockPersonality=yes",
         "--property=RestrictNamespaces=~cgroup",
-        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         # Each bwrap gets a separate network namespace. Its user-mode gateway
         # is still provider-UID traffic on the host and is constrained by the
         # persistent nft boundary. A small fd ceiling also bounds concurrent
@@ -1495,7 +1601,13 @@ def main() -> int:
             ownership_changed.append(mount["path"])
             change_runtime_ownership(mount["path"], account.pw_uid, runtime_gid)
         prctl(PR_SET_CHILD_SUBREAPER, 1)
-    except (KeyError, OSError, RuntimeError, ValueError):
+    except (KeyError, OSError, RuntimeError, ValueError) as error:
+        # Every message raised above is deployment-authored and contains no
+        # provider environment or credential value. Keep the diagnostic
+        # bounded so a rejected launch is observable without turning the
+        # privileged journal into an attacker-controlled output channel.
+        diagnostic = str(error).replace("\n", " ").replace("\r", " ")[:512]
+        print(f"openmaus-provider-supervisor: setup rejected: {diagnostic}", file=sys.stderr)
         if sandbox is not None:
             close_sandbox_fds(sandbox)
         for path in reversed(ownership_changed):
