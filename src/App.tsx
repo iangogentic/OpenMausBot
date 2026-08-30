@@ -50,7 +50,9 @@ function Shell() {
   const heartbeatFailures = useRef(new Map<string, { leaseToken: string; count: number }>());
   const electronViewerLeases = useRef(new Map<string, StoredComputerLease>());
   const group = state.groups.find((g) => g.id === state.selectedId);
-  const bot = group ? undefined : (state.bots.find((b) => b.id === state.selectedId) ?? state.bots[0]);
+  // Hydration owns the cold-start fallback. Rendering bots[0] for an invalid
+  // non-empty selection makes a reconnect look like an unsolicited jump.
+  const bot = group ? undefined : state.bots.find((b) => b.id === state.selectedId);
   const locallyControlledBots = state.bots.filter((candidate) => {
     if (!state.computerControl[candidate.id]?.held) return false;
     return readComputerLease(candidate.id)?.ownerId === computerOwnerId;

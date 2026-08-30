@@ -10,6 +10,7 @@ import {
   reducer,
   screenTransportUrl,
   type Bot,
+  type Group,
   type Message,
 } from "./store";
 import type { ComputerChildMonitor } from "../../shared/computer-child-monitor";
@@ -223,6 +224,93 @@ describe("computer child monitor fold", () => {
 });
 
 describe("main renderer screen transport", () => {
+  it("restores a persisted selected conversation when hydration knows it", () => {
+    const next = reducer({ ...initialState, selectedId: "hermes" }, {
+      type: "hydrate",
+      bots: [{ id: "basil" } as Bot, { id: "hermes" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+    });
+    expect(next.selectedId).toBe("hermes");
+  });
+
+  it("falls back when hydration authoritatively lacks a stale selection", () => {
+    const next = reducer({ ...initialState, selectedId: "deleted" }, {
+      type: "hydrate",
+      bots: [{ id: "basil" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+    });
+    expect(next.selectedId).toBe("basil");
+  });
+
+  it("upserts a late-created bot without stealing the active conversation", () => {
+    const state = { ...initialState, bots: [{ id: "hermes" } as Bot], selectedId: "hermes" };
+    const next = reducer(state, { type: "botAdded", bot: { id: "new-bot" } as Bot });
+    expect(next.selectedId).toBe("hermes");
+    expect(next.bots.map((bot) => bot.id)).toEqual(["new-bot", "hermes"]);
+  });
+
+  it("selects an externally-created first bot when no conversation exists", () => {
+    const next = reducer({ ...initialState, bots: [], selectedId: "" }, {
+      type: "botPatched",
+      bot: { id: "first-bot" } as Bot,
+    });
+    expect(next.selectedId).toBe("first-bot");
+  });
+
+  it("atomically rejects delayed navigation after any selection change", () => {
+    const started = { ...initialState, bots: [{ id: "basil" } as Bot, { id: "hermes" } as Bot], selectedId: "basil" };
+    const epoch = started.selectionEpoch;
+    const navigated = reducer(started, { type: "select", id: "hermes" });
+    expect(navigated.selectionEpoch).toBe(epoch + 1);
+    expect(reducer(navigated, { type: "selectIfUnchanged", id: "basil", selectionEpoch: epoch }).selectedId).toBe("hermes");
+  });
+
+  it("folds a stale hydrate without replacing a later selected conversation", () => {
+    const started = { ...initialState, bots: [{ id: "basil" } as Bot], selectedId: "basil" };
+    const epoch = started.selectionEpoch;
+    const navigated = reducer({ ...started, bots: [...started.bots, { id: "hermes" } as Bot] }, { type: "select", id: "hermes" });
+    const stale = reducer(navigated, {
+      type: "hydrate",
+      bots: [{ id: "basil" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+      selectionEpoch: epoch,
+    });
+    expect(stale.selectedId).toBe("hermes");
+    expect(stale.bots.some((bot) => bot.id === "hermes")).toBe(true);
+  });
+
+  it("fences delayed chat navigation after moving to another app view", () => {
+    const started = { ...initialState, bots: [{ id: "basil" } as Bot], selectedId: "basil" };
+    const epoch = started.selectionEpoch;
+    const routines = reducer(started, { type: "showRoutines" });
+    expect(routines.selectionEpoch).toBe(epoch + 1);
+    const stale = reducer(routines, { type: "selectIfUnchanged", id: "basil", selectionEpoch: epoch });
+    expect(stale.activeView).toBe("routines");
+  });
+
+  it("does not consume workflow intent when the first imported bot fills an empty app", () => {
+    const empty = { ...initialState, selectedId: "", bots: [] };
+    const epoch = empty.selectionEpoch;
+    const botArrived = reducer(empty, { type: "botAdded", bot: { id: "member" } as Bot });
+    expect(botArrived.selectedId).toBe("member");
+    expect(botArrived.selectionEpoch).toBe(epoch);
+    const room = reducer({ ...botArrived, groups: [{ id: "room" } as Group] }, {
+      type: "selectIfUnchanged",
+      id: "room",
+      selectionEpoch: epoch,
+    });
+    expect(room.selectedId).toBe("room");
+  });
+
   it("uses explicit screen-off URLs while hidden and screen-on URLs while visible", () => {
     expect(screenTransportUrl("/api/events", false)).toBe("/api/events?screens=off");
     expect(screenTransportUrl("/api/bots", false)).toBe("/api/bots?screens=off");

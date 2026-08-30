@@ -29,6 +29,7 @@ import {
   removeLegacyBridgeSecrets,
 } from "./remote-client.mjs";
 import { startOwnedRemoteSshConnector } from "./remote-ssh-connector.mjs";
+import { watchRemoteServer } from "./remote-server-watch.mjs";
 import { composePhysicalCapture, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -1022,50 +1023,6 @@ async function installUiSessionHeader() {
   );
 }
 
-function watchRemoteServer(win) {
-  if (!REMOTE_SERVER_URL) return;
-  let lastReachable = null;
-  let loadFailed = false;
-  let checking = false;
-
-  win.webContents.on("did-fail-load", (_event, _code, _description, url, isMainFrame) => {
-    if (isMainFrame !== false && typeof url === "string" && url.startsWith(REMOTE_SERVER_URL)) {
-      loadFailed = true;
-      lastReachable = false;
-    }
-  });
-
-  const check = async () => {
-    if (checking || win.isDestroyed()) return;
-    checking = true;
-    let reachable = false;
-    try {
-      const response = await fetch(`${REMOTE_SERVER_URL}/api/health`, {
-        signal: AbortSignal.timeout(2_000),
-      });
-      reachable = response.ok;
-    } catch {
-      reachable = false;
-    } finally {
-      checking = false;
-    }
-
-    const recovered = reachable && (lastReachable === false || loadFailed);
-    lastReachable = reachable;
-    if (recovered && !win.isDestroyed()) {
-      loadFailed = false;
-      void win.loadURL(REMOTE_SERVER_URL).catch(() => {
-        loadFailed = true;
-      });
-    }
-  };
-
-  const timer = setInterval(() => void check(), 3_000);
-  timer.unref?.();
-  win.once("closed", () => clearInterval(timer));
-  void check();
-}
-
 function respondToDisplayMediaRequest(callback, response) {
   const error = invokeDisplayMediaCallback(callback, response);
   // An empty response intentionally rejects the renderer request, and Electron
@@ -1480,7 +1437,7 @@ function createWindow() {
 
   if (REMOTE_SERVER_URL) {
     void win.loadURL(REMOTE_SERVER_URL).catch(() => {});
-    watchRemoteServer(win);
+    watchRemoteServer(win, REMOTE_SERVER_URL);
   } else if (app.isPackaged) {
     win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
   } else {

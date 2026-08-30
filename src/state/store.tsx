@@ -24,6 +24,7 @@ import { showNotification, type NotificationTarget } from "@/lib/notify";
 import { speaker } from "@/lib/tts";
 import { createBotPatchQueue, type BotUpdatePatch } from "./bot-patch-queue";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
+import { readSelectedConversationId, writeSelectedConversationId } from "@/lib/selected-conversation";
 
 export type { MausColor } from "@/lib/mascot";
 
@@ -367,6 +368,8 @@ export interface AppState {
   config: ConfigStatus | null;
   /** selected chat — a bot id OR a group id */
   selectedId: string;
+  /** Monotonic fence for async workflows that intend to navigate on finish. */
+  selectionEpoch: number;
   activeView: "chat" | "team-map" | "routines" | "skill-recorder";
   routines: Routine[];
   routineRuns: RoutineRun[];
@@ -469,6 +472,8 @@ export type Action =
       computerControl: Record<string, { held: boolean; helpReason: string | null }>;
       computerChildren: ComputerChildMonitor[];
       computerChildVisuals: ComputerChildVisualState[];
+      /** Reject a snapshot that started before a later navigation. */
+      selectionEpoch?: number;
     }
   | { type: "showRoutines" }
   | { type: "showTeamMap" }
@@ -502,6 +507,7 @@ export type Action =
   | { type: "instances"; instances: InstanceInfo[] }
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
+  | { type: "selectIfUnchanged"; id: string; selectionEpoch: number }
   | { type: "send"; botId: string; text: string; replyToId?: string }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
@@ -642,16 +648,28 @@ function dismissOnboardingCard(state: AppState, botId: string): AppState {
 function reduceAppState(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "hydrate": {
-      const known = (id: string) => action.bots.some((b) => b.id === id) || action.groups.some((g) => g.id === id);
-      const selectedId =
-        state.selectedId && known(state.selectedId) ? state.selectedId : (action.bots[0]?.id ?? "");
+      const navigationChanged = action.selectionEpoch !== undefined && action.selectionEpoch !== state.selectionEpoch;
+      let bots = action.bots;
+      let groups = action.groups;
+      const known = (id: string) => bots.some((b) => b.id === id) || groups.some((g) => g.id === id);
+      let selectedId = state.selectedId && known(state.selectedId) ? state.selectedId : (bots[0]?.id ?? "");
+      if (navigationChanged) {
+        // The snapshot is still authoritative for every other conversation,
+        // but it started before a later local navigation. Retain that exact
+        // selected entity until the queued SSE fold can confirm a deletion.
+        const selectedBot = state.bots.find((bot) => bot.id === state.selectedId);
+        const selectedGroup = state.groups.find((group) => group.id === state.selectedId);
+        if (selectedBot && !bots.some((bot) => bot.id === selectedBot.id)) bots = [selectedBot, ...bots];
+        if (selectedGroup && !groups.some((group) => group.id === selectedGroup.id)) groups = [selectedGroup, ...groups];
+        selectedId = state.selectedId;
+      }
       const computerChildren = Object.fromEntries(
         action.computerChildren.map((monitor) => [monitor.childId, monitor]),
       );
       return {
         ...state,
-        bots: action.bots,
-        groups: action.groups,
+        bots,
+        groups,
         computerControl: action.computerControl,
         computerChildren,
         computerChildVisuals: retainedComputerChildVisuals(
@@ -773,6 +791,10 @@ function reduceAppState(state: AppState, action: Action): AppState {
         (b) => ({ ...b, unread: false }),
       );
     }
+    case "selectIfUnchanged":
+      return state.selectionEpoch === action.selectionEpoch
+        ? reduceAppState(state, { type: "select", id: action.id })
+        : state;
     // optimistic card settle; the server's message.patch confirms it later
     case "answerCard": {
       const bot = state.bots.find((candidate) => candidate.id === action.botId);
@@ -795,10 +817,10 @@ function reduceAppState(state: AppState, action: Action): AppState {
       return withMascotMotion({
         ...state,
         // An HTTP create/import response and its SSE broadcast can race. Fold
-        // both paths without ever showing the same bot twice.
+        // both paths without ever showing the same bot twice. Navigation is
+        // owned by the workflow, not by a delayed upsert response.
         bots: [action.bot, ...state.bots.filter((bot) => bot.id !== action.bot.id)],
-        activeView: "chat",
-        selectedId: action.bot.id,
+        selectedId: state.selectedId || action.bot.id,
       }, action.bot.id, "arrive");
     case "deleteBot": {
       const bots = state.bots.filter((b) => b.id !== action.botId);
@@ -818,6 +840,7 @@ function reduceAppState(state: AppState, action: Action): AppState {
         return {
           ...state,
           bots: [{ ...action.bot, messages: action.bot.messages ?? [] }, ...state.bots],
+          selectedId: state.selectedId || action.bot.id,
         };
       }
       const kind =
@@ -1256,7 +1279,12 @@ function withoutHiddenComputerPixels(state: AppState): AppState {
 }
 
 export function reducer(state: AppState, action: Action): AppState {
-  return withoutHiddenComputerPixels(reduceAppState(state, action));
+  const next = withoutHiddenComputerPixels(reduceAppState(state, action));
+  const automaticFirstBotSelection =
+    !state.selectedId && (action.type === "botAdded" || action.type === "botPatched");
+  return (next.selectedId === state.selectedId && next.activeView === state.activeView) || automaticFirstBotSelection
+    ? next
+    : { ...next, selectionEpoch: state.selectionEpoch + 1 };
 }
 
 /** Matches App's actual ComputerPanel mount condition, not just its toggle. */
@@ -1275,7 +1303,8 @@ export const initialState: AppState = {
   groups: [],
   instances: [],
   config: null,
-  selectedId: "",
+  selectedId: readSelectedConversationId(),
+  selectionEpoch: 0,
   activeView: "chat",
   routines: [],
   routineRuns: [],
@@ -1415,6 +1444,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [],
   );
   const computerScreensVisible = computerPanelVisible(state);
+
+  useEffect(() => {
+    writeSelectedConversationId(state.selectedId);
+  }, [state.selectedId]);
 
   useEffect(() => {
     // StrictMode's dev probe runs this cleanup once against the same memoized
@@ -1589,12 +1622,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           break;
         }
-        case "newBot":
+        case "newBot": {
+          const selectionEpoch = stateRef.current.selectionEpoch;
           api("/api/bots", { method: "POST" })
-            .then(({ bot }) => rawDispatch({ type: "botAdded", bot }))
+            .then(({ bot }) => {
+              rawDispatch({ type: "botAdded", bot });
+              rawDispatch({ type: "selectIfUnchanged", id: bot.id, selectionEpoch });
+            })
             .catch(showError);
           break;
+        }
         case "duplicateBot": {
+          const selectionEpoch = stateRef.current.selectionEpoch;
           const source = stateRef.current.bots.find((b) => b.id === action.botId);
           if (!source) break;
           const duplicateProfile = {
@@ -1616,9 +1655,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 // JSON.stringify omits undefined optional fields while preserving
                 // an explicit null avatar clear, so duplication mirrors the source.
                 body: JSON.stringify(duplicateProfile),
-              }).then(({ bot: patched }) =>
-                rawDispatch({ type: "botAdded", bot: { ...bot, ...patched, messages: bot.messages } }),
-              ),
+              }).then(({ bot: patched }) => {
+                const duplicate = { ...bot, ...patched, messages: bot.messages };
+                rawDispatch({ type: "botAdded", bot: duplicate });
+                rawDispatch({ type: "selectIfUnchanged", id: duplicate.id, selectionEpoch });
+              }),
             )
             .catch(showError);
           break;
@@ -1638,17 +1679,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }
           break;
         }
-        case "createGroup":
+        case "createGroup": {
+          const selectionEpoch = stateRef.current.selectionEpoch;
           api(`/api/groups`, {
             method: "POST",
             body: JSON.stringify({ memberIds: action.memberIds, name: action.name, section: action.section }),
           })
             .then(({ group }) => {
               rawDispatch({ type: "groupPatched", group });
-              rawDispatch({ type: "select", id: group.id });
+              rawDispatch({ type: "selectIfUnchanged", id: group.id, selectionEpoch });
             })
             .catch(showError);
           break;
+        }
         case "sendGroup":
           api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
@@ -1764,30 +1807,35 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // ── initial load + SSE fold ──────────────────────────────────────────
   useEffect(() => {
     let alive = true;
-    const loadAll = () =>
+    let hydrationGeneration = 0;
+    let rehydrateRequested = false;
+    const loadAll = (generation: number, selectionEpochAtStart: number) =>
       Promise.all([
         api(screenTransportUrl("/api/bots", computerScreensVisible))
-          .then(({ bots, groups, computerControl, computerChildren, computerChildVisuals }) =>
-            alive && rawDispatch({
+          .then(({ bots, groups, computerControl, computerChildren, computerChildVisuals }) => {
+            if (!alive || generation !== hydrationGeneration) return;
+            rawDispatch({
               type: "hydrate",
               bots,
               groups: groups ?? [],
               computerControl: computerControl ?? {},
               computerChildren: computerChildren ?? [],
               computerChildVisuals: computerChildVisuals ?? [],
-            }))
+              selectionEpoch: selectionEpochAtStart,
+            });
+          })
           .catch(() => {}),
         api("/api/instances")
-          .then(({ instances }) => alive && rawDispatch({ type: "instances", instances }))
+          .then(({ instances }) => alive && generation === hydrationGeneration && rawDispatch({ type: "instances", instances }))
           .catch(() => {}),
         api("/api/config")
-          .then((config) => alive && rawDispatch({ type: "configStatus", config }))
+          .then((config) => alive && generation === hydrationGeneration && rawDispatch({ type: "configStatus", config }))
           .catch(() => {}),
         api("/api/routines")
-          .then(({ routines, runs }) => alive && rawDispatch({ type: "routinesHydrated", routines, runs }))
+          .then(({ routines, runs }) => alive && generation === hydrationGeneration && rawDispatch({ type: "routinesHydrated", routines, runs }))
           .catch(() => {}),
         api("/api/webhooks")
-          .then(({ webhooks, attempts, ingress }) => alive && rawDispatch({ type: "webhooksHydrated", webhooks, attempts: attempts ?? [], ingress }))
+          .then(({ webhooks, attempts, ingress }) => alive && generation === hydrationGeneration && rawDispatch({ type: "webhooksHydrated", webhooks, attempts: attempts ?? [], ingress }))
           .catch(() => {}),
       ]);
 
@@ -1798,10 +1846,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // an eager request and the stream opening and disappear entirely.
     let hydrated = false;
     let hydrating = false;
-    let rehydrateRequested = false;
     const pendingFrames: any[] = [];
     let handleFrame: (frame: any) => void;
     const hydrate = () => {
+      const generation = ++hydrationGeneration;
+      const selectionEpochAtStart = stateRef.current.selectionEpoch;
       if (hydrating) {
         // A second non-resumable hello means this snapshot may have started
         // before another connection gap. Run one more after it settles.
@@ -1810,7 +1859,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       hydrating = true;
       hydrated = false;
-      void loadAll().finally(() => {
+      void loadAll(generation, selectionEpochAtStart).finally(() => {
         if (!alive) return;
         hydrating = false;
         if (rehydrateRequested) {
