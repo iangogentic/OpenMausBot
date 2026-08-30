@@ -149,6 +149,214 @@ describe("Local VM visual action policy", () => {
 });
 
 describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () => {
+  it("advertises the bounded native computer_batch synthetic tool", async () => {
+    const socket = new FakeSocket();
+    const handle = attachLocalVmMcpBroker(baseOptions(socket));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+    const response = JSON.parse(socket.sent[0]!.toString());
+    const batch = response.result.tools.find((tool: { name?: string }) => tool.name === "computer_batch");
+    expect(batch.inputSchema.properties.actions).toMatchObject({ minItems: 1, maxItems: 9 });
+    expect(batch.inputSchema.properties.actions.items.oneOf).toHaveLength(5);
+    handle.close("tools list complete");
+    await handle.closed;
+  });
+
+  it("runs a validated batch sequentially under one ticket and returns only one final screen", async () => {
+    const socket = new FakeSocket();
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "batch-ticket" }));
+    const endAction = vi.fn(() => true);
+    const captureAfterAction = vi.fn(async (toolName: string) => {
+      expect(toolName).toBe("press_key");
+      return { data: "aW1hZ2U=", mimeType: "image/png" as const };
+    });
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      endAction,
+      captureAfterAction,
+      maxToolCalls: 3,
+    }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 101,
+      method: "tools/call",
+      params: {
+        name: "computer_batch",
+        arguments: { actions: [
+          { name: "click", arguments: { x: 10, y: 20 } },
+          { name: "type_text", arguments: { text: "hello" } },
+          { name: "press_key", arguments: { key: "enter" } },
+        ] },
+      },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 101)).toBe(true));
+    const frames = socket.sent.map((bytes) => JSON.parse(bytes.toString()));
+    const response = frames.find((frame) => frame.id === 101);
+    expect(beginAction).toHaveBeenCalledOnce();
+    expect(endAction).toHaveBeenCalledOnce();
+    expect(endAction).toHaveBeenCalledWith("batch-ticket");
+    expect(captureAfterAction).toHaveBeenCalledOnce();
+    expect(response.result.isError).toBeUndefined();
+    expect(response.result.content.filter((item: { type?: string }) => item.type === "image")).toEqual([
+      { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+    ]);
+    expect(JSON.stringify(frames)).not.toContain("__openmaus_computer_batch_");
+    handle.close("batch complete");
+    await handle.closed;
+  });
+
+  it("rejects ten batch actions atomically without truncation or a control ticket", async () => {
+    const socket = new FakeSocket();
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "must-not-run" }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { beginAction }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 102,
+      method: "tools/call",
+      params: {
+        name: "computer_batch",
+        arguments: { actions: Array.from({ length: 10 }, () => ({ name: "press_key", arguments: { key: "tab" } })) },
+      },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+    const response = JSON.parse(socket.sent[0]!.toString());
+    expect(response).toMatchObject({ id: 102, result: { isError: true } });
+    expect(JSON.stringify(response)).toContain("was not run");
+    expect(beginAction).not.toHaveBeenCalled();
+    handle.close("invalid batch complete");
+    await handle.closed;
+  });
+
+  it("shares the nine-action turn budget across ordinary actions and repeated batches", async () => {
+    const socket = new FakeSocket();
+    let ticket = 0;
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: `budget-${++ticket}` }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      captureAfterAction: async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 110, method: "tools/call", params: { name: "click", arguments: { x: 1, y: 1 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 110)).toBe(true));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 111, method: "tools/call", params: { name: "computer_batch", arguments: { actions: Array.from({ length: 8 }, () => ({ name: "press_key", arguments: { key: "tab" } })) } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 111)).toBe(true));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 112, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "click", arguments: { x: 2, y: 2 } }] } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 112)).toBe(true));
+    const rejected = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 112);
+    expect(rejected.result.isError).toBe(true);
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 113, method: "tools/call", params: { name: "click", arguments: { x: 3, y: 3 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 113)).toBe(true));
+    const rejectedSingle = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 113);
+    expect(rejectedSingle.result.isError).toBe(true);
+    expect(beginAction).toHaveBeenCalledTimes(2);
+    handle.close("shared budget complete");
+    await handle.closed;
+  });
+
+  it("does not interleave a second provider request while the batch ticket is held", async () => {
+    const socket = new FakeSocket();
+    const delayed = String.raw`
+      const readline = require("node:readline");
+      const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+      rl.on("line", (line) => { const frame = JSON.parse(line); setTimeout(() => {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: { content: [] } }) + "\n");
+      }, 100); });
+    `;
+    let ticket = 0;
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: `ticket-${++ticket}` }));
+    const endAction = vi.fn(() => true);
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      endAction,
+      captureAfterAction: async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }),
+      spawnDriver: () => spawnResponder(delayed),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 103, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "click", arguments: { x: 1, y: 1 } }] } } }) + "\n");
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 104, method: "tools/call", params: { name: "click", arguments: { x: 2, y: 2 } } }) + "\n");
+    await vi.waitFor(() => expect(beginAction).toHaveBeenCalledOnce(), { timeout: 80 });
+    expect(endAction).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(beginAction).toHaveBeenCalledTimes(2));
+    expect(endAction.mock.calls[0]).toEqual(["ticket-1"]);
+    handle.close("interleave test complete");
+    await handle.closed;
+  });
+
+  it("settles a driver-error batch without capturing or leaking the driver error", async () => {
+    const socket = new FakeSocket();
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "action-a" }));
+    const endAction = vi.fn(() => true);
+    const captureAfterAction = vi.fn();
+    const failing = String.raw`
+      const readline = require("node:readline");
+      const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+      rl.on("line", (line) => { const frame = JSON.parse(line);
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, error: { code: 99, message: "secret runtime path /var/run/host" } }) + "\n");
+      });
+    `;
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      endAction,
+      captureAfterAction,
+      spawnDriver: () => spawnResponder(failing),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 105, method: "tools/call", params: { name: "computer_batch", arguments: { actions: Array.from({ length: 9 }, () => ({ name: "click", arguments: { x: 1, y: 1 } })) } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+    const response = socket.sent.map((bytes) => bytes.toString()).join("");
+    expect(response).toContain('"isError":true');
+    expect(response).not.toContain("secret runtime path");
+    expect(captureAfterAction).not.toHaveBeenCalled();
+    expect(endAction).toHaveBeenCalledOnce();
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 108, method: "tools/call", params: { name: "click", arguments: { x: 2, y: 2 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 108)).toBe(true));
+    expect(beginAction).toHaveBeenCalledOnce();
+    handle.close("driver error complete");
+    await handle.closed;
+  });
+
+  it("reports a missing final capture as an error after safely releasing the batch ticket", async () => {
+    const socket = new FakeSocket();
+    const endAction = vi.fn(() => true);
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      endAction,
+      captureAfterAction: async () => null,
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 109, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "click", arguments: { x: 1, y: 1 } }] } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 109)).toBe(true));
+    const response = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 109);
+    expect(response.result.isError).toBe(true);
+    expect(JSON.stringify(response)).toContain("final screenshot was unavailable");
+    expect(endAction).toHaveBeenCalledOnce();
+    handle.close("capture failure complete");
+    await handle.closed;
+  });
+
+  it("fails closed and quarantines when a completed batch ticket cannot be released", async () => {
+    const socket = new FakeSocket();
+    const quarantine = vi.fn();
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      endAction: () => false,
+      quarantine,
+      captureAfterAction: async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 106, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "press_key", arguments: { key: "tab" } }] } } }) + "\n");
+    await handle.closed;
+    await vi.waitFor(() => expect(quarantine).toHaveBeenCalledOnce());
+    expect(socket.open).toBe(false);
+    expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 106)).toBe(false);
+  });
+
+  it("quarantines a batch ticket when teardown interrupts an unanswered action", async () => {
+    const socket = new FakeSocket();
+    const quarantine = vi.fn();
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      quarantine,
+      responseTimeoutMs: 100,
+      spawnDriver: () => spawnResponder("setInterval(() => {}, 1000);"),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 107, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "click", arguments: { x: 1, y: 1 } }] } } }) + "\n");
+    await handle.closed;
+    await vi.waitFor(() => expect(quarantine).toHaveBeenCalledOnce());
+  });
+
   it("gates an exact action, correlates its result, and reaps the runtime process group", async () => {
     const socket = new FakeSocket();
     const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "action-7" }));

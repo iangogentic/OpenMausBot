@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 
 import { augmentedPath } from "./env-path.ts";
 import {
+  COMPUTER_BATCH_TOOL,
+  COMPUTER_BATCH_MAX_ACTIONS,
   COMPUTER_REQUEST_HELP_TOOL,
   MCP_MAX_LINE_BYTES,
   MCP_MAX_PENDING_BYTES,
@@ -11,6 +13,7 @@ import {
   createGateInterceptor,
   createLineSplitter,
   type GateInterceptor,
+  type ComputerBatchAction,
 } from "./mcp-bridge.ts";
 import { cuaExecArgs, CUA_SOCKET, type Runtime } from "./container-computer.ts";
 import type { ActionPermit } from "./control-client.ts";
@@ -28,6 +31,10 @@ export const LOCAL_VM_MAX_MCP_FRAMES = 4_096;
 export const LOCAL_VM_MAX_TOOL_CALLS = 2_048;
 export const LOCAL_VM_GENERATION_POLL_MS = 2_000;
 export const LOCAL_VM_MCP_RESPONSE_TIMEOUT_MS = 180_000;
+/** Base64 screenshot ceiling below the 4 MiB MCP frame limit, leaving room
+ * for JSON framing and the textual batch result. Production optimized frames
+ * are normally below 400 KiB. */
+export const LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES = 3 * 1024 * 1024;
 
 /** Cua Driver's low-level action tools report only metadata. Attach the
  * resulting pixels in the broker so a vision model receives one atomic
@@ -208,6 +215,10 @@ export function attachLocalVmMcpBroker(options: {
   let driverInputEnded = false;
   let generationChecking = false;
   let toolCalls = 0;
+  // One child/turn mechanical-action budget shared by ordinary calls and all
+  // synthetic batches. A batch reserves its full size before action one, so a
+  // failed prefix cannot be retried to exceed the nine-action contract.
+  let computerActionsConsumed = 0;
   let lastDeliveredFrameHash: string | null = null;
   let inputFrames = 0;
   let outputFrames = 0;
@@ -217,6 +228,12 @@ export function attachLocalVmMcpBroker(options: {
   const pendingActionTools = new Map<string, string>();
   const pendingToolsList = new Set<string>();
   const pendingPassthrough = new Set<string>();
+  const pendingBatchDriverCalls = new Map<string, {
+    resolve: (frame: Record<string, unknown>) => void;
+    reject: (error: Error) => void;
+  }>();
+  let activeBatchActionId: string | null = null;
+  let batchDriverSequence = 0;
   const responseTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let offBrokerDrain: () => void = () => {};
   let generationTimer: ReturnType<typeof setInterval> | null = null;
@@ -279,12 +296,16 @@ export function attachLocalVmMcpBroker(options: {
     generationTimer = null;
     for (const timer of responseTimers.values()) clearTimeout(timer);
     responseTimers.clear();
+    for (const pending of pendingBatchDriverCalls.values()) pending.reject(new Error(reason));
+    pendingBatchDriverCalls.clear();
     options.signal?.removeEventListener("abort", onAbort);
     offBrokerDrain();
     options.broker.resumeInput();
     child?.stdout.pause();
     child?.stdin.destroy();
-    if (quarantine && pendingActions.size) void quarantineSafely();
+    if ((quarantine || activeBatchActionId !== null) && (pendingActions.size || activeBatchActionId)) {
+      void quarantineSafely();
+    }
     if (options.broker.open) options.broker.close(1008, reason);
     completeCleanup(child);
   };
@@ -336,20 +357,21 @@ export function attachLocalVmMcpBroker(options: {
     options.broker.resumeInput();
   };
 
-  const forwardDriver = (line: string) => {
-    if (closed) return;
+  const forwardDriver = (line: string): boolean => {
+    if (closed) return false;
     const bytes = Buffer.from(line + "\n");
     if (!driverReady || pendingDriver.length) {
       pendingDriverBytes += bytes.length;
       if (pendingDriverBytes > MCP_MAX_PENDING_BYTES || pendingDriver.length >= MCP_MAX_PENDING_FRAMES) {
         finish("Local VM MCP driver queue exceeded its limit", pendingActions.size > 0);
-        return;
+        return false;
       }
       pendingDriver.push(bytes);
       flushDriver();
-      return;
+      return true;
     }
     if (!child || !child.stdin.write(bytes)) options.broker.pauseInput();
+    return !closed;
   };
 
   const claimToolCall = async (): Promise<boolean> => {
@@ -365,10 +387,34 @@ export function attachLocalVmMcpBroker(options: {
     return true;
   };
 
+  const callBatchDriver = (action: ComputerBatchAction): Promise<Record<string, unknown>> => {
+    const internalId = `__openmaus_computer_batch_${++batchDriverSequence}`;
+    const requestKey = `string:${internalId}`;
+    return new Promise((resolve, reject) => {
+      pendingBatchDriverCalls.set(requestKey, { resolve, reject });
+      armResponseDeadline(requestKey);
+      const forwarded = forwardDriver(JSON.stringify({
+        jsonrpc: "2.0",
+        id: internalId,
+        method: "tools/call",
+        params: { name: action.name, arguments: action.arguments },
+      }));
+      if (!forwarded && pendingBatchDriverCalls.delete(requestKey)) {
+        clearResponseDeadline(requestKey);
+        reject(new Error("Local VM driver was unavailable"));
+      }
+    });
+  };
+
   const gate: GateInterceptor = createGateInterceptor({
-    beginAction: async () => {
+    beginAction: async (toolName) => {
       if (!(await claimToolCall())) return { allowed: false, reason: "unavailable" };
-      return options.beginAction();
+      if (LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName) && computerActionsConsumed >= COMPUTER_BATCH_MAX_ACTIONS) {
+        return { allowed: false, reason: "unavailable" };
+      }
+      const permit = await options.beginAction();
+      if (permit.allowed && LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName)) computerActionsConsumed += 1;
+      return permit;
     },
     actionForwarded: (requestId, actionId, toolName) => {
       if (closed) {
@@ -411,6 +457,69 @@ export function attachLocalVmMcpBroker(options: {
     requestHelp: async (reason) => await claimToolCall()
       ? options.requestHelp(reason)
       : { text: "Local VM authority became unavailable while asking for help.", isError: true },
+    requestComputerBatch: async (actions) => {
+      if (closed || !(await authorizedAndCurrent())) {
+        return { content: [{ type: "text", text: "Local VM authority is unavailable; no batch actions were run." }], isError: true };
+      }
+      if (computerActionsConsumed + actions.length > COMPUTER_BATCH_MAX_ACTIONS) {
+        return { content: [{ type: "text", text: `The Local VM allows at most ${COMPUTER_BATCH_MAX_ACTIONS} mechanical actions per turn; this entire batch was rejected and none ran.` }], isError: true };
+      }
+      const permit = await Promise.resolve(options.beginAction()).catch(
+        (): ActionPermit => ({ allowed: false, reason: "unavailable" }),
+      );
+      if (!permit.allowed) {
+        return { content: [{ type: "text", text: "Computer control is currently unavailable or held; no batch actions were run." }], isError: true };
+      }
+      computerActionsConsumed += actions.length;
+      activeBatchActionId = permit.actionId;
+      let completed = 0;
+      let result: { content: Array<Record<string, unknown>>; isError?: boolean } = {
+        content: [{ type: "text", text: "The computer batch could not complete safely." }],
+        isError: true,
+      };
+      try {
+        for (const action of actions) {
+          if (!(await claimToolCall())) {
+            return { content: [{ type: "text", text: `The computer batch stopped safely after ${completed} actions because its authority expired.` }], isError: true };
+          }
+          const response = await callBatchDriver(action);
+          if ("error" in response) {
+            return { content: [{ type: "text", text: `The computer batch stopped after ${completed} completed actions because action ${completed + 1} failed.` }], isError: true };
+          }
+          completed += 1;
+        }
+        const finalTool = actions.at(-1)?.name ?? "computer_batch";
+        const screenshot = await options.captureAfterAction?.(finalTool);
+        if (!screenshot || screenshot.data.length > LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES) {
+          result = { content: [{ type: "text", text: `All ${completed} computer batch actions completed, but the bounded final screenshot was unavailable.` }], isError: true };
+        } else {
+          const frameHash = createHash("sha256")
+            .update(screenshot.mimeType)
+            .update("\0")
+            .update(screenshot.data)
+            .digest("hex");
+          lastDeliveredFrameHash = frameHash;
+          result = {
+            content: [
+              { type: "text", text: `Completed ${completed} computer batch actions. Final screen attached (sha256=${frameHash}).` },
+              { type: "image", data: screenshot.data, mimeType: screenshot.mimeType },
+            ],
+          };
+        }
+      } catch {
+        result = { content: [{ type: "text", text: `The computer batch stopped safely after ${completed} completed actions.` }], isError: true };
+      } finally {
+        if (!closed) {
+          const actionId = activeBatchActionId;
+          if (!actionId || !(await Promise.resolve(options.endAction(actionId)).catch(() => false))) {
+            finish("Local VM control did not acknowledge the completed computer batch", true);
+          } else {
+            activeBatchActionId = null;
+          }
+        }
+      }
+      return result;
+    },
     forward: forwardDriver,
     refuse: emitBroker,
     onOverflow: () => finish("Local VM MCP request queue exceeded its limit", pendingActions.size > 0),
@@ -474,9 +583,19 @@ export function attachLocalVmMcpBroker(options: {
       const id = typeof frame?.id === "string" || typeof frame?.id === "number"
         ? `${typeof frame.id}:${String(frame.id)}`
         : null;
+      // Driver notifications emitted while the synthetic batch is active may
+      // contain its private correlation id. The provider receives exactly one
+      // final synthetic result, never intermediate driver chatter.
+      if (activeBatchActionId !== null && id === null) return;
       let responseLine = line;
       if (id && ("result" in (frame ?? {}) || "error" in (frame ?? {}))) {
         clearResponseDeadline(id);
+        const batchCall = pendingBatchDriverCalls.get(id);
+        if (batchCall && frame) {
+          pendingBatchDriverCalls.delete(id);
+          batchCall.resolve(frame);
+          return;
+        }
         pendingPassthrough.delete(id);
         const actionId = pendingActions.get(id);
         if (actionId) {
@@ -534,7 +653,11 @@ export function attachLocalVmMcpBroker(options: {
           pendingActionTools.delete(id);
         }
       }
-      const response = augmentToolsListResponse(responseLine, pendingToolsList);
+      const response = augmentToolsListResponse(
+        responseLine,
+        pendingToolsList,
+        [COMPUTER_REQUEST_HELP_TOOL, COMPUTER_BATCH_TOOL],
+      );
       try {
         const delivered = JSON.parse(response) as { result?: { content?: unknown[] } };
         for (const item of delivered.result?.content ?? []) {

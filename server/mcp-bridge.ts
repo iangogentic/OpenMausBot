@@ -162,6 +162,105 @@ export const COMPUTER_REQUEST_HELP_TOOL = {
   },
 } as const;
 
+export const COMPUTER_BATCH_MAX_ACTIONS = 9;
+
+export type ComputerBatchAction =
+  | { name: "click"; arguments: { x: number; y: number; button?: "left" | "right"; count?: number } }
+  | { name: "type_text"; arguments: { text: string } }
+  | { name: "press_key"; arguments: { key: string } }
+  | { name: "hotkey"; arguments: { keys: string[] } }
+  | { name: "scroll"; arguments: { x: number; y: number; direction: "up" | "down"; amount?: number; by?: "line" | "pixel" } };
+
+export const COMPUTER_BATCH_TOOL = {
+  name: "computer_batch",
+  description:
+    "Run up to nine predictable mechanical computer actions sequentially under one control ticket, then return one final screenshot. Stop before any step whose result must be inspected.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      actions: {
+        type: "array",
+        minItems: 1,
+        maxItems: COMPUTER_BATCH_MAX_ACTIONS,
+        items: {
+          oneOf: [
+            { type: "object", properties: { name: { const: "click" }, arguments: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, button: { type: "string", enum: ["left", "right"] }, count: { type: "integer", minimum: 1, maximum: 2 } }, required: ["x", "y"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "type_text" }, arguments: { type: "object", properties: { text: { type: "string", minLength: 1, maxLength: 4096 } }, required: ["text"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "press_key" }, arguments: { type: "object", properties: { key: { type: "string", minLength: 1, maxLength: 64 } }, required: ["key"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "hotkey" }, arguments: { type: "object", properties: { keys: { type: "array", minItems: 2, maxItems: 4, items: { type: "string", minLength: 1, maxLength: 32 } } }, required: ["keys"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "scroll" }, arguments: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, direction: { type: "string", enum: ["up", "down"] }, amount: { type: "integer", minimum: 1, maximum: 20 }, by: { type: "string", enum: ["line", "pixel"] } }, required: ["x", "y", "direction"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+          ],
+        },
+      },
+    },
+    required: ["actions"],
+    additionalProperties: false,
+  },
+} as const;
+
+type BatchValidation = { ok: true; actions: ComputerBatchAction[] } | { ok: false; message: string };
+
+function plainObject(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+/** Runtime validation mirrors COMPUTER_BATCH_TOOL and returns fresh objects so
+ * no unreviewed provider fields can reach the driver. */
+export function validateComputerBatchArguments(value: unknown): BatchValidation {
+  const root = plainObject(value);
+  if (!root || !exactKeys(root, ["actions"]) || !Array.isArray(root.actions)) {
+    return { ok: false, message: "computer_batch requires only an actions array" };
+  }
+  if (root.actions.length < 1 || root.actions.length > COMPUTER_BATCH_MAX_ACTIONS) {
+    return { ok: false, message: `computer_batch requires 1-${COMPUTER_BATCH_MAX_ACTIONS} actions; the batch was not run` };
+  }
+  const actions: ComputerBatchAction[] = [];
+  for (const candidate of root.actions) {
+    const action = plainObject(candidate);
+    const args = plainObject(action?.arguments);
+    if (!action || !args || !exactKeys(action, ["name", "arguments"])) {
+      return { ok: false, message: "computer_batch contains an invalid action object" };
+    }
+    if (action.name === "click" && exactKeys(args, ["x", "y", "button", "count"]) &&
+      typeof args.x === "number" && Number.isFinite(args.x) && args.x >= 0 && args.x <= 16384 &&
+      typeof args.y === "number" && Number.isFinite(args.y) && args.y >= 0 && args.y <= 16384 &&
+      (args.button === undefined || args.button === "left" || args.button === "right") &&
+      (args.count === undefined || (Number.isInteger(args.count) && Number(args.count) >= 1 && Number(args.count) <= 2))) {
+      actions.push({ name: "click", arguments: { x: args.x, y: args.y, ...(args.button ? { button: args.button } : {}), ...(args.count !== undefined ? { count: Number(args.count) } : {}) } });
+      continue;
+    }
+    if (action.name === "type_text" && exactKeys(args, ["text"]) && typeof args.text === "string" && args.text.length >= 1 && args.text.length <= 4096) {
+      actions.push({ name: "type_text", arguments: { text: args.text } });
+      continue;
+    }
+    if (action.name === "press_key" && exactKeys(args, ["key"]) && typeof args.key === "string" && args.key.length >= 1 && args.key.length <= 64) {
+      actions.push({ name: "press_key", arguments: { key: args.key } });
+      continue;
+    }
+    if (action.name === "hotkey" && exactKeys(args, ["keys"]) && Array.isArray(args.keys) && args.keys.length >= 2 && args.keys.length <= 4 && args.keys.every((key) => typeof key === "string" && key.length >= 1 && key.length <= 32)) {
+      actions.push({ name: "hotkey", arguments: { keys: [...args.keys] as string[] } });
+      continue;
+    }
+    if (action.name === "scroll" && exactKeys(args, ["x", "y", "direction", "amount", "by"]) &&
+      typeof args.x === "number" && Number.isFinite(args.x) && args.x >= 0 && args.x <= 16384 &&
+      typeof args.y === "number" && Number.isFinite(args.y) && args.y >= 0 && args.y <= 16384 &&
+      (args.direction === "up" || args.direction === "down") &&
+      (args.amount === undefined || (Number.isInteger(args.amount) && Number(args.amount) >= 1 && Number(args.amount) <= 20)) &&
+      (args.by === undefined || args.by === "line" || args.by === "pixel")) {
+      actions.push({ name: "scroll", arguments: { x: args.x, y: args.y, direction: args.direction, ...(args.amount !== undefined ? { amount: Number(args.amount) } : {}), ...(args.by ? { by: args.by } : {}) } });
+      continue;
+    }
+    return { ok: false, message: "computer_batch contains an unsupported action or invalid arguments" };
+  }
+  return { ok: true, actions };
+}
+
 /** Collect a byte stream into complete newline-terminated lines. MCP's
  * stdio transport is one JSON-RPC frame per line, so line boundaries are
  * the only safe place to inspect — or inject — anything. */
@@ -251,7 +350,7 @@ export function createLineSplitter(
 export type GateInterceptor = ((line: string) => boolean) & { drain: () => Promise<void> };
 
 export function createGateInterceptor(options: {
-  beginAction: () => Promise<ActionPermit>;
+  beginAction: (toolName: string) => Promise<ActionPermit>;
   forward: (line: string) => void;
   refuse: (line: string) => void;
   actionForwarded?: (requestId: string, actionId: string, toolName: string) => void;
@@ -261,6 +360,10 @@ export function createGateInterceptor(options: {
    * response and falsely settle that action. */
   requestForwarded?: (requestId: string) => void;
   requestHelp?: (reason: string) => Promise<{ text: string; isError?: boolean }>;
+  requestComputerBatch?: (actions: ComputerBatchAction[]) => Promise<{
+    content: Array<Record<string, unknown>>;
+    isError?: boolean;
+  }>;
   /** Reject a request id that is already live at the far-end driver. This is
    * evaluated on the same serialized queue as beginAction, so a duplicate
    * cannot race the first request's actionForwarded callback. */
@@ -364,7 +467,27 @@ export function createGateInterceptor(options: {
         options.refuse(toolResultFrame(frame.id, result.text, result.isError === true));
         return;
       }
-      const permit = await options.beginAction().catch(
+      if (frame.params?.name === COMPUTER_BATCH_TOOL.name && options.requestComputerBatch) {
+        const validated = validateComputerBatchArguments(frame.params?.arguments);
+        if (!validated.ok) {
+          options.refuse(toolResultFrame(frame.id, validated.message, true));
+          return;
+        }
+        const result = await options.requestComputerBatch(validated.actions).catch(() => ({
+          content: [{ type: "text", text: "The computer batch could not complete safely." }],
+          isError: true,
+        }));
+        if (failed) return;
+        options.refuse(JSON.stringify({
+          jsonrpc: "2.0",
+          id: frame.id ?? null,
+          result: { content: result.content, ...(result.isError ? { isError: true } : {}) },
+        }));
+        return;
+      }
+      const permit = await options.beginAction(
+        typeof frame.params?.name === "string" ? frame.params.name : "",
+      ).catch(
         (): ActionPermit => ({ allowed: false, reason: "unavailable" }),
       );
       if (failed) {
@@ -434,7 +557,11 @@ function toolResultFrame(id: unknown, text: string, isError: boolean): string {
 /** Add the bridge-owned handoff tool without hiding or rewriting any driver
  * tools. Only the response to a tools/list request observed on this bridge is
  * eligible, and an upstream tool of the same name wins to avoid duplication. */
-export function augmentToolsListResponse(line: string, pendingRequestIds: Set<string>): string {
+export function augmentToolsListResponse(
+  line: string,
+  pendingRequestIds: Set<string>,
+  syntheticTools: readonly Record<string, unknown>[] = [COMPUTER_REQUEST_HELP_TOOL],
+): string {
   let frame: any = null;
   try {
     frame = JSON.parse(line);
@@ -444,10 +571,12 @@ export function augmentToolsListResponse(line: string, pendingRequestIds: Set<st
   assertBoundedJsonShape(frame, PROVIDER_NDJSON_LIMITS);
   const id = requestKey(frame?.id);
   if (!id || !pendingRequestIds.delete(id) || !Array.isArray(frame?.result?.tools)) return line;
-  if (frame.result.tools.some((tool: any) => tool?.name === COMPUTER_REQUEST_HELP_TOOL.name)) return line;
+  const existing = new Set(frame.result.tools.map((tool: any) => tool?.name).filter((name: unknown) => typeof name === "string"));
+  const additions = syntheticTools.filter((tool) => typeof tool.name === "string" && !existing.has(tool.name));
+  if (!additions.length) return line;
   return JSON.stringify({
     ...frame,
-    result: { ...frame.result, tools: [...frame.result.tools, COMPUTER_REQUEST_HELP_TOOL] },
+    result: { ...frame.result, tools: [...frame.result.tools, ...additions] },
   });
 }
 

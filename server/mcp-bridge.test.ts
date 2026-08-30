@@ -8,12 +8,36 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
+  COMPUTER_BATCH_MAX_ACTIONS,
   augmentToolsListResponse,
   createGateInterceptor,
   createInactivityWatchdog,
   createLineSplitter,
   runLivenessProbe,
+  validateComputerBatchArguments,
 } from "./mcp-bridge.ts";
+
+describe("computer_batch validation", () => {
+  it("accepts only the explicit bounded mechanical schema", () => {
+    expect(validateComputerBatchArguments({ actions: [
+      { name: "click", arguments: { x: 10, y: 20, button: "left" } },
+      { name: "type_text", arguments: { text: "hello" } },
+      { name: "press_key", arguments: { key: "enter" } },
+      { name: "hotkey", arguments: { keys: ["ctrl", "l"] } },
+      { name: "scroll", arguments: { x: 10, y: 20, direction: "down", amount: 3, by: "line" } },
+    ] }).ok).toBe(true);
+    expect(validateComputerBatchArguments({ actions: Array.from(
+      { length: COMPUTER_BATCH_MAX_ACTIONS + 1 },
+      () => ({ name: "press_key", arguments: { key: "tab" } }),
+    ) }).ok).toBe(false);
+    expect(validateComputerBatchArguments({ actions: [
+      { name: "click", arguments: { x: 1, y: 2, command: "cat /etc/passwd" } },
+    ] }).ok).toBe(false);
+    expect(validateComputerBatchArguments({ actions: [
+      { name: "computer_exec", arguments: { command: "id" } },
+    ] }).ok).toBe(false);
+  });
+});
 
 /** a probe whose answers the test scripts one call at a time */
 function scriptedProbe(answers: boolean[]) {
