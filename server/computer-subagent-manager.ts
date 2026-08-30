@@ -10,7 +10,9 @@ export interface ComputerSubagentParent {
   botId: string;
   threadId: string;
   turnId: string;
-  generation: number;
+  /** Harness generations are opaque fencing values. Older integrations used
+   * counters; the current harness uses UUID-like strings. */
+  generation: string | number;
 }
 
 export interface ComputerSubagentStartInput {
@@ -131,8 +133,13 @@ function assertParent(parent: ComputerSubagentParent): void {
   assertText(parent.botId, "parent.botId");
   assertText(parent.threadId, "parent.threadId");
   assertText(parent.turnId, "parent.turnId");
-  if (!Number.isSafeInteger(parent.generation) || parent.generation < 0) {
-    throw new TypeError("parent.generation must be a non-negative integer");
+  const generationRepresentation = Object.prototype.toString.call(parent.generation);
+  if (generationRepresentation === "[object String]") {
+    assertText(String(parent.generation), "parent.generation");
+  } else if (generationRepresentation !== "[object Number]"
+    || !Number.isSafeInteger(parent.generation)
+    || Number(parent.generation) < 0) {
+    throw new TypeError("parent.generation must be a non-empty string or non-negative integer");
   }
 }
 

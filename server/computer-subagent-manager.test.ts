@@ -32,6 +32,20 @@ function stale(handle: ComputerSubagentHandle): ComputerSubagentHandle {
 }
 
 describe("ComputerSubagentManager", () => {
+  it("accepts the harness UUID generation and fences it exactly", () => {
+    const manager = new ComputerSubagentManager();
+    const uuidParent = { ...parent, generation: "019c-turn-generation" };
+    const created = manager.start({
+      parent: uuidParent,
+      targetKey: "box:string-generation",
+      targetGeneration: "vm-generation-a",
+      childId: "child-string-generation",
+    });
+    manager.markRunning(created.handle);
+    expect(manager.cancelParent({ ...uuidParent, generation: "019c-other-generation" })).toEqual([]);
+    expect(manager.cancelParent(uuidParent)).toEqual(["child-string-generation"]);
+  });
+
   it("atomically leases one target and binds the full parent identity", () => {
     const manager = new ComputerSubagentManager({ now: () => 100 });
     const first = start(manager);
@@ -117,7 +131,7 @@ describe("ComputerSubagentManager", () => {
     const manager = new ComputerSubagentManager();
     const first = start(manager);
     manager.markRunning(first.handle);
-    expect(manager.cancelParent({ ...parent, generation: parent.generation - 1 })).toEqual([]);
+    expect(manager.cancelParent({ ...parent, generation: 3 })).toEqual([]);
     expect(manager.get(first.handle.childId)?.status).toBe("running");
     expect(manager.cancelParent(parent)).toEqual(["child-a"]);
     expect(manager.get(first.handle.childId)).toMatchObject({ status: "aborted", leaseHeld: true });
