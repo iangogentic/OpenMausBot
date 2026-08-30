@@ -32,8 +32,8 @@ OpenMaus status in this ledger is deliberately split:
 ## Current checkout and deployment boundary
 
 The deployed implementation revision is
-`e93e6a5c21b5d8f9d3f8cd913139ae84cb14d3de` (`Persist remote chat selection
-safely`) on `feat/grokbot-remote-client`. Its complete repository gate,
+`750254b4a299c7c02d012d2881b7c75438909f68` (`Keep remote renderer origin
+stable`) on `feat/grokbot-remote-client`. Its complete repository gate,
 production build, immutable Razer cutover, and post-cutover live proof are
 recorded below rather than inferred from an earlier revision.
 The fork history identifies the material additions: hardened Razer deployment
@@ -42,8 +42,8 @@ Ian Brain, remote clients, and the recent Hermes visual-loop work. These are Ian
 fork additions; they are not upstream OpenMaus behavior. The exact commit list
 is available with `git log upstream/main..HEAD`.
 
-Revision `e93e6a5c21b5d8f9d3f8cd913139ae84cb14d3de` is installed at
-`/opt/openmausbot/releases/e93e6a5c21b5d8f9d3f8cd913139ae84cb14d3de` with the
+Revision `750254b4a299c7c02d012d2881b7c75438909f68` is installed at
+`/opt/openmausbot/releases/750254b4a299c7c02d012d2881b7c75438909f68` with the
 previous release retained as rollback. The atomic `current` symlink, server,
 companion, and four Unix sockets were verified after cutover and a second
 restart. The immutable manifest contains 629 verified files. The complete gate
@@ -51,7 +51,7 @@ registered 2,958 Vitest cases (2,937 passed, 21 skipped), seven broker tests,
 and 148 Electron-node cases (147 passed, one Windows-only skip); typecheck,
 UI/server/companion builds, and packaged-server smoke also passed. The installed
 signed Mac app's `app.asar` SHA-256 is
-`14efbe4f1c79872ea6310fd1089a46b2cd499b5540e1a65f9a81f42a306a1807`.
+`ec16eb8fe0c266eb371b03735c00a8d6b55b2535f14666276b1de79418d70437`.
 The authenticated Mac app also proved requested/effective policy `always`
 survived restart. The deploy
 README separates server/provider/companion identities, gives Docker authority
@@ -88,10 +88,14 @@ returned `OPENMAUS-E93E6A5-VISUAL-7C41`. Independent inspection of the returned
 1280x900 PNG visibly confirmed the exact marker and fresh prompt; the bot became
 idle afterward. This is a fresh unknown-pixel visual acceptance proof. That run
 also exposed the wider random-origin persistence defect: onboarding reappeared
-and other localStorage state could reset. The follow-up change persists and
+and other localStorage state could reset. Revision `750254b` persists and
 exclusively reuses the app-owned loopback pair, fails closed on a squatter, and
-acquires the single-instance lock before binding. It remains source-tested
-until a fresh package/install/restart run proves it live.
+acquires the single-instance lock before binding. The signed package then
+live-reused ports 59176/59177 through two full process restarts, retained the
+submitted onboarding gate and prior visual transcript, restored Hermes Qwen's
+exact opaque selection ID, and rejected a deliberate second launch without
+creating another tunnel. A fresh installed-app round trip returned
+`STABLE-ORIGIN-750254B-OK` through `http://127.0.0.1:59176/`.
 
 ## Parity matrix
 
