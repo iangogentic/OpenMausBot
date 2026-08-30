@@ -1232,7 +1232,12 @@ const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
     signal.throwIfAborted();
     if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn is stale");
     const context = COMPUTER_OPERATOR_CONTEXTS.get(`${parent.botId}\0${parent.threadId}\0${String(parent.generation)}`);
-    if (!context || context.operatorModel.instanceId !== COMPUTER_SUBAGENT_MANAGER.get(handle.childId)?.operatorModel?.instanceId) {
+    const leasedModel = COMPUTER_SUBAGENT_MANAGER.get(handle.childId)?.operatorModel;
+    if (
+      !context ||
+      context.operatorModel.instanceId !== leasedModel?.instanceId ||
+      context.operatorModel.model !== leasedModel.model
+    ) {
       throw new Error("computer operator target authority is unavailable");
     }
     const currentTarget = localVmTargetForBot(parent.botId);
