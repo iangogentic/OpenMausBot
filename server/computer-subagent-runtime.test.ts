@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import type { ComputerChildMonitor } from "../shared/computer-child-monitor.ts";
 import { ComputerSubagentManager, type ComputerSubagentParent } from "./computer-subagent-manager.ts";
 import {
   ComputerSubagentRuntime,
@@ -73,6 +74,7 @@ function harness(overrides: {
   isParentCurrent?: (parent: ComputerSubagentParent) => boolean | Promise<boolean>;
   quarantineChild?: () => void | Promise<void>;
   captureFinalScreenshot?: (signal: AbortSignal) => Promise<ComputerSubagentFinalScreenshot>;
+  acquireTarget?: (childId: string) => Promise<ComputerSubagentCapabilityDescriptor>;
 } = {}) {
   const manager = new ComputerSubagentManager();
   const launched: ComputerSubagentProviderLaunchInput[] = [];
@@ -82,6 +84,7 @@ function harness(overrides: {
   const acquired: string[] = [];
   const released: string[] = [];
   const events: string[] = [];
+  const monitors: ComputerChildMonitor[] = [];
   const runtime = new ComputerSubagentRuntime({
     manager,
     provider: {
@@ -94,6 +97,7 @@ function harness(overrides: {
     },
     acquireTarget: async (handle) => {
       acquired.push(handle.childId);
+      if (overrides.acquireTarget) return overrides.acquireTarget(handle.childId);
       return { ...target, opaqueCapability: { childId: handle.childId, nonce: acquired.length } };
     },
     releaseTarget: async (childId) => { released.push(childId); },
@@ -111,8 +115,9 @@ function harness(overrides: {
         childId: completion.childId,
       });
     },
+    onMonitorChange: (monitor) => { monitors.push(monitor); },
   });
-  return { manager, launched, children, completions, screenshots, acquired, released, events, runtime };
+  return { manager, launched, children, completions, screenshots, acquired, released, events, monitors, runtime };
 }
 
 async function waitForChild(children: FakeChild[], index = 0): Promise<FakeChild> {
@@ -128,6 +133,112 @@ async function settle(child: FakeChild, outcome: ComputerSubagentProviderOutcome
 }
 
 describe("ComputerSubagentRuntime", () => {
+  it("publishes authority-free snapshots for queued, running, human handoff, terminal, and release", async () => {
+    const h = harness();
+    const monitorParent = { ...parent, generation: "secret-parent-fence" };
+    const handle = h.runtime.start({
+      parent: monitorParent,
+      target,
+      operatorModel: { instanceId: "secret-provider-instance", model: "secret-provider-model" },
+      prompt: "secret tool argument",
+      childId: "child-monitor",
+    });
+    await waitForChild(h.children);
+    expect(h.monitors.map((monitor) => [monitor.status, monitor.leaseHeld])).toEqual([
+      ["queued", true],
+      ["running", true],
+    ]);
+
+    const waiting = await h.runtime.markWaitingOnHuman(handle, monitorParent);
+    expect(waiting).toMatchObject({ status: "waiting-on-human", leaseHeld: true });
+    expect(() => h.runtime.accountActions(handle)).toThrow("not accepting computer actions");
+    const resumed = await h.runtime.resumeAfterHuman(handle, monitorParent);
+    expect(resumed).toMatchObject({ status: "running", leaseHeld: true });
+    expect(h.runtime.accountActions(handle)).toBe(1);
+
+    await settle(h.children[0]!, { status: "completed", output: "private provider output" });
+    await handle.done;
+    expect(h.monitors.map((monitor) => [monitor.status, monitor.leaseHeld])).toEqual([
+      ["queued", true],
+      ["running", true],
+      ["waiting-on-human", true],
+      ["running", true],
+      ["completed", true],
+      ["completed", false],
+    ]);
+    const projection = JSON.stringify(h.monitors);
+    expect(projection).not.toContain("secret-provider-instance");
+    expect(projection).not.toContain("secret-provider-model");
+    expect(projection).not.toContain("secret tool argument");
+    expect(projection).not.toContain("private provider output");
+    expect(projection).not.toContain("opaque-capability");
+    expect(projection).not.toContain("secret-parent-fence");
+    expect(projection).not.toContain(target.targetKey);
+    expect(projection).not.toContain(target.targetGeneration);
+    expect(Object.keys(h.monitors.at(-1)!).sort()).toEqual([
+      "actionCount",
+      "actionLimit",
+      "childId",
+      "createdAt",
+      "finishedAt",
+      "leaseHeld",
+      "parent",
+      "status",
+    ]);
+  });
+
+  it("fences human handoff wrappers by owner token and exact current parent", async () => {
+    let parentIsCurrent = true;
+    const h = harness({ isParentCurrent: () => parentIsCurrent });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-human-fence",
+    });
+    await waitForChild(h.children);
+    const before = h.monitors.length;
+    await expect(h.runtime.markWaitingOnHuman(
+      { ...handle, ownerToken: "wrong-owner" },
+      parent,
+    )).rejects.toThrow("owner is stale or invalid");
+    await expect(h.runtime.markWaitingOnHuman(handle, { ...parent, turnId: "wrong-turn" }))
+      .rejects.toThrow("owner is stale or invalid");
+    parentIsCurrent = false;
+    await expect(h.runtime.markWaitingOnHuman(handle, parent)).rejects.toThrow("owner is stale or invalid");
+    expect(h.monitors).toHaveLength(before);
+    expect(h.manager.get(handle.childId)?.status).toBe("running");
+    parentIsCurrent = true;
+    await h.runtime.markWaitingOnHuman(handle, parent);
+    await expect(h.runtime.resumeAfterHuman(handle, { ...parent, generation: 2 }))
+      .rejects.toThrow("owner is stale or invalid");
+    expect(h.manager.get(handle.childId)?.status).toBe("waiting-on-human");
+    await h.runtime.resumeAfterHuman(handle, parent);
+    await settle(h.children[0]!, { status: "completed" });
+    await handle.done;
+  });
+
+  it("keeps actions paused when human control begins during target acquisition", async () => {
+    const acquisition = deferred<ComputerSubagentCapabilityDescriptor>();
+    const h = harness({ acquireTarget: () => acquisition.promise });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-pause-during-acquire",
+    });
+    await h.runtime.markWaitingOnHuman(handle, parent);
+    acquisition.resolve(target);
+    await waitForChild(h.children);
+    expect(() => h.runtime.accountActions(handle)).toThrow("not accepting computer actions");
+    await h.runtime.resumeAfterHuman(handle, parent);
+    expect(h.runtime.accountActions(handle)).toBe(1);
+    await settle(h.children[0]!, { status: "completed" });
+    await handle.done;
+  });
+
   it("launches the exact Qwen operator model with the opaque selected target", async () => {
     const h = harness();
     const handle = h.runtime.start({

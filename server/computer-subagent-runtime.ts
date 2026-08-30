@@ -1,6 +1,7 @@
 import type { ComputerSubagentHandle, ComputerSubagentManager, ComputerSubagentParent, ComputerSubagentRecord } from "./computer-subagent-manager.ts";
-import { COMPUTER_SUBAGENT_TERMINAL_STATUSES, ComputerSubagentOwnershipError, ComputerSubagentStateError } from "./computer-subagent-manager.ts";
+import { COMPUTER_SUBAGENT_TERMINAL_STATUSES, MAX_COMPUTER_SUBAGENT_ACTIONS, ComputerSubagentOwnershipError, ComputerSubagentStateError } from "./computer-subagent-manager.ts";
 import type { ModelSelection } from "./contracts.ts";
+import type { ComputerChildMonitor, ComputerChildMonitorListener } from "../shared/computer-child-monitor.ts";
 
 export const MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES = 512_000;
 export const DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS = 30_000;
@@ -58,6 +59,9 @@ export interface ComputerSubagentRuntimeOptions {
    * launch, interrupt, or cleanup promise is wedged. */
   quarantineChild: (childId: string, parent: ComputerSubagentParent) => void | Promise<void>;
   onComplete: (completion: ComputerSubagentCompletion) => void | Promise<void>;
+  /** Receives authority-free snapshots after each runtime lifecycle change.
+   * Listener failures are isolated from the child runtime. */
+  onMonitorChange?: ComputerChildMonitorListener;
   operationTimeoutMs?: number;
   abortGraceMs?: number;
   cleanupTimeoutMs?: number;
@@ -117,6 +121,7 @@ export class ComputerSubagentRuntime {
   private readonly isParentCurrent: ComputerSubagentRuntimeOptions["isParentCurrent"];
   private readonly quarantineChild: ComputerSubagentRuntimeOptions["quarantineChild"];
   private readonly onComplete: ComputerSubagentRuntimeOptions["onComplete"];
+  private readonly onMonitorChange?: ComputerChildMonitorListener;
   private readonly operationTimeoutMs: number;
   private readonly abortGraceMs: number;
   private readonly cleanupTimeoutMs: number;
@@ -126,6 +131,7 @@ export class ComputerSubagentRuntime {
     this.manager = options.manager; this.provider = options.provider; this.acquireTarget = options.acquireTarget;
     this.releaseTarget = options.releaseTarget; this.captureFinalScreenshot = options.captureFinalScreenshot;
     this.isParentCurrent = options.isParentCurrent; this.quarantineChild = options.quarantineChild; this.onComplete = options.onComplete;
+    this.onMonitorChange = options.onMonitorChange;
     this.operationTimeoutMs = this.validTimeout(options.operationTimeoutMs ?? DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS, "operationTimeoutMs");
     this.abortGraceMs = this.validTimeout(options.abortGraceMs ?? DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS, "abortGraceMs");
     this.cleanupTimeoutMs = this.validTimeout(options.cleanupTimeoutMs ?? DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS, "cleanupTimeoutMs");
@@ -137,6 +143,22 @@ export class ComputerSubagentRuntime {
     const execution = this.execution(handle);
     if (!execution.acceptingActions) throw new ComputerSubagentStateError(handle.childId, "is not accepting computer actions");
     return this.manager.consumeActions(handle, amount);
+  }
+  /** Pause the exact owned child while its current parent turn remains live. */
+  async markWaitingOnHuman(handle: ComputerSubagentHandle, parent: ComputerSubagentParent): Promise<ComputerChildMonitor> {
+    const execution = await this.currentOwnedExecution(handle, parent);
+    this.requireHumanHandoffMutable(execution);
+    const record = this.manager.markWaitingOnHuman(execution.handle);
+    execution.acceptingActions = false;
+    return this.publishMonitor(record);
+  }
+  /** Resume the exact owned child after human control returns to the agent. */
+  async resumeAfterHuman(handle: ComputerSubagentHandle, parent: ComputerSubagentParent): Promise<ComputerChildMonitor> {
+    const execution = await this.currentOwnedExecution(handle, parent);
+    this.requireHumanHandoffMutable(execution);
+    const record = this.manager.markRunningAfterHuman(execution.handle);
+    execution.acceptingActions = execution.child !== null && !execution.terminalized && !execution.abortRequested;
+    return this.publishMonitor(record);
   }
   async abort(handle: ComputerSubagentHandle): Promise<ComputerSubagentCompletion | null> {
     const execution = this.execution(handle);
@@ -181,12 +203,13 @@ export class ComputerSubagentRuntime {
       abortRequested: false, steering: false, acceptingActions: false, terminalized: false, released: false, steerPromise: null,
       abortController: new AbortController(), targetReleased: false, targetReleasePromise: null,
     };
-    execution.settled = this.run(execution);
     this.executions.set(execution.handle.childId, execution);
+    this.publishMonitor(created.record);
+    execution.settled = this.run(execution);
     return { ...execution.handle, done: chain.done.promise };
   }
   private async run(execution: Execution): Promise<ComputerSubagentCompletion | null> {
-    this.manager.markRunning(execution.handle);
+    this.publishMonitor(this.manager.markRunning(execution.handle));
     const acquirePromise = Promise.resolve().then(() => this.acquireTarget(
       execution.handle,
       cloneParent(execution.input.parent),
@@ -233,7 +256,7 @@ export class ComputerSubagentRuntime {
         : { status: "unknown", error: "provider child cleanup could not be proven after interruption" }, contained);
     }
 
-    execution.acceptingActions = true;
+    execution.acceptingActions = this.manager.get(execution.handle.childId)?.status === "running";
     const outcomeResult = await this.racePhase(execution, launched.value.completion, 0);
     execution.acceptingActions = false;
     if (!outcomeResult.ok) {
@@ -381,6 +404,8 @@ export class ComputerSubagentRuntime {
     try {
       this.manager.release(execution.handle);
       execution.released = true;
+      const released = this.manager.get(execution.handle.childId);
+      if (released) this.publishMonitor(released);
       this.executions.delete(execution.handle.childId);
     } catch { /* stale owner stays fail-closed */ }
   }
@@ -469,9 +494,11 @@ export class ComputerSubagentRuntime {
       : status === "failed" ? this.manager.fail(execution.handle, error ?? "provider failed")
         : status === "aborted" ? this.manager.abort(execution.handle, error ?? "aborted")
           : this.manager.markUnknown(execution.handle, error ?? "unknown provider result");
+    this.publishMonitor(record);
     if (cleanupProven && capabilityReleased) {
       this.manager.release(execution.handle); execution.released = true;
       record = this.manager.get(execution.handle.childId) ?? record;
+      this.publishMonitor(record);
       this.executions.delete(execution.handle.childId);
     }
     const completion: ComputerSubagentCompletion = { childId: execution.handle.childId, parent: cloneParent(execution.input.parent), status, record, finalScreenshotCaptured: finalScreenshot !== undefined };
@@ -499,6 +526,43 @@ export class ComputerSubagentRuntime {
     const execution = this.executions.get(handle.childId);
     if (!execution || execution.handle.ownerToken !== handle.ownerToken) throw new ComputerSubagentOwnershipError(handle.childId);
     return execution;
+  }
+  private async currentOwnedExecution(handle: ComputerSubagentHandle, parent: ComputerSubagentParent): Promise<Execution> {
+    let execution = this.execution(handle);
+    if (!this.sameParent(execution.input.parent, parent)) throw new ComputerSubagentOwnershipError(handle.childId);
+    if (!(await this.parentCurrent(parent))) throw new ComputerSubagentOwnershipError(handle.childId);
+    // Recheck ownership and the exact parent after the asynchronous current
+    // generation fence so a terminal/replacement race cannot be resumed.
+    execution = this.execution(handle);
+    if (!this.sameParent(execution.input.parent, parent)) throw new ComputerSubagentOwnershipError(handle.childId);
+    return execution;
+  }
+  private sameParent(a: ComputerSubagentParent, b: ComputerSubagentParent): boolean {
+    return a.botId === b.botId && a.threadId === b.threadId && a.turnId === b.turnId && a.generation === b.generation;
+  }
+  private requireHumanHandoffMutable(execution: Execution): void {
+    if (execution.abortRequested || execution.steering || execution.terminalized) {
+      throw new ComputerSubagentStateError(execution.handle.childId, "cannot change human handoff while stopping");
+    }
+  }
+  private publishMonitor(record: ComputerSubagentRecord): ComputerChildMonitor {
+    const parent = Object.freeze({
+      botId: record.parent.botId,
+      threadId: record.parent.threadId,
+      turnId: record.parent.turnId,
+    });
+    const monitor: ComputerChildMonitor = Object.freeze({
+      childId: record.childId,
+      parent,
+      status: record.status,
+      actionCount: record.actionCount,
+      actionLimit: MAX_COMPUTER_SUBAGENT_ACTIONS,
+      leaseHeld: record.leaseHeld,
+      createdAt: record.createdAt,
+      ...(record.finishedAt === undefined ? {} : { finishedAt: record.finishedAt }),
+    });
+    try { this.onMonitorChange?.(monitor); } catch { /* observation cannot break execution */ }
+    return monitor;
   }
   private validTimeout(value: number, label: string): number {
     if (!Number.isSafeInteger(value) || value < 1 || value > 300_000) throw new TypeError(`${label} must be a positive bounded safe integer`);
