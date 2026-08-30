@@ -142,7 +142,10 @@ export class ComputerSubagentRuntime {
   accountActions(handle: ComputerSubagentHandle, amount = 1): number {
     const execution = this.execution(handle);
     if (!execution.acceptingActions) throw new ComputerSubagentStateError(handle.childId, "is not accepting computer actions");
-    return this.manager.consumeActions(handle, amount);
+    const count = this.manager.consumeActions(handle, amount);
+    const record = this.manager.get(handle.childId);
+    if (record) this.publishMonitor(record);
+    return count;
   }
   /** Pause the exact owned child while its current parent turn remains live. */
   async markWaitingOnHuman(handle: ComputerSubagentHandle, parent: ComputerSubagentParent): Promise<ComputerChildMonitor> {

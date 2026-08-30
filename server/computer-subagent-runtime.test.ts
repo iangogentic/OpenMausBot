@@ -163,6 +163,7 @@ describe("ComputerSubagentRuntime", () => {
       ["running", true],
       ["waiting-on-human", true],
       ["running", true],
+      ["running", true],
       ["completed", true],
       ["completed", false],
     ]);
@@ -282,6 +283,7 @@ describe("ComputerSubagentRuntime", () => {
     await waitForChild(h.children);
     expect(h.launched[0]).not.toHaveProperty("onActions");
     expect(h.runtime.accountActions(handle, 9)).toBe(9);
+    expect(h.monitors.at(-1)).toMatchObject({ status: "running", actionCount: 9, actionLimit: 9 });
     expect(() => h.runtime.accountActions(handle)).toThrow("action budget exceeded");
     expect(h.manager.get(handle.childId)?.actionCount).toBe(9);
     await settle(h.children[0]!, { status: "completed" });
