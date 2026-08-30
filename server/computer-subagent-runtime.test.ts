@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ComputerSubagentManager, type ComputerSubagentParent } from "./computer-subagent-manager.ts";
 import {
   ComputerSubagentRuntime,
   type ComputerSubagentCapabilityDescriptor,
+  type ComputerSubagentFinalScreenshot,
   type ComputerSubagentProviderChild,
   type ComputerSubagentProviderLaunchInput,
   type ComputerSubagentProviderOutcome,
@@ -25,8 +26,8 @@ const target: ComputerSubagentCapabilityDescriptor = {
 
 const screenshot = {
   mimeType: "image/jpeg" as const,
-  dataBase64: Buffer.from("pixels").toString("base64"),
-  byteLength: Buffer.byteLength("pixels"),
+  dataBase64: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9]).toString("base64"),
+  byteLength: 8,
   width: 2,
   height: 2,
   sha256: "pixel-sha",
@@ -68,7 +69,11 @@ function fakeChild(): FakeChild {
   return child;
 }
 
-function harness() {
+function harness(overrides: {
+  isParentCurrent?: (parent: ComputerSubagentParent) => boolean | Promise<boolean>;
+  quarantineChild?: () => void | Promise<void>;
+  captureFinalScreenshot?: () => Promise<ComputerSubagentFinalScreenshot>;
+} = {}) {
   const manager = new ComputerSubagentManager();
   const launched: ComputerSubagentProviderLaunchInput[] = [];
   const children: FakeChild[] = [];
@@ -87,12 +92,17 @@ function harness() {
         return child;
       },
     },
-    acquireTarget: async (childId) => {
-      acquired.push(childId);
-      return { ...target, opaqueCapability: { childId, nonce: acquired.length } };
+    acquireTarget: async (handle) => {
+      acquired.push(handle.childId);
+      return { ...target, opaqueCapability: { childId: handle.childId, nonce: acquired.length } };
     },
     releaseTarget: async (childId) => { released.push(childId); },
-    captureFinalScreenshot: async ({ childId }) => { screenshots.push(childId); events.push("screenshot"); return screenshot; },
+    captureFinalScreenshot: async ({ childId }) => { screenshots.push(childId); events.push("screenshot"); return overrides.captureFinalScreenshot ? overrides.captureFinalScreenshot() : screenshot; },
+    isParentCurrent: overrides.isParentCurrent ?? (() => true),
+    quarantineChild: overrides.quarantineChild ?? (async () => undefined),
+    operationTimeoutMs: 500,
+    abortGraceMs: 5,
+    cleanupTimeoutMs: 50,
     onComplete: (completion) => {
       events.push("complete");
       completions.push({
@@ -103,6 +113,11 @@ function harness() {
     },
   });
   return { manager, launched, children, completions, screenshots, acquired, released, events, runtime };
+}
+
+async function waitForChild(children: FakeChild[], index = 0): Promise<FakeChild> {
+  await vi.waitFor(() => expect(children.length).toBeGreaterThan(index));
+  return children[index]!;
 }
 
 async function settle(child: FakeChild, outcome: ComputerSubagentProviderOutcome): Promise<void> {
@@ -122,7 +137,7 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "Click the save button",
       childId: "child-qwen",
     });
-    await Promise.resolve();
+    await waitForChild(h.children);
     expect(h.launched[0]).toMatchObject({
       childId: "child-qwen",
       parent,
@@ -150,10 +165,7 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "work",
       childId: "child-budget",
     });
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await waitForChild(h.children);
     expect(h.launched[0]).not.toHaveProperty("onActions");
     expect(h.runtime.accountActions(handle, 9)).toBe(9);
     expect(() => h.runtime.accountActions(handle)).toThrow("action budget exceeded");
@@ -171,17 +183,16 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "work",
       childId: "child-abort",
     });
-    await Promise.resolve();
+    await waitForChild(h.children);
     const abort = h.runtime.abort(handle);
-    await Promise.resolve();
-    expect(h.children[0]!.interrupted).toBe(true);
+    await vi.waitFor(() => expect(h.children[0]!.interrupted).toBe(true));
     expect(h.manager.get(handle.childId)?.leaseHeld).toBe(true);
     let finished = false;
     void abort.then(() => { finished = true; });
-    await Promise.resolve();
+    await waitForChild(h.children);
     expect(finished).toBe(false);
     h.children[0]!.completionControl.resolve({ status: "aborted", reason: "stop" });
-    await Promise.resolve();
+    await waitForChild(h.children);
     expect(h.manager.get(handle.childId)?.leaseHeld).toBe(true);
     h.children[0]!.cleanupControl.resolve();
     const completion = await abort;
@@ -193,41 +204,41 @@ describe("ComputerSubagentRuntime", () => {
   it("interrupts a child that arrives after abort during pending provider launch", async () => {
     const manager = new ComputerSubagentManager();
     const launchControl = deferred<ComputerSubagentProviderChild>();
+    const launchStarted = deferred<void>();
     const child = fakeChild();
     const releases: string[] = [];
     const callbacks: string[] = [];
     const runtime = new ComputerSubagentRuntime({
       manager,
-      provider: { launch: async () => launchControl.promise },
-      acquireTarget: async (childId) => ({ ...target, opaqueCapability: { childId } }),
+      provider: { launch: async () => { launchStarted.resolve(); return launchControl.promise; } },
+      acquireTarget: async (handle) => ({ ...target, opaqueCapability: { childId: handle.childId } }),
       releaseTarget: async (childId) => { releases.push(childId); },
       captureFinalScreenshot: async () => screenshot,
+      isParentCurrent: () => true,
+      quarantineChild: async () => undefined,
       onComplete: ({ childId }) => { callbacks.push(childId); },
+      operationTimeoutMs: 500,
+      abortGraceMs: 5,
+      cleanupTimeoutMs: 50,
     });
     const handle = runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "child-pending-launch" });
-    await Promise.resolve();
+    await launchStarted.promise;
     const abortPromise = runtime.abort(handle);
-    let abortSettled = false;
-    void abortPromise.then(() => { abortSettled = true; });
-    await Promise.resolve();
-    expect(abortSettled).toBe(false);
-    launchControl.resolve(child);
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(child.interrupted).toBe(true);
-    expect(manager.get(handle.childId)?.leaseHeld).toBe(true);
-    child.completionControl.resolve({ status: "aborted", reason: "interrupted" });
-    await Promise.resolve();
-    expect(abortSettled).toBe(false);
-    child.cleanupControl.resolve();
-    expect((await abortPromise)?.status).toBe("aborted");
+    const boundedAbort = await abortPromise;
+    expect(boundedAbort?.status).toBe("aborted");
     expect(releases).toEqual(["child-pending-launch"]);
+    expect(callbacks).toEqual(["child-pending-launch"]);
+    launchControl.resolve(child);
+    await vi.waitFor(() => expect(child.interrupted).toBe(true));
+    child.completionControl.resolve({ status: "aborted", reason: "interrupted" });
+    child.cleanupControl.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(callbacks).toEqual(["child-pending-launch"]);
     expect(manager.get(handle.childId)?.leaseHeld).toBe(false);
   });
 
   it("keeps an unknown lease when cleanup cannot be proven, until explicitly recovered", async () => {
-    const h = harness();
+    const h = harness({ quarantineChild: async () => { throw new Error("quarantine unavailable"); } });
     const handle = h.runtime.start({
       parent,
       target,
@@ -235,7 +246,7 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "work",
       childId: "child-unknown",
     });
-    await Promise.resolve();
+    await waitForChild(h.children);
     h.children[0]!.completionControl.resolve({ status: "aborted", reason: "stop" });
     h.children[0]!.cleanupControl.reject("transport lost");
     const completion = await handle.done;
@@ -254,9 +265,9 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "first",
       childId: "child-first",
     });
-    await Promise.resolve();
+    await waitForChild(h.children);
     const successorPromise = h.runtime.steer(first, "retry with keyboard");
-    await Promise.resolve();
+    await vi.waitFor(() => expect(h.children[0]!.interrupted).toBe(true));
     expect(h.launched).toHaveLength(1);
     expect(h.children[0]!.interrupted).toBe(true);
     h.children[0]!.completionControl.resolve({ status: "aborted", reason: "steer" });
@@ -264,7 +275,7 @@ describe("ComputerSubagentRuntime", () => {
     expect(h.launched).toHaveLength(1);
     h.children[0]!.cleanupControl.resolve();
     const successor = await successorPromise;
-    await Promise.resolve();
+    await waitForChild(h.children, 1);
     expect(h.launched).toHaveLength(2);
     expect(h.launched[1]!.prompt).toBe("retry with keyboard");
     expect(h.launched[1]!.childId).not.toBe(first.childId);
@@ -279,14 +290,14 @@ describe("ComputerSubagentRuntime", () => {
   it("keeps one logical steer done and one final callback across an adversarial predecessor race", async () => {
     const h = harness();
     const first = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "first", childId: "chain-first" });
-    await Promise.resolve();
+    await waitForChild(h.children);
     const successorPromise = h.runtime.steer(first, "second");
     // Completion wins the race with interrupt, but remains an internal
     // predecessor result and cannot revive the parent.
     h.children[0]!.completionControl.resolve({ status: "completed", output: "predecessor" });
     h.children[0]!.cleanupControl.resolve();
     const successor = await successorPromise;
-    await Promise.resolve();
+    await waitForChild(h.children, 1);
     expect(h.completions).toEqual([]);
     let logicalDone = false;
     void first.done.then(() => { logicalDone = true; });
@@ -302,9 +313,9 @@ describe("ComputerSubagentRuntime", () => {
   });
 
   it("fails closed and does not launch a steer successor when predecessor cleanup is unknown", async () => {
-    const h = harness();
+    const h = harness({ quarantineChild: async () => { throw new Error("quarantine unavailable"); } });
     const first = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "first", childId: "unknown-first" });
-    await Promise.resolve();
+    await waitForChild(h.children);
     const successorPromise = h.runtime.steer(first, "must not launch");
     h.children[0]!.completionControl.resolve({ status: "aborted", reason: "steer" });
     h.children[0]!.cleanupControl.reject("cleanup transport lost");
@@ -326,10 +337,11 @@ describe("ComputerSubagentRuntime", () => {
       acquireTarget: async () => ({ ...target, opaqueCapability: "fresh" }),
       releaseTarget: async () => { throw new Error("revocation unavailable"); },
       captureFinalScreenshot: async () => screenshot,
+      isParentCurrent: () => true,
+      quarantineChild: async () => undefined,
       onComplete: ({ status }) => { callbacks.push(status); },
     });
     const handle = runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "release-unknown" });
-    await Promise.resolve();
     child.completionControl.resolve({ status: "completed" });
     child.cleanupControl.resolve();
     const completion = await handle.done;
@@ -347,7 +359,7 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "old",
       childId: "child-old",
     });
-    await Promise.resolve();
+    await waitForChild(h.children);
     // Simulate parent cancellation/fencing performed by the owner before a
     // late provider event arrives. The runtime must not revive this child.
     h.manager.abort(old, "parent generation cancelled");
@@ -359,7 +371,7 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "new",
       childId: "child-new",
     });
-    await Promise.resolve();
+    await waitForChild(h.children, 1);
     h.children[0]!.completionControl.resolve({ status: "completed", output: "stale" });
     h.children[0]!.cleanupControl.resolve();
     await old.done;
@@ -378,9 +390,155 @@ describe("ComputerSubagentRuntime", () => {
       prompt: "once",
       childId: "child-once",
     });
-    await Promise.resolve();
+    await waitForChild(h.children);
     await settle(h.children[0]!, { status: "completed" });
     await handle.done;
     expect(h.completions).toHaveLength(1);
+  });
+
+  it("bounds abort during target acquisition and releases a capability that arrives late", async () => {
+    const manager = new ComputerSubagentManager();
+    const acquireControl = deferred<ComputerSubagentCapabilityDescriptor>();
+    const acquireStarted = deferred<AbortSignal>();
+    const providerLaunch = vi.fn();
+    const released: string[] = [];
+    const callbacks: string[] = [];
+    const quarantined: string[] = [];
+    const runtime = new ComputerSubagentRuntime({
+      manager,
+      provider: { launch: providerLaunch },
+      acquireTarget: async (_handle, _parent, signal) => {
+        acquireStarted.resolve(signal);
+        return acquireControl.promise;
+      },
+      releaseTarget: async (childId) => { released.push(childId); },
+      captureFinalScreenshot: async () => screenshot,
+      isParentCurrent: () => true,
+      quarantineChild: async (childId) => { quarantined.push(childId); },
+      onComplete: ({ childId }) => { callbacks.push(childId); },
+      operationTimeoutMs: 500,
+      abortGraceMs: 5,
+      cleanupTimeoutMs: 25,
+    });
+    const handle = runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "late-acquire" });
+    const signal = await acquireStarted.promise;
+    const completion = await runtime.abort(handle);
+    expect(signal.aborted).toBe(true);
+    expect(completion?.status).toBe("aborted");
+    expect(quarantined).toEqual(["late-acquire"]);
+    expect(providerLaunch).not.toHaveBeenCalled();
+    expect(manager.get(handle.childId)?.leaseHeld).toBe(false);
+
+    acquireControl.resolve({ ...target, opaqueCapability: "late" });
+    await vi.waitFor(() => expect(released).toEqual(["late-acquire"]));
+    expect(providerLaunch).not.toHaveBeenCalled();
+    expect(callbacks).toEqual(["late-acquire"]);
+  });
+
+  it("returns bounded unknown when launch and quarantine wedge, then cleans a late child without publishing it", async () => {
+    const manager = new ComputerSubagentManager();
+    const launchControl = deferred<ComputerSubagentProviderChild>();
+    const launchStarted = deferred<AbortSignal>();
+    const child = fakeChild();
+    child.interrupt = async () => { child.interrupted = true; child.cleanupControl.resolve(); };
+    const releaseTarget = vi.fn(async () => undefined);
+    const callbacks: string[] = [];
+    const runtime = new ComputerSubagentRuntime({
+      manager,
+      provider: { launch: async (input) => { launchStarted.resolve(input.signal); return launchControl.promise; } },
+      acquireTarget: async () => ({ ...target, opaqueCapability: "launch-cap" }),
+      releaseTarget,
+      captureFinalScreenshot: async () => screenshot,
+      isParentCurrent: () => true,
+      quarantineChild: async () => new Promise<void>(() => {}),
+      onComplete: ({ childId }) => { callbacks.push(childId); },
+      operationTimeoutMs: 500,
+      abortGraceMs: 5,
+      cleanupTimeoutMs: 20,
+    });
+    const handle = runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "late-launch" });
+    const signal = await launchStarted.promise;
+    const completion = await runtime.abort(handle);
+    expect(signal.aborted).toBe(true);
+    expect(completion?.status).toBe("unknown");
+    expect(manager.get(handle.childId)).toMatchObject({ status: "unknown", leaseHeld: true });
+    expect(callbacks).toEqual(["late-launch"]);
+
+    launchControl.resolve(child);
+    await vi.waitFor(() => expect(child.interrupted).toBe(true));
+    await vi.waitFor(() => expect(manager.get(handle.childId)?.leaseHeld).toBe(false));
+    expect(releaseTarget).toHaveBeenCalledOnce();
+    expect(callbacks).toEqual(["late-launch"]);
+  });
+
+  it("fences a stale parent before provider launch", async () => {
+    const current = vi.fn(() => false);
+    const h = harness({ isParentCurrent: current });
+    const handle = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "stale-before-launch" });
+    const completion = await handle.done;
+    expect(completion?.status).toBe("aborted");
+    expect(h.launched).toEqual([]);
+    expect(h.screenshots).toEqual([]);
+    expect(h.completions).toEqual([]);
+    expect(h.released).toEqual(["stale-before-launch"]);
+  });
+
+  it("rechecks the parent before final screenshot and suppresses stale publication", async () => {
+    const current = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    const h = harness({ isParentCurrent: current });
+    const handle = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "stale-before-screen" });
+    await waitForChild(h.children);
+    await settle(h.children[0]!, { status: "completed", output: "must-not-publish" });
+    const completion = await handle.done;
+    expect(completion).toMatchObject({ status: "aborted", finalScreenshotCaptured: false });
+    expect(h.screenshots).toEqual([]);
+    expect(h.completions).toEqual([]);
+  });
+
+  it("rechecks the parent immediately before callback publication", async () => {
+    const current = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    const h = harness({ isParentCurrent: current });
+    const handle = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "stale-before-callback" });
+    await waitForChild(h.children);
+    await settle(h.children[0]!, { status: "completed", output: "internal-only" });
+    const completion = await handle.done;
+    expect(completion).toMatchObject({ status: "completed", finalScreenshotCaptured: true });
+    expect(h.screenshots).toEqual(["stale-before-callback"]);
+    expect(h.completions).toEqual([]);
+  });
+
+  it("fences a steer successor when its parent becomes stale", async () => {
+    const current = vi.fn()
+      .mockReturnValueOnce(true)
+      .mockReturnValue(false);
+    const h = harness({ isParentCurrent: current });
+    const first = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "first", childId: "stale-steer" });
+    await waitForChild(h.children);
+    const successor = h.runtime.steer(first, "second");
+    await vi.waitFor(() => expect(h.children[0]!.interrupted).toBe(true));
+    h.children[0]!.cleanupControl.resolve();
+    await expect(successor).rejects.toThrow("parent generation is stale");
+    expect(h.launched).toHaveLength(1);
+    expect(h.completions).toEqual([]);
+  });
+
+  it("rejects spoofed screenshot bytes even when MIME and declared length look valid", async () => {
+    const spoof = {
+      ...screenshot,
+      dataBase64: Buffer.from("not-a-jpeg").toString("base64"),
+      byteLength: Buffer.byteLength("not-a-jpeg"),
+    };
+    const h = harness({ captureFinalScreenshot: async () => spoof });
+    const handle = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "spoofed-screen" });
+    await waitForChild(h.children);
+    await settle(h.children[0]!, { status: "completed" });
+    const completion = await handle.done;
+    expect(completion).toMatchObject({ status: "failed", finalScreenshotCaptured: false });
+    expect(completion?.error).toContain("magic bytes");
   });
 });
