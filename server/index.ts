@@ -206,7 +206,7 @@ import {
 } from "./computer-subagent-runtime.ts";
 import { createComputerOperatorProviderRuntime } from "./computer-operator-provider.ts";
 import { ComputerOperatorRequestError, executeComputerOperatorRequest } from "./computer-operator-surface.ts";
-import { reserveComputerOperator } from "./computer-operator-active.ts";
+import { consumeComputerOperatorTurn, reserveComputerOperator } from "./computer-operator-active.ts";
 import { imageDimensions } from "./image-dimensions.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
@@ -1167,6 +1167,7 @@ type ComputerOperatorTargetCapability = ComputerOperatorTargetCapabilityBase & (
 interface ComputerOperatorTurnContextBase {
   readonly turn: InternalCapabilityTurn;
   readonly operatorModel: ModelSelection;
+  delegated: boolean;
 }
 type ComputerOperatorTurnContext = ComputerOperatorTurnContextBase & ({
   readonly kind: "local-vm";
@@ -1834,6 +1835,7 @@ function computerOperatorIntegration(
     runtime,
     vmGeneration,
     operatorModel,
+    delegated: false,
   });
   return {
     command: process.execPath,
@@ -1865,6 +1867,7 @@ function physicalComputerOperatorIntegration(
     executorGeneration: registration.executorGeneration,
     platform: registration.platform,
     operatorModel,
+    delegated: false,
   });
   return {
     command: process.execPath,
@@ -4762,9 +4765,9 @@ async function startTurn(
         system:
           persona +
           (computerKind === "vm-operator"
-            ? " You have a dedicated visual computer operator for this bot's isolated Linux desktop. Delegate each concrete desktop task with delegate_computer and wait for its verified text plus final screenshot before deciding the next step. You do not have direct computer tools. Give the operator one clear outcome at a time, include relevant visible context, and judge success only from the returned final screen. At passwords, MFA, CAPTCHAs, purchases, destructive actions, or protected input, stop and ask the user."
+            ? " You have a dedicated visual computer operator for this bot's isolated Linux desktop. Call delegate_computer exactly once for the user's complete concrete visual outcome and wait for its verified text plus final screenshot. You do not have direct computer tools. After the operator returns, answer the user directly from that result; never delegate a second time or perform memory bookkeeping in the same turn. Include relevant visible context and judge success only from the returned final screen. At passwords, MFA, CAPTCHAs, purchases, destructive actions, or protected input, stop and ask the user."
             : computerKind === "local-operator"
-            ? " You have a dedicated visual computer operator for the user's explicitly approved physical Mac or Windows computer. Delegate each concrete desktop task with delegate_computer and wait for its verified text plus a fresh final screenshot before deciding the next step. You do not have direct computer tools. Give the operator one clear outcome at a time and never delegate passwords, MFA, CAPTCHAs, purchases, destructive actions, or other protected input."
+            ? " You have a dedicated visual computer operator for the user's explicitly approved physical Mac or Windows computer. Call delegate_computer exactly once for the user's complete concrete visual outcome and wait for its verified text plus a fresh final screenshot. You do not have direct computer tools. After the operator returns, answer the user directly from that result; never delegate a second time or perform memory bookkeeping in the same turn. Never delegate passwords, MFA, CAPTCHAs, purchases, destructive actions, or other protected input."
             : computerKind === "vm"
             ? localVmMode(cfg) === "per-bot"
               ? " You have your own isolated Cua sandbox: a Linux desktop in a container reserved for this bot. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. If multiple windows match, use their bounds and stacking order to select the newly opened or topmost requested window, click inside that exact window, and verify focus before typing. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged. A tool error does not prove its requested effect happened, and you must not claim success unless the resulting pixels visibly prove the requested postcondition. Use computer_batch for up to nine predictable click/type/key/scroll steps that do not need intermediate inspection; it returns one final screen and never truncates an oversized batch. On Linux, every batched keyboard action aimed at a known window must repeat that window's pid and window_id with delivery_mode set to foreground; use the canonical key name enter rather than Return."
@@ -4787,7 +4790,9 @@ async function startTurn(
           (coordinationPrompt ? ` ${coordinationPrompt}` : "") +
           credentialPrompt +
           sectionContextSystemPrompt(bot.section) +
-          (privateWorkspace ? memorySystemPrompt(bot.id) + skillsSystemPrompt(bot.id) : "") +
+          (privateWorkspace && instance.driverKind !== "hermesAgent"
+            ? memorySystemPrompt(bot.id) + skillsSystemPrompt(bot.id)
+            : "") +
           skillInstructions +
           packagePlaybooks +
           (opts?.automationSource === "webhook"
@@ -6528,6 +6533,7 @@ const server = createServer(async (req, res) => {
               if (!parent || !isComputerOperatorParentCurrent(parent)) {
                 throw new Error("the computer operator parent runtime turn is unavailable");
               }
+              consumeComputerOperatorTurn(context);
               const parentKey = computerOperatorParentKey(parent);
               const active = reserveComputerOperator(ACTIVE_COMPUTER_OPERATORS, parentKey, () => {
                 const handle = COMPUTER_SUBAGENT_RUNTIME.start({

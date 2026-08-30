@@ -86,6 +86,7 @@ describe("computer operator MCP proxy", () => {
     expect(initialized.result.serverInfo.name).toContain("computer-operator");
     const listed = await rpc("tools/list");
     expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(["delegate_computer"]);
+    expect(listed.result.tools[0].description).toMatch(/at most once per parent turn/i);
 
     const call = rpc("tools/call", { name: "delegate_computer", arguments: { task: "open Terminal" } });
     for (let attempt = 0; attempt < 50 && !releaseResponse; attempt += 1) {

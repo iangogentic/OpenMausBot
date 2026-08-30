@@ -19,7 +19,7 @@ const OUTPUT_MAX_PENDING_BYTES = 2 * 1024 * 1024;
 const TOOL = {
   name: "delegate_computer",
   description:
-    "Delegate visual computer work to the dedicated computer operator and wait for it to finish. Give it the complete concrete task and expected visible result. It returns the operator's bounded report and final verified screen. Do not call direct computer tools while this call is running.",
+    "Delegate one complete visual outcome to the dedicated computer operator and wait for it to finish. This tool may be called at most once per parent turn. Give it the complete concrete task and expected visible result. It returns the operator's bounded report and final verified screen; after it returns, answer the user directly and do not delegate again.",
   inputSchema: {
     type: "object",
     properties: {

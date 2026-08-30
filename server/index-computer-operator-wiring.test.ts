@@ -66,6 +66,12 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("reserveComputerOperator(ACTIVE_COMPUTER_OPERATORS, parentKey, () => {");
   });
 
+  it("allows one delegated outcome per parent turn and removes contradictory Hermes memory instructions", () => {
+    expect(source).toContain("consumeComputerOperatorTurn(context)");
+    expect(source).toContain("Call delegate_computer exactly once");
+    expect(source).toContain('privateWorkspace && instance.driverKind !== "hermesAgent"');
+  });
+
   it("retires every deterministic hidden operator home with its bot", () => {
     expect(source).toContain("const operatorTargets = [perBotLocalVmTarget(botId).key, SHARED_LOCAL_VM_TARGET.key, \"physical:host\"]");
     expect(source).toContain("retireProviderOwnerState(`computer-operator:${botId}:${targetKey}`)");
