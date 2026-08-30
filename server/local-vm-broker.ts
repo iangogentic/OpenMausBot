@@ -622,8 +622,28 @@ export function attachLocalVmMcpBroker(options: {
         const actionId = pendingActions.get(id);
         if (actionId) {
           const toolName = pendingActionTools.get(id) ?? "";
+          const ordinaryResult = frame?.result;
+          const ordinaryDriverError = "error" in (frame ?? {});
+          const ordinaryResultValid = !ordinaryDriverError && (
+            ordinaryResult !== null && typeof ordinaryResult === "object" && !Array.isArray(ordinaryResult)
+          );
+          if (ordinaryDriverError || !ordinaryResultValid) {
+            responseLine = JSON.stringify({
+              jsonrpc: "2.0",
+              id: frame?.id,
+              result: {
+                content: [{
+                  type: "text",
+                  text: ordinaryDriverError
+                    ? `FAILED: ${toolName || "computer action"} reported a driver error; its postcondition is unproven.`
+                    : `FAILED: ${toolName || "computer action"} returned a malformed driver result; its postcondition is unproven.`,
+                }],
+                isError: true,
+              },
+            });
+          }
           if (
-            !("error" in (frame ?? {})) &&
+            ordinaryResultValid &&
             LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName) &&
             options.captureAfterAction
           ) {

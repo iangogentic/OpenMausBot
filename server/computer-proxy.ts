@@ -278,7 +278,7 @@ function captureBlock(settleMs = SETTLE_MS, crop: CropRegion | null = null): str
     'raw=/tmp/ogb-shot.png',
     `rm -f "$f" 2>/dev/null || true`,
     `rm -f "$raw" 2>/dev/null || true`,
-    `if [ -x ${REMOTE_CUA_EXECUTABLE} ] && ${REMOTE_CUA_EXECUTABLE} status --socket ${REMOTE_CUA_SOCKET} >/dev/null 2>&1 && env ${CUA_ENV} ${REMOTE_CUA_EXECUTABLE} call get_desktop_state ${shellQuote(JSON.stringify({ scope: "desktop", session: REMOTE_CUA_SESSION }))} --socket ${REMOTE_CUA_SOCKET} --screenshot-out-file "$raw" >/dev/null 2>&1 && command -v convert >/dev/null 2>&1 && convert "$raw" -quality ${JPEG_QUALITY} "$f" 2>/dev/null; then echo "CAPTURE CUA"; else scrot -o -q ${JPEG_QUALITY} "$f" 2>/dev/null || import -window root -quality ${JPEG_QUALITY} "$f" 2>/dev/null || ffmpeg -y -f x11grab -i "$DISPLAY" -frames:v 1 -q:v 6 "$f" >/dev/null 2>&1; echo "CAPTURE X11"; fi`,
+    `CUA_CAPTURED=0; if [ -x ${REMOTE_CUA_EXECUTABLE} ] && ${REMOTE_CUA_EXECUTABLE} status --socket ${REMOTE_CUA_SOCKET} >/dev/null 2>&1 && env ${CUA_ENV} ${REMOTE_CUA_EXECUTABLE} call get_desktop_state ${shellQuote(JSON.stringify({ scope: "desktop", session: REMOTE_CUA_SESSION }))} --socket ${REMOTE_CUA_SOCKET} --screenshot-out-file "$raw" >/dev/null 2>&1 && [ -s "$raw" ]; then raw_bytes=$(stat -c%s "$raw" 2>/dev/null || echo 0); if [ "$raw_bytes" -gt 0 ] && [ "$raw_bytes" -le ${INLINE_MAX_BYTES} ]; then cp "$raw" "$f" && CUA_CAPTURED=1; elif command -v convert >/dev/null 2>&1 && convert "$raw" -quality ${JPEG_QUALITY} "$f" 2>/dev/null; then CUA_CAPTURED=1; elif command -v ffmpeg >/dev/null 2>&1 && ffmpeg -loglevel error -y -i "$raw" -frames:v 1 -q:v 6 "$f"; then CUA_CAPTURED=1; fi; fi; if [ "$CUA_CAPTURED" -eq 1 ]; then echo "CAPTURE CUA"; else scrot -o -q ${JPEG_QUALITY} "$f" 2>/dev/null || import -window root -quality ${JPEG_QUALITY} "$f" 2>/dev/null || ffmpeg -y -f x11grab -i "$DISPLAY" -frames:v 1 -q:v 6 "$f" >/dev/null 2>&1; echo "CAPTURE X11"; fi`,
     // only re-encode when the display is bigger than the model's space —
     // ImageMagick startup is the most expensive step in the old pipeline
     downscale,
@@ -315,6 +315,12 @@ function wholeImage(bytes: Buffer, expectedBytes?: number): boolean {
     return tail.includes(Buffer.from("IEND", "ascii"));
   }
   return false;
+}
+
+function imageMime(bytes: Buffer): "image/jpeg" | "image/png" | null {
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  return null;
 }
 
 /** Big frames (and any inline read that came back malformed) are fetched
@@ -426,14 +432,16 @@ async function frameFrom(out: RunOut): Promise<Frame | null> {
   if (geometry?.height) lastDisplayGeometry = geometry;
   if (inline && inlineWorks) {
     const bytes = Buffer.from(inline, "base64");
-    if (wholeImage(bytes, size || undefined)) return { data: inline, mime: "image/jpeg", hash, geometry };
+    const mime = imageMime(bytes);
+    if (mime && wholeImage(bytes, size || undefined)) return { data: inline, mime, hash, geometry };
     // stdout mangled it (the failure this channel is known for) — never
     // hand a partial frame to the model; fetch it and stop trusting stdout
     inlineWorks = false;
   }
   const fetched = await fetchFrame(size || undefined);
   if (!fetched) return null;
-  return { data: fetched, mime: "image/jpeg", hash, geometry };
+  const mime = imageMime(Buffer.from(fetched, "base64"));
+  return mime ? { data: fetched, mime, hash, geometry } : null;
 }
 
 const MAX_IN_FLIGHT_REQUESTS = 4;
@@ -698,12 +706,14 @@ const TOOLS = [
   {
     name: "computer_batch",
     description:
-      "Run several UI actions in ONE go and return the screen at the end — much faster than separate calls (one round trip, one screenshot). Use it for mechanical sequences you can predict without looking in between, e.g. click a field, type, Tab, type, press Return. Stop the batch before anything whose outcome you need to see first.",
+      "Run at most nine UI actions in ONE go and return the screen at the end. A click in this same batch must establish the exact visible focus before any keyboard action. Stop before anything whose outcome you need to inspect.",
     inputSchema: {
       type: "object",
       properties: {
         actions: {
           type: "array",
+          minItems: 1,
+          maxItems: 9,
           description: "in order; each is {action: click|type_text|press_key|scroll|wait, ...its params}",
           items: {
             type: "object",
@@ -720,6 +730,7 @@ const TOOLS = [
               ms: { type: "number", description: "wait: milliseconds, max 5000" },
             },
             required: ["action"],
+            additionalProperties: false,
           },
         },
         ...OBSERVE_PROPS,
@@ -897,7 +908,7 @@ async function semanticActAndObserve(
       : `clicked ${ref} (trusted Chrome DevTools input)`
     : `${action} ${ref} failed: ${out.stderr.slice(0, 200) || "the page changed; take a new browser_snapshot"}`;
   if (!observe) return text(id, note, !acted);
-  return observed(id, note, await frameFrom(out));
+  return observed(id, note, await frameFrom(out), null, true, !acted);
 }
 
 /** The only tools a bot may use while the person is driving: asking to be
@@ -1122,8 +1133,16 @@ async function callWithPermit(id: unknown, name: string, args: any) {
     return actAndObserve(id, [{ action: "scroll", direction, clicks }], `scrolled ${direction} ${clicks}`, args);
   }
   if (name === "computer_batch") {
-    const actions = Array.isArray(args.actions) ? args.actions.slice(0, 24) : [];
+    const actions = Array.isArray(args.actions) ? args.actions : [];
     if (!actions.length) return text(id, "computer_batch needs a non-empty actions array", true);
+    if (actions.length > 9) return text(id, "computer_batch allows at most 9 actions; none were run", true);
+    let focusEstablished = false;
+    for (const action of actions) {
+      if (action?.action === "click") focusEstablished = true;
+      if ((action?.action === "type_text" || action?.action === "press_key") && !focusEstablished) {
+        return text(id, "computer_batch keyboard actions require an earlier exact click in the same batch; none were run", true);
+      }
+    }
     const summary = actions
       .map((a: any) =>
         a.action === "click"
@@ -1146,7 +1165,7 @@ async function callWithPermit(id: unknown, name: string, args: any) {
     const note = `exit ${out.exitCode}\n${out.stdout.slice(-6000)}${out.stderr ? `\n[stderr]\n${out.stderr.slice(-2000)}` : ""}`;
     if (args.observe !== true) return text(id, note);
     const shot = await runOnBox([ENV, GEOMETRY, ensureRemoteCuaCommand(), captureBlock()].join("; "), 60_000);
-    return observed(id, note, await frameFrom(shot));
+    return observed(id, note, await frameFrom(shot), null, true, out.exitCode !== 0);
   }
   if (name === "open_url") {
     const url = String(args.url ?? "");
@@ -1173,8 +1192,8 @@ async function callWithPermit(id: unknown, name: string, args: any) {
     const note = verification.ok
       ? `opened and navigation verified: ${publicUrl}`
       : `opened ${publicUrl}, but the exact destination was not verified. Current structured state: ${current}`;
-    if (!observe) return text(id, note);
-    return observed(id, note, await frameFrom(out));
+    if (!observe) return text(id, note, !verification.ok);
+    return observed(id, note, await frameFrom(out), null, true, !verification.ok);
   }
   return text(id, `unknown tool ${name}`, true);
 }

@@ -26,6 +26,11 @@ const JPEG = Buffer.concat([
   Buffer.alloc(700, 0x20),
   Buffer.from([0xff, 0xd9]),
 ]).toString("base64");
+const PNG = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.alloc(700, 0x20),
+  Buffer.from("IEND", "ascii"),
+]).toString("base64");
 
 describe("computer proxy (fake box)", () => {
   let box: Server;
@@ -40,6 +45,9 @@ describe("computer proxy (fake box)", () => {
   let captureFails = false;
   let actionFails = false;
   let fileReadFails = false;
+  let semanticFails = false;
+  let execFails = false;
+  let frameData = JPEG;
 
   const rpc = (msg: unknown) => proxy.stdin!.write(JSON.stringify(msg) + "\n");
   const results = new Map<number, any>();
@@ -65,7 +73,7 @@ describe("computer proxy (fake box)", () => {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify(fileReadFails
               ? { ok: false, status: 500, error: "capture unavailable" }
-              : { ok: true, status: 200, data: JPEG }));
+              : { ok: true, status: 200, data: frameData }));
             return;
           }
           if (parsed.op !== "command") {
@@ -76,7 +84,7 @@ describe("computer proxy (fake box)", () => {
           const command = parsed.command ?? "";
           commands.push(command);
           // a real box echoes what the capture block printed
-          const size = Buffer.from(JPEG, "base64").length;
+          const size = Buffer.from(frameData, "base64").length;
           const stdout = command.includes("127.0.0.1:9222/json/list")
             ? JSON.stringify([
                 { id: "page-1", type: "page", title: " Example ", url: browserUrl },
@@ -91,16 +99,16 @@ describe("computer proxy (fake box)", () => {
                   ],
                 })
               : command.includes("openmausbot-cdp.mjs click") || command.includes("openmausbot-cdp.mjs fill")
-                ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${JPEG}\nSEM ok\n`
+                ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${frameData}\nSEM ${semanticFails ? "failed" : "ok"}\n`
             : cropFails && /convert "\$f" -crop/.test(command)
               ? `GEOM 1920 1080\nHASH ${hash}\nCROP_FAILED\n`
               : captureFails && /GEOM/.test(command)
                 ? `GEOM 1920 1080\nACT ${actionFails ? "failed" : "ok"}\n`
               : /GEOM/.test(command)
-                ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${JPEG}\nACT ${actionFails ? "failed" : "ok"}\n`
+                ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${frameData}\nACT ${actionFails ? "failed" : "ok"}\n`
                 : "ACT ok\n";
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: true, status: 200, exitCode: 0, stdout, stderr: "" }));
+          res.end(JSON.stringify({ ok: true, status: 200, exitCode: execFails ? 7 : 0, stdout, stderr: execFails ? "command failed" : "" }));
         });
         return;
       }
@@ -292,6 +300,30 @@ describe("computer proxy (fake box)", () => {
     expect(res.result.content[1]).toMatchObject({ type: "image" });
   });
 
+  it("rejects oversized or unfocused keyboard batches atomically", async () => {
+    const before = commands.length;
+    rpc({ jsonrpc: "2.0", id: 63, method: "tools/call", params: { name: "computer_batch", arguments: { actions: Array.from({ length: 10 }, () => ({ action: "click", x: 1, y: 1 })) } } });
+    expect((await waitFor(63)).result.isError).toBe(true);
+    rpc({ jsonrpc: "2.0", id: 64, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ action: "type_text", text: "wrong focus" }] } } });
+    expect((await waitFor(64)).result.isError).toBe(true);
+    expect(commands.length).toBe(before);
+  });
+
+  it("preserves a complete raw CUA PNG with the correct MIME without requiring ImageMagick", async () => {
+    const old = frameData;
+    frameData = PNG;
+    hash = "raw-png-frame";
+    try {
+      rpc({ jsonrpc: "2.0", id: 65, method: "tools/call", params: { name: "click", arguments: { x: 20, y: 30 } } });
+      const res = await waitFor(65);
+      expect(res.result.content[1]).toMatchObject({ type: "image", mimeType: "image/png", data: PNG });
+      expect(commands.at(-1)).toContain('cp "$raw" "$f"');
+      expect(commands.at(-1)).toContain("command -v ffmpeg");
+    } finally {
+      frameData = old;
+    }
+  });
+
   it("fails the protocol result when a batch cannot capture its proof frame", async () => {
     captureFails = true;
     fileReadFails = true;
@@ -300,7 +332,7 @@ describe("computer proxy (fake box)", () => {
         jsonrpc: "2.0",
         id: 61,
         method: "tools/call",
-        params: { name: "computer_batch", arguments: { actions: [{ action: "press_key", keys: "Tab" }] } },
+        params: { name: "computer_batch", arguments: { actions: [{ action: "click", x: 1, y: 1 }, { action: "press_key", keys: "Tab" }] } },
       });
       const res = await waitFor(61);
       expect(res.result.isError).toBe(true);
@@ -430,6 +462,45 @@ describe("computer proxy (fake box)", () => {
     rpc({ jsonrpc: "2.0", id: 91, method: "tools/call", params: { name: "observation_metrics", arguments: {} } });
     const metricsAfter = JSON.parse((await waitFor(91)).result.content[0].text);
     expect(metricsAfter.structuredBrowserObservations).toBe(metricsBefore.structuredBrowserObservations);
+  });
+
+  it("keeps failed semantic browser actions failed even when pixels are returned", async () => {
+    rpc({ jsonrpc: "2.0", id: 87, method: "tools/call", params: { name: "browser_snapshot", arguments: {} } });
+    await waitFor(87);
+    semanticFails = true;
+    hash = "semantic-failed-frame";
+    try {
+      rpc({ jsonrpc: "2.0", id: 88, method: "tools/call", params: { name: "browser_click", arguments: { ref: "b42" } } });
+      const failed = await waitFor(88);
+      expect(failed.result.isError).toBe(true);
+      expect(failed.result.content[0].text).toMatch(/^FAILED:/);
+      expect(failed.result.content[1]).toMatchObject({ type: "image" });
+    } finally {
+      semanticFails = false;
+    }
+  });
+
+  it("marks unverified navigation and observed shell failures as errors", async () => {
+    const previousUrl = browserUrl;
+    browserUrl = "https://example.com/different";
+    hash = "navigation-failed-frame";
+    try {
+      rpc({ jsonrpc: "2.0", id: 89, method: "tools/call", params: { name: "open_url", arguments: { url: "https://example.com/expected" } } });
+      const navigation = await waitFor(89);
+      expect(navigation.result.isError).toBe(true);
+      expect(navigation.result.content[0].text).toMatch(/^FAILED:/);
+
+      execFails = true;
+      hash = "exec-failed-frame";
+      rpc({ jsonrpc: "2.0", id: 891, method: "tools/call", params: { name: "computer_exec", arguments: { command: "exit 7", observe: true } } });
+      const executed = await waitFor(891);
+      expect(executed.result.isError).toBe(true);
+      expect(executed.result.content[0].text).toMatch(/^FAILED:/);
+      expect(executed.result.content[1]).toMatchObject({ type: "image" });
+    } finally {
+      browserUrl = previousUrl;
+      execFails = false;
+    }
   });
 
   it("rejects out-of-height crops and fails closed when conversion fails", async () => {

@@ -377,6 +377,31 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await handle.closed;
   });
 
+  it("fails closed on a malformed ordinary mutation result", async () => {
+    const socket = new FakeSocket();
+    const captureAfterAction = vi.fn();
+    const malformed = String.raw`
+      const readline = require("node:readline");
+      const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+      rl.on("line", (line) => { const frame = JSON.parse(line);
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: "unexpected private value" }) + "\n");
+      });
+    `;
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction,
+      spawnDriver: () => spawnResponder(malformed),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 114, method: "tools/call", params: { name: "click", arguments: { x: 1, y: 2 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 114)).toBe(true));
+    const response = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 114);
+    expect(response.result.isError).toBe(true);
+    expect(JSON.stringify(response)).toContain("malformed driver result");
+    expect(JSON.stringify(response)).not.toContain("unexpected private value");
+    expect(captureAfterAction).not.toHaveBeenCalled();
+    handle.close("ordinary malformed result complete");
+    await handle.closed;
+  });
+
   it("reports a missing final capture as an error after safely releasing the batch ticket", async () => {
     const socket = new FakeSocket();
     const endAction = vi.fn(() => true);
