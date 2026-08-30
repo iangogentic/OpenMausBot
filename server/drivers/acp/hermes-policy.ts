@@ -94,7 +94,8 @@ _PINNED_MCP = frozenset({
     "mcp_computer_double_click", "mcp_computer_right_click",
     "mcp_computer_drag", "mcp_computer_type_text",
     "mcp_computer_press_key", "mcp_computer_hotkey",
-    "mcp_computer_scroll", "mcp_computer_get_browser_state",
+    "mcp_computer_scroll", "mcp_computer_computer_batch",
+    "mcp_computer_get_browser_state",
     "mcp_computer_browser_prepare", "mcp_computer_browser_navigate",
     "mcp_computer_browser_click", "mcp_computer_browser_type",
     # High-frequency, read-oriented Ian Brain entry points.
@@ -124,6 +125,7 @@ _VISUAL_OBSERVATION_TOOLS = frozenset({
 })
 _MUTATING_COMPUTER_TOOLS = frozenset({
     "mcp_computer_bring_to_front", "mcp_computer_browser_click",
+    "mcp_computer_computer_batch",
     "mcp_computer_browser_dialog", "mcp_computer_browser_navigate",
     "mcp_computer_browser_set_input_files", "mcp_computer_browser_type",
     "mcp_computer_click", "mcp_computer_clipboard_write",
