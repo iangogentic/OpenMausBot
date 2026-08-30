@@ -39,6 +39,22 @@ describe("security-key relay frames", () => {
     expect(() => parseSecurityKeyControllerFrame({ ...base, controllerGeneration: -1 })).toThrow();
   });
 
+  it("rejects request fields that are not valid JSON objects", () => {
+    const base = {
+      type: "browser.request",
+      protocolVersion: SECURITY_KEY_RELAY_PROTOCOL_VERSION,
+      ceremonyId: id,
+      chromeRequestId: 12,
+      kind: "get",
+      botId: "bot_0123456789ab",
+      targetKey: "target_0123456789",
+      vmGeneration: 2,
+      browserGeneration: 3,
+    };
+    expect(() => parseSecurityKeyBrowserFrame({ ...base, requestDetailsJson: "not-json" })).toThrow();
+    expect(() => parseSecurityKeyBrowserFrame({ ...base, requestDetailsJson: "[]" })).toThrow();
+  });
+
   it("rejects oversized serialized frames before JSON parsing", () => {
     expect(() => parseSecurityKeyBrowserFrame("x".repeat(SECURITY_KEY_RELAY_MAX_FRAME_BYTES + 1))).toThrow(
       "invalid security-key relay frame size",

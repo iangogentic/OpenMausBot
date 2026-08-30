@@ -43,6 +43,7 @@ describe("security-key validation", () => {
     await expect(hashCanonicalRequestJson('{"z":1,"a":2}')).resolves.toBe(
       await hashCanonicalRequestJson('{ "a": 2, "z": 1 }'),
     );
+    expect(() => canonicalizeRequestJson("[]")).toThrow("request JSON must be an object");
   });
 
   it("normalizes only HTTPS origins and the explicit localhost HTTP exception", () => {

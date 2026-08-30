@@ -2,14 +2,16 @@
 // /api/search. Self-contained — owns its open state and its global chord,
 // so App.tsx only mounts it.
 import { useEffect, useRef, useState } from "react";
-import { Bot as BotIcon, MessageSquare, Search, Users } from "lucide-react";
+import { Bot as BotIcon, Command, MessageSquare, Search, Users } from "lucide-react";
 import { api, useStore, type Bot, type Group } from "@/state/store";
 import { rankByName } from "@/lib/palette-rank";
 import { cn } from "@/lib/cn";
 import type { SearchHit } from "@/lib/search-hit";
 import { landOnSearchHit } from "@/lib/focus-message";
+import { appCommands, matchingAppCommands, type AppCommand } from "@/lib/app-commands";
 
 type PaletteEntry =
+  | { kind: "command"; command: AppCommand }
   | { kind: "bot"; bot: Bot }
   | { kind: "room"; group: Group }
   | { kind: "message"; hit: SearchHit };
@@ -21,6 +23,8 @@ export function CommandPalette() {
   const [messageHits, setMessageHits] = useState<SearchHit[]>([]);
   const [cursor, setCursor] = useState(0);
   const selectedRef = useRef<HTMLButtonElement>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
+  const wasOpen = useRef(false);
 
   // The chord fires from anywhere — Shell's app-wide shortcuts (⌘N, ⌘1–9)
   // set the precedent of not guarding against focused inputs, and a
@@ -29,12 +33,25 @@ export function CommandPalette() {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k" && !e.shiftKey && !e.altKey) {
         e.preventDefault();
-        setOpen((o) => !o);
+        setOpen((o) => {
+          if (!o) previousFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+          return !o;
+        });
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  useEffect(() => {
+    if (wasOpen.current && !open) {
+      const target = previousFocus.current;
+      const frame = window.requestAnimationFrame(() => target?.isConnected && target.focus());
+      wasOpen.current = open;
+      return () => window.cancelAnimationFrame(frame);
+    }
+    wasOpen.current = open;
+  }, [open]);
 
   // fresh palette every open; stale queries from last time would flash
   useEffect(() => {
@@ -79,7 +96,9 @@ export function CommandPalette() {
 
   const bots = rankByName(state.bots.filter((b) => !b.hidden), q);
   const rooms = rankByName(state.groups, q);
+  const commands = matchingAppCommands(appCommands(state), q);
   const entries: PaletteEntry[] = [
+    ...commands.map((command): PaletteEntry => ({ kind: "command", command })),
     ...bots.map((bot): PaletteEntry => ({ kind: "bot", bot })),
     ...rooms.map((group): PaletteEntry => ({ kind: "room", group })),
     // message hits only make sense for a typed query; empty = switcher mode
@@ -89,7 +108,10 @@ export function CommandPalette() {
   const selected = entries.length ? Math.min(cursor, entries.length - 1) : 0;
 
   const activate = async (entry: PaletteEntry) => {
-    if (entry.kind === "message") {
+    if (entry.kind === "command") {
+      if (!entry.command.enabled) return;
+      dispatch(entry.command.action);
+    } else if (entry.kind === "message") {
       const hit = entry.hit;
       try {
         await landOnSearchHit(hit, state, dispatch);
@@ -122,14 +144,16 @@ export function CommandPalette() {
   };
 
   // flat cursor across sections; each row needs its absolute index
-  const roomOffset = bots.length;
-  const messageOffset = bots.length + rooms.length;
+  const botOffset = commands.length;
+  const roomOffset = botOffset + bots.length;
+  const messageOffset = roomOffset + rooms.length;
 
-  const row = (key: string, index: number, onPick: () => void, children: React.ReactNode, twoLine = false) => (
+  const row = (key: string, index: number, onPick: () => void, children: React.ReactNode, twoLine = false, disabled = false) => (
     <button
       key={key}
       ref={index === selected ? selectedRef : undefined}
       onClick={onPick}
+      aria-disabled={disabled || undefined}
       // mousemove, not mouseenter: rows shifting under a resting pointer
       // (hits arriving) must not steal the keyboard selection
       onMouseMove={() => setCursor(index)}
@@ -137,6 +161,7 @@ export function CommandPalette() {
         "flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left",
         twoLine && "flex-col items-stretch gap-0.5",
         index === selected ? "bg-raised" : "hover:bg-raised/50",
+        disabled && "cursor-not-allowed opacity-60",
       )}
     >
       {children}
@@ -161,7 +186,7 @@ export function CommandPalette() {
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search bots, channels, messages…"
+            placeholder="Search or run a command…"
             className="w-full bg-transparent text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
           />
           <kbd className="shrink-0 rounded-md border border-hairline/40 px-1.5 py-0.5 text-[11px] text-ink-secondary">
@@ -174,6 +199,27 @@ export function CommandPalette() {
               {q ? `Nothing matches “${query}”` : "Nothing to switch to yet"}
             </div>
           )}
+          {commands.length > 0 && (
+            <div className="px-3 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              Commands
+            </div>
+          )}
+          {commands.map((command, i) =>
+            row(
+              `command:${command.id}`,
+              i,
+              () => void activate({ kind: "command", command }),
+              <>
+                <Command size={16} className="shrink-0 text-ink-secondary" />
+                <span className={cn("truncate text-[14px]", command.enabled ? "text-ink" : "text-ink-secondary/60")}>{command.name}</span>
+                <span className="min-w-0 truncate text-[12.5px] text-ink-secondary">
+                  {command.enabled ? command.description : command.disabledReason}
+                </span>
+              </>,
+              false,
+              !command.enabled,
+            ),
+          )}
           {bots.length > 0 && (
             <div className="px-3 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
               Bots
@@ -182,7 +228,7 @@ export function CommandPalette() {
           {bots.map((bot, i) =>
             row(
               `bot:${bot.id}`,
-              i,
+              botOffset + i,
               () => void activate({ kind: "bot", bot }),
               <>
                 <BotIcon size={16} className="shrink-0 text-ink-secondary" />

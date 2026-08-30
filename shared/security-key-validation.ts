@@ -67,13 +67,15 @@ export function canonicalizeRequestJson(requestDetailsJson: string): string {
   if (new TextEncoder().encode(requestDetailsJson).byteLength > SECURITY_KEY_RELAY_MAX_REQUEST_JSON_BYTES) {
     throw new Error("request JSON exceeds byte limit");
   }
-  let value: JsonValue;
+  let decoded: unknown;
   try {
-    value = z.json().parse(JSON.parse(requestDetailsJson));
+    decoded = JSON.parse(requestDetailsJson);
   } catch {
     throw new Error("invalid request JSON");
   }
-  return canonicalJson(value);
+  const parsed = z.record(z.string(), z.json()).safeParse(decoded);
+  if (!parsed.success) throw new Error("request JSON must be an object");
+  return canonicalJson(parsed.data);
 }
 
 export async function hashCanonicalRequestJson(requestDetailsJson: string): Promise<string> {
