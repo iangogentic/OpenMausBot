@@ -72,6 +72,7 @@ describe("production computer operator wiring", () => {
     expect(source).toContain('privateWorkspace && instance.driverKind !== "hermesAgent"');
     expect(source).toContain('workspace && instance.driverKind !== "hermesAgent"');
     expect(source).toContain('includeRoot: Boolean(workspace) && instance.driverKind !== "hermesAgent"');
+    expect(source).toMatch(/includeRoot:\s*worksInWorkspace &&\s*instance\.driverKind !== "hermesAgent"/);
   });
 
   it("retires every deterministic hidden operator home with its bot", () => {

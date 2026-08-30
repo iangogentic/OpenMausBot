@@ -4396,7 +4396,10 @@ async function startTurn(
       const worksInWorkspace = instance.driverKind !== "grok" && instance.driverKind !== "boxAgent";
       const privateWorkspace = worksInWorkspace ? ensureWorkspace(bot.id) : undefined;
       const skillInstructions = renderSkillInstructions(selectedSkills, {
-        includeRoot: worksInWorkspace && opts?.runOn !== "cloud",
+        includeRoot:
+          worksInWorkspace &&
+          instance.driverKind !== "hermesAgent" &&
+          opts?.runOn !== "cloud",
       });
       const packagePlaybooks = installedPlaybookInstructions(text, bot.playbooks);
       // An explicit working folder wins for new tasks; otherwise they use
