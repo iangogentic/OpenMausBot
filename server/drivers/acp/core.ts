@@ -162,6 +162,10 @@ export interface AcpSupport {
   classifyError?(error: unknown): ProviderErrorCode | undefined;
   /** Compose the session/prompt text. Default prepends the persona. */
   buildPromptText?(turn: SendTurnInput): string;
+  /** Normalize the completed assistant item before it is persisted. This is
+   * provider-scoped by the support implementation; streaming deltas remain
+   * untouched so the adapter cannot silently rewrite another harness. */
+  normalizeAssistantText?(text: string, turn: SendTurnInput): string;
   /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
    * and session/select. Local inject writers live here so the child sees a
    * model it already knows. */
@@ -415,8 +419,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
 
         /** Emit buffered assistant text as its own item, then clear it. */
         const flushAssistantText = () => {
-          const text = state.text;
+          const raw = state.text;
           state.text = "";
+          const text = support.normalizeAssistantText?.(raw, cliTurn) ?? raw;
           if (!text.trim()) return;
           emit({ ...base(threadId, turnId), type: "item.completed", itemType: "assistant_text", text });
         };

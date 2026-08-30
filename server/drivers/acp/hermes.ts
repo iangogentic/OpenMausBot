@@ -185,6 +185,26 @@ export function hermesAcpModelId(modelId: string | null | undefined): string | n
  */
 export const HERMES_CONFIG_MODEL_ID = "hermes-default";
 
+/** Spark GLM occasionally returns the complete terminal answer twice in one
+ * response after a tool turn. Collapse only an exact whole-answer repeat,
+ * only for this injected host. Do not fuzzy-match or alter partial repeats. */
+export function normalizeHermesAssistantText(text: string, modelId: string | undefined): string {
+  if (decodeInjectId(modelId)?.host !== "spark_glm") return text;
+  const leading = text.match(/^\s*/u)?.[0] ?? "";
+  const trailing = text.match(/\s*$/u)?.[0] ?? "";
+  const body = text.slice(leading.length, text.length - trailing.length);
+  for (let separatorLength = 0; separatorLength <= 4; separatorLength += 1) {
+    const repeatedLength = body.length - separatorLength;
+    if (repeatedLength < 24 || repeatedLength % 2 !== 0) continue;
+    const unitLength = repeatedLength / 2;
+    const first = body.slice(0, unitLength);
+    const separator = body.slice(unitLength, unitLength + separatorLength);
+    const second = body.slice(unitLength + separatorLength);
+    if (separator.trim() === "" && first === second) return `${leading}${first}${trailing}`;
+  }
+  return text;
+}
+
 function nonEmptyDotenvValue(text: string, name: string): string | null {
   const match = new RegExp(`^[ \\t]*(?:export[ \\t]+)?${name}[ \\t]*=[ \\t]*([^\\r\\n]*)$`, "m").exec(text);
   if (!match) return null;
@@ -584,6 +604,7 @@ const support: AcpSupport = {
     );
   },
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
+  normalizeAssistantText: (text, turn) => normalizeHermesAssistantText(text, turn.model),
 };
 
 export const HermesAgentDriver = createAcpDriver(support);

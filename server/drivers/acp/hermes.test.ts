@@ -8,6 +8,7 @@ import { parse as parseYaml } from "yaml";
 import { removeTempDir } from "../../testing/cleanup.ts";
 import {
   HERMES_CONFIG_MODEL_ID,
+  normalizeHermesAssistantText,
   hermesAcpModelId,
   hermesConfiguredModel,
   isOfficialHermesLauncher,
@@ -23,6 +24,23 @@ import {
   sanitizeHermesDotenv,
   verifyHermesPolicyProof,
 } from "./hermes-policy.ts";
+
+describe("normalizeHermesAssistantText", () => {
+  const spark = "spark_glm::glm53-ablit-dflash2-k7-b4096-ms1-1m";
+
+  it("collapses one exact whole-answer repeat for Spark GLM", () => {
+    const answer = "GLM_POSTDEPLOY_OK — 1280x900 @1x; 22425 events.";
+    expect(normalizeHermesAssistantText(`\n\n${answer}${answer}`, spark)).toBe(`\n\n${answer}`);
+    expect(normalizeHermesAssistantText(`${answer}\n${answer}\n`, spark)).toBe(`${answer}\n`);
+  });
+
+  it("preserves partial repeats, short answers, and every other Hermes route", () => {
+    const answer = "The first paragraph.\nThe first paragraph is referenced again.";
+    expect(normalizeHermesAssistantText(answer, spark)).toBe(answer);
+    expect(normalizeHermesAssistantText("OKOK", spark)).toBe("OKOK");
+    expect(normalizeHermesAssistantText("answeranswer", "desktop2::qwen")).toBe("answeranswer");
+  });
+});
 
 describe("hermesConfiguredModel", () => {
   const dirs: string[] = [];
