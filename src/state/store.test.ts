@@ -9,6 +9,33 @@ import {
   type Bot,
   type Message,
 } from "./store";
+import type { ComputerChildMonitor } from "../../shared/computer-child-monitor";
+
+function childMonitor(index: number, status: ComputerChildMonitor["status"] = "completed"): ComputerChildMonitor {
+  return {
+    childId: `child-${index}`,
+    parent: { botId: "bot", threadId: "thread", turnId: "turn" },
+    status,
+    actionCount: 1,
+    actionLimit: 9,
+    leaseHeld: status === "running",
+    createdAt: index,
+  };
+}
+
+describe("computer child monitor fold", () => {
+  it("updates exact children and bounds terminal history without dropping active work", () => {
+    let state = initialState;
+    state = reducer(state, { type: "computerChild", monitor: childMonitor(-1, "running") });
+    for (let index = 0; index < 140; index += 1) {
+      state = reducer(state, { type: "computerChild", monitor: childMonitor(index) });
+    }
+    expect(Object.keys(state.computerChildren)).toHaveLength(128);
+    expect(state.computerChildren["child--1"]?.status).toBe("running");
+    expect(state.computerChildren["child-0"]).toBeUndefined();
+    expect(state.computerChildren["child-139"]?.status).toBe("completed");
+  });
+});
 
 describe("bot deletion confirmation", () => {
   it("explains the complete local deletion and fail-closed Box/VPS preflight", () => {

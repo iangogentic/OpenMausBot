@@ -406,6 +406,26 @@ export interface AppState {
 }
 
 const MAX_CONSUMED_QUEUE_IDS = 64;
+const MAX_COMPUTER_CHILD_MONITORS = 128;
+
+function upsertComputerChildMonitor(
+  current: Record<string, ComputerChildMonitor>,
+  monitor: ComputerChildMonitor,
+): Record<string, ComputerChildMonitor> {
+  const next = { ...current, [monitor.childId]: monitor };
+  const overflow = Object.keys(next).length - MAX_COMPUTER_CHILD_MONITORS;
+  if (overflow <= 0) return next;
+  const terminal = Object.values(next)
+    .filter((candidate) =>
+      candidate.status === "completed" || candidate.status === "failed" ||
+      candidate.status === "aborted" || candidate.status === "unknown"
+    )
+    .sort((a, b) => a.createdAt - b.createdAt);
+  for (let index = 0; index < overflow && index < terminal.length; index += 1) {
+    delete next[terminal[index]!.childId];
+  }
+  return next;
+}
 
 function rememberConsumedQueueId(consumed: Record<string, true>, queueId: string): Record<string, true> {
   const next = { ...consumed, [queueId]: true as const };
@@ -913,10 +933,7 @@ export function reducer(state: AppState, action: Action): AppState {
     case "computerChild":
       return {
         ...state,
-        computerChildren: {
-          ...state.computerChildren,
-          [action.monitor.childId]: action.monitor,
-        },
+        computerChildren: upsertComputerChildMonitor(state.computerChildren, action.monitor),
       };
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
