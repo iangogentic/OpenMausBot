@@ -258,6 +258,10 @@ def _install():
     original_register_mcp = HermesACPAgent._register_session_mcp_servers
 
     async def guarded_register_mcp(self, state, mcp_servers):
+        # Hermes set_session_model replaces state.agent wholesale. Retain only
+        # the ACP-provided descriptors on the state object so the exact same
+        # scoped servers can be registered on the replacement agent below.
+        state._openmaus_mcp_servers = list(mcp_servers or [])
         await original_register_mcp(self, state, mcp_servers)
         # Hermes may collapse the model-facing MCP catalog into its native
         # tool_search schema. Prove required servers against the authoritative
@@ -295,6 +299,27 @@ def _install():
                 )
 
     HermesACPAgent._register_session_mcp_servers = guarded_register_mcp
+
+    # Upstream Hermes 0.17 creates the ACP session (and registers its MCPs)
+    # before OpenMaus applies session/set_model. The model switch constructs a
+    # new AIAgent and drops the session-mounted computer/agents tool surface.
+    # Re-register the nonce-scoped descriptors immediately after that switch;
+    # guarded_register_mcp re-runs both the catalog filter and required-server
+    # assertions before the prompt can be sent.
+    original_set_session_model = getattr(HermesACPAgent, "set_session_model", None)
+    if callable(original_set_session_model):
+        async def guarded_set_session_model(self, model_id, session_id, **kwargs):
+            before = self.session_manager.get_session(session_id)
+            servers = list(getattr(before, "_openmaus_mcp_servers", []) or []) if before else []
+            result = await original_set_session_model(
+                self, model_id=model_id, session_id=session_id, **kwargs
+            )
+            after = self.session_manager.get_session(session_id)
+            if after is not None and servers:
+                await self._register_session_mcp_servers(after, servers)
+            return result
+
+        HermesACPAgent.set_session_model = guarded_set_session_model
 
     proof = os.environ.get("OPENMAUSBOT_HERMES_POLICY_PROOF", "")
     nonce = os.environ.get("OPENMAUSBOT_HERMES_POLICY_NONCE", "")
