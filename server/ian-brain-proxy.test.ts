@@ -121,4 +121,20 @@ describe("Ian Brain stdio bridge", () => {
     expect(code).toBeGreaterThanOrEqual(0);
     expect(output).not.toContain("outside the private harness boundary");
   });
+
+  it("reports a bounded rejection category without echoing the broker body", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "forbidden: loopback host required", secret: "must-not-echo" }));
+    });
+    const port = await listen(server);
+    const child = childFor(`http://127.0.0.1:${port}/api/internal/ian-brain/mcp`);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 7, method: "initialize", params: {} })}\n`);
+    const response = await line(child);
+    child.stdin.end();
+    await once(child, "exit");
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    expect(response).toMatchObject({ id: 7, error: { message: expect.stringContaining("loopback Host rejected") } });
+    expect(JSON.stringify(response)).not.toContain("must-not-echo");
+  });
 });

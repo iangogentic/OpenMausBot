@@ -147,8 +147,21 @@ async function relay(message: Json): Promise<Json | null> {
     const nextSession = response.headers.get("mcp-session-id");
     if (nextSession) upstreamSessionId = nextSession;
     if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      throw new Error(`Ian Brain broker returned HTTP ${response.status}`);
+      const body = await readBoundedResponseText(
+        response,
+        8 * 1024,
+        "Ian Brain broker rejection exceeded 8 KB",
+      ).catch(() => "");
+      const category = body.includes("loopback host required")
+        ? "loopback Host rejected"
+        : body.includes("cross-origin request")
+          ? "origin rejected"
+          : body.includes("invalid_token") || body.includes("Invalid or expired token")
+            ? "upstream bearer rejected"
+            : body.includes("scoped Ian Brain turn")
+              ? "turn scope rejected"
+              : "request rejected";
+      throw new Error(`Ian Brain broker returned HTTP ${response.status} (${category})`);
     }
     return parseUpstream(response, message.id);
   } finally {
