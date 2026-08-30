@@ -7,7 +7,7 @@ const encode = (value: string) => new TextEncoder().encode(value);
 function workbook(sheetXml: string, extras: Record<string, string> = {}): ArrayBuffer {
   const zipped = zipSync({
     "xl/workbook.xml": encode('<?xml version="1.0"?><workbook xmlns:r="rel"><sheets><sheet name="Bounds" r:id="rId1"/></sheets></workbook>'),
-    "xl/_rels/workbook.xml.rels": encode('<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>'),
+    "xl/_rels/workbook.xml.rels": encode('<?xml version="1.0"?><Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'),
     "xl/worksheets/sheet1.xml": encode(sheetXml),
     ...Object.fromEntries(Object.entries(extras).map(([name, value]) => [name, encode(value)])),
   });
@@ -38,9 +38,23 @@ describe("parseWorkbookPreview", () => {
   it("rejects external relationships and prohibited XML declarations", () => {
     const external = zipSync({
       "xl/workbook.xml": encode("<workbook><sheets/></workbook>"),
-      "xl/_rels/workbook.xml.rels": encode('<Relationships><Relationship Id="x" Target="https://attacker.invalid" TargetMode="External"/></Relationships>'),
+      "xl/_rels/workbook.xml.rels": encode('<Relationships><Relationship Id="x" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="https://attacker.invalid" TargetMode="External"/></Relationships>'),
     });
     expect(() => parseWorkbookPreview(external.buffer.slice(external.byteOffset, external.byteOffset + external.byteLength) as ArrayBuffer)).toThrow(/External/);
     expect(() => parseWorkbookPreview(workbook('<!DOCTYPE x [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><worksheet/>'))).toThrow(/prohibited/);
+  });
+
+  it("requires exact worksheet relationship types and rejects duplicate IDs, paths, and unsafe targets", () => {
+    const build = (relationships: string) => {
+      const archive = zipSync({
+        "xl/workbook.xml": encode('<workbook xmlns:r="rel"><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>'),
+        "xl/_rels/workbook.xml.rels": encode(`<Relationships>${relationships}</Relationships>`),
+        "xl/worksheets/sheet1.xml": encode("<worksheet><sheetData/></worksheet>"),
+      });
+      return archive.buffer.slice(archive.byteOffset, archive.byteOffset + archive.byteLength) as ArrayBuffer;
+    };
+    expect(() => parseWorkbookPreview(build('<Relationship Id="rId1" Type="http://attacker.invalid/worksheet" Target="worksheets/sheet1.xml"/>'))).toThrow(/invalid worksheet relationship/);
+    expect(() => parseWorkbookPreview(build('<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>'))).toThrow(/duplicate relationship IDs/);
+    expect(() => parseWorkbookPreview(build('<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="../secret.xml"/>'))).toThrow(/unsafe relationship target/);
   });
 });

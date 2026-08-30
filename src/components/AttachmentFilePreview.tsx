@@ -1,15 +1,43 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronLeft, ChevronRight, Download, File, FileSpreadsheet, LoaderCircle, Minus, Plus, X } from "lucide-react";
 
 import { downloadAttachment, validatePdf, validateXlsxArchive, type DownloadedAttachment } from "@/lib/attachment-documents";
 import type { TranscriptFileAttachment } from "@/lib/composer-attachments";
 
-type WorkbookPreview = { sheets: Array<{ name: string; rows: string[][]; truncated: boolean }>; truncated: boolean };
+type WorkbookPreview = { sheets: Array<{ name: string; rows: string[][]; rowNumbers?: number[]; truncated: boolean }>; truncated: boolean };
 type PreviewWorker = Pick<Worker, "postMessage" | "terminate" | "onmessage" | "onerror">;
 const PDF_MAX_IMAGE_PIXELS = 16_000_000;
 const PDF_MAX_CANVAS_BYTES = 64 * 1024 * 1024;
 const PDF_MAX_PAGE_PIXELS = 16_000_000;
+const PDF_MAX_PAGES = 2_000;
+const PDF_LOAD_TIMEOUT_MS = 15_000;
+const PDF_PAGE_TIMEOUT_MS = 10_000;
+const PDF_MAX_ACCESSIBLE_TEXT_CHARS = 20_000;
+const SPREADSHEET_VISIBLE_ROW_STEP = 100;
+
+export function withPreviewDeadline<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = globalThis.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { onTimeout(); } catch {}
+      reject(new Error(message));
+    }, timeoutMs);
+    promise.then((value) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      resolve(value);
+    }, (reason) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      reject(reason);
+    });
+  });
+}
 
 function saveBytes(file: DownloadedAttachment) {
   const copied = new Uint8Array(file.bytes.byteLength);
@@ -27,6 +55,7 @@ function PdfPages({ file }: { file: DownloadedAttachment }) {
   const [document, setDocument] = useState<import("pdfjs-dist").PDFDocumentProxy | null>(null);
   const [page, setPage] = useState(1);
   const [zoom, setZoom] = useState(1);
+  const [pageText, setPageText] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -47,7 +76,11 @@ function PdfPages({ file }: { file: DownloadedAttachment }) {
           maxImageSize: PDF_MAX_IMAGE_PIXELS,
           canvasMaxAreaInBytes: PDF_MAX_CANVAS_BYTES,
         });
-        loaded = await task.promise;
+        loaded = await withPreviewDeadline(task.promise, PDF_LOAD_TIMEOUT_MS, () => { void task?.destroy(); }, "PDF preview timed out while opening.");
+        if (!Number.isSafeInteger(loaded.numPages) || loaded.numPages < 1 || loaded.numPages > PDF_MAX_PAGES) {
+          await loaded.destroy();
+          throw new Error(`This PDF has more than ${PDF_MAX_PAGES.toLocaleString()} pages and cannot be previewed safely.`);
+        }
         if (alive) setDocument(loaded);
       } catch (reason) {
         if (alive) setError(reason instanceof Error ? reason.message : "PDF preview failed.");
@@ -64,9 +97,13 @@ function PdfPages({ file }: { file: DownloadedAttachment }) {
     if (!document || !canvasRef.current) return;
     let cancelled = false;
     let renderTask: import("pdfjs-dist").RenderTask | undefined;
-    void document.getPage(page).then((pdfPage) => {
+    let pdfPage: import("pdfjs-dist").PDFPageProxy | undefined;
+    setPageText("");
+    void (async () => {
+      pdfPage = await withPreviewDeadline(document.getPage(page), PDF_PAGE_TIMEOUT_MS, () => { void document.destroy(); }, "PDF page loading timed out.");
       if (cancelled || !canvasRef.current) return;
-      const viewport = pdfPage.getViewport({ scale: zoom * Math.min(2, window.devicePixelRatio || 1) });
+      const pixelRatio = Math.min(2, window.devicePixelRatio || 1);
+      const viewport = pdfPage.getViewport({ scale: zoom * pixelRatio });
       if (!Number.isFinite(viewport.width) || !Number.isFinite(viewport.height) || viewport.width <= 0 || viewport.height <= 0 || viewport.width * viewport.height > PDF_MAX_PAGE_PIXELS) {
         throw new Error("This PDF page is too large to preview safely.");
       }
@@ -75,14 +112,19 @@ function PdfPages({ file }: { file: DownloadedAttachment }) {
       if (!context) throw new Error("Canvas rendering is unavailable.");
       canvas.width = Math.ceil(viewport.width);
       canvas.height = Math.ceil(viewport.height);
-      canvas.style.width = `${viewport.width / Math.min(2, window.devicePixelRatio || 1)}px`;
-      canvas.style.height = `${viewport.height / Math.min(2, window.devicePixelRatio || 1)}px`;
+      canvas.style.width = `${viewport.width / pixelRatio}px`;
+      canvas.style.height = `${viewport.height / pixelRatio}px`;
       renderTask = pdfPage.render({ canvas, canvasContext: context, viewport });
-      return renderTask.promise;
-    }).catch((reason) => {
-      if (!cancelled && reason?.name !== "RenderingCancelledException") setError("This PDF page could not be rendered.");
+      const textPromise = withPreviewDeadline(pdfPage.getTextContent(), PDF_PAGE_TIMEOUT_MS, () => pdfPage?.cleanup(), "PDF text extraction timed out.")
+        .then((content) => content.items.flatMap((item) => "str" in item ? [item.str] : []).join(" ").slice(0, PDF_MAX_ACCESSIBLE_TEXT_CHARS))
+        .catch(() => "");
+      await withPreviewDeadline(renderTask.promise, PDF_PAGE_TIMEOUT_MS, () => renderTask?.cancel(), "PDF page rendering timed out.");
+      const text = await textPromise;
+      if (!cancelled) setPageText(text);
+    })().catch((reason) => {
+      if (!cancelled && reason?.name !== "RenderingCancelledException") setError(reason instanceof Error ? reason.message : "This PDF page could not be rendered.");
     });
-    return () => { cancelled = true; renderTask?.cancel(); };
+    return () => { cancelled = true; renderTask?.cancel(); pdfPage?.cleanup(); };
   }, [document, page, zoom]);
 
   if (error) return <ViewerError message={error} />;
@@ -99,7 +141,11 @@ function PdfPages({ file }: { file: DownloadedAttachment }) {
         <button className="rounded p-1 hover:bg-raised disabled:opacity-35" disabled={zoom >= 2.5} onClick={() => setZoom((value) => Math.min(2.5, value + 0.25))} aria-label="Zoom PDF in"><Plus size={15} /></button>
       </div>
       <div className="min-h-0 flex-1 overflow-auto bg-inset p-4 text-center">
-        <canvas ref={canvasRef} className="mx-auto bg-white shadow-xl" aria-label={`PDF page ${page}`} />
+        <canvas ref={canvasRef} className="mx-auto bg-white shadow-xl" aria-label={`PDF page ${page}`} aria-describedby={`pdf-page-text-${page}`}>PDF page {page}. Use the accessible page text below.</canvas>
+        <details id={`pdf-page-text-${page}`} className="mx-auto mt-3 max-w-3xl rounded-lg bg-panel p-3 text-left text-[12px] text-ink-secondary">
+          <summary className="cursor-pointer font-medium text-ink">Accessible page text</summary>
+          <p className="mt-2 whitespace-pre-wrap">{pageText || "No extractable text is available for this page."}</p>
+        </details>
       </div>
     </div>
   );
@@ -136,9 +182,63 @@ export function parseWorkbookInWorker(
   });
 }
 
+export function WorkbookPreviewView({ book }: { book: WorkbookPreview }) {
+  const instanceId = useId().replaceAll(":", "");
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const [sheet, setSheet] = useState(0);
+  const [visibleRows, setVisibleRows] = useState(SPREADSHEET_VISIBLE_ROW_STEP);
+  const active = book.sheets[sheet];
+  useEffect(() => { setVisibleRows(SPREADSHEET_VISIBLE_ROW_STEP); }, [sheet]);
+  if (!active) return <ViewerError message="This workbook has no visible worksheets." />;
+  const shownRows = active.rows.slice(0, visibleRows);
+  const columnCount = Math.min(100, shownRows.reduce((maximum, row) => Math.max(maximum, row.length), 0));
+  const selectSheet = (index: number, focus = false) => {
+    const normalized = (index + book.sheets.length) % book.sheets.length;
+    setSheet(normalized);
+    if (focus) queueMicrotask(() => tabRefs.current[normalized]?.focus());
+  };
+  const columnName = (index: number) => {
+    let value = index + 1;
+    let label = "";
+    while (value > 0) { value -= 1; label = String.fromCharCode(65 + value % 26) + label; value = Math.floor(value / 26); }
+    return label;
+  };
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div role="tablist" aria-label="Workbook sheets" className="flex shrink-0 gap-1 overflow-x-auto border-b border-hairline/30 px-3 py-2">
+        {book.sheets.map((item, index) => <button
+          key={`${item.name}:${index}`}
+          ref={(element) => { tabRefs.current[index] = element; }}
+          id={`${instanceId}-sheet-tab-${index}`}
+          role="tab"
+          tabIndex={index === sheet ? 0 : -1}
+          aria-selected={index === sheet}
+          aria-controls={`${instanceId}-sheet-panel-${index}`}
+          onClick={() => selectSheet(index)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowRight") { event.preventDefault(); selectSheet(index + 1, true); }
+            else if (event.key === "ArrowLeft") { event.preventDefault(); selectSheet(index - 1, true); }
+            else if (event.key === "Home") { event.preventDefault(); selectSheet(0, true); }
+            else if (event.key === "End") { event.preventDefault(); selectSheet(book.sheets.length - 1, true); }
+          }}
+          className={`shrink-0 rounded-md px-2.5 py-1 text-[11.5px] ${index === sheet ? "bg-accent/15 text-accent-text" : "text-ink-secondary hover:bg-raised"}`}
+        >{item.name}</button>)}
+      </div>
+      {(active.truncated || book.truncated) && <div role="status" className="shrink-0 border-b border-warning/20 bg-warning/10 px-3 py-2 text-[11px] text-warning">Preview limited for safety. Download the workbook to see omitted sheets or cells.</div>}
+      <div id={`${instanceId}-sheet-panel-${sheet}`} role="tabpanel" tabIndex={0} aria-labelledby={`${instanceId}-sheet-tab-${sheet}`} className="min-h-0 flex-1 overflow-auto bg-inset p-3">
+        {shownRows.length === 0 ? <p className="text-[12px] text-ink-secondary">This worksheet is empty.</p> : <table className="border-collapse bg-panel text-[11.5px] text-ink">
+          <caption className="sr-only">Worksheet {active.name}; showing {shownRows.length} of {active.rows.length} preview rows</caption>
+          <thead><tr><th scope="col" className="border border-hairline/35 bg-raised px-2 py-1.5" aria-label="Row number" />{Array.from({ length: columnCount }, (_, index) => <th key={index} scope="col" className="border border-hairline/35 bg-raised px-2 py-1.5 font-medium">{columnName(index)}</th>)}</tr></thead>
+          <tbody>{shownRows.map((row, rowIndex) => { const sourceRow = active.rowNumbers?.[rowIndex] ?? rowIndex + 1; return <tr key={`${sourceRow}:${rowIndex}`}><th scope="row" className="border border-hairline/35 bg-raised px-2 py-1.5 font-medium tabular-nums">{sourceRow}</th>{Array.from({ length: columnCount }, (_, columnIndex) => <td key={columnIndex} aria-label={`${columnName(columnIndex)}${sourceRow}: ${row[columnIndex] || "blank"}`} className="max-w-[360px] overflow-hidden border border-hairline/35 px-2 py-1.5 align-top whitespace-pre-wrap break-words">{row[columnIndex] || ""}</td>)}</tr>; })}</tbody>
+        </table>}
+        {visibleRows < active.rows.length && <button className="mt-3 rounded-md border border-hairline/40 bg-panel px-3 py-2 text-[11.5px] text-ink hover:bg-raised" onClick={() => setVisibleRows((value) => Math.min(active.rows.length, value + SPREADSHEET_VISIBLE_ROW_STEP))}>Show {Math.min(SPREADSHEET_VISIBLE_ROW_STEP, active.rows.length - visibleRows)} more rows</button>}
+      </div>
+    </div>
+  );
+}
+
 function Spreadsheet({ file }: { file: DownloadedAttachment }) {
   const [book, setBook] = useState<WorkbookPreview | null>(null);
-  const [sheet, setSheet] = useState(0);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -149,21 +249,7 @@ function Spreadsheet({ file }: { file: DownloadedAttachment }) {
   }, [file]);
   if (error) return <ViewerError message={error} />;
   if (!book) return <Loading label="Opening spreadsheet…" />;
-  const active = book.sheets[sheet];
-  if (!active) return <ViewerError message="This workbook has no visible worksheets." />;
-  return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div role="tablist" aria-label="Workbook sheets" className="flex shrink-0 gap-1 overflow-x-auto border-b border-hairline/30 px-3 py-2">
-        {book.sheets.map((item, index) => <button key={`${item.name}:${index}`} role="tab" aria-selected={index === sheet} onClick={() => setSheet(index)} className={`shrink-0 rounded-md px-2.5 py-1 text-[11.5px] ${index === sheet ? "bg-accent/15 text-accent-text" : "text-ink-secondary hover:bg-raised"}`}>{item.name}</button>)}
-      </div>
-      {(active.truncated || book.truncated) && <div role="status" className="shrink-0 border-b border-warning/20 bg-warning/10 px-3 py-2 text-[11px] text-warning">Preview limited for safety. Download the workbook to see omitted sheets or cells.</div>}
-      <div className="min-h-0 flex-1 overflow-auto bg-inset p-3">
-        <table className="border-collapse bg-panel text-[11.5px] text-ink">
-          <tbody>{active.rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, columnIndex) => <td key={columnIndex} className="max-w-[360px] overflow-hidden border border-hairline/35 px-2 py-1.5 align-top whitespace-pre-wrap break-words">{cell}</td>)}</tr>)}</tbody>
-        </table>
-      </div>
-    </div>
-  );
+  return <WorkbookPreviewView book={book} />;
 }
 
 function Loading({ label }: { label: string }) { return <div className="flex flex-1 items-center justify-center gap-2 text-[13px] text-ink-secondary" role="status"><LoaderCircle size={18} className="animate-spin" />{label}</div>; }

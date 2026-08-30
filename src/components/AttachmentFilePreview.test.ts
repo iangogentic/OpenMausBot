@@ -1,28 +1,12 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { zipSync } from "fflate";
 
-import { AttachedFileGallery, parseWorkbookInWorker } from "./AttachmentFilePreview";
+import { AttachedFileGallery, parseWorkbookInWorker, withPreviewDeadline, WorkbookPreviewView } from "./AttachmentFilePreview";
 
 function validXlsxContainer(): Uint8Array {
-  const names = ["[Content_Types].xml", "xl/workbook.xml"].map((name) => new TextEncoder().encode(name));
-  const size = names.reduce((total, name) => total + 46 + name.length, 0);
-  const bytes = new Uint8Array(size + 22);
-  const view = new DataView(bytes.buffer);
-  let cursor = 0;
-  for (const name of names) {
-    view.setUint32(cursor, 0x02014b50, true);
-    view.setUint32(cursor + 20, 10, true);
-    view.setUint32(cursor + 24, 10, true);
-    view.setUint16(cursor + 28, name.length, true);
-    bytes.set(name, cursor + 46);
-    cursor += 46 + name.length;
-  }
-  view.setUint32(cursor, 0x06054b50, true);
-  view.setUint16(cursor + 8, names.length, true);
-  view.setUint16(cursor + 10, names.length, true);
-  view.setUint32(cursor + 12, size, true);
-  return bytes;
+  return zipSync({ "[Content_Types].xml": new Uint8Array([1]), "xl/workbook.xml": new Uint8Array([1]) });
 }
 
 afterEach(() => vi.useRealTimers());
@@ -55,5 +39,30 @@ describe("AttachedFileGallery", () => {
     await vi.advanceTimersByTimeAsync(11);
     await rejection;
     expect(terminate).toHaveBeenCalledOnce();
+  });
+
+  it("cancels an operation deterministically at its deadline", async () => {
+    vi.useFakeTimers();
+    const cancel = vi.fn(() => { throw new Error("cancellation failure"); });
+    const pending = withPreviewDeadline(new Promise<never>(() => {}), 20, cancel, "Preview timed out.");
+    const rejection = expect(pending).rejects.toThrow("Preview timed out.");
+    await vi.advanceTimersByTimeAsync(21);
+    await rejection;
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("renders bounded accessible worksheet tabs, coordinates, caption, and progressive rows", () => {
+    const rows = Array.from({ length: 150 }, (_, index) => [`row ${index + 1}`, "value"]);
+    const markup = renderToStaticMarkup(createElement(WorkbookPreviewView, { book: { sheets: [
+      { name: "First", rows, truncated: false },
+      { name: "Second", rows: [["two"]], truncated: false },
+    ], truncated: false } }));
+    expect(markup).toContain('role="tablist"');
+    expect(markup).toContain('role="tabpanel"');
+    expect(markup).toContain('tabindex="-1"');
+    expect(markup).toContain("Worksheet First; showing 100 of 150 preview rows");
+    expect(markup).toContain('aria-label="A1: row 1"');
+    expect(markup).toContain("Show 50 more rows");
+    expect(markup).not.toContain("row 101");
   });
 });

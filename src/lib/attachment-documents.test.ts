@@ -1,30 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { zipSync } from "fflate";
 
 import { DOCUMENT_MAX_BYTES, downloadAttachment, validatePdf, validateXlsxArchive } from "./attachment-documents";
 
 function write16(bytes: Uint8Array, offset: number, value: number) { new DataView(bytes.buffer).setUint16(offset, value, true); }
 function write32(bytes: Uint8Array, offset: number, value: number) { new DataView(bytes.buffer).setUint32(offset, value, true); }
 
-function centralArchive(names: string[], opts: { uncompressed?: number; compressed?: number } = {}): Uint8Array {
-  const encoder = new TextEncoder();
-  const encoded = names.map((name) => encoder.encode(name));
-  const centralSize = encoded.reduce((sum, name) => sum + 46 + name.length, 0);
-  const bytes = new Uint8Array(centralSize + 22);
-  let cursor = 0;
-  for (const name of encoded) {
-    write32(bytes, cursor, 0x02014b50);
-    write32(bytes, cursor + 20, opts.compressed ?? 10);
-    write32(bytes, cursor + 24, opts.uncompressed ?? 10);
-    write16(bytes, cursor + 28, name.length);
-    bytes.set(name, cursor + 46);
-    cursor += 46 + name.length;
-  }
-  write32(bytes, cursor, 0x06054b50);
-  write16(bytes, cursor + 8, names.length);
-  write16(bytes, cursor + 10, names.length);
-  write32(bytes, cursor + 12, centralSize);
-  write32(bytes, cursor + 16, 0);
-  return bytes;
+function centralArchive(names: string[], content = new Uint8Array([1])): Uint8Array {
+  return zipSync(Object.fromEntries(names.map((name) => [name, content])));
+}
+
+function findSignature(bytes: Uint8Array, signature: number, from = 0): number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let offset = from; offset <= bytes.byteLength - 4; offset += 1) if (view.getUint32(offset, true) === signature) return offset;
+  return -1;
 }
 
 describe("document parser guards", () => {
@@ -37,9 +26,45 @@ describe("document parser guards", () => {
   it("accepts an XLSX-shaped central directory and rejects ZIP traversal and bombs", () => {
     expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "xl/workbook.xml"]))).not.toThrow();
     expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "../xl/workbook.xml"]))).toThrow(/unsafe archive path/);
-    expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "xl/workbook.xml", "xl/workbook.xml"]))).toThrow(/duplicate archive paths/);
-    expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "xl/workbook.xml"], { compressed: 1, uncompressed: 2_000_000 }))).toThrow(/highly compressed/);
+    const duplicate = centralArchive(["[Content_Types].xml", "xl/workbook.xml", "xl/workbook.xm2"]);
+    const needle = new TextEncoder().encode("xl/workbook.xm2");
+    const replacement = new TextEncoder().encode("xl/workbook.xml");
+    for (let offset = 0; offset <= duplicate.length - needle.length; offset += 1) {
+      if (needle.every((value, index) => duplicate[offset + index] === value)) duplicate.set(replacement, offset);
+    }
+    expect(() => validateXlsxArchive(duplicate)).toThrow(/duplicate archive paths/);
+    expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "xl/workbook.xml"], new Uint8Array(2_000_000)))).toThrow(/highly compressed/);
     expect(() => validateXlsxArchive(new Uint8Array([0x50, 0x4b, 0x03, 0x04]))).toThrow(/valid XLSX/);
+  });
+
+  it("rejects ambiguous EOCDs, multi-disk, ZIP64, unsupported compression, and local-name mismatch", () => {
+    const trailing = centralArchive(["[Content_Types].xml", "xl/workbook.xml"]);
+    const withTrailing = new Uint8Array(trailing.length + 1); withTrailing.set(trailing);
+    expect(() => validateXlsxArchive(withTrailing)).toThrow(/trailing or malformed/);
+
+    const multiDisk = centralArchive(["[Content_Types].xml", "xl/workbook.xml"]);
+    const eocd = findSignature(multiDisk, 0x06054b50);
+    write16(multiDisk, eocd + 4, 1);
+    expect(() => validateXlsxArchive(multiDisk)).toThrow(/Multi-disk/);
+
+    const zip64 = centralArchive(["[Content_Types].xml", "xl/workbook.xml"]);
+    const zip64Eocd = findSignature(zip64, 0x06054b50);
+    write32(zip64, zip64Eocd + 16, 0xffffffff);
+    expect(() => validateXlsxArchive(zip64)).toThrow(/ZIP64/);
+
+    const unsupported = centralArchive(["[Content_Types].xml", "xl/workbook.xml"]);
+    const local = findSignature(unsupported, 0x04034b50);
+    const central = findSignature(unsupported, 0x02014b50);
+    write16(unsupported, local + 8, 99); write16(unsupported, central + 10, 99);
+    expect(() => validateXlsxArchive(unsupported)).toThrow(/unsupported compression/);
+
+    const mismatch = centralArchive(["[Content_Types].xml", "xl/workbook.xml"]);
+    mismatch[30] = "!".charCodeAt(0);
+    expect(() => validateXlsxArchive(mismatch)).toThrow(/inconsistent entry names/);
+
+    const sizeMismatch = centralArchive(["[Content_Types].xml", "xl/workbook.xml"]);
+    write32(sizeMismatch, 18, 99);
+    expect(() => validateXlsxArchive(sizeMismatch)).toThrow(/inconsistent local sizes/);
   });
 });
 
