@@ -69,6 +69,8 @@ describe("production computer operator wiring", () => {
   it("retires every deterministic hidden operator home with its bot", () => {
     expect(source).toContain("const operatorTargets = [perBotLocalVmTarget(botId).key, SHARED_LOCAL_VM_TARGET.key, \"physical:host\"]");
     expect(source).toContain("retireProviderOwnerState(`computer-operator:${botId}:${targetKey}`)");
+    expect(source).toContain("for (const targetKey of operatorTargets)");
+    expect(source).not.toContain("...operatorTargets.map");
   });
 
   it("pauses the delegated child on the global target even when takeover comes through another bot", () => {

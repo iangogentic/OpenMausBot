@@ -668,7 +668,7 @@ describe("ComputerSubagentRuntime", () => {
     await waitForChild(h.children);
     await settle(h.children[0]!, { status: "completed", output: "internal-only" });
     const completion = await handle.done;
-    expect(completion).toMatchObject({ status: "completed", finalScreenshotCaptured: true });
+    expect(completion).toMatchObject({ status: "aborted", finalScreenshotCaptured: false });
     expect(h.screenshots).toEqual(["stale-before-callback"]);
     expect(h.events).not.toContain("final-frame");
     expect(h.completions).toEqual([]);

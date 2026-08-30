@@ -496,9 +496,14 @@ export class ComputerSubagentRuntime {
         }), this.operationTimeoutMs);
         if (!captured.ok) throw new Error(captured.error ?? captured.reason);
         finalScreenshot = validateScreenshot(captured.value);
-        // Parent cancellation can race the capture callback. Never publish
-        // terminal pixels for a generation that became stale after capture.
-        if (this.onFinalScreenshot && await this.parentCurrent(execution.input.parent)) {
+        // Parent cancellation can race the capture callback. A stale child
+        // must not retain pixels in handle.done, not merely hide its UI frame.
+        if (!(await this.parentCurrent(execution.input.parent))) {
+          status = "aborted";
+          error = "parent generation became stale after final screenshot";
+          output = undefined;
+          finalScreenshot = undefined;
+        } else if (this.onFinalScreenshot) {
           await this.bounded(Promise.resolve().then(() => this.onFinalScreenshot!({
             childId: execution.handle.childId,
             parent: cloneParent(execution.input.parent),

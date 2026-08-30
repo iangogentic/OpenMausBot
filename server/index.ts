@@ -2194,15 +2194,17 @@ const botDeletionJournal = new BotDeletionJournal(join(DATA_DIR, "bot-deletions"
 const botDeletionCleanup: BotDeletionCleanup = {
   logicalDelete: (botId) => { store.deleteBot(botId); },
   provider: async (botId) => {
-    // The main provider and both deterministic hidden-operator targets own
+    // The main provider and three deterministic hidden-operator targets own
     // distinct persistent homes. Retire every one on bot deletion so neither
     // private state nor the supervisor's bounded home slots leak.
     const operatorTargets = [perBotLocalVmTarget(botId).key, SHARED_LOCAL_VM_TARGET.key, "physical:host"];
-    await Promise.all([
-      retireProviderOwnerState(botId),
-      ...operatorTargets.map((targetKey) =>
-        retireProviderOwnerState(`computer-operator:${botId}:${targetKey}`)),
-    ]);
+    // Retirement processes scan the same instance locks. Serialize their
+    // bounded, idempotent operations so their supervisor deadlines cannot
+    // expire while competing with each other.
+    await retireProviderOwnerState(botId);
+    for (const targetKey of operatorTargets) {
+      await retireProviderOwnerState(`computer-operator:${botId}:${targetKey}`);
+    }
   },
   checkpoints: (botId) => checkpoints.deleteBotCheckpoints(botId),
   vm: (botId) => deletePerBotLocalVmWorkspace(botId),
@@ -6541,6 +6543,14 @@ const server = createServer(async (req, res) => {
               if (executionSignal.aborted) abortChild();
               try {
                 const completion = await active.handle.done;
+                executionSignal.throwIfAborted();
+                if (
+                  !isComputerOperatorParentCurrent(parent) ||
+                  !capabilityStillActive() ||
+                  !scopedTargetStillActive()
+                ) {
+                  throw new DOMException("computer operator parent became stale before result delivery", "AbortError");
+                }
                 if (!completion) return { text: "computer operator ended without a terminal result", isError: true };
                 const text = completion.output?.trim() || completion.error?.trim() ||
                   (completion.status === "completed" ? "Computer task completed." : `Computer task ${completion.status}.`);
