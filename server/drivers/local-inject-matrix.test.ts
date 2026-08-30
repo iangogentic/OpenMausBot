@@ -608,7 +608,8 @@ describe("Qwen / Hermes ACP turns", () => {
       expect(sharedYaml).toContain("provider: auto");
       expect(sharedYaml).not.toContain("  omlx:");
       const isolatedYaml = readFileSync(join(seen.env.HERMES_HOME, "config.yaml"), "utf8");
-      expect(isolatedYaml).toContain("provider: auto");
+      expect(isolatedYaml).toContain("provider: custom:omlx");
+      expect(isolatedYaml).toContain("default: gemma-4-31b-it-bf16");
       expect(isolatedYaml).toContain("  omlx:");
       // Hermes itself may read its provider credential, but the model has no
       // terminal/file/browser/code-execution surface capable of opening it.

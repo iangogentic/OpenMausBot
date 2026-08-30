@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
 
 import { applyDroidLocalAuthEnv, DroidAgentDriver, ensureDroidInjectModel } from "./acp/droid.ts";
 import { ensureGrokInjectSlug, GrokAgentDriver } from "./acp/grok.ts";
@@ -1022,6 +1023,27 @@ describe("ensureHermesInjectProvider", () => {
     expect(text.match(/^  omlx:$/gm)?.length).toBe(1);
     expect(text).toContain("base_url: http://127.0.0.1:8080/v1");
     expect(text).toContain("api_key: omlx");
+  });
+
+  it("sets a bootstrap default only inside OpenMaus' isolated turn profile", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-hermes-isolated-inject-"));
+    scratchDirs.push(home);
+    const isolated = join(home, "isolated");
+    mkdirSync(isolated, { recursive: true });
+    writeFileSync(join(isolated, "config.yaml"), "model:\n  provider: auto\n");
+
+    ensureHermesInjectProvider("omlx::gemma-4-31b-it-bf16", {
+      HERMES_HOME: isolated,
+      OPENMAUSBOT_HERMES_POLICY: "1",
+    });
+
+    const config = parseYaml(readFileSync(join(isolated, "config.yaml"), "utf8")) as {
+      model: { default: string; provider: string };
+    };
+    expect(config.model).toEqual({
+      default: "gemma-4-31b-it-bf16",
+      provider: "custom:omlx",
+    });
   });
 
   it("replaces a nested provider block without leaving orphan YAML lines", () => {

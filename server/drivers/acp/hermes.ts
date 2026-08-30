@@ -7,7 +7,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, posix, win32 } from "node:path";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 import type { ModelCatalog } from "../../contracts.ts";
 import { DATA_DIR } from "../../config.ts";
@@ -88,6 +88,31 @@ function upsertHermesProvider(text: string, hostId: string, baseUrl: string, api
   return `${prefix}\nproviders:\n${block}`;
 }
 
+/** Give Hermes ACP a valid agent for session/new, before OpenMaus can call
+ * session/set_model. This is used only in the per-bot isolated profile;
+ * never rewrite the user's real Hermes default as a side effect of a turn. */
+function upsertHermesBootstrapModel(text: string, hostId: string, model: string): string {
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text);
+  } catch {
+    parsed = null;
+  }
+  const config = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? { ...(parsed as Record<string, unknown>) }
+    : {};
+  const previous = config.model;
+  const modelConfig = previous && typeof previous === "object" && !Array.isArray(previous)
+    ? { ...(previous as Record<string, unknown>) }
+    : {};
+  config.model = {
+    ...modelConfig,
+    default: model,
+    provider: `custom:${hostId}`,
+  };
+  return stringifyYaml(config);
+}
+
 /** Replace `  hostId:` through the next sibling 2-space key or a top-level key. */
 function replaceHermesHostBlock(text: string, hostId: string, block: string): string | null {
   const lines = text.split("\n");
@@ -123,7 +148,10 @@ export function ensureHermesInjectProvider(
   } catch {
     text = "";
   }
-  const next = upsertHermesProvider(text, inject.host, connection.openaiBaseUrl, connection.apiKey);
+  let next = upsertHermesProvider(text, inject.host, connection.openaiBaseUrl, connection.apiKey);
+  if (env.OPENMAUSBOT_HERMES_POLICY === "1") {
+    next = upsertHermesBootstrapModel(next, inject.host, inject.model);
+  }
   if (next !== text) writeFileSync(path, next);
   return hermesAcpModelId(modelId) ?? modelId;
 }
