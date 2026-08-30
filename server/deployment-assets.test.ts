@@ -29,6 +29,7 @@ describe("Razer hostile-provider deployment assets", () => {
   it("installs and requires the exact firewall, private-net, and aggregate-slice checks", () => {
     const readme = asset("README.md");
     const service = asset("openmausbot.service");
+    const ianBrainTunnel = asset("../razer-ian-brain/ian-brain-tunnel.service");
     const companionService = asset("openmausbot-companion.service");
     const tmpfiles = asset("openmausbot.tmpfiles.conf");
     const supervisor = asset("openmaus-provider-supervisor");
@@ -38,6 +39,11 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(service).toContain("Requires=openmaus-provider.slice");
     expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-network --check");
     expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-slice-check --check");
+    expect(service).toContain(
+      "ExecStartPre=/usr/bin/curl --silent --show-error --connect-timeout 2 --max-time 5 --output /dev/null http://127.0.0.1:15050/mcp",
+    );
+    expect(ianBrainTunnel).toContain("-o ConnectionAttempts=1");
+    expect(ianBrainTunnel).toContain("-o ConnectTimeout=10");
     expect(service.match(/^ExecStartPre=\+\/usr\/bin\/btrfs qgroup show --raw /gm)).toHaveLength(3);
     expect(service).toContain("ExecStartPre=+/usr/bin/install -d -o openmaus-server -g openmaus-runtime -m 2750 /run/openmaus-provider");
     expect(service).toContain("RuntimeDirectory=openmausbot-private\n");
