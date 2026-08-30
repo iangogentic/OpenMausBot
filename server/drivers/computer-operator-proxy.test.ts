@@ -11,6 +11,7 @@ let server: Server;
 let port = 0;
 let child: ChildProcess;
 let lastAuthorization: string | undefined;
+let lastHost: string | undefined;
 let lastBody: unknown;
 let releaseResponse: (() => void) | null = null;
 const pending = new Map<number, (message: any) => void>();
@@ -34,6 +35,7 @@ beforeAll(async () => {
       return;
     }
     lastAuthorization = req.headers.authorization;
+    lastHost = req.headers.host;
     let raw = "";
     req.on("data", (chunk) => { raw += chunk; });
     req.on("end", () => {
@@ -44,12 +46,15 @@ beforeAll(async () => {
       };
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => server.listen(0, resolve));
   port = (server.address() as { port: number }).port;
   child = spawn(process.execPath, [PROXY], {
     env: {
       ...process.env,
-      OMB_HARNESS_URL: `http://127.0.0.1:${port}`,
+      // `localhost` proves that the transport connects to the configured
+      // address while overriding Host to the loopback authority expected by
+      // the production harness (the real provider address is 10.0.2.2).
+      OMB_HARNESS_URL: `http://localhost:${port}`,
       OMB_COMPUTER_OPERATOR_CAPABILITY_TOKEN: TOKEN,
     },
     stdio: ["pipe", "pipe", "inherit"],
@@ -87,6 +92,7 @@ describe("computer operator MCP proxy", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect(lastAuthorization).toBe(`Bearer ${TOKEN}`);
+    expect(lastHost).toBe(`127.0.0.1:${port}`);
     expect(lastBody).toEqual({ task: "open Terminal" });
     let settled = false;
     void call.then(() => { settled = true; });

@@ -2,6 +2,7 @@
 // harness owns the target, operator model, child lifecycle, and final screen;
 // this process receives only one exact-parent capability.
 import { readBoundedResponseText } from "../bounded-response.ts";
+import { request as httpRequest } from "node:http";
 import {
   COMPUTER_OPERATOR_IMAGE_MAX_BASE64_BYTES,
   normalizeComputerOperatorResult,
@@ -9,6 +10,8 @@ import {
 import { BoundedJsonLineDecoder, PROVIDER_NDJSON_LIMITS } from "./bounded-json-lines.ts";
 
 const HARNESS = process.env.OMB_HARNESS_URL ?? "http://127.0.0.1:8799";
+const HARNESS_URL = new URL("/api/internal/computer-operator", HARNESS);
+const HARNESS_HOST = `127.0.0.1:${HARNESS_URL.port}`;
 const TOKEN = process.env.OMB_COMPUTER_OPERATOR_CAPABILITY_TOKEN ?? "";
 const RESPONSE_MAX_BYTES = COMPUTER_OPERATOR_IMAGE_MAX_BASE64_BYTES + 128 * 1024;
 const OUTPUT_MAX_PENDING_BYTES = 2 * 1024 * 1024;
@@ -55,6 +58,51 @@ const ok = (id: unknown, result: unknown) => send({ jsonrpc: "2.0", id, result }
 const rpcError = (id: unknown, code: number, message: string) =>
   send({ jsonrpc: "2.0", id, error: { code, message } });
 
+function requestHarness(body: string, signal: AbortSignal): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(HARNESS_URL, {
+      method: "POST",
+      signal,
+      // Provider sandboxes connect through slirp's 10.0.2.2 gateway. The
+      // harness still requires a loopback Host header so this exact-turn
+      // capability cannot weaken the DNS-rebinding boundary for any route.
+      headers: {
+        host: HARNESS_HOST,
+        "content-type": "application/json",
+        authorization: `Bearer ${TOKEN}`,
+      },
+    });
+    request.once("error", reject);
+    request.once("response", (incoming) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      incoming.on("data", (chunk: Buffer) => {
+        total += chunk.byteLength;
+        if (total > RESPONSE_MAX_BYTES) {
+          incoming.destroy(new Error("computer operator response exceeded its limit"));
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      });
+      incoming.once("error", reject);
+      incoming.once("end", () => {
+        const responseHeaders = new Headers();
+        for (const [name, value] of Object.entries(incoming.headers)) {
+          if (Array.isArray(value)) for (const item of value) responseHeaders.append(name, item);
+          else if (value !== undefined) responseHeaders.set(name, value);
+        }
+        const status = incoming.statusCode ?? 502;
+        resolve(new Response(status === 204 || status === 304 ? null : Buffer.concat(chunks, total), {
+          status,
+          statusText: incoming.statusMessage,
+          headers: responseHeaders,
+        }));
+      });
+    });
+    request.end(body);
+  });
+}
+
 async function run(requestId: unknown, task: unknown): Promise<ReturnType<typeof normalizeComputerOperatorResult>> {
   if (activeCall) throw new Error("the computer operator is already working for this parent turn");
   if (typeof task !== "string") throw new Error("task is required");
@@ -62,12 +110,18 @@ async function run(requestId: unknown, task: unknown): Promise<ReturnType<typeof
   const call = { requestId, controller };
   activeCall = call;
   try {
-    const response = await fetch(`${HARNESS}/api/internal/computer-operator`, {
-      method: "POST",
-      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30 * 60_000)]),
-      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ task }),
-    });
+    let response: Response;
+    try {
+      response = await requestHarness(
+        JSON.stringify({ task }),
+        AbortSignal.any([controller.signal, AbortSignal.timeout(30 * 60_000)]),
+      );
+    } catch (error) {
+      if (controller.signal.aborted && controller.signal.reason instanceof Error) {
+        throw controller.signal.reason;
+      }
+      throw error;
+    }
     const raw = await readBoundedResponseText(response, RESPONSE_MAX_BYTES, "computer operator response exceeded its limit");
     let parsed: unknown;
     try {
