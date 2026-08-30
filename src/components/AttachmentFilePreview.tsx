@@ -256,7 +256,7 @@ function Loading({ label }: { label: string }) { return <div className="flex fle
 function ViewerError({ message }: { message: string }) { return <div className="flex flex-1 items-center justify-center p-8 text-center text-[13px] text-danger" role="alert">{message}</div>; }
 function DownloadOnly({ file }: { file: DownloadedAttachment }) { return <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center"><File size={38} className="text-ink-secondary" /><div><div className="text-[13px] font-medium text-ink">No in-app preview for this file type</div><div className="mt-1 text-[11.5px] text-ink-secondary">Download it without opening or executing it.</div></div><button onClick={() => saveBytes(file)} className="flex items-center gap-2 rounded-lg bg-accent px-3 py-2 text-[12px] font-medium text-white"><Download size={15} />Download file</button></div>; }
 
-export function AttachmentFilePreviewDialog({ attachment, onClose }: { attachment: TranscriptFileAttachment; onClose: () => void }) {
+export function AttachmentFilePreviewDialog({ attachment, threadId, messageId, draft = false, onClose }: { attachment: TranscriptFileAttachment; threadId: string; messageId?: string; draft?: boolean; onClose: () => void }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   const [file, setFile] = useState<DownloadedAttachment | null>(null);
@@ -264,7 +264,11 @@ export function AttachmentFilePreviewDialog({ attachment, onClose }: { attachmen
   useLayoutEffect(() => { closeRef.current = onClose; }, [onClose]);
   useEffect(() => {
     const controller = new AbortController();
-    void downloadAttachment(attachment.path, controller.signal).then(setFile).catch((reason) => {
+    if (!attachment.attachmentId) {
+      setError("This older attachment has no secure preview capability.");
+      return () => controller.abort();
+    }
+    void downloadAttachment({ threadId, messageId, attachmentId: attachment.attachmentId, ...(draft ? { draft: true } : {}) }, controller.signal).then(setFile).catch((reason) => {
       if (reason?.name !== "AbortError") setError(reason instanceof Error ? reason.message : "Attachment preview failed.");
     });
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -285,7 +289,7 @@ export function AttachmentFilePreviewDialog({ attachment, onClose }: { attachmen
     };
     window.addEventListener("keydown", key);
     return () => { controller.abort(); window.removeEventListener("keydown", key); previous?.focus(); };
-  }, [attachment.path]);
+  }, [attachment.attachmentId, draft, messageId, threadId]);
   return createPortal(
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-3 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label={`Preview ${attachment.name}`} className="flex h-full max-h-[900px] w-full max-w-[1200px] flex-col overflow-hidden rounded-2xl border border-hairline/50 bg-panel shadow-2xl outline-none">
@@ -299,11 +303,11 @@ export function AttachmentFilePreviewDialog({ attachment, onClose }: { attachmen
   );
 }
 
-export function AttachedFileGallery({ files }: { files: TranscriptFileAttachment[] }) {
+export function AttachedFileGallery({ files, threadId, messageId }: { files: TranscriptFileAttachment[]; threadId: string; messageId: string }) {
   const [selected, setSelected] = useState<TranscriptFileAttachment | null>(null);
   if (!files.length) return null;
   return <><div className="mb-2 flex flex-wrap justify-end gap-2">{files.map((file, index) => {
     const Icon = file.preview === "xlsx" ? FileSpreadsheet : File;
     return <button key={`${file.name}:${index}`} onClick={() => setSelected(file)} aria-label={file.preview ? `Preview attached file ${file.name}` : `Download attached file ${file.name}`} className="flex max-w-[260px] items-center gap-2 rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-left hover:border-hairline"><Icon size={16} className="shrink-0 text-ink-secondary" /><span className="truncate text-[12px] text-ink">{file.name}</span><span className="rounded bg-accent/10 px-1.5 py-0.5 text-[9.5px] uppercase text-accent-text">{file.preview ? "Preview" : "Download"}</span></button>;
-  })}</div>{selected && <AttachmentFilePreviewDialog attachment={selected} onClose={() => setSelected(null)} />}</>;
+  })}</div>{selected && <AttachmentFilePreviewDialog attachment={selected} threadId={threadId} messageId={messageId} onClose={() => setSelected(null)} />}</>;
 }

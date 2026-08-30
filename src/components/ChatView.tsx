@@ -415,7 +415,7 @@ function Bubble({
                 <AttachedImageGallery paths={attachedImages.images} />
               )}
               {attachedImages && attachedImages.files.length > 0 && (
-                <AttachedFileGallery files={attachedImages.files} />
+                <AttachedFileGallery files={attachedImages.files} threadId={bot.threadId} messageId={message.id} />
               )}
               <div
                 className={cn(collapsible && "max-h-40 overflow-hidden [mask-image:linear-gradient(to_bottom,black_60%,transparent)]")}

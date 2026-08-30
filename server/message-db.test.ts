@@ -168,11 +168,13 @@ describe("message-db", () => {
   });
 
   it("indexes attachment basenames without exposing their private directories", () => {
+    const attachmentId = "123e4567-e89b-42d3-a456-426614174000";
     insertMessage("paths", msg(
       "m1",
-      'review this\n\n<attached-file path="/var/lib/openmausbot/uploaded-files/123e4567-e89b-12d3-a456-426614174000-quarterly-plan.xlsx" />',
+      `review this\n\n<attached-file path="/var/lib/openmausbot/uploaded-files/private-thread/${attachmentId}-quarterly-plan.xlsx" attachment-id="${attachmentId}" />`,
     ));
     expect(searchMessages("var/lib/openmausbot")).toEqual([]);
+    expect(searchMessages(attachmentId)).toEqual([]);
     const hit = searchMessages("quarterly-plan.xlsx")[0];
     expect(hit).toMatchObject({ threadId: "paths", messageId: "m1" });
     expect(hit.snippet).toContain("quarterly-plan.xlsx");

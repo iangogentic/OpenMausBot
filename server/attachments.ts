@@ -2,7 +2,7 @@
 // ~/.openmausbot/attachments so every CLI engine can open them by path —
 // the app never ships image bytes through the prompt itself.
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve, sep } from "node:path";
 import { DATA_DIR } from "./config.ts";
 import { WORKSPACES_DIR } from "./workspace.ts";
@@ -93,6 +93,7 @@ export function saveImage(bytes: Buffer, mime: string): SavedAttachment {
 }
 
 export interface SavedFile {
+  attachmentId: string;
   path: string;
   name: string;
   bytes: number;
@@ -130,7 +131,7 @@ export function uploadNameFromHeader(value: string | undefined): string | null {
 /** Persist a non-image attachment selected by a remote controller. The UUID
  * is the actual storage name; the original name is retained only for the UI
  * and download dialog. */
-export function saveUploadedFile(bytes: Buffer, displayName: string): SavedFile {
+export function saveUploadedFile(bytes: Buffer, displayName: string, threadId?: string): SavedFile {
   const name = safeUploadName(displayName);
   if (!name) throw Object.assign(new Error("file name is invalid"), { status: 400 });
   if (bytes.byteLength === 0) throw Object.assign(new Error("empty files cannot be attached"), { status: 400 });
@@ -138,10 +139,16 @@ export function saveUploadedFile(bytes: Buffer, displayName: string): SavedFile 
     throw Object.assign(new Error(`file exceeds ${FILE_MAX_BYTES} bytes`), { status: 413 });
   }
   ensureUploadedFilesDir();
-  const storedName = `${randomUUID()}-${name}`;
-  const path = join(UPLOADED_FILES_DIR, storedName);
+  if (threadId !== undefined && !/^[\w-]{1,128}$/.test(threadId)) {
+    throw Object.assign(new Error("conversation id is invalid"), { status: 400 });
+  }
+  const attachmentId = randomUUID();
+  const directory = threadId ? join(UPLOADED_FILES_DIR, threadId) : UPLOADED_FILES_DIR;
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const storedName = `${attachmentId}-${name}`;
+  const path = join(directory, storedName);
   writeFileSync(path, bytes, { mode: 0o600, flag: "wx" });
-  return { path, name, bytes: bytes.byteLength };
+  return { attachmentId, path, name, bytes: bytes.byteLength };
 }
 
 function containedBy(root: string, target: string): boolean {
@@ -164,7 +171,10 @@ export function readSavableServerFile(rawPath: string): { bytes: Buffer; name: s
   let roots: string[];
   try {
     requested = resolve(rawPath);
-    roots = [WORKSPACES_DIR, ATTACHMENTS_DIR, UPLOADED_FILES_DIR].flatMap((root) => {
+    // Uploaded user attachments are intentionally excluded: renderer preview
+    // must resolve those through readConversationUploadedFile with an opaque
+    // conversation-scoped id, never a model/user-authored filesystem path.
+    roots = [WORKSPACES_DIR, ATTACHMENTS_DIR].flatMap((root) => {
       try {
         return [realpathSync(root)];
       } catch {
@@ -197,6 +207,52 @@ export function readSavableServerFile(rawPath: string): { bytes: Buffer; name: s
       offset += read;
     }
     return { bytes, name: basename(target) };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Resolve one app-issued upload capability inside one exact conversation.
+ * The caller never supplies a filesystem path or display name. */
+export function readConversationUploadedFile(
+  threadId: string,
+  attachmentId: string,
+): { bytes: Buffer; name: string; path: string } | null {
+  if (!/^[\w-]{1,128}$/.test(threadId) || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attachmentId)) return null;
+  let directory: string;
+  let names: string[];
+  try {
+    directory = realpathSync(join(UPLOADED_FILES_DIR, threadId));
+    if (!containedBy(realpathSync(UPLOADED_FILES_DIR), directory)) return null;
+    names = readdirSync(directory).filter((name) => name.startsWith(`${attachmentId}-`));
+  } catch {
+    return null;
+  }
+  if (names.length !== 1) return null;
+  const path = join(directory, names[0]!);
+  let fd: number | undefined;
+  try {
+    const linkInfo = lstatSync(path, { bigint: true });
+    if (!linkInfo.isFile() || linkInfo.isSymbolicLink()) return null;
+    const target = realpathSync(path);
+    if (!containedBy(directory, target)) return null;
+    const before = statSync(target, { bigint: true });
+    if (!before.isFile() || before.size > BigInt(FILE_MAX_BYTES) || before.ino !== linkInfo.ino || before.dev !== linkInfo.dev) return null;
+    fd = openSync(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd, { bigint: true });
+    if (!opened.isFile() || opened.size !== before.size || opened.ino !== before.ino || opened.dev !== before.dev) return null;
+    if (realpathSync(path) !== target) return null;
+    const size = Number(opened.size);
+    const bytes = Buffer.allocUnsafe(size);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(fd, bytes, offset, size - offset, offset);
+      if (count <= 0) return null;
+      offset += count;
+    }
+    return { bytes, name: names[0]!.slice(attachmentId.length + 1), path: target };
   } catch {
     return null;
   } finally {

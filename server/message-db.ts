@@ -88,7 +88,7 @@ function searchableRowText(text: string | null, json: string): string {
 function visibleSearchText(text: string | null): string | null {
   if (!text) return text;
   return text.replace(
-    /<attached-(?:image|file)\s+path="([^"]*)"\s*\/?>(?:\s*\n)?/g,
+    /<attached-(?:image|file)\s+path="([^"]*)"(?:\s+attachment-id="[^"]*")?\s*\/?>(?:\s*\n)?/g,
     (_tag, encodedPath: string) => {
       const encodedName = encodedPath.split(/[\\/]/).at(-1) ?? "";
       const name = encodedName

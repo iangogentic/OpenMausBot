@@ -93,13 +93,14 @@ describe("splitAttachedImages", () => {
 
 describe("splitTranscriptAttachments", () => {
   it("extracts safe file chips and hides all full paths from display text", () => {
-    const stored = 'Review these\n<attached-file path="/private/server/123e4567-e89b-12d3-a456-426614174000-report.pdf" />\n<attached-file path="C:\\secret\\budget.xlsx" />';
+    const stored = 'Review these\n<attached-file path="/private/server/123e4567-e89b-12d3-a456-426614174000-report.pdf" attachment-id="123e4567-e89b-42d3-a456-426614174000" />\n<attached-file path="C:\\secret\\budget.xlsx" />';
     const result = splitTranscriptAttachments(stored);
     expect(result.display).toBe("Review these");
     expect(result.files).toEqual([
-      { path: "/private/server/123e4567-e89b-12d3-a456-426614174000-report.pdf", name: "report.pdf", preview: "pdf" },
+      { path: "/private/server/123e4567-e89b-12d3-a456-426614174000-report.pdf", attachmentId: "123e4567-e89b-42d3-a456-426614174000", name: "report.pdf", preview: "pdf" },
       { path: "C:\\secret\\budget.xlsx", name: "budget.xlsx", preview: "xlsx" },
     ]);
+    expect(result.display).not.toContain("123e4567-e89b-42d3-a456-426614174000");
   });
 
   it("keeps unsupported attachments as inert filename-only chips", () => {
@@ -109,8 +110,8 @@ describe("splitTranscriptAttachments", () => {
   });
 
   it("preserves hidden attachment tags when visible message text is edited", () => {
-    const original = 'old\n\n<attached-file path="/secret/report.pdf" />';
-    expect(replaceTranscriptDisplayText(original, "new")).toBe('new\n\n<attached-file path="/secret/report.pdf" />');
+    const original = 'old\n\n<attached-file path="/secret/report.pdf" attachment-id="123e4567-e89b-42d3-a456-426614174000" />';
+    expect(replaceTranscriptDisplayText(original, "new")).toBe('new\n\n<attached-file path="/secret/report.pdf" attachment-id="123e4567-e89b-42d3-a456-426614174000" />');
   });
 });
 

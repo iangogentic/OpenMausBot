@@ -228,7 +228,7 @@ const Transcript = memo(function Transcript({
                         <AttachedImageGallery paths={attachedImages.images} />
                       )}
                       {attachedImages && attachedImages.files.length > 0 && (
-                        <AttachedFileGallery files={attachedImages.files} />
+                        <AttachedFileGallery files={attachedImages.files} threadId={group.threadId} messageId={m.id} />
                       )}
                       {attachedImages?.display ?? m.text}
                     </>

@@ -31,6 +31,7 @@ export function ComposerAttachments({
   onRemove,
   onDisplayInChatBox,
   allowImages = true,
+  threadId,
   notice,
   onNotice,
 }: {
@@ -39,6 +40,7 @@ export function ComposerAttachments({
   onRemove: (id: string) => void;
   onDisplayInChatBox: (attachment: PasteAttachment) => void;
   allowImages?: boolean;
+  threadId: string;
   notice: string | null;
   onNotice: (notice: string | null) => void;
 }) {
@@ -80,7 +82,7 @@ export function ComposerAttachments({
         allowImages,
         getPath: pathForFile,
         uploadImage: imageAttachmentFromFile,
-        uploadFile: fileAttachmentFromFile,
+        uploadFile: (file) => fileAttachmentFromFile(file as File, threadId),
       });
       if (!active) return;
       if (attachments.length) onAdd(attachments);
@@ -100,7 +102,7 @@ export function ComposerAttachments({
       window.removeEventListener("dragover", onOver);
       window.removeEventListener("drop", onDrop);
     };
-  }, [onAdd, allowImages, onNotice]);
+  }, [onAdd, allowImages, onNotice, threadId]);
 
   return (
     <>
@@ -176,7 +178,7 @@ export function ComposerAttachments({
                   type="button"
                   onClick={() => {
                     const extension = a.name.split(".").pop()?.toLowerCase();
-                    setFilePreview({ path: a.path, name: a.name, preview: extension === "pdf" ? "pdf" : extension === "xlsx" ? "xlsx" : null });
+                    setFilePreview({ path: a.path, attachmentId: a.attachmentId, name: a.name, preview: extension === "pdf" ? "pdf" : extension === "xlsx" ? "xlsx" : null });
                   }}
                   className="flex h-[76px] w-full items-center gap-2 text-left"
                   aria-label={/\.(pdf|xlsx)$/i.test(a.name) ? `Preview ${a.name}` : `Download ${a.name}`}
@@ -193,7 +195,7 @@ export function ComposerAttachments({
         </div>
       )}
       {preview && <AttachmentPreviewDialog image={preview} onClose={() => setPreview(null)} />}
-      {filePreview && <AttachmentFilePreviewDialog attachment={filePreview} onClose={() => setFilePreview(null)} />}
+      {filePreview && <AttachmentFilePreviewDialog attachment={filePreview} threadId={threadId} draft onClose={() => setFilePreview(null)} />}
     </>
   );
 }

@@ -510,7 +510,7 @@ function handle(msg: any) {
       }
       if (mode === "read-attachment") {
         const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
-        const encodedPath = /<attached-file\s+path="([^"]+)"\s*\/?>/.exec(promptText)?.[1] ?? "";
+        const encodedPath = /<attached-file\s+path="([^"]+)"(?:\s+attachment-id="[^"]*")?\s*\/?>/.exec(promptText)?.[1] ?? "";
         const path = encodedPath
           .replaceAll("&quot;", '"')
           .replaceAll("&lt;", "<")

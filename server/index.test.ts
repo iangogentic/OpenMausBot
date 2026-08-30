@@ -1352,6 +1352,7 @@ describe("harness HTTP API", () => {
   });
 
   it("moves remote binary uploads onto the server and saves exact Razer workspace bytes", async () => {
+    const uploadBot = (await api("POST", "/api/bots", {})).body.bot;
     const macOnlyBytes = Buffer.from("this must not become a Mac path");
     const finderName = "📄-报告.bin";
     const uploaded = await fetch(`${BASE}/api/files/upload`, {
@@ -1360,15 +1361,30 @@ describe("harness HTTP API", () => {
         ...UI_SESSION_HEADER,
         "content-type": "application/octet-stream",
         "x-openmausbot-file-name-b64": Buffer.from(finderName, "utf8").toString("base64url"),
+        "x-openmausbot-thread-id": uploadBot.threadId,
       },
       body: macOnlyBytes,
     });
     expect(uploaded.status).toBe(201);
-    const stored = await uploaded.json() as { path: string; name: string; bytes: number };
+    const stored = await uploaded.json() as { attachmentId: string; path: string; name: string; bytes: number };
     expect(stored.path).toContain("uploaded-files");
     expect(stored.path).not.toContain("/Users/");
     expect(stored.name).toBe(finderName);
     expect(stored.bytes).toBe(macOnlyBytes.byteLength);
+    const draftPreview = await fetch(`${BASE}/api/files/attachment`, {
+      method: "POST",
+      headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
+      body: JSON.stringify({ threadId: uploadBot.threadId, attachmentId: stored.attachmentId, draft: true }),
+    });
+    expect(draftPreview.status).toBe(200);
+    expect(Buffer.from(await draftPreview.arrayBuffer())).toEqual(macOnlyBytes);
+    const otherBot = (await api("POST", "/api/bots", {})).body.bot;
+    const crossThread = await fetch(`${BASE}/api/files/attachment`, {
+      method: "POST",
+      headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
+      body: JSON.stringify({ threadId: otherBot.threadId, attachmentId: stored.attachmentId, draft: true }),
+    });
+    expect(crossThread.status).toBe(404);
 
     const razerWorkspace = join(home, ".openmausbot", "workspaces", "razer-bot");
     mkdirSync(razerWorkspace, { recursive: true });
@@ -1412,16 +1428,35 @@ describe("harness HTTP API", () => {
           ...UI_SESSION_HEADER,
           "content-type": "application/octet-stream",
           "x-openmausbot-file-name-b64": Buffer.from("provider-exact.bin").toString("base64url"),
+          "x-openmausbot-thread-id": bot.threadId,
         },
         body: payload,
       });
       expect(upload.status).toBe(201);
-      const saved = await upload.json() as { path: string };
+      const saved = await upload.json() as { attachmentId: string; path: string };
 
       rmSync(fakeClaudeDump, { force: true });
       expect((await api("POST", `/api/bots/${bot.id}/messages`, {
-        text: `read this exact file\n\n<attached-file path="${saved.path}" />`,
+        text: `read this exact file\n\n<attached-file path="${saved.path}" attachment-id="${saved.attachmentId}" />`,
       })).status).toBe(202);
+      const currentBot = (await api("GET", "/api/bots")).body.bots.find((candidate: { id: string }) => candidate.id === bot.id);
+      const attachedMessage = currentBot.messages.find((message: { role: string; text?: string }) => message.role === "user" && message.text?.includes(saved.attachmentId));
+      const settledPreview = await fetch(`${BASE}/api/files/attachment`, {
+        method: "POST",
+        headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
+        body: JSON.stringify({ threadId: bot.threadId, messageId: attachedMessage.id, attachmentId: saved.attachmentId }),
+      });
+      expect(settledPreview.status).toBe(200);
+      expect(Buffer.from(await settledPreview.arrayBuffer())).toEqual(payload);
+      const forgedMessage = currentBot.messages.find((message: { id: string }) => message.id !== attachedMessage.id)?.id;
+      if (forgedMessage) {
+        const replay = await fetch(`${BASE}/api/files/attachment`, {
+          method: "POST",
+          headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
+          body: JSON.stringify({ threadId: bot.threadId, messageId: forgedMessage, attachmentId: saved.attachmentId }),
+        });
+        expect(replay.status).toBe(404);
+      }
       await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
       const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
       const prompt = String(dump.prompt?.message?.content ?? "");
@@ -1434,7 +1469,7 @@ describe("harness HTTP API", () => {
       // mid-turn must queue for a fresh provider process, never be written as
       // a raw DATA_DIR path into Claude's live stdin.
       const queued = await api("POST", `/api/bots/${bot.id}/messages`, {
-        text: `also read this\n\n<attached-file path="${saved.path}" />`,
+        text: `also read this\n\n<attached-file path="${saved.path}" attachment-id="${saved.attachmentId}" />`,
       });
       expect(queued).toMatchObject({ status: 202, body: { ok: true, queued: true } });
       expect(queued.body.steered).toBeUndefined();

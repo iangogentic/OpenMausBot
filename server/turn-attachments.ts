@@ -19,7 +19,7 @@ import {
   rmSync,
   writeSync,
 } from "node:fs";
-import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
   ATTACHMENTS_DIR,
@@ -70,7 +70,7 @@ interface OpenedManagedFile {
 
 const UUID_PREFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
 const IMAGE_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(png|jpg|gif|webp)$/i;
-const TAG = /<attached-(image|file)\s+path="([^"]*)"\s*\/?>/g;
+const TAG = /<attached-(image|file)\s+path="([^"]*)"(?:\s+attachment-id="([^"]*)")?\s*\/?>/g;
 
 function attachmentError(message: string, status = 400): Error {
   return Object.assign(new Error(message), { status });
@@ -106,7 +106,7 @@ function managedRootForPath(rawPath: string): { kind: AttachmentKind; root: stri
   if (!isAbsolute(rawPath) || rawPath.length > 4096 || rawPath.includes("\0")) return null;
   const parent = dirname(resolve(rawPath));
   if (parent === resolve(ATTACHMENTS_DIR)) return { kind: "image", root: ATTACHMENTS_DIR };
-  if (parent === resolve(UPLOADED_FILES_DIR)) return { kind: "file", root: UPLOADED_FILES_DIR };
+  if (parent === resolve(UPLOADED_FILES_DIR) || dirname(parent) === resolve(UPLOADED_FILES_DIR)) return { kind: "file", root: UPLOADED_FILES_DIR };
   return null;
 }
 
@@ -160,7 +160,9 @@ function openManagedFile(rawPath: string, tagKind: AttachmentKind): OpenedManage
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("unsafe managed root");
     // realpath(parent) must be the exact managed root. No nested directories,
     // alternate store, or symlinked parent can widen the source authority.
-    if (realpathSync(dirname(sourcePath)) !== realpathSync(managed.root)) throw new Error("wrong managed root");
+    const realParent = realpathSync(dirname(sourcePath));
+    const realRoot = realpathSync(managed.root);
+    if (realParent !== realRoot && dirname(realParent) !== realRoot) throw new Error("wrong managed root");
     const before = lstatSync(sourcePath, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink()) throw new Error("not a regular managed file");
     fd = openSync(sourcePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
@@ -251,7 +253,7 @@ function stagedName(kind: AttachmentKind, displayName: string, index: number): s
  * they may already name a file inside the bot's mounted project workspace.
  * A path inside a managed store is never left behind on validation failure.
  */
-export function stageTurnAttachments(texts: readonly string[]): StagedTurnAttachments {
+export function stageTurnAttachments(texts: readonly string[], threadId?: string): StagedTurnAttachments {
   if (texts.length > 64) throw attachmentError("too many turn text segments");
   let runtime: ReturnType<typeof createProviderTempDirectory> | null = null;
   let cleaned = false;
@@ -268,11 +270,18 @@ export function stageTurnAttachments(texts: readonly string[]): StagedTurnAttach
   try {
     const rewritten = texts.map((text) => {
       if (typeof text !== "string") throw attachmentError("turn text must be a string");
-      return text.replace(TAG, (_whole, rawKind: string, rawAttribute: string) => {
+      return text.replace(TAG, (_whole, rawKind: string, rawAttribute: string, rawAttachmentId?: string) => {
         const kind = rawKind as AttachmentKind;
         const sourcePath = unescapeAttribute(rawAttribute);
         const managed = managedRootForPath(sourcePath);
         if (!managed) return _whole;
+        if (kind === "file" && threadId) {
+          const attachmentId = rawAttachmentId ? unescapeAttribute(rawAttachmentId) : "";
+          const expectedParent = resolve(join(UPLOADED_FILES_DIR, threadId));
+          if (!/^[0-9a-f-]{36}$/i.test(attachmentId) || dirname(resolve(sourcePath)) !== expectedParent || !basename(sourcePath).startsWith(`${attachmentId}-`)) {
+            throw attachmentError("managed attachment does not belong to this conversation");
+          }
+        }
 
         const key = `${kind}\0${resolve(sourcePath)}`;
         let handoff = stagedBySource.get(key);

@@ -15,6 +15,7 @@ export type FileAttachment = {
   path: string;
   name: string;
   size: number;
+  attachmentId?: string;
 };
 
 export type ImageAttachment = {
@@ -45,6 +46,7 @@ export function isAttachment(value: unknown): value is Attachment {
       typeof attachment.path === "string" &&
       attachment.path.length > 0 &&
       typeof attachment.name === "string"
+      && (attachment.attachmentId === undefined || typeof attachment.attachmentId === "string")
     );
   }
   if (attachment.kind === "image") {
@@ -150,7 +152,8 @@ export function uploadFileNameHeader(name: string): string {
 /** Persist a non-image file in the harness-owned upload directory. Local and
  * remote sessions use the same managed copy so transcripts never retain an
  * arbitrary Finder path and in-app preview works identically in both modes. */
-export async function fileAttachmentFromFile(file: File): Promise<FileAttachment> {
+export async function fileAttachmentFromFile(file: File, threadId: string): Promise<FileAttachment> {
+  if (!/^[\w-]{1,128}$/.test(threadId)) throw Object.assign(new Error("conversation is unavailable"), { status: 400 });
   if (file.size <= 0) throw Object.assign(new Error(`${file.name || "file"} is empty`), { status: 400 });
   if (file.size > REMOTE_FILE_MAX_BYTES) {
     throw Object.assign(new Error(`${file.name || "file"} exceeds 25 MB`), { status: 413 });
@@ -160,6 +163,7 @@ export async function fileAttachmentFromFile(file: File): Promise<FileAttachment
     headers: {
       "content-type": "application/octet-stream",
       "x-openmausbot-file-name-b64": uploadFileNameHeader(file.name || "attachment"),
+      "x-openmausbot-thread-id": threadId,
     },
     body: await file.arrayBuffer(),
   });
@@ -167,13 +171,14 @@ export async function fileAttachmentFromFile(file: File): Promise<FileAttachment
     const detail = (await response.json().catch(() => ({ error: response.statusText }))) as { error?: string };
     throw Object.assign(new Error(detail.error ?? "file upload failed"), { status: response.status });
   }
-  const saved = (await response.json()) as { path: string; name?: string; bytes: number };
+  const saved = (await response.json()) as { attachmentId: string; path: string; name?: string; bytes: number };
   return {
     kind: "file",
     id: newId(),
     path: saved.path,
     name: saved.name || file.name || "attachment",
     size: saved.bytes,
+    attachmentId: saved.attachmentId,
   };
 }
 
@@ -248,7 +253,9 @@ export function composeMessage(text: string, attachments: Attachment[]): string 
     } else if (a.kind === "image") {
       parts.push(`<attached-image path="${escapeAttribute(a.path)}" />`);
     } else {
-      parts.push(`<attached-file path="${escapeAttribute(a.path)}" />`);
+      parts.push(a.attachmentId
+        ? `<attached-file path="${escapeAttribute(a.path)}" attachment-id="${escapeAttribute(a.attachmentId)}" />`
+        : `<attached-file path="${escapeAttribute(a.path)}" />`);
     }
   });
   return parts.filter(Boolean).join("\n\n");
@@ -285,6 +292,7 @@ export function splitAttachedImages(text: string): { display: string; images: st
 
 export type TranscriptFileAttachment = {
   path: string;
+  attachmentId?: string;
   name: string;
   preview: "pdf" | "xlsx" | null;
 };
@@ -308,8 +316,8 @@ export function splitTranscriptAttachments(text: string) {
   const files: TranscriptFileAttachment[] = [];
   const tags: string[] = [];
   const display = text.replace(
-    /<(attached-image|attached-file)\s+path="([^"]*)"\s*\/?>(?:\s*\n)?/g,
-    (match, tag: string, encodedPath: string) => {
+    /<(attached-image|attached-file)\s+path="([^"]*)"(?:\s+attachment-id="([^"]*)")?\s*\/?>(?:\s*\n)?/g,
+    (match, tag: string, encodedPath: string, encodedAttachmentId?: string) => {
       tags.push(match.trim());
       const path = decodeAttribute(encodedPath);
       if (!path) return "";
@@ -321,6 +329,7 @@ export function splitTranscriptAttachments(text: string) {
         const extension = name.split(".").pop()?.toLowerCase();
         files.push({
           path,
+          ...(encodedAttachmentId ? { attachmentId: decodeAttribute(encodedAttachmentId) } : {}),
           name,
           preview: extension === "pdf" ? "pdf" : extension === "xlsx" ? "xlsx" : null,
         });

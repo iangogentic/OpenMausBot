@@ -34,6 +34,7 @@ import {
   FILE_MAX_BYTES,
   IMAGE_MAX_BYTES,
   readAttachment,
+  readConversationUploadedFile,
   readSavableServerFile,
   saveImage,
   saveUploadedFile,
@@ -3914,7 +3915,7 @@ async function startTurn(
       const attachmentHandoff = stageTurnAttachments([
         turnText,
         ...transcript.map((message) => message.text),
-      ]);
+      ], threadId);
       if (attachmentHandoff.providerRuntimePaths.length) {
         registerTurnAttachmentHandoff(internalTurn, attachmentHandoff.cleanup);
       }
@@ -4724,7 +4725,7 @@ async function runGroupMemberTurn(
     integrations.phone = phoneIntegration();
   }
   try {
-    const attachmentHandoff = stageTurnAttachments([roomText]);
+    const attachmentHandoff = stageTurnAttachments([roomText], group.threadId);
     providerRoomText = attachmentHandoff.texts[0]!;
     providerRuntimePaths = attachmentHandoff.providerRuntimePaths;
     if (providerRuntimePaths.length) {
@@ -7348,9 +7349,55 @@ const server = createServer(async (req, res) => {
         : req.headers["x-openmausbot-file-name-b64"];
       const name = uploadNameFromHeader(rawName);
       if (!name) return json(res, 400, { error: "a safe file name is required" });
+      const rawThreadId = Array.isArray(req.headers["x-openmausbot-thread-id"])
+        ? req.headers["x-openmausbot-thread-id"][0]
+        : req.headers["x-openmausbot-thread-id"];
+      const threadId = typeof rawThreadId === "string" ? rawThreadId : "";
+      if (!store.botByThread(threadId) && !store.groupByThread(threadId)) {
+        return json(res, 404, { error: "no such conversation" });
+      }
       const bytes = await readRawBody(req, FILE_MAX_BYTES);
-      const saved = saveUploadedFile(bytes, name);
+      const saved = saveUploadedFile(bytes, name, threadId);
       return json(res, 201, saved);
+    }
+
+    // Transcript file previews use a server-issued opaque id scoped to an
+    // exact conversation. A filesystem path appearing in user-authored text
+    // is never authority. Settled previews additionally prove the exact
+    // message contains the app-authored attachment id; drafts are limited to
+    // the same thread and current authenticated UI session.
+    if (method === "POST" && path === "/api/files/attachment") {
+      const parsed = z.object({
+        threadId: z.string().regex(/^[\w-]{1,128}$/),
+        messageId: z.string().regex(/^[\w-]{1,128}$/).optional(),
+        attachmentId: z.string().uuid(),
+        draft: z.boolean().optional(),
+      }).safeParse(await readBody(req, 8 * 1024));
+      if (!parsed.success || (parsed.data.draft === true) === Boolean(parsed.data.messageId)) {
+        return json(res, 400, { error: "an exact attachment reference is required" });
+      }
+      const { threadId, messageId, attachmentId } = parsed.data;
+      if (!store.botByThread(threadId) && !store.groupByThread(threadId)) {
+        return json(res, 404, { error: "no such conversation" });
+      }
+      if (messageId) {
+        const message = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
+        const escapedId = attachmentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const provenance = new RegExp(`<attached-file\\s+path="[^"]*"\\s+attachment-id="${escapedId}"\\s*\\/?>(?:\\s*\\n)?`);
+        if (message?.role !== "user" || !message.text || !provenance.test(message.text)) {
+          return json(res, 404, { error: "That attachment does not belong to this message" });
+        }
+      }
+      const file = readConversationUploadedFile(threadId, attachmentId);
+      if (!file) return json(res, 404, { error: "That attachment is unavailable" });
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": String(file.bytes.byteLength),
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+        "x-openmausbot-file-name-b64": Buffer.from(file.name, "utf8").toString("base64url"),
+      });
+      return res.end(file.bytes);
     }
 
     // The renderer sends a model-provided path to Electron; in remote mode

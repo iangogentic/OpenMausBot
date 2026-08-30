@@ -291,6 +291,7 @@ export function Composer({
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   // Auto mode belongs to one bot; a room has several, each with its own.
   const autoBot = group ? undefined : bot;
+  const attachmentThreadId = group?.threadId ?? bot?.threadId ?? "";
   const pickFiles = async (picked: FileList | null) => {
     if (!picked?.length) return;
     const { attachments: added, notice } = await intakeFiles(Array.from(picked), {
@@ -300,7 +301,7 @@ export function Composer({
       // Always copy binary files into the harness-owned attachment store.
       // This gives local and remote chats the same safe preview/download path
       // and avoids persisting arbitrary Finder paths in transcripts.
-      uploadFile: fileAttachmentFromFile,
+      uploadFile: (file) => fileAttachmentFromFile(file as File, attachmentThreadId),
     });
     if (added.length) addAttachments(added);
     // Keep file-specific failures beside the attachments. A successful
@@ -494,7 +495,8 @@ export function Composer({
           onAdd={addAttachments}
           onRemove={removeAttachment}
           onDisplayInChatBox={displayPasteInChatBox}
-        allowImages={engineSupportsImages}
+          allowImages={engineSupportsImages}
+          threadId={attachmentThreadId}
           notice={attachmentNotice}
           onNotice={setAttachmentNotice}
         />

@@ -1,4 +1,4 @@
-import { attachmentBasename, safeAttachmentDisplayName } from "./composer-attachments";
+import { safeAttachmentDisplayName } from "./composer-attachments";
 
 export const DOCUMENT_MAX_BYTES = 25 * 1024 * 1024;
 export const XLSX_MAX_ENTRIES = 2_000;
@@ -62,12 +62,21 @@ function decodeBase64UrlUtf8(value: string | null): string | null {
 /** Fetch through the existing authenticated, containment-checked server
  * route. The response is bounded both before and after buffering because
  * proxies are not required to send Content-Length. */
-export async function downloadAttachment(path: string, signal?: AbortSignal): Promise<DownloadedAttachment> {
-  if (!path || path.length > 4096) throw new Error("This attachment path is invalid.");
-  const response = await fetch("/api/files/download", {
+export type AttachmentDownloadReference = {
+  threadId: string;
+  messageId?: string;
+  attachmentId: string;
+  draft?: boolean;
+};
+
+export async function downloadAttachment(reference: AttachmentDownloadReference, signal?: AbortSignal): Promise<DownloadedAttachment> {
+  if (!/^[\w-]{1,128}$/.test(reference.threadId) || !/^[0-9a-f-]{36}$/i.test(reference.attachmentId)) {
+    throw new Error("This attachment reference is invalid.");
+  }
+  const response = await fetch("/api/files/attachment", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify(reference),
     signal,
   });
   if (!response.ok) {
@@ -87,7 +96,7 @@ export async function downloadAttachment(path: string, signal?: AbortSignal): Pr
   const bytes = await readBoundedBody(response, DOCUMENT_MAX_BYTES);
   if (bytes.byteLength === 0) throw new Error("This attachment is empty.");
   const headerName = decodeBase64UrlUtf8(response.headers.get("x-openmausbot-file-name-b64"));
-  const fallback = attachmentBasename(path);
+  const fallback = "attachment";
   return { bytes, name: safeAttachmentDisplayName(headerName || fallback) };
 }
 

@@ -13,9 +13,9 @@ afterEach(() => vi.useRealTimers());
 
 describe("AttachedFileGallery", () => {
   it("renders safe preview chips without revealing server paths", () => {
-    const markup = renderToStaticMarkup(createElement(AttachedFileGallery, { files: [
-      { path: "/var/lib/openmausbot/private/report.pdf", name: "report.pdf", preview: "pdf" },
-      { path: "/var/lib/openmausbot/private/archive.zip", name: "archive.zip", preview: null },
+    const markup = renderToStaticMarkup(createElement(AttachedFileGallery, { threadId: "thread", messageId: "message", files: [
+      { path: "/var/lib/openmausbot/private/report.pdf", attachmentId: "123e4567-e89b-42d3-a456-426614174000", name: "report.pdf", preview: "pdf" },
+      { path: "/var/lib/openmausbot/private/archive.zip", attachmentId: "223e4567-e89b-42d3-a456-426614174000", name: "archive.zip", preview: null },
     ] }));
     expect(markup).toContain("report.pdf");
     expect(markup).toContain("archive.zip");

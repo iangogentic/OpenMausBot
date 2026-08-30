@@ -18,6 +18,7 @@ const {
   UPLOAD_DISPLAY_NAME_MAX_BYTES,
   extensionForMime,
   readAttachment,
+  readConversationUploadedFile,
   readSavableServerFile,
   safeViewerKind,
   safeUploadName,
@@ -121,11 +122,22 @@ describe("remote server file transfer containment", () => {
 
   it("stores a remote binary under the server and returns its exact bytes", () => {
     const payload = Buffer.from([0, 1, 2, 0xff]);
-    const saved = saveUploadedFile(payload, "report.bin");
+    const saved = saveUploadedFile(payload, "report.bin", "thread-a");
     expect(saved.path.startsWith(UPLOADED_FILES_DIR)).toBe(true);
-    expect(readSavableServerFile(saved.path)).toMatchObject({ bytes: payload });
+    expect(readConversationUploadedFile("thread-a", saved.attachmentId)).toMatchObject({ bytes: payload });
+    expect(readConversationUploadedFile("thread-b", saved.attachmentId)).toBeNull();
+    expect(readSavableServerFile(saved.path)).toBeNull();
     expect(safeUploadName("../escape.bin")).toBeNull();
     expect(safeUploadName("bad\nname")).toBeNull();
+  });
+
+  it("refuses a scoped upload path replaced by a symlink", () => {
+    const saved = saveUploadedFile(Buffer.from("original"), "private.txt", "thread-a");
+    const outside = join(DATA_ROOT, "scoped-outside.txt");
+    writeFileSync(outside, "replacement");
+    rmSync(saved.path);
+    symlinkSync(outside, saved.path);
+    expect(readConversationUploadedFile("thread-a", saved.attachmentId)).toBeNull();
   });
 
   it("round-trips canonical UTF-8 filename metadata and rejects malformed encodings", () => {

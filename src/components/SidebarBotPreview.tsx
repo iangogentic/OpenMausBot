@@ -34,14 +34,14 @@ function messageSummary(message: Message | undefined): string {
   if (message.kind === "secret" && message.secret) return message.secret.label;
   const safeText = (message.text ?? "")
     .replace(/<attached-image\s+path="[^"]*"\s*\/>/g, "[image]")
-    .replace(/<attached-file\s+path="[^"]*"\s*\/>/g, "[file]");
+    .replace(/<attached-file\s+path="[^"]*"(?:\s+attachment-id="[^"]*")?\s*\/>/g, "[file]");
   return replySnippet(safeText) || "Message without text";
 }
 
 function attachmentNames(messages: Message[]): string[] {
   const names: string[] = [];
   for (const message of messages) {
-    for (const match of (message.text ?? "").matchAll(/<attached-(?:image|file)\s+path="([^"]*)"\s*\/>/g)) {
+    for (const match of (message.text ?? "").matchAll(/<attached-(?:image|file)\s+path="([^"]*)"(?:\s+attachment-id="[^"]*")?\s*\/>/g)) {
       const name = attachmentBasename(match[1] ?? "");
       if (name) names.push(name.replaceAll("&amp;", "&").replaceAll("&quot;", '"'));
     }

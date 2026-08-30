@@ -89,6 +89,21 @@ describe("exact-turn attachment handoff", () => {
     expect(() => lstatSync(turnDirectory)).toThrow();
   });
 
+  it("authorizes scoped uploads only for the exact conversation and attachment id", () => {
+    const file = saveUploadedFile(Buffer.from("thread A only"), "private.txt", "thread-a");
+    const tag = `<attached-file path="${file.path}" attachment-id="${file.attachmentId}" />`;
+
+    const authorized = stageTurnAttachments([tag], "thread-a");
+    expect(readFileSync(authorized.staged[0]!.stagedPath, "utf8")).toBe("thread A only");
+    expect(authorized.texts[0]).not.toContain(file.attachmentId);
+    authorized.cleanup();
+
+    expect(() => stageTurnAttachments([tag], "thread-b")).toThrow(/does not belong/);
+    expect(() => stageTurnAttachments([
+      tag.replace(file.attachmentId, "00000000-0000-4000-8000-000000000000"),
+    ], "thread-a")).toThrow(/does not belong/);
+  });
+
   it("denies symlinked sources and a managed file tagged as the wrong type", () => {
     const outside = join(TEST_ROOT, "outside-secret.txt");
     writeFileSync(outside, "server secret");

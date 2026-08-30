@@ -69,6 +69,7 @@ describe("document parser guards", () => {
 });
 
 describe("downloadAttachment", () => {
+  const reference = { threadId: "thread-1", messageId: "message-1", attachmentId: "123e4567-e89b-42d3-a456-426614174000" };
   afterEach(() => vi.unstubAllGlobals());
 
   it("uses the authenticated same-origin POST and decodes filename metadata", async () => {
@@ -77,13 +78,13 @@ describe("downloadAttachment", () => {
       "x-openmausbot-file-name-b64": "cmVwb3J0LnBkZg",
     } }));
     vi.stubGlobal("fetch", fetchMock);
-    await expect(downloadAttachment("/server/private/report.pdf")).resolves.toMatchObject({ name: "report.pdf" });
-    expect(fetchMock).toHaveBeenCalledWith("/api/files/download", expect.objectContaining({ method: "POST", body: JSON.stringify({ path: "/server/private/report.pdf" }) }));
+    await expect(downloadAttachment(reference)).resolves.toMatchObject({ name: "report.pdf" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/files/attachment", expect.objectContaining({ method: "POST", body: JSON.stringify(reference) }));
   });
 
   it("rejects declared and actual oversized responses", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([1]), { headers: { "content-length": String(DOCUMENT_MAX_BYTES + 1) } })));
-    await expect(downloadAttachment("/safe/a.pdf")).rejects.toThrow(/25 MB/);
+    await expect(downloadAttachment(reference)).rejects.toThrow(/25 MB/);
 
     let cancelled = false;
     const chunk = new Uint8Array(1024 * 1024);
@@ -94,7 +95,7 @@ describe("downloadAttachment", () => {
       cancel() { cancelled = true; },
     });
     vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
-    await expect(downloadAttachment("/safe/streamed.pdf")).rejects.toThrow(/25 MB/);
+    await expect(downloadAttachment(reference)).rejects.toThrow(/25 MB/);
     expect(cancelled).toBe(true);
   });
 
@@ -106,7 +107,7 @@ describe("downloadAttachment", () => {
       cancel() { cancelled = true; },
     });
     vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 500 })));
-    await expect(downloadAttachment("/safe/error.pdf")).rejects.toThrow(/unavailable/);
+    await expect(downloadAttachment(reference)).rejects.toThrow(/unavailable/);
     expect(cancelled).toBe(true);
   });
 });
