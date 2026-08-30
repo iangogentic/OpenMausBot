@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { dirname, join, posix, win32 } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
-import type { ModelCatalog } from "../../contracts.ts";
+import type { ModelCatalog, SendTurnInput } from "../../contracts.ts";
 import { DATA_DIR } from "../../config.ts";
 import { providerRuntimeBase } from "../../provider-runtime.ts";
 import { findCliCandidates } from "../../env-path.ts";
@@ -184,15 +184,37 @@ export function hermesAcpModelId(modelId: string | null | undefined): string | n
  * ignores it), so nothing overrides that choice.
  */
 export const HERMES_CONFIG_MODEL_ID = "hermes-default";
+const SPARK_FINAL_OPEN = "<openmaus_final>";
+const SPARK_FINAL_CLOSE = "</openmaus_final>";
+const SPARK_FINAL_CONTRACT = [
+  "OpenMaus output protocol for this turn:",
+  "You may reason internally, but after completing the task emit exactly one user-visible final response",
+  `wrapped once in ${SPARK_FINAL_OPEN} and ${SPARK_FINAL_CLOSE}.`,
+  "Put no reasoning inside that element. The closing tag must be your final output.",
+].join(" ");
+
+function isSparkHermesModel(modelId: string | undefined): boolean {
+  return decodeInjectId(modelId)?.host === "spark_glm";
+}
+
+export function buildHermesPromptText(turn: Pick<SendTurnInput, "model" | "system" | "text">): string {
+  const prompt = turn.system ? `${turn.system}\n\n${turn.text}` : turn.text;
+  return isSparkHermesModel(turn.model) ? `${prompt}\n\n${SPARK_FINAL_CONTRACT}` : prompt;
+}
 
 /** Spark GLM occasionally returns the complete terminal answer twice in one
  * response after a tool turn. Collapse only an exact whole-answer repeat,
  * only for this injected host. Do not fuzzy-match or alter partial repeats. */
 export function normalizeHermesAssistantText(text: string, modelId: string | undefined): string {
-  if (decodeInjectId(modelId)?.host !== "spark_glm") return text;
+  if (!isSparkHermesModel(modelId)) return text;
   const leading = text.match(/^\s*/u)?.[0] ?? "";
   const trailing = text.match(/\s*$/u)?.[0] ?? "";
   const body = text.slice(leading.length, text.length - trailing.length);
+  const closeIndex = body.lastIndexOf(SPARK_FINAL_CLOSE);
+  const openIndex = closeIndex >= 0 ? body.lastIndexOf(SPARK_FINAL_OPEN, closeIndex) : -1;
+  if (openIndex >= 0) {
+    return body.slice(openIndex + SPARK_FINAL_OPEN.length, closeIndex).trim();
+  }
   for (let tailLength = 0; tailLength <= 4; tailLength += 1) {
     for (let separatorLength = 0; separatorLength <= 4; separatorLength += 1) {
       const repeatedLength = body.length - separatorLength - tailLength;
@@ -605,9 +627,9 @@ const support: AcpSupport = {
       `model "${native}"`,
     );
   },
-  buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
+  buildPromptText: buildHermesPromptText,
   normalizeAssistantText: (text, turn) => normalizeHermesAssistantText(text, turn.model),
-  discardAssistantTextBeforeTool: (_text, turn) => decodeInjectId(turn.model)?.host === "spark_glm",
+  discardAssistantTextBeforeTool: (_text, turn) => isSparkHermesModel(turn.model),
 };
 
 export const HermesAgentDriver = createAcpDriver(support);

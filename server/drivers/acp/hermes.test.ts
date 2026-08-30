@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 
 import { removeTempDir } from "../../testing/cleanup.ts";
 import {
+  buildHermesPromptText,
   HERMES_CONFIG_MODEL_ID,
   normalizeHermesAssistantText,
   hermesAcpModelId,
@@ -33,6 +34,20 @@ describe("normalizeHermesAssistantText", () => {
     expect(normalizeHermesAssistantText(`\n\n${answer}${answer}`, spark)).toBe(`\n\n${answer}`);
     expect(normalizeHermesAssistantText(`${answer}\n${answer}\n`, spark)).toBe(`${answer}\n`);
     expect(normalizeHermesAssistantText(`${answer}${answer}擎`, spark)).toBe(answer);
+  });
+
+  it("extracts only the final protocol element from Spark reasoning", () => {
+    const raw = "private planning\n<openmaus_final>Clean final answer.</openmaus_final>";
+    expect(normalizeHermesAssistantText(raw, spark)).toBe("Clean final answer.");
+  });
+
+  it("adds the final element contract only to Spark prompts", () => {
+    expect(buildHermesPromptText({ model: spark, system: "persona", text: "do work" })).toMatch(
+      /^persona\n\ndo work\n\nOpenMaus output protocol.*<openmaus_final>/,
+    );
+    expect(buildHermesPromptText({ model: "desktop2::qwen", system: "persona", text: "do work" })).toBe(
+      "persona\n\ndo work",
+    );
   });
 
   it("preserves partial repeats, short answers, and every other Hermes route", () => {
