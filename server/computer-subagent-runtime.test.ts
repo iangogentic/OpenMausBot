@@ -211,6 +211,9 @@ describe("ComputerSubagentRuntime", () => {
     expect(h.manager.get(handle.childId)?.status).toBe("running");
     parentIsCurrent = true;
     await h.runtime.markWaitingOnHuman(handle, parent);
+    await expect(h.runtime.resumeAfterHuman(handle, parent, () => false))
+      .rejects.toThrow("cannot resume while human control is reserved");
+    expect(h.manager.get(handle.childId)?.status).toBe("waiting-on-human");
     await expect(h.runtime.resumeAfterHuman(handle, { ...parent, generation: 2 }))
       .rejects.toThrow("owner is stale or invalid");
     expect(h.manager.get(handle.childId)?.status).toBe("waiting-on-human");

@@ -122,6 +122,25 @@ describe("computer control lease", () => {
     control.dispose();
   });
 
+  it("reports both a draining takeover and a live lease as reserved for human control", async () => {
+    const { control } = deterministic({ drainTimeoutMs: 1_000 });
+    const action = control.beginAction("b1", "vm:shared", BRIDGE_A);
+    expect(action.allowed).toBe(true);
+    if (!action.allowed) throw new Error("action unexpectedly refused");
+    const takeover = control.takeLease({ botId: "b2", targetKey: "vm:shared", ownerId: "renderer-b" });
+    await Promise.resolve();
+    expect(control.targetReservedForHuman("vm:shared")).toBe(true);
+    control.endAction("b1", "vm:shared", BRIDGE_A, action.actionId);
+    const result = await takeover;
+    expect(result.ok).toBe(true);
+    expect(control.targetReservedForHuman("vm:shared")).toBe(true);
+    if (result.ok) {
+      control.releaseLease({ botId: "b2", targetKey: "vm:shared", ownerId: "renderer-b", leaseToken: result.leaseToken });
+    }
+    expect(control.targetReservedForHuman("vm:shared")).toBe(false);
+    control.dispose();
+  });
+
   it("fences new actions, drains an in-flight action, and only then reports control", async () => {
     const { control } = deterministic({ drainTimeoutMs: 1_000 });
     const action = control.beginAction("b1", "vm:shared", BRIDGE_A);

@@ -153,9 +153,17 @@ export class ComputerSubagentRuntime {
     return this.publishMonitor(record);
   }
   /** Resume the exact owned child after human control returns to the agent. */
-  async resumeAfterHuman(handle: ComputerSubagentHandle, parent: ComputerSubagentParent): Promise<ComputerChildMonitor> {
+  async resumeAfterHuman(
+    handle: ComputerSubagentHandle,
+    parent: ComputerSubagentParent,
+    mayResume: () => boolean = () => true,
+  ): Promise<ComputerChildMonitor> {
     const execution = await this.currentOwnedExecution(handle, parent);
     this.requireHumanHandoffMutable(execution);
+    // currentOwnedExecution awaits parent validation. A new human takeover can
+    // begin during that await, so recheck its target reservation at the final
+    // synchronous boundary before action admission becomes live again.
+    if (!mayResume()) throw new ComputerSubagentStateError(handle.childId, "cannot resume while human control is reserved");
     const record = this.manager.markRunningAfterHuman(execution.handle);
     execution.acceptingActions = execution.child !== null && !execution.terminalized && !execution.abortRequested;
     return this.publishMonitor(record);

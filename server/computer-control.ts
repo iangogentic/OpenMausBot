@@ -254,6 +254,14 @@ export class ComputerControl {
     return null;
   }
 
+  /** True while a human lease is held or a takeover is draining. Callers use
+   * this as the final synchronous handoff fence before resuming an agent. */
+  targetReservedForHuman(targetKey: string): boolean {
+    this.reapExpired();
+    const target = this.targets.get(targetKey);
+    return Boolean(target?.lease || target?.pendingTake);
+  }
+
   /** Subscribe a viewer proxy so sockets disappear the instant ownership is
    * released or expires. Returns an unsubscribe function. */
   onRevoked(listener: (event: LeaseRevocation) => void): () => void {
