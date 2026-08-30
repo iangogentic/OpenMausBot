@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { createPortal } from "react-dom";
 import {
   CalendarClock,
   CalendarDays,
@@ -23,10 +24,19 @@ import { WebhooksPanel } from "@/components/WebhooksPanel";
 import { cn } from "@/lib/cn";
 import { MAUS_COLORS, type MausState } from "@/lib/mascot";
 import type { Routine, RoutineInput, RoutineRun, RoutineRunOn, RoutineRunStatus } from "@/lib/routines";
+import { normalizeTimeZone, systemTimeZone, zonedDailyOccurrences } from "../../shared/routine-timezone";
 import { api, useStore, type Bot } from "@/state/store";
 
 const HOUR_HEIGHT = 68;
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const DIALOG_FOCUSABLE = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
 
 type CalendarItem = {
   id: string;
@@ -51,13 +61,6 @@ function startOfWeek(at: number) {
   const date = new Date(startOfDay(at));
   const offset = (date.getDay() + 6) % 7;
   date.setDate(date.getDate() - offset);
-  return date.getTime();
-}
-
-function atLocalTime(day: number, time: string) {
-  const [hour, minute] = time.split(":").map(Number);
-  const date = new Date(day);
-  date.setHours(hour, minute, 0, 0);
   return date.getTime();
 }
 
@@ -90,7 +93,21 @@ function scheduleLabel(routine: Routine) {
       : days.join(",") === "1,2,3,4,5"
         ? "Weekdays"
         : days.map((day) => DAY_NAMES[day]).join(", ");
-  return `${dayLabel} at ${niceTime(atLocalTime(Date.now(), routine.schedule.time))}`;
+  const timeZone = normalizeTimeZone(routine.schedule.timeZone);
+  const sample = routine.nextRunAt ?? zonedDailyOccurrences({
+    time: routine.schedule.time,
+    weekdays: routine.schedule.weekdays,
+    timeZone,
+  }, Date.now(), Date.now() + 9 * 86_400_000, 1)[0];
+  const timeLabel = sample == null
+    ? routine.schedule.time
+    : new Intl.DateTimeFormat([], {
+        timeZone,
+        hour: "numeric",
+        minute: "2-digit",
+        timeZoneName: "short",
+      }).format(sample);
+  return `${dayLabel} at ${timeLabel}`;
 }
 
 function canToggleRoutine(routine: Routine) {
@@ -166,10 +183,12 @@ function projectedItems(routines: Routine[], runs: RoutineRun[], from: number, t
       }
       continue;
     }
-    for (let day = startOfDay(from); day < to; day = addDays(day, 1)) {
-      const date = new Date(day);
-      if (!routine.schedule.weekdays.includes(date.getDay())) continue;
-      const at = atLocalTime(day, routine.schedule.time);
+    const occurrences = zonedDailyOccurrences({
+      time: routine.schedule.time,
+      weekdays: routine.schedule.weekdays,
+      timeZone: normalizeTimeZone(routine.schedule.timeZone),
+    }, from, to);
+    for (const at of occurrences) {
       if (at >= from && at < to && at >= routine.createdAt && !hasReceipt(routine.id, at)) {
         items.push({ id: `next-${routine.id}-${at}`, at, routine, run: null });
       }
@@ -315,6 +334,15 @@ export function RoutineEditor({
   onClose: () => void;
 }) {
   const { state, dispatch } = useStore();
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null,
+  );
   const [name, setName] = useState(routine?.name ?? "");
   const [prompt, setPrompt] = useState(routine?.prompt ?? "");
   const [botId, setBotId] = useState(lockedBotId ?? routine?.botId ?? bots[0]?.id ?? "");
@@ -324,6 +352,11 @@ export function RoutineEditor({
     toInputDateTime(routine?.schedule.type === "once" ? routine.schedule.at : nextHour()),
   );
   const [time, setTime] = useState(routine?.schedule.type === "daily" ? routine.schedule.time : "09:00");
+  const [timeZone, setTimeZone] = useState(
+    routine?.schedule.type === "daily"
+      ? normalizeTimeZone(routine.schedule.timeZone)
+      : systemTimeZone(),
+  );
   const [weekdays, setWeekdays] = useState(
     routine?.schedule.type === "daily" ? routine.schedule.weekdays : [1, 2, 3, 4, 5],
   );
@@ -332,6 +365,48 @@ export function RoutineEditor({
   const [error, setError] = useState("");
   const cloudInstance = state.instances.find((instance) => instance.driverKind === "boxAgent");
   const cloudReady = Boolean(state.config?.box.configured && cloudInstance?.snapshot.state === "available");
+
+  useEffect(() => {
+    nameInputRef.current?.focus();
+    return () => {
+      const restore = restoreFocusRef.current;
+      if (restore?.isConnected) restore.focus();
+    };
+  }, []);
+
+  const onDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      // Keep this Escape inside the top-most modal. In particular, the
+      // Computer panel also listens for Escape at window level; one key must
+      // close only the routine editor, not both layers.
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+    if (event.key !== "Tab") return;
+
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE)).filter(
+      (element) => !element.hidden && element.getAttribute("aria-hidden") !== "true" && element.tabIndex >= 0,
+    );
+    if (focusable.length === 0) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !dialog.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !dialog.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
 
   const save = async () => {
     const input: RoutineInput = {
@@ -344,7 +419,7 @@ export function RoutineEditor({
       schedule:
         kind === "once"
           ? { type: "once", at: new Date(at).getTime() }
-          : { type: "daily", time, weekdays },
+          : { type: "daily", time, weekdays, timeZone },
     };
     setSaving(true);
     setError("");
@@ -362,20 +437,29 @@ export function RoutineEditor({
     }
   };
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-5 backdrop-blur-sm" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="max-h-[90vh] w-full max-w-[620px] overflow-y-auto rounded-2xl border border-hairline/60 bg-panel shadow-2xl">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        onKeyDown={onDialogKeyDown}
+        className="max-h-[90vh] w-full max-w-[620px] overflow-y-auto rounded-2xl border border-hairline/60 bg-panel shadow-2xl"
+      >
         <div className="sticky top-0 z-10 flex items-center justify-between border-b border-hairline/40 bg-panel/95 px-5 py-4 backdrop-blur">
           <div>
-            <div className="text-[17px] font-semibold text-ink">{routine ? "Edit routine" : "New routine"}</div>
-            <div className="mt-0.5 text-[12px] text-ink-secondary">Each run starts a fresh task for this agent. No cron syntax required.</div>
+            <div id={titleId} className="text-[17px] font-semibold text-ink">{routine ? "Edit routine" : "New routine"}</div>
+            <div id={descriptionId} className="mt-0.5 text-[12px] text-ink-secondary">Each run starts a fresh task for this agent. No cron syntax required.</div>
           </div>
-          <button onClick={onClose} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
+          <button onClick={onClose} aria-label="Close routine editor" className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink"><X size={18} /></button>
         </div>
         <div className="space-y-5 p-5">
           <label className="block">
             <span className="mb-1.5 block text-[12px] font-medium text-ink-secondary">Routine name</span>
-            <input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Morning research brief" className="w-full rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70" />
+            <input ref={nameInputRef} value={name} onChange={(event) => setName(event.target.value)} placeholder="Morning research brief" className="w-full rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none placeholder:text-ink-secondary/60 focus:border-accent/70" />
           </label>
           <div>
             <div className="mb-2 text-[12px] font-medium text-ink-secondary">Where does it run?</div>
@@ -440,6 +524,31 @@ export function RoutineEditor({
             ) : (
               <div className="space-y-3">
                 <input type="time" value={time} onChange={(event) => setTime(event.target.value)} className="rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[14px] text-ink outline-none focus:border-accent/70 [color-scheme:dark]" />
+                <label className="block">
+                  <span className="mb-1.5 block text-[11.5px] text-ink-secondary">Timezone</span>
+                  <input
+                    list="openmaus-timezones"
+                    value={timeZone}
+                    onChange={(event) => setTimeZone(event.target.value)}
+                    onBlur={() => {
+                      try { setTimeZone(normalizeTimeZone(timeZone)); } catch { /* save shows the server error */ }
+                    }}
+                    className="w-full rounded-xl border border-hairline/60 bg-inset px-3.5 py-2.5 text-[13px] text-ink outline-none focus:border-accent/70"
+                  />
+                  <datalist id="openmaus-timezones">
+                    {Array.from(new Set([
+                      systemTimeZone(),
+                      "UTC",
+                      "America/Chicago",
+                      "America/New_York",
+                      "America/Denver",
+                      "America/Los_Angeles",
+                      "Europe/London",
+                      "Asia/Tokyo",
+                    ])).map((zone) => <option key={zone} value={zone} />)}
+                  </datalist>
+                  <span className="mt-1 block text-[11px] text-ink-secondary">Saved with the routine, so a Razer-hosted scheduler follows your intended wall clock through travel and daylight-saving changes.</span>
+                </label>
                 <div className="flex flex-wrap gap-1.5">
                   {DAY_NAMES.map((label, day) => (
                     <button key={label} type="button" onClick={() => setWeekdays((current) => current.includes(day) ? (current.length === 1 ? current : current.filter((value) => value !== day)) : [...current, day].sort())} className={cn("size-10 rounded-xl border text-[11px] font-medium", weekdays.includes(day) ? "border-accent bg-accent text-white" : "border-hairline/50 bg-inset text-ink-secondary hover:text-ink")}>{label.slice(0, 2)}</button>
@@ -463,7 +572,8 @@ export function RoutineEditor({
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

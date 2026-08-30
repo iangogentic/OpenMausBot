@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
+import { decodeInjectId, localHost, localInjectConnection, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 // FACTORY_HOME_OVERRIDE replaces the HOME the CLI resolves, NOT the data root:
@@ -81,6 +81,7 @@ export function ensureDroidInjectModel(
   if (!inject) return modelId;
   const host = localHost(inject.host);
   if (!host) return modelId;
+  const connection = localInjectConnection(host, inject.model, env);
 
   const id = droidInjectId(inject.host, inject.model);
   const dir = join(factoryHome(env), ".factory");
@@ -93,26 +94,21 @@ export function ensureDroidInjectModel(
     if (existsSync(path)) throw error;
   }
   const custom = Array.isArray(settings.customModels) ? [...settings.customModels] : [];
-  const match = custom.find(
+  const matchIndex = custom.findIndex(
     (row) =>
-      row.id === id || (row.model === inject.model && row.baseUrl === host.baseUrl),
+      row.id === id || (row.model === inject.model && row.baseUrl === connection.openaiBaseUrl),
   );
-  if (match) {
-    if (!match.id) {
-      match.id = id;
-      settings.customModels = custom;
-      writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
-    }
-    return match.id;
-  }
-  custom.push({
+  const next = {
+    ...(matchIndex >= 0 ? custom[matchIndex] : {}),
     id,
     model: inject.model,
     displayName: `${inject.model} (${host.label})`,
-    baseUrl: host.baseUrl,
-    apiKey: hostApiKey(host, env),
+    baseUrl: connection.openaiBaseUrl,
+    apiKey: connection.apiKey,
     provider: "generic-chat-completion-api",
-  });
+  };
+  if (matchIndex >= 0) custom[matchIndex] = next;
+  else custom.push(next);
   settings.customModels = custom;
   writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
   return id;

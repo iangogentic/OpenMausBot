@@ -29,6 +29,7 @@ const JPEG = Buffer.concat([
 
 describe("computer proxy (fake box)", () => {
   let box: Server;
+  let controlServer: Server;
   let proxy: ChildProcess;
   let port = 0;
   const commands: string[] = [];
@@ -51,11 +52,23 @@ describe("computer proxy (fake box)", () => {
   beforeAll(async () => {
     box = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://x");
-      if (url.pathname.endsWith("/commands")) {
+      if (url.pathname === "/api/internal/box") {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
-          const command = JSON.parse(body || "{}").command ?? "";
+          const parsed = JSON.parse(body || "{}");
+          if (parsed.op === "read-file") {
+            fileReads += 1;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, status: 200, data: JPEG }));
+            return;
+          }
+          if (parsed.op !== "command") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, status: 200, body: { box: { state: "ready" } } }));
+            return;
+          }
+          const command = parsed.command ?? "";
           commands.push(command);
           // a real box echoes what the capture block printed
           const size = Buffer.from(JPEG, "base64").length;
@@ -80,14 +93,8 @@ describe("computer proxy (fake box)", () => {
                 ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${JPEG}\nACT ok\n`
                 : "ACT ok\n";
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ exitCode: 0, stdout, stderr: "" }));
+          res.end(JSON.stringify({ ok: true, status: 200, exitCode: 0, stdout, stderr: "" }));
         });
-        return;
-      }
-      if (url.pathname.endsWith("/artifacts") || url.pathname.endsWith("/files")) {
-        fileReads += 1;
-        res.writeHead(200, { "content-type": "application/octet-stream" });
-        res.end(Buffer.from(JPEG, "base64"));
         return;
       }
       res.writeHead(404).end("{}");
@@ -95,12 +102,39 @@ describe("computer proxy (fake box)", () => {
     await new Promise<void>((r) => box.listen(0, "127.0.0.1", r));
     port = (box.address() as any).port;
 
+    let actionSequence = 0;
+    controlServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const parsed = JSON.parse(body || "{}");
+        res.writeHead(200, { "content-type": "application/json" });
+        if (req.method === "POST" && parsed.op === "begin-action") {
+          res.end(JSON.stringify({ valid: true, allowed: true, actionId: `action-${++actionSequence}` }));
+          return;
+        }
+        if (req.method === "DELETE" && parsed.op === "end-action") {
+          res.end(JSON.stringify({ valid: true, ended: true }));
+          return;
+        }
+        if (req.method === "DELETE" && parsed.op === "end-all-actions") {
+          res.end(JSON.stringify({ valid: true, ended: true }));
+          return;
+        }
+        res.end(JSON.stringify({ valid: true, held: false, helpOpen: false }));
+      });
+    });
+    await new Promise<void>((resolve) => controlServer.listen(0, "127.0.0.1", resolve));
+    const controlPort = (controlServer.address() as any).port;
+
     proxy = spawn(process.execPath, ["--experimental-strip-types", PROXY], {
       env: {
         ...process.env,
-        OGB_BOX_API: `http://127.0.0.1:${port}`,
         OGB_BOX_ID: "box-1",
-        OGB_BOX_TOKEN: "t",
+        OMB_BOX_BROKER_URL: `http://127.0.0.1:${port}/api/internal/box`,
+        OMB_BOX_CAPABILITY_TOKEN: "box-capability",
+        OMB_CONTROL_URL: `http://127.0.0.1:${controlPort}/api/internal/computer-control?botId=b1`,
+        OMB_CONTROL_TOKEN: "control-secret",
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -127,6 +161,7 @@ describe("computer proxy (fake box)", () => {
   afterAll(() => {
     proxy?.kill();
     box?.close();
+    controlServer?.close();
   });
 
   it("exposes action, structured-state, crop, and metrics tools", async () => {
@@ -479,7 +514,12 @@ describe("computer proxy control gate (fake box + fake control)", () => {
   let held = false;
   let helpOpen = false;
   let failHelpPost = false;
+  let failActionCheck = false;
+  let failStateRead = false;
   const expiredHelpIds: string[] = [];
+  const begunActionIds: string[] = [];
+  const endedActionIds: string[] = [];
+  const completionOrder: string[] = [];
   const authHeaders: Array<string | undefined> = [];
 
   const rpc = (msg: unknown) => proxy.stdin!.write(JSON.stringify(msg) + "\n");
@@ -496,15 +536,23 @@ describe("computer proxy control gate (fake box + fake control)", () => {
   beforeAll(async () => {
     box = createServer((req, res) => {
       const url = new URL(req.url ?? "/", "http://x");
-      if (url.pathname.endsWith("/commands")) {
+      if (url.pathname === "/api/internal/box") {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
-          commands.push(JSON.parse(body || "{}").command ?? "");
+          const parsed = JSON.parse(body || "{}");
+          if (parsed.op !== "command") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, status: 200, body: { box: { state: "ready" } } }));
+            return;
+          }
+          commands.push(parsed.command ?? "");
           const size = Buffer.from(JPEG, "base64").length;
           res.writeHead(200, { "content-type": "application/json" });
           res.end(
             JSON.stringify({
+              ok: true,
+              status: 200,
               exitCode: 0,
               stdout: `GEOM 1920 1080\nHASH h1\nSIZE ${size}\nB64 ${JPEG}\nACT ok\n`,
               stderr: "",
@@ -521,17 +569,35 @@ describe("computer proxy control gate (fake box + fake control)", () => {
     controlServer = createServer((req, res) => {
       authHeaders.push(Array.isArray(req.headers.authorization) ? undefined : req.headers.authorization);
       if (req.method === "POST") {
-        if (failHelpPost) {
-          req.resume();
-          res.writeHead(503, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "offline" }));
-          return;
-        }
-        helpOpen = true;
-        req.resume();
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
         req.on("end", () => {
+          const parsed = JSON.parse(body || "{}");
+          if (parsed.op === "begin-action") {
+            if (failActionCheck) {
+              res.writeHead(503, { "content-type": "application/json" });
+              res.end(JSON.stringify({ error: "offline" }));
+              return;
+            }
+            if (held) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ valid: true, allowed: false, reason: "human-control" }));
+              return;
+            }
+            const actionId = `action-${begunActionIds.length + 1}`;
+            begunActionIds.push(actionId);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ valid: true, allowed: true, actionId }));
+            return;
+          }
+          if (failHelpPost) {
+            res.writeHead(503, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "offline" }));
+            return;
+          }
+          helpOpen = true;
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ held, helpOpen, requestId: "help-1" }));
+          res.end(JSON.stringify({ valid: true, held, helpOpen, requestId: "help-1" }));
         });
         return;
       }
@@ -539,15 +605,33 @@ describe("computer proxy control gate (fake box + fake control)", () => {
         let body = "";
         req.on("data", (chunk) => (body += chunk));
         req.on("end", () => {
-          expiredHelpIds.push(JSON.parse(body || "{}").requestId);
+          const parsed = JSON.parse(body || "{}");
+          if (parsed.op === "end-action") {
+            endedActionIds.push(parsed.actionId);
+            completionOrder.push(`end:${parsed.actionId}`);
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ valid: true, ended: true }));
+            return;
+          }
+          if (parsed.op === "end-all-actions") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ valid: true, ended: true }));
+            return;
+          }
+          expiredHelpIds.push(parsed.requestId);
           helpOpen = false;
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ held, helpOpen }));
+          res.end(JSON.stringify({ valid: true, held, helpOpen }));
         });
         return;
       }
+      if (failStateRead) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "offline" }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ held, helpOpen }));
+      res.end(JSON.stringify({ valid: true, held, helpOpen }));
     });
     await new Promise<void>((r) => controlServer.listen(0, "127.0.0.1", r));
     const controlPort = (controlServer.address() as any).port;
@@ -555,9 +639,9 @@ describe("computer proxy control gate (fake box + fake control)", () => {
     proxy = spawn(process.execPath, ["--experimental-strip-types", PROXY], {
       env: {
         ...process.env,
-        OGB_BOX_API: `http://127.0.0.1:${boxPort}`,
         OGB_BOX_ID: "box-1",
-        OGB_BOX_TOKEN: "t",
+        OMB_BOX_BROKER_URL: `http://127.0.0.1:${boxPort}/api/internal/box`,
+        OMB_BOX_CAPABILITY_TOKEN: "box-capability",
         OMB_CONTROL_URL: `http://127.0.0.1:${controlPort}/api/internal/computer-control?botId=b1`,
         OMB_CONTROL_TOKEN: "control-secret",
         // fast cadence so the wait tests measure logic, not wall-clock
@@ -576,7 +660,10 @@ describe("computer proxy control gate (fake box + fake control)", () => {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          if (msg.id != null) results.set(msg.id, msg);
+          if (msg.id != null) {
+            completionOrder.push(`result:${msg.id}`);
+            results.set(msg.id, msg);
+          }
         } catch {
           /* ignore */
         }
@@ -598,6 +685,9 @@ describe("computer proxy control gate (fake box + fake control)", () => {
     const result = await waitFor(2);
     expect(result.result.isError).toBeUndefined();
     expect(commands.length).toBeGreaterThan(0);
+    const actionId = begunActionIds.at(-1)!;
+    expect(endedActionIds).toContain(actionId);
+    expect(completionOrder.indexOf(`end:${actionId}`)).toBeLessThan(completionOrder.indexOf("result:2"));
     expect(authHeaders.every((h) => h === "Bearer control-secret")).toBe(true);
   });
 
@@ -611,6 +701,18 @@ describe("computer proxy control gate (fake box + fake control)", () => {
     rpc({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "screenshot", arguments: {} } });
     const shot = await waitFor(4);
     expect(shot.result.isError).toBe(true);
+    expect(commands.length).toBe(before);
+  });
+
+  it("fails closed when the control authority cannot issue an action ticket", async () => {
+    held = false;
+    failActionCheck = true;
+    const before = commands.length;
+    rpc({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "click", arguments: { x: 20, y: 20 } } });
+    const result = await waitFor(9);
+    failActionCheck = false;
+    expect(result.result.isError).toBe(true);
+    expect(result.result.content[0].text).toMatch(/authority could not be verified/i);
     expect(commands.length).toBe(before);
   });
 
@@ -662,5 +764,167 @@ describe("computer proxy control gate (fake box + fake control)", () => {
     failHelpPost = false;
     expect(result.result.isError).toBe(true);
     expect(result.result.content[0].text).toMatch(/could not be paged/i);
+  });
+
+  it("fails promptly and expires its plea if authority disappears while waiting", async () => {
+    held = false;
+    helpOpen = false;
+    failStateRead = false;
+    rpc({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "computer_request_help", arguments: {} } });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(helpOpen).toBe(true);
+    failStateRead = true;
+    const result = await waitFor(10, 800);
+    failStateRead = false;
+    expect(result.result.isError).toBe(true);
+    expect(result.result.content[0].text).toMatch(/authority became unavailable/i);
+    expect(expiredHelpIds).toContain("help-1");
+  });
+});
+
+describe("computer proxy teardown safety", () => {
+  let box: Server;
+  let controlServer: Server;
+  let boxPort = 0;
+  let controlPort = 0;
+  const pendingBoxResponses: Array<import("node:http").ServerResponse> = [];
+  const controlOps: Array<{ op: string; actionId?: string }> = [];
+  let actionSequence = 0;
+
+  const waitUntil = async (predicate: () => boolean, message: string, ms = 4_000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(message);
+  };
+
+  const startProxy = () => spawn(process.execPath, ["--experimental-strip-types", PROXY], {
+    env: {
+      ...process.env,
+      OGB_BOX_ID: "box-1",
+      OMB_BOX_BROKER_URL: `http://127.0.0.1:${boxPort}/api/internal/box`,
+      OMB_BOX_CAPABILITY_TOKEN: "box-capability",
+      OMB_CONTROL_URL: `http://127.0.0.1:${controlPort}/api/internal/computer-control?botId=b1`,
+      OMB_CONTROL_TOKEN: "control-secret",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const finishNextBoxAction = () => {
+    const response = pendingBoxResponses.shift();
+    if (!response) throw new Error("no pending Box action");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, status: 200, exitCode: 0, stdout: "ACT ok\n", stderr: "" }));
+  };
+
+  beforeAll(async () => {
+    box = createServer((req, res) => {
+      if (new URL(req.url ?? "/", "http://x").pathname === "/api/internal/box") {
+        req.resume();
+        req.on("end", () => pendingBoxResponses.push(res));
+        return;
+      }
+      res.writeHead(404).end("{}");
+    });
+    await new Promise<void>((resolve) => box.listen(0, "127.0.0.1", resolve));
+    boxPort = (box.address() as any).port;
+
+    controlServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const parsed = JSON.parse(body || "{}");
+        controlOps.push(parsed);
+        res.writeHead(200, { "content-type": "application/json" });
+        if (req.method === "POST" && parsed.op === "begin-action") {
+          res.end(JSON.stringify({ valid: true, allowed: true, actionId: `action-${++actionSequence}` }));
+          return;
+        }
+        if (req.method === "DELETE" && parsed.op === "end-action") {
+          res.end(JSON.stringify({ valid: true, ended: true }));
+          return;
+        }
+        res.end(JSON.stringify({ valid: true, held: false, helpOpen: false }));
+      });
+    });
+    await new Promise<void>((resolve) => controlServer.listen(0, "127.0.0.1", resolve));
+    controlPort = (controlServer.address() as any).port;
+  });
+
+  afterAll(() => {
+    for (const response of pendingBoxResponses.splice(0)) response.destroy();
+    box?.closeAllConnections?.();
+    controlServer?.closeAllConnections?.();
+    box?.close();
+    controlServer?.close();
+  });
+
+  it("waits through stdin EOF and ends only the exact delayed action after proof of completion", async () => {
+    const proxy = startProxy();
+    const closed = new Promise<void>((resolve) => proxy.once("close", () => resolve()));
+    let stdout = "";
+    proxy.stdout!.on("data", (chunk) => (stdout += chunk));
+    proxy.stdin!.end(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 41,
+      method: "tools/call",
+      params: { name: "click", arguments: { x: 1, y: 1, observe: false } },
+    }) + "\n");
+
+    await waitUntil(() => controlOps.some((entry) => entry.op === "begin-action") && pendingBoxResponses.length === 1,
+      "delayed Box action never started");
+    expect(controlOps.some((entry) => entry.op === "end-action")).toBe(false);
+    expect(proxy.exitCode).toBeNull();
+
+    finishNextBoxAction();
+    await waitUntil(() => controlOps.some((entry) => entry.op === "end-action" && entry.actionId === "action-1"),
+      "exact action was not ended after Box completed");
+    await Promise.race([
+      closed,
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error("proxy did not exit after its in-flight request drained")),
+        3_000,
+      )),
+    ]);
+    expect(stdout).toContain('"id":41');
+    expect(controlOps.some((entry) => entry.op === "end-all-actions")).toBe(false);
+  });
+
+  it("kills only the proxy receiving a fragmented no-newline frame", async () => {
+    const hostile = startProxy();
+    const sibling = startProxy();
+    hostile.stdin!.on("error", () => {});
+    const hostileClosed = new Promise<number | null>((resolve) => hostile.once("close", (code) => resolve(code)));
+    const fragment = Buffer.alloc(64 * 1024, 0x78);
+    for (let i = 0; i < 33; i += 1) hostile.stdin!.write(fragment);
+    await expect(hostileClosed).resolves.toBe(1);
+
+    let siblingOutput = "";
+    sibling.stdout!.on("data", (chunk) => { siblingOutput += chunk; });
+    sibling.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id: 99, method: "initialize", params: {} }) + "\n");
+    await waitUntil(() => siblingOutput.includes('"id":99'), "sibling computer proxy stopped responding");
+    sibling.kill("SIGKILL");
+  });
+
+  it("does not clear an ambiguous action when the proxy is SIGKILLed", async () => {
+    const proxy = startProxy();
+    const closed = new Promise<void>((resolve) => proxy.once("close", () => resolve()));
+    proxy.stdin!.write(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 42,
+      method: "tools/call",
+      params: { name: "click", arguments: { x: 2, y: 2, observe: false } },
+    }) + "\n");
+    await waitUntil(() => controlOps.filter((entry) => entry.op === "begin-action").length === 2 && pendingBoxResponses.length === 1,
+      "second delayed Box action never started");
+
+    proxy.kill("SIGKILL");
+    await closed;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(controlOps.some((entry) => entry.op === "end-action" && entry.actionId === "action-2")).toBe(false);
+    expect(controlOps.some((entry) => entry.op === "end-all-actions")).toBe(false);
+    pendingBoxResponses.shift()?.destroy();
   });
 });

@@ -5,7 +5,7 @@
 // ones. Without this, an interrupted writeFileSync produces half-written JSON
 // that fails to parse on next boot and is silently treated as empty state.
 import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 
 export function writeFileAtomic(path: string, data: string, options: { mode?: number } = {}): void {
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -14,7 +14,15 @@ export function writeFileAtomic(path: string, data: string, options: { mode?: nu
     // Apply sensitive-file permissions to the temporary inode itself. The
     // final rename preserves them and never leaves a broader-permission
     // config file visible between the write and a later chmod.
-    fd = openSync(tmp, "w", options.mode);
+    fd = openSync(
+      tmp,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+      options.mode,
+    );
+    // open(2)'s mode is filtered through the service umask. Restore the
+    // exact caller-requested mode on the already-open inode before it is
+    // ever renamed into place.
+    if (options.mode !== undefined) fchmodSync(fd, options.mode);
     writeFileSync(fd, data);
     fsyncSync(fd);
     closeSync(fd);

@@ -105,6 +105,10 @@ function decodeLegacyDescriptor(
     args,
     env: env as Record<string, string>,
     platform: supportedPlatform,
+    ...(typeof (value as Record<string, unknown>).generation === "string" &&
+    /^[0-9a-f-]{32,64}$/i.test((value as Record<string, string>).generation)
+      ? { generation: (value as Record<string, string>).generation }
+      : {}),
     scope: "local-computer",
   };
 }
@@ -441,15 +445,11 @@ export function readCuaConnection({
   userData = process.env.OMB_USER_DATA,
   home = homedir(),
   validateLinuxRuntime = validateLinuxDescriptorRuntime,
-  validateRemoteMacRuntime = validateRemoteMacDescriptorRuntime,
-  validateRemoteDeviceRuntime = validateRemoteDeviceDescriptorRuntime,
 }: {
   platform?: NodeJS.Platform;
   userData?: string;
   home?: string;
   validateLinuxRuntime?: (file: string, raw: LinuxConnectionDescriptor) => boolean;
-  validateRemoteMacRuntime?: (file: string, raw: RemoteMacConnectionDescriptor) => boolean;
-  validateRemoteDeviceRuntime?: (file: string, raw: RemoteDeviceConnectionDescriptor) => boolean;
 } = {}): LocalComputerConnection | null {
   const candidates = userData ? [join(userData, "cua-connection.json")] : [];
   if (platform === "linux" && !userData) candidates.push(join(home, ".openmausbot", "cua-connection.json"));
@@ -464,10 +464,11 @@ export function readCuaConnection({
     try {
       const raw = JSON.parse(readFileSync(file, "utf8"));
       if (platform === "linux") {
-        const remoteDevice = decodeRemoteDeviceDescriptor(raw);
-        if (remoteDevice && validateRemoteDeviceRuntime(file, raw)) return remoteDevice;
-        const remoteMac = decodeRemoteMacDescriptor(raw);
-        if (remoteMac && validateRemoteMacRuntime(file, raw)) return remoteMac;
+        // Remote physical devices are never discovered from disk. The old
+        // descriptor/token/reverse-port bridge let any same-UID provider
+        // shell invoke CUA directly. Only a local Linux Electron-owned CUA
+        // descriptor remains valid here; Mac/Windows attach through the
+        // authenticated in-memory outbound registry in index.ts.
         const decoded = decodeLinuxDescriptor(raw);
         if (decoded && validateLinuxRuntime(file, raw)) return decoded;
       } else {

@@ -8,12 +8,71 @@
 // memory/ holds topic files the bot reads on demand with its ordinary
 // file tools. Plain markdown on purpose — the user can open, edit, or
 // delete anything the bot believes.
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fchownSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
+import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
+import { ensureStorageLeafSync } from "./storage-leaf.ts";
 
-export const WORKSPACES_DIR = join(DATA_DIR, "workspaces");
+export const WORKSPACES_DIR = process.env.OMB_WORKSPACES_DIR?.trim() || join(DATA_DIR, "workspaces");
+const ISOLATED_PROVIDER_WORKSPACES = Boolean(process.env.OMB_WORKSPACES_DIR?.trim());
+// setgid is essential in provider-isolated deployments: files created by the
+// provider UID must inherit openmaus-workspace rather than its private primary
+// group, or the trusted server cannot read the result on the next turn.
+const WORKSPACE_DIRECTORY_MODE = ISOLATED_PROVIDER_WORKSPACES ? 0o2770 : 0o700;
+const WORKSPACE_FILE_MODE = ISOLATED_PROVIDER_WORKSPACES ? 0o660 : 0o600;
+
+function secureOpen(path: string, directory: boolean): number {
+  return openSync(
+    path,
+    constants.O_RDONLY |
+      (constants.O_NOFOLLOW ?? 0) |
+      (directory ? (constants.O_DIRECTORY ?? 0) : 0),
+  );
+}
+
+/** Validate and permission the exact already-created inode. Using an fd with
+ * O_NOFOLLOW means a provider-created symlink cannot redirect chmod/chgrp to
+ * server-private state between turns. */
+function secureWorkspaceInode(path: string, directory: boolean, mode: number): void {
+  const fd = secureOpen(path, directory);
+  try {
+    const stat = fstatSync(fd);
+    if (directory ? !stat.isDirectory() : !stat.isFile()) {
+      throw new Error(`workspace path has the wrong type: ${path}`);
+    }
+    if (ISOLATED_PROVIDER_WORKSPACES) {
+      const workspaceGroup = statSync(WORKSPACES_DIR).gid;
+      if (stat.gid !== workspaceGroup) fchownSync(fd, -1, workspaceGroup);
+    }
+    fchmodSync(fd, mode);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readWorkspaceFile(path: string): string {
+  const fd = secureOpen(path, false);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`workspace path is not a file: ${path}`);
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /** The load budget: however large MEMORY.md grows, only this much rides
  * into the system prompt. Mirrors the shape of Claude Code's auto-memory
@@ -32,11 +91,32 @@ Longer notes belong in memory/<topic>.md files, read on demand.
  * cheap enough to call at every turn dispatch. */
 export function ensureWorkspace(botId: string): string {
   const dir = join(WORKSPACES_DIR, botId);
+  ensureStorageLeafSync("workspace", botId);
   // Memories can contain personal details and task history. New workspace
   // directories should not be readable by other local accounts.
-  mkdirSync(join(dir, "memory"), { recursive: true, mode: 0o700 });
+  mkdirSync(dir, { recursive: true, mode: WORKSPACE_DIRECTORY_MODE });
+  secureWorkspaceInode(dir, true, WORKSPACE_DIRECTORY_MODE);
+  const memoryDir = join(dir, "memory");
+  mkdirSync(memoryDir, { recursive: true, mode: WORKSPACE_DIRECTORY_MODE });
+  secureWorkspaceInode(memoryDir, true, WORKSPACE_DIRECTORY_MODE);
   const memoryFile = join(dir, "MEMORY.md");
-  if (!existsSync(memoryFile)) writeFileSync(memoryFile, MEMORY_SEED, { mode: 0o600 });
+  try {
+    secureWorkspaceInode(memoryFile, false, WORKSPACE_FILE_MODE);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const fd = openSync(
+      memoryFile,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+      WORKSPACE_FILE_MODE,
+    );
+    try {
+      writeFileSync(fd, MEMORY_SEED);
+      fchmodSync(fd, WORKSPACE_FILE_MODE);
+    } finally {
+      closeSync(fd);
+    }
+    secureWorkspaceInode(memoryFile, false, WORKSPACE_FILE_MODE);
+  }
   return dir;
 }
 
@@ -50,7 +130,7 @@ export function workspaceDir(botId: string): string {
 export function loadMemory(botId: string): { text: string; truncated: boolean } | null {
   let raw: string;
   try {
-    raw = readFileSync(join(workspaceDir(botId), "MEMORY.md"), "utf8");
+    raw = readWorkspaceFile(join(workspaceDir(botId), "MEMORY.md"));
   } catch {
     return null;
   }
@@ -86,7 +166,7 @@ export const MEMORY_FILE_MAX_BYTES = 256 * 1024;
 export function readMemoryFile(botId: string) {
   let raw: string;
   try {
-    raw = readFileSync(join(workspaceDir(botId), "MEMORY.md"), "utf8");
+    raw = readWorkspaceFile(join(workspaceDir(botId), "MEMORY.md"));
   } catch {
     return { text: "", truncated: false };
   }
@@ -100,7 +180,9 @@ export function readMemoryFile(botId: string) {
  * run a turn, and the write must not depend on that ordering. */
 export function writeMemoryFile(botId: string, text: string): void {
   ensureWorkspace(botId);
-  writeFileSync(join(workspaceDir(botId), "MEMORY.md"), text, { mode: 0o600 });
+  const path = join(workspaceDir(botId), "MEMORY.md");
+  writeFileAtomic(path, text, { mode: WORKSPACE_FILE_MODE });
+  secureWorkspaceInode(path, false, WORKSPACE_FILE_MODE);
 }
 
 // One path segment, starts with a word character, plain characters only,
@@ -126,8 +208,14 @@ export function listMemoryTopics(botId: string): Array<{ name: string; bytes: nu
     .filter(isMemoryTopicName)
     .flatMap((name) => {
       try {
-        const stat = statSync(join(workspaceDir(botId), "memory", name));
-        return stat.isFile() ? [{ name, bytes: stat.size }] : [];
+        const path = join(workspaceDir(botId), "memory", name);
+        const fd = secureOpen(path, false);
+        try {
+          const stat = fstatSync(fd);
+          return stat.isFile() ? [{ name, bytes: stat.size }] : [];
+        } finally {
+          closeSync(fd);
+        }
       } catch {
         return [];
       }
@@ -141,7 +229,7 @@ export function listMemoryTopics(botId: string): Array<{ name: string; bytes: nu
 export function readMemoryTopic(botId: string, name: string): string | null {
   if (!isMemoryTopicName(name)) return null;
   try {
-    return readFileSync(join(workspaceDir(botId), "memory", name), "utf8");
+    return readWorkspaceFile(join(workspaceDir(botId), "memory", name));
   } catch {
     return null;
   }

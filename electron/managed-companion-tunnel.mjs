@@ -14,6 +14,7 @@ import {
   MANAGED_COMPANION_ORIGIN_PORT,
   validCompanionOriginTarget,
 } from "./companion-origin-gateway.mjs";
+import { readBoundedResponseText } from "./bounded-response.mjs";
 import { minimalGuardianEnvironment } from "./managed-companion-guardian.mjs";
 
 export const MANAGED_COMPANION_ENDPOINT_FIELD = "managedCompanionEndpointUrl";
@@ -291,8 +292,12 @@ async function verifyHostedEndpoint(
       : requestSignal,
   });
   if (!response.ok) return false;
-  const text = await response.text();
-  if (Buffer.byteLength(text) > 4096) return false;
+  const text = await readBoundedResponseText(
+    response,
+    4096,
+    "managed companion health response exceeded 4 KB",
+  ).catch(() => "");
+  if (!text) return false;
   try {
     return JSON.parse(text)?.app === "openmausbot";
   } catch {

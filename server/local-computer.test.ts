@@ -148,7 +148,7 @@ afterEach(() => {
 });
 
 describe("local computer descriptor", () => {
-  it("accepts a hash-pinned private remote Mac bridge on the Linux server", () => {
+  it("keeps legacy remote Mac descriptors decodable for migration but never activates them", () => {
     const userData = privateUserData("remote-mac-user-data");
     const descriptor = remoteMacDescriptor(userData);
     const file = join(userData, "cua-connection.json");
@@ -169,10 +169,10 @@ describe("local computer descriptor", () => {
       scope: "local-computer",
     });
     expect(validateRemoteMacDescriptorRuntime(file, descriptor)).toBe(true);
-    expect(readCuaConnection({ platform: "linux", userData })).not.toBeNull();
+    expect(readCuaConnection({ platform: "linux", userData })).toBeNull();
   });
 
-  it("accepts a hash-pinned private Windows bridge on the Linux server", () => {
+  it("keeps legacy remote Windows descriptors decodable for migration but never activates them", () => {
     const userData = privateUserData("remote-windows-user-data");
     const descriptor = remoteWindowsDescriptor(userData);
     const file = join(userData, "cua-connection.json");
@@ -193,7 +193,7 @@ describe("local computer descriptor", () => {
       scope: "local-computer",
     });
     expect(validateRemoteDeviceDescriptorRuntime(file, descriptor)).toBe(true);
-    expect(readCuaConnection({ platform: "linux", userData })).toMatchObject({ platform: "win32" });
+    expect(readCuaConnection({ platform: "linux", userData })).toBeNull();
   });
 
   it("rejects a Windows bridge with legacy mode, an unsupported platform, or a non-loopback host", () => {
@@ -222,13 +222,13 @@ describe("local computer descriptor", () => {
     expect(validateRemoteMacDescriptorRuntime(file, descriptor)).toBe(false);
   });
 
-  it("discovers the standalone server descriptor from ~/.openmausbot", () => {
+  it("ignores a legacy standalone remote descriptor in ~/.openmausbot", () => {
     const home = privateUserData("home");
     const userData = join(home, ".openmausbot");
     mkdirSync(userData, { mode: 0o700 });
     const descriptor = remoteMacDescriptor(userData);
     writeFileSync(join(userData, "cua-connection.json"), JSON.stringify(descriptor), { mode: 0o600 });
-    expect(readCuaConnection({ platform: "linux", home, userData: undefined })).not.toBeNull();
+    expect(readCuaConnection({ platform: "linux", home, userData: undefined })).toBeNull();
   });
 
   it("accepts only the exact certified Linux X11 descriptor", () => {

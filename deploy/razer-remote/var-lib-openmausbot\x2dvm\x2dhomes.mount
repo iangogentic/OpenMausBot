@@ -1,0 +1,15 @@
+[Unit]
+Description=Bounded OpenMaus Local VM homes
+After=local-fs.target
+Requires=openmaus-storage-preflight.service
+After=openmaus-storage-preflight.service
+Before=openmaus-storage-prepare.service
+
+[Mount]
+What=/var/lib/openmaus-vm-homes.btrfs
+Where=/var/lib/openmausbot-vm-homes
+Type=btrfs
+Options=loop,nodev,nosuid,noatime
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { needsCli, needsSignIn } from "./EngineSetup";
+import { engineSetupPlan, needsCli, needsSignIn } from "./EngineSetup";
 import type { InstanceInfo } from "@/state/store";
 
 function instance(snapshot: InstanceInfo["snapshot"]): InstanceInfo {
@@ -30,5 +30,23 @@ describe("needsCli / needsSignIn", () => {
     const ready = instance({ state: "available", authenticated: true, version: "0.36.1" });
     expect(needsCli(ready)).toBe(false);
     expect(needsSignIn(ready)).toBe(false);
+  });
+});
+
+describe("remote EngineSetup presentation", () => {
+  const install = { command: { darwin: "brew install agent", linux: "npm i -g agent" } };
+
+  it("uses the server-reported Linux command and never offers a local terminal", () => {
+    const plan = engineSetupPlan(install, "remote", "linux");
+    expect(plan).toEqual({ command: "npm i -g agent", runOnServer: true });
+  });
+
+  it("withholds a remote install action until the server reports its platform", () => {
+    expect(engineSetupPlan(install, "remote")).toEqual({ command: null, runOnServer: true });
+  });
+
+  it("preserves the local-machine install behavior", () => {
+    // Explicitly Linux here keeps this test host-independent.
+    expect(engineSetupPlan({ command: { linux: "npm i -g agent" } }, "local")).toMatchObject({ runOnServer: false });
   });
 });

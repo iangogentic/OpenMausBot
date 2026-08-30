@@ -19,6 +19,7 @@
 //   async `spawn` event, so a value grabbed right after fork() is still
 //   undefined and our own freshly-bound child would fail the identity match
 //   and be reaped as a "foreign owner" on its very first health answer.
+import { readBoundedResponseJson } from "./bounded-response.mjs";
 
 export const BOOT_PROBE_INTERVAL_MS = 500;
 
@@ -53,9 +54,10 @@ export async function pollServerIdentity({
     if (remainingMs <= 0) return { outcome: "timeout" };
 
     let res;
+    const probeSignal = AbortSignal.timeout(remainingMs);
     try {
       res = await fetchImpl(`http://127.0.0.1:${port}/api/health`, {
-        signal: AbortSignal.timeout(remainingMs),
+        signal: probeSignal,
       });
     } catch {
       // Not up yet, or this probe ran into the wall-clock budget — either way
@@ -63,7 +65,11 @@ export async function pollServerIdentity({
       await sleep(Math.min(BOOT_PROBE_INTERVAL_MS, Math.max(1, deadline - now())));
       continue;
     }
-    const body = await res.json().catch(() => null);
+    const body = await readBoundedResponseJson(
+      res,
+      4096,
+      "server health response exceeded 4 KB",
+    ).catch(() => null);
     // Body consumption is covered by the same abort signal as fetch. If it
     // reaches the deadline, a null body means the probe timed out—not that a
     // different process answered on the port.

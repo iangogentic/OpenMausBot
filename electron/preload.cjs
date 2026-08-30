@@ -2,6 +2,21 @@
 // this narrow surface (window.ogb), never Node or ipcRenderer itself.
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+// A fresh token is created inside the isolated preload world for every
+// document, including same-origin reloads that reuse the same WebContents and
+// frame routing IDs. The page never sees it; every outbound bridge call adds
+// it automatically and main rejects tokens from an earlier document.
+const rendererDocumentToken = globalThis.crypto.randomUUID();
+if (ipcRenderer.sendSync("desktop:claim-renderer-document", rendererDocumentToken) !== true) {
+  throw new Error("The OpenMausBot renderer document could not claim its desktop bridge");
+}
+const invokePrivileged = (channel, ...args) =>
+  ipcRenderer.invoke(channel, rendererDocumentToken, ...args);
+const sendPrivileged = (channel, ...args) =>
+  ipcRenderer.send(channel, rendererDocumentToken, ...args);
+const sendPrivilegedSync = (channel, ...args) =>
+  ipcRenderer.sendSync(channel, rendererDocumentToken, ...args);
+
 let pendingPackageInstallUrl = null;
 const packageInstallListeners = new Set();
 ipcRenderer.on("package:install", (_event, url) => {
@@ -14,8 +29,8 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Host platform ("darwin" | "win32" | "linux") — for platform-aware UI. */
   platform: process.platform,
   /** Whether this shell owns an embedded harness or controls an existing one. */
-  connection: () => ipcRenderer.invoke("desktop:connection"),
-  getCapabilities: () => ipcRenderer.invoke("desktop:capabilities"),
+  connection: () => invokePrivileged("desktop:connection"),
+  getCapabilities: () => invokePrivileged("desktop:capabilities"),
   onCapabilitiesChanged: (cb) => {
     const handler = (_event, capabilities) => cb(capabilities);
     ipcRenderer.on("desktop:capabilities-changed", handler);
@@ -26,43 +41,43 @@ contextBridge.exposeInMainWorld("ogb", {
    * Every call answers with the whole state, so the panel never has to
    * stitch two round-trips together. */
   companion: {
-    state: () => ipcRenderer.invoke("companion:state"),
-    start: () => ipcRenderer.invoke("companion:start"),
-    stop: () => ipcRenderer.invoke("companion:stop"),
-    keepAwake: (enabled) => ipcRenderer.invoke("companion:keep-awake", enabled),
-    pairing: (open, expectedToken) => ipcRenderer.invoke("companion:pairing", open, expectedToken),
-    cloudDesktop: (deviceId, allowed) => ipcRenderer.invoke("companion:cloud-desktop", deviceId, allowed),
-    revoke: (deviceId) => ipcRenderer.invoke("companion:revoke", deviceId),
+    state: () => invokePrivileged("companion:state"),
+    start: () => invokePrivileged("companion:start"),
+    stop: () => invokePrivileged("companion:stop"),
+    keepAwake: (enabled) => invokePrivileged("companion:keep-awake", enabled),
+    pairing: (open, expectedToken) => invokePrivileged("companion:pairing", open, expectedToken),
+    cloudDesktop: (deviceId, allowed) => invokePrivileged("companion:cloud-desktop", deviceId, allowed),
+    revoke: (deviceId) => invokePrivileged("companion:revoke", deviceId),
   },
   /** Optional account-backed HTTPS access for Companion. Secrets stay in the
    * main process; the renderer sees only status and narrow user actions. */
   companionAccount: {
-    state: () => ipcRenderer.invoke("companion-account:state"),
-    requestCode: (email) => ipcRenderer.invoke("companion-account:request-code", email),
-    verifyCode: (email, code) => ipcRenderer.invoke("companion-account:verify-code", email, code),
-    retry: () => ipcRenderer.invoke("companion-account:retry"),
-    signOut: () => ipcRenderer.invoke("companion-account:sign-out"),
+    state: () => invokePrivileged("companion-account:state"),
+    requestCode: (email) => invokePrivileged("companion-account:request-code", email),
+    verifyCode: (email, code) => invokePrivileged("companion-account:verify-code", email, code),
+    retry: () => invokePrivileged("companion-account:retry"),
+    signOut: () => invokePrivileged("companion-account:sign-out"),
   },
   localControl: {
-    status: () => ipcRenderer.invoke("cua:linux-status"),
-    enable: () => ipcRenderer.invoke("cua:linux-enable"),
-    disable: () => ipcRenderer.invoke("cua:linux-disable"),
-    retry: () => ipcRenderer.invoke("cua:linux-retry"),
+    status: () => invokePrivileged("cua:linux-status"),
+    enable: () => invokePrivileged("cua:linux-enable"),
+    disable: () => invokePrivileged("cua:linux-disable"),
+    retry: () => invokePrivileged("cua:linux-retry"),
   },
   /** Arms exactly one display-media request from the current renderer frame. */
-  beginScreenPreviewIntent: () => ipcRenderer.sendSync("screen:preview-intent"),
+  beginScreenPreviewIntent: () => sendPrivilegedSync("screen:preview-intent"),
   /** One frame of this computer's screen as a data: URL when supported. */
-  screenFrame: () => ipcRenderer.invoke("screen:frame"),
+  screenFrame: () => invokePrivileged("screen:frame"),
   /** Physical USB Android devices. Network ADB is deliberately excluded. */
   androidDevice: {
-    status: () => ipcRenderer.invoke("android-device:status"),
-    frame: (serial) => ipcRenderer.invoke("android-device:frame", serial),
+    status: () => invokePrivileged("android-device:status"),
+    frame: (serial) => invokePrivileged("android-device:frame", serial),
     input: (serial, payload) =>
-      ipcRenderer.invoke("android-device:input", serial, payload).then(() => undefined),
+      invokePrivileged("android-device:input", serial, payload).then(() => undefined),
   },
-  speechStart: (options) => ipcRenderer.invoke("speech:start", options),
-  speechStop: () => ipcRenderer.invoke("speech:stop"),
-  speechFinish: () => ipcRenderer.invoke("speech:finish"),
+  speechStart: (options) => invokePrivileged("speech:start", options),
+  speechStop: () => invokePrivileged("speech:stop"),
+  speechFinish: () => invokePrivileged("speech:finish"),
   onSpeechTranscript: (cb) => {
     const handler = (_event, line) => cb(line);
     ipcRenderer.on("speech:transcript", handler);
@@ -76,10 +91,10 @@ contextBridge.exposeInMainWorld("ogb", {
   /** A local-first demonstration recorder. Global events stay in main; the
    * renderer receives only the privacy-filtered event stream. */
   skillRecorder: {
-    permissions: () => ipcRenderer.invoke("skill-recorder:permissions"),
-    start: () => ipcRenderer.invoke("skill-recorder:start"),
-    stop: () => ipcRenderer.invoke("skill-recorder:stop"),
-    save: (payload) => ipcRenderer.invoke("skill-recorder:save", payload),
+    permissions: () => invokePrivileged("skill-recorder:permissions"),
+    start: () => invokePrivileged("skill-recorder:start"),
+    stop: () => invokePrivileged("skill-recorder:stop"),
+    save: (payload) => invokePrivileged("skill-recorder:save", payload),
     onEvent: (cb) => {
       const handler = (_event, value) => cb(value);
       ipcRenderer.on("skill-recorder:event", handler);
@@ -92,9 +107,9 @@ contextBridge.exposeInMainWorld("ogb", {
     },
   },
   transcription: {
-    status: () => ipcRenderer.invoke("assemblyai:status"),
-    setKey: (value) => ipcRenderer.invoke("assemblyai:set-key", value),
-    streamingToken: () => ipcRenderer.invoke("assemblyai:streaming-token"),
+    status: () => invokePrivileged("assemblyai:status"),
+    setKey: (value) => invokePrivileged("assemblyai:set-key", value),
+    streamingToken: () => invokePrivileged("assemblyai:streaming-token"),
   },
   /** Absolute path of a dropped File — Electron 32 removed File.path, and
    * only the preload can ask. "" when the drag carried no file on disk. */
@@ -108,18 +123,18 @@ contextBridge.exposeInMainWorld("ogb", {
   /** {mic} TCC status strings: granted|denied|not-determined|unknown.
    * No screen field — macOS 15+ caches that status per-process, so any
    * value here would lie for the whole session after a grant. */
-  permStatus: () => ipcRenderer.invoke("perm:status"),
+  permStatus: () => invokePrivileged("perm:status"),
   /** Triggers the macOS microphone prompt; resolves true when granted. */
-  permRequestMic: () => ipcRenderer.invoke("perm:request-mic"),
+  permRequestMic: () => invokePrivileged("perm:request-mic"),
   /** Opens System Settings on the given privacy pane: mic|screen|speech. */
-  permOpenSettings: (pane) => ipcRenderer.invoke("perm:open-settings", pane),
+  permOpenSettings: (pane) => invokePrivileged("perm:open-settings", pane),
 
   /** Copies an engine install command and opens a blank terminal. Resolves
    * false if no terminal could be launched; the clipboard still has it. */
-  openInstallTerminal: (command) => ipcRenderer.invoke("engine:open-terminal", command),
+  openInstallTerminal: (command) => invokePrivileged("engine:open-terminal", command),
   /** Open a web link in the default browser. Unlike renderer window.open,
    * this remains reliable after an asynchronous API request. */
-  openExternal: (url) => ipcRenderer.invoke("desktop:open-external", url),
+  openExternal: (url) => invokePrivileged("desktop:open-external", url),
   /** A reviewed BotMRR package opened through openmausbot://install. */
   onPackageInstall: (cb) => {
     packageInstallListeners.add(cb);
@@ -127,12 +142,13 @@ contextBridge.exposeInMainWorld("ogb", {
     return () => packageInstallListeners.delete(cb);
   },
   /** Mirrors durable unread state into the native Dock/taskbar badge. */
-  setUnreadCount: (count) => ipcRenderer.send("desktop:unread-count", count),
+  setUnreadCount: (count) => sendPrivileged("desktop:unread-count", count),
   /** Live VNC/noVNC in a sandboxed window owned by the app window. */
   desktopViewer: {
-    open: (url, title, contextId) => ipcRenderer.invoke("desktop-viewer:open", url, title, contextId),
-    close: (contextId) => ipcRenderer.invoke("desktop-viewer:close", contextId),
-    currentState: () => ipcRenderer.invoke("desktop-viewer:state-now"),
+    open: (url, title, contextId) => invokePrivileged("desktop-viewer:open", url, title, contextId),
+    close: (contextId) => invokePrivileged("desktop-viewer:close", contextId),
+    currentState: (contextId) => invokePrivileged("desktop-viewer:state-now", contextId),
+    currentStates: () => invokePrivileged("desktop-viewer:states-now"),
     onState: (cb) => {
       const handler = (_event, state) => cb(state);
       ipcRenderer.on("desktop-viewer:state", handler);
@@ -140,34 +156,33 @@ contextBridge.exposeInMainWorld("ogb", {
     },
   },
   /** Native folder picker for a bot's working folder; null when cancelled. */
-  pickFolder: (current) => ipcRenderer.invoke("desktop:pick-folder", current),
+  pickFolder: (current) => invokePrivileged("desktop:pick-folder", current),
   /** Writes the redacted diagnostics report to a user-chosen file; resolves
    * the path, or null when the save dialog was cancelled. */
-  exportDiagnostics: () => ipcRenderer.invoke("desktop:export-diagnostics"),
+  exportDiagnostics: () => invokePrivileged("desktop:export-diagnostics"),
   /** Ask where to save a bot-created file (inside ~/.openmausbot), copy it
    * there and reveal it. Returns the chosen path, or null if the user
    * cancelled the dialog. The chat bubble shows the
    * rejection text verbatim, so strip the "Error invoking remote method"
    * wrapper ipcRenderer adds around a main-process throw. */
   saveFile: (filePath) =>
-    ipcRenderer.invoke("desktop:save-file", filePath).catch((error) => {
+    invokePrivileged("desktop:save-file", filePath).catch((error) => {
       const message = String(error?.message ?? error);
       throw new Error(message.replace(/^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/, ""));
     }),
   /** Store a provider credential with OS-backed encryption. */
-  setCredential: (name, value) => ipcRenderer.invoke("credential:set", name, value),
+  setCredential: (name, value) => invokePrivileged("credential:set", name, value),
 
   /** In-app auto-update. State object:
    *  { status: "idle"|"checking"|"available"|"downloading"|"downloaded"|"error",
    *    version?, percent?, message? }. onState fires immediately with the
    *    current state, then on every transition. Dormant in dev (no bridge). */
   updater: {
-    check: () => ipcRenderer.invoke("update:check"),
-    download: () => ipcRenderer.invoke("update:download"),
-    install: () => ipcRenderer.invoke("update:install"),
+    check: () => invokePrivileged("update:check"),
+    download: () => invokePrivileged("update:download"),
+    install: () => invokePrivileged("update:install"),
     onState: (cb) => {
-      ipcRenderer
-        .invoke("update:get-state")
+      invokePrivileged("update:get-state")
         .then((s) => cb(s))
         .catch(() => {});
       const handler = (_event, s) => cb(s);

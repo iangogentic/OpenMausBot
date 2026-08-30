@@ -228,6 +228,24 @@ describe("StdioMcp", () => {
     await expect(pending).rejects.toThrow(/aborted/);
     await vi.waitFor(() => expect(JSON.parse(readFileSync(dump, "utf8"))).toMatchObject({ requestId: 2 }));
   });
+
+  it("closes only the MCP child that emits excessively deep JSON", async () => {
+    const hostile = createClient(`
+      process.stdin.once("data", () => {
+        let nested = { ok: true };
+        for (let i = 0; i < 70; i += 1) nested = { nested };
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: nested }) + "\\n");
+      });
+    `);
+    const sibling = createClient(`
+      process.stdin.once("data", () => {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { capabilities: {} } }) + "\\n");
+      });
+    `);
+
+    await expect(hostile.init()).rejects.toThrow(/json_depth/);
+    await expect(sibling.init()).resolves.toBeUndefined();
+  });
 });
 
 describe("Pi MCP extension registration", () => {

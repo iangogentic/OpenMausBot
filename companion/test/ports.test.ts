@@ -12,12 +12,18 @@
 // than discovered as EADDRINUSE. This checks the refusal, because the value
 // of the whole thing is the sentence it prints.
 import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ENTRY = join(HERE, "..", "src", "index.ts");
+const CREDENTIALS_DIRECTORY = mkdtempSync(join(tmpdir(), "omb-port-creds-"));
+writeFileSync(join(CREDENTIALS_DIRECTORY, "openmausbot-ui-session"), "h".repeat(48), { mode: 0o600 });
+writeFileSync(join(CREDENTIALS_DIRECTORY, "openmausbot-companion-session"), "c".repeat(48), { mode: 0o600 });
+afterAll(() => rmSync(CREDENTIALS_DIRECTORY, { recursive: true, force: true }));
 
 /** Start the sidecar and collect how it died. Never reaches `listen` in any
  * case here — the check runs first, so nothing binds and nothing to clean.
@@ -40,6 +46,7 @@ const start = (env: Record<string, string>): Promise<{ code: number | null; err:
         ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
         ...(process.env.USERPROFILE ? { USERPROFILE: process.env.USERPROFILE } : {}),
         ...(process.env.OMB_COMPANION_DIR ? { OMB_COMPANION_DIR: process.env.OMB_COMPANION_DIR } : {}),
+        CREDENTIALS_DIRECTORY,
         ...env,
       },
       stdio: ["ignore", "ignore", "pipe"],

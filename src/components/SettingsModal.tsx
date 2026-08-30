@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Coins, KeyRound, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
-import { analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
+import { analyticsAvailable, analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
 import { ApiKeyRow, VpsConnection } from "./ApiKeys";
 import { useUpdaterState } from "@/lib/updater";
@@ -113,27 +113,29 @@ function UpdatesRow() {
   );
 }
 
-/** Usage analytics, on by default and switchable here. Naming what is sent
- * matters more than the switch: people who cannot see the scope assume the
- * worst, and the worst — conversation text — is exactly what this never
- * sends (autocapture is off; see lib/analytics.ts). */
+/** Optional distributor analytics. The official fork build has no analytics
+ * destination at all; a custom build must configure one and the person must
+ * still explicitly opt in. */
 function AnalyticsRow() {
   const [on, setOn] = useState(analyticsEnabled);
+  const available = analyticsAvailable();
   return (
     <Card
       title="Usage analytics"
-      subtitle="Anonymous product events — app opened, which features get used. Never conversations, prompts, file contents, or bot output. Your email is only attached if you shared it during setup."
+      subtitle={available
+        ? "Optional product events only. Disabled until you opt in; never conversations, prompts, files, or bot output."
+        : "Disabled in this build. No analytics key or destination is installed."}
     >
       <button
         role="switch"
         aria-checked={on}
         aria-label="Send usage analytics"
+        disabled={!available}
         onClick={() => {
           const next = !on;
-          setAnalyticsEnabled(next);
-          setOn(next);
+          setOn(setAnalyticsEnabled(next));
         }}
-        className={cnSwitch(on)}
+        className={`${cnSwitch(on)} disabled:cursor-not-allowed disabled:opacity-40`}
       >
         <span className={cnKnob(on)} />
       </button>

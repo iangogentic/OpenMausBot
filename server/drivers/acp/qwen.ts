@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ModelCatalog } from "../../contracts.ts";
-import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
+import { decodeInjectId, localHost, localInjectConnection, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 const EMPTY: ModelCatalog = { default: "", options: [] };
@@ -28,6 +28,7 @@ export function ensureQwenInjectModel(
   if (!inject) return modelId;
   const host = localHost(inject.host);
   if (!host) return modelId;
+  const connection = localInjectConnection(host, inject.model, env);
 
   const dir = qwenHome(env);
   mkdirSync(dir, { recursive: true });
@@ -41,7 +42,7 @@ export function ensureQwenInjectModel(
     }
   }
   const keyName = envKeyFor(inject.host);
-  const key = hostApiKey(host, env);
+  const key = connection.apiKey;
   const envMap =
     settings.env && typeof settings.env === "object" && !Array.isArray(settings.env)
       ? { ...(settings.env as Record<string, unknown>) }
@@ -54,23 +55,25 @@ export function ensureQwenInjectModel(
       ? { ...(settings.modelProviders as Record<string, unknown>) }
       : {};
   const openai = Array.isArray(providers.openai) ? [...providers.openai] : [];
-  const match = openai.find(
+  const matchIndex = openai.findIndex(
     (row) =>
       row &&
       typeof row === "object" &&
-      (row as { id?: unknown }).id === inject.model &&
-      (row as { baseUrl?: unknown }).baseUrl === host.baseUrl,
+      (row as { id?: unknown }).id === inject.model,
   );
-  if (!match) {
-    openai.push({
+  const next = {
+      ...(matchIndex >= 0 && openai[matchIndex] && typeof openai[matchIndex] === "object"
+        ? openai[matchIndex] as Record<string, unknown>
+        : {}),
       id: inject.model,
       name: `${inject.model} (${host.label})`,
-      baseUrl: host.baseUrl,
+      baseUrl: connection.openaiBaseUrl,
       envKey: keyName,
-    });
-    providers.openai = openai;
-    settings.modelProviders = providers;
-  }
+    };
+  if (matchIndex >= 0) openai[matchIndex] = next;
+  else openai.push(next);
+  providers.openai = openai;
+  settings.modelProviders = providers;
   writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
   try {
     chmodSync(path, 0o600);

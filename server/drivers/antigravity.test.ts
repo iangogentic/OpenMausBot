@@ -96,6 +96,8 @@ describe("Antigravity turns (fake CLI)", () => {
   });
 
   afterEach(async () => {
+    delete process.env.FAKE_AGY_DUMP;
+    delete process.env.FAKE_AGY_POST_RESULT_DELAY_MS;
     recorder?.stop();
     await instance?.dispose();
   });
@@ -140,6 +142,45 @@ describe("Antigravity turns (fake CLI)", () => {
   it("respondToRequest resolves `unavailable` — no interactive permission channel, so the caller denies", async () => {
     await create();
     await expect(instance.adapter.respondToRequest("t-happy", "req-1", { behavior: "allow" })).resolves.toBe("unavailable");
+  });
+
+  it("fails closed instead of silently sending a local-model pick to Google's cloud", async () => {
+    await create();
+    await expect(instance.adapter.sendTurn({
+      threadId: "t-local-model",
+      text: "hi",
+      model: "desktop2_qwen::Qwen3.8-27B-Abliterated",
+      integrations: {
+        modelRelay: {
+          openaiBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay/v1",
+          anthropicBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay",
+          token: "opaque-exact-turn-model-token-123456",
+          host: "desktop2_qwen",
+          model: "Qwen3.8-27B-Abliterated",
+        },
+      },
+    })).rejects.toThrow(/cannot use a turn-scoped local model relay/);
+  });
+
+  it("reaps a post-result process before another task can take the same bot HOME", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-agy-isolated-home-"));
+    try {
+      process.env.FAKE_AGY_POST_RESULT_DELAY_MS = "5000";
+      process.env.FAKE_AGY_DUMP = join(scratch, "first.json");
+      await create();
+      await instance.adapter.sendTurn({ threadId: "task-one", isolationKey: "bot-one", text: "one" });
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "task-one");
+      const firstPid = JSON.parse(readFileSync(join(scratch, "first.json"), "utf8")).pid as number;
+      expect(() => process.kill(firstPid, 0)).toThrow();
+
+      await instance.adapter.sendTurn({ threadId: "task-two", isolationKey: "bot-one", text: "two" });
+      await recorder.until((event) => event.type === "turn.completed" && event.threadId === "task-two");
+      const secondPid = JSON.parse(readFileSync(join(scratch, "first.json"), "utf8")).pid as number;
+      expect(secondPid).not.toBe(firstPid);
+      expect(() => process.kill(secondPid, 0)).toThrow();
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 });
 
@@ -214,7 +255,7 @@ describe("Antigravity computer MCP config", () => {
     computer: {
       kind: "box" as const,
       boxId: "bx_1",
-      token: "box-tok",
+      broker: { url: "http://127.0.0.1:9/api/internal/box", token: "box-cap" },
       control: { url: "http://127.0.0.1:9/control", token: "ctl-tok" },
     },
   };
@@ -227,7 +268,8 @@ describe("Antigravity computer MCP config", () => {
       env: {
         ELECTRON_RUN_AS_NODE: "1",
         OGB_BOX_ID: "bx_1",
-        OGB_BOX_TOKEN: "box-tok",
+        OMB_BOX_BROKER_URL: "http://127.0.0.1:9/api/internal/box",
+        OMB_BOX_CAPABILITY_TOKEN: "box-cap",
         OMB_CONTROL_URL: "http://127.0.0.1:9/control",
         OMB_CONTROL_TOKEN: "ctl-tok",
       },
@@ -480,6 +522,60 @@ describe("Antigravity computer MCP config", () => {
     }
   });
 
+  it("cancels an exact turn waiting in the global MCP FIFO without spawning it later", async () => {
+    ensureDirs();
+    chmodSync(FAKE_CLI, 0o755);
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-mcp-cancel-pending-"));
+    const blockedDump = join(home, "blocked.json");
+    const first = await AntigravityDriver.create({
+      instanceId: "agy-mcp-holder",
+      displayName: undefined,
+      environment: { HOME: home, FAKE_AGY_DELAY_MS: "200" },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const blocked = await AntigravityDriver.create({
+      instanceId: "agy-mcp-blocked",
+      displayName: undefined,
+      environment: { HOME: home, FAKE_AGY_MCP_DUMP: blockedDump },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const successor = await AntigravityDriver.create({
+      instanceId: "agy-mcp-successor",
+      displayName: undefined,
+      environment: { HOME: home },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const firstRecorder = recordEvents(first.adapter);
+    const successorRecorder = recordEvents(successor.adapter);
+    try {
+      await first.adapter.sendTurn({ threadId: "t-mcp-holder", text: "hold", integrations: boxIntegrations });
+      const controller = new AbortController();
+      const blockedTurn = blocked.adapter.sendTurn({
+        threadId: "t-mcp-blocked",
+        text: "must never spawn",
+        dispatchSignal: controller.signal,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      controller.abort();
+      await expect(blockedTurn).rejects.toMatchObject({ name: "AbortError" });
+
+      await firstRecorder.until((event) => event.type === "turn.completed");
+      await successor.adapter.sendTurn({ threadId: "t-mcp-successor", text: "next" });
+      await successorRecorder.until((event) => event.type === "turn.completed");
+      expect(existsSync(blockedDump)).toBe(false);
+    } finally {
+      firstRecorder.stop();
+      successorRecorder.stop();
+      await first.dispose();
+      await blocked.dispose();
+      await successor.dispose();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("reaps a child that hangs after result, restores the mount, and unblocks the next turn", async () => {
     ensureDirs();
     chmodSync(FAKE_CLI, 0o755);
@@ -510,18 +606,15 @@ describe("Antigravity computer MCP config", () => {
     try {
       await first.adapter.sendTurn({ threadId: "t-mcp-zombie", text: "first", integrations: boxIntegrations });
       await firstRecorder.until((event) => event.type === "turn.completed");
-      expect(readConfig(home).mcpServers[ANTIGRAVITY_COMPUTER_MCP_KEY]).toEqual(boxEntry());
+      expect(existsSync(configPath(home))).toBe(false);
 
       let secondSpawned = false;
       const secondTurn = second.adapter.sendTurn({ threadId: "t-mcp-after-zombie", text: "second" }).then((result) => {
         secondSpawned = true;
         return result;
       });
-      if (process.platform !== "win32") {
-        await new Promise((resolve) => setTimeout(resolve, 2_500));
-        expect(secondSpawned).toBe(false);
-      }
       await secondTurn;
+      expect(secondSpawned).toBe(true);
       await secondRecorder.until((event) => event.type === "turn.completed");
 
       expect(JSON.parse(readFileSync(firstDump, "utf8")).mcpServers[ANTIGRAVITY_COMPUTER_MCP_KEY]).toEqual(boxEntry());
@@ -566,16 +659,11 @@ describe("Antigravity computer MCP config", () => {
       expect(readConfig(home).mcpServers[ANTIGRAVITY_COMPUTER_MCP_KEY]).toEqual(boxEntry());
       await expect.poll(() => existsSync(readyFile), { timeout: 2_000 }).toBe(true);
       await first.adapter.interruptTurn("t-mcp-interrupted");
+      // interrupt is process-exit proof now: it does not resolve after merely
+      // sending TERM to this deliberately uncooperative child.
+      await expect.poll(() => existsSync(configPath(home)), { timeout: 2_000 }).toBe(false);
 
-      let secondSpawned = false;
-      const secondTurn = second.adapter.sendTurn({ threadId: "t-mcp-after-interrupt", text: "second" }).then((result) => {
-        secondSpawned = true;
-        return result;
-      });
-      if (process.platform !== "win32") {
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
-        expect(secondSpawned).toBe(false);
-      }
+      const secondTurn = second.adapter.sendTurn({ threadId: "t-mcp-after-interrupt", text: "second" });
       await secondTurn;
       await secondRecorder.until((event) => event.type === "turn.completed");
       await expect.poll(() => existsSync(configPath(home)), { timeout: 6_000 }).toBe(false);

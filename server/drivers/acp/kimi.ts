@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ModelCatalog } from "../../contracts.ts";
-import { decodeInjectId, hostApiKey, LOCAL_HOSTS, localHost, mergeLocalInject } from "../local-inject.ts";
+import { decodeInjectId, LOCAL_HOSTS, localHost, localInjectConnection, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 const STATIC_KIMI_MODELS: ModelCatalog = {
@@ -353,6 +353,23 @@ function patchTomlTable(text: string, heading: string, rows: string[]): string {
   return `${before}${pad}${missing.join("\n")}${after.startsWith("\n") ? "" : "\n"}${after}`;
 }
 
+/** Set generated connection keys on every turn. Exact-turn relay tokens make
+ * a create-if-missing writer both broken and unsafe after the first turn. */
+function setTomlTableRows(text: string, heading: string, rows: string[]): string {
+  const name = canonicalizeTomlHeading(heading);
+  if (!name) return text;
+  const table = tomlTables(text).find((entry) => entry.name === name);
+  if (!table) return text;
+  let body = text.slice(table.bodyStart, table.end);
+  for (const row of rows) {
+    const key = tomlRowKey(row);
+    const pattern = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\s*=.*$`, "m");
+    if (pattern.test(body)) body = body.replace(pattern, row);
+    else body = `${body.replace(/\s*$/, "")}\n${row}\n`;
+  }
+  return `${text.slice(0, table.bodyStart)}${body}${text.slice(table.end)}`;
+}
+
 /** Write [providers.host] + [models."host/alias"] so `kimi -m` hits the local host. */
 export function ensureKimiInjectAlias(
   modelId: string,
@@ -362,6 +379,7 @@ export function ensureKimiInjectAlias(
   if (!inject) return modelId;
   const host = localHost(inject.host);
   if (!host) return modelId;
+  const connection = localInjectConnection(host, inject.model, env);
 
   const alias = `${inject.host}/${inject.model.replace(/\//g, "-")}`;
   const dataRoot = kimiDataRoot(env);
@@ -383,11 +401,17 @@ export function ensureKimiInjectAlias(
       [
         providerHeading,
         `type = "openai_legacy"`,
-        `base_url = ${quoteToml(host.baseUrl)}`,
-        `api_key = ${quoteToml(hostApiKey(host, env))}`,
+        `base_url = ${quoteToml(connection.openaiBaseUrl)}`,
+        `api_key = ${quoteToml(connection.apiKey)}`,
         "",
       ].join("\n"),
     );
+  } else {
+    text = setTomlTableRows(text, providerHeading, [
+      `type = "openai_legacy"`,
+      `base_url = ${quoteToml(connection.openaiBaseUrl)}`,
+      `api_key = ${quoteToml(connection.apiKey)}`,
+    ]);
   }
   // Kimi 0.36+ refuses openai_legacy as a wire protocol; ACP then
   // skips default-model binding and falls through to OAuth. Patch
@@ -438,9 +462,10 @@ export function applyKimiLocalModelEnv(
   if (!inject) return;
   const host = localHost(inject.host);
   if (!host) return;
+  const connection = localInjectConnection(host, inject.model, env);
   env.KIMI_MODEL_NAME = inject.model;
-  env.KIMI_MODEL_API_KEY = hostApiKey(host, env);
-  env.KIMI_MODEL_BASE_URL = host.baseUrl;
+  env.KIMI_MODEL_API_KEY = connection.apiKey;
+  env.KIMI_MODEL_BASE_URL = connection.openaiBaseUrl;
   // Env overlay accepts openai | anthropic | kimi — not the toml
   // openai_legacy type we write for the on-disk provider row.
   env.KIMI_MODEL_PROVIDER_TYPE = "openai";

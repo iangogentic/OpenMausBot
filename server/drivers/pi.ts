@@ -17,15 +17,17 @@
 // `get_available_models` and every entry is flagged `custom` because pi is a
 // custom-only (BYOK) engine — the model picker's Local pane only lists
 // `custom` options for custom-only engines.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { readFileSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
-import { describeSpawnFailure, killCliTree, spawnCli } from "../procs.ts";
+import { describeSpawnFailure, killCliTree, spawnCli, terminateCliTree } from "../procs.ts";
+import { providerChildEnvironment } from "../provider-child-env.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+import { createProviderTempDirectory, writeProviderRuntimeFile } from "../provider-runtime.ts";
 
 import type {
   DriverCreateInput,
@@ -40,6 +42,7 @@ import type {
 } from "../contracts.ts";
 import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { BoundedJsonLineDecoder, CATALOG_NDJSON_LIMITS } from "./bounded-json-lines.ts";
 
 const DRIVER_KIND = "piAgent";
 const PI_ARGS = ["--mode", "rpc", "--no-session"];
@@ -76,6 +79,17 @@ export function buildMcpServers(turn: SendTurnInput): Record<string, unknown> | 
     };
   }
   if (turn.integrations?.agents) servers.agents = { ...turn.integrations.agents };
+  if (turn.integrations?.ianBrain) {
+    servers.ian_brain = {
+      command: process.execPath,
+      args: [SPAWNED_PROXIES.ianBrain],
+      env: {
+        ...NODE_ENV_FLAG,
+        OMB_IAN_BRAIN_URL: turn.integrations.ianBrain.url,
+        OMB_IAN_BRAIN_CAPABILITY_TOKEN: turn.integrations.ianBrain.token,
+      },
+    };
+  }
   if (turn.integrations?.phone) servers.phone = { ...turn.integrations.phone };
   if (turn.integrations?.dweb) {
     servers.dweb = {
@@ -106,14 +120,9 @@ interface PiModelsResponse {
 export function parsePiCatalog(stdout: string, fallbackDefault = ""): ModelCatalog {
   const options: Array<{ id: string; label: string; custom: true }> = [];
   let def = fallbackDefault;
-  for (const line of stdout.split("\n")) {
-    if (!line.trim()) continue;
-    let msg: unknown;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  const decoder = new BoundedJsonLineDecoder(CATALOG_NDJSON_LIMITS);
+  const framed = stdout.endsWith("\n") ? stdout : `${stdout}\n`;
+  for (const { value: msg } of decoder.push(framed)) {
     const res = msg as PiModelsResponse;
     if (res?.type !== "response" || res.command !== "get_available_models" || !res.success) continue;
     for (const m of res.data?.models ?? []) {
@@ -152,7 +161,7 @@ export async function fetchPiModels(
 ): Promise<ModelCatalog> {
   const child = spawnCli(cli, PI_ARGS, { stdio: ["pipe", "pipe", "pipe"], env });
   return new Promise((resolve) => {
-    let buf = "";
+    const stdout = new BoundedJsonLineDecoder(CATALOG_NDJSON_LIMITS);
     let done = false;
     const fallbackDefault = readPiDefaultModel(env);
     const finish = (catalog: ModelCatalog) => {
@@ -167,20 +176,18 @@ export async function fetchPiModels(
     };
     const timer = setTimeout(() => finish({ default: "", options: [] }), 15_000);
     timer.unref?.();
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      buf += chunk;
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) !== -1) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        if (!line.trim()) continue;
-        const parsed = parsePiCatalog(line + "\n", fallbackDefault);
-        if (parsed.options.length || line.includes('"get_available_models"')) {
+    child.stdout.on("data", (chunk: Buffer) => {
+      try {
+        for (const { value, line } of stdout.push(chunk)) {
+          const parsed = parsePiCatalog(line + "\n", fallbackDefault);
+          if (!parsed.options.length && (value as PiModelsResponse)?.command !== "get_available_models") continue;
           clearTimeout(timer);
           finish(parsed);
           return;
         }
+      } catch {
+        clearTimeout(timer);
+        finish({ default: "", options: [] });
       }
     });
     child.on("error", () => finish({ default: "", options: [] }));
@@ -238,16 +245,14 @@ interface PiEvent {
   title?: string;
 }
 
-function piEnvironment(source: Record<string, string | undefined>): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = { ...source, PATH: augmentedPath() };
-  // pi is BYOK and reads provider keys straight from its environment: an
-  // inherited key would silently flip billing onto one the user never granted
-  // pi, and workspace credentials are the harness's secrets, not pi's. The
-  // keys pi may use live in its own settings file, so the child inherits
-  // neither list.
-  stripWorkspaceCredentialEnv(env);
-  for (const key of PROVIDER_CREDENTIAL_ENV) delete env[key];
-  return env;
+function piEnvironment(explicit: Record<string, string | undefined>): Record<string, string | undefined> {
+  // pi's BYOK state lives in its private HOME. Ambient provider/workspace
+  // secrets never cross; only values explicitly configured on this pi
+  // instance plus the small OS base are visible to the child.
+  const safeExplicit = { ...explicit };
+  stripWorkspaceCredentialEnv(safeExplicit);
+  for (const name of PROVIDER_CREDENTIAL_ENV) delete safeExplicit[name];
+  return providerChildEnvironment(safeExplicit, { internal: { PATH: augmentedPath() } });
 }
 
 export const PiDriver: ProviderDriver<PiConfig> = {
@@ -268,7 +273,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
 
   async create(input: DriverCreateInput<PiConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
-    const catalogEnv = piEnvironment({ ...process.env, ...input.environment });
+    const catalogEnv = piEnvironment(input.environment);
     let models = EMPTY;
     const refreshModels = async () => {
       try {
@@ -283,7 +288,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread
     const active = new Map<string, {
-      stop: () => void;
+      stop: () => Promise<void>;
       turnId: string;
       pending: Map<string, (decision: { behavior: "allow" | "deny" | "answer"; message?: string }) => void>;
       child?: { stdin: { write: (s: string) => void } };
@@ -311,9 +316,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       if (controlsHost && config.fullAuto) {
         throw new Error("local computer control requires the interactive approval broker");
       }
-      const turnId = newId();
+      const turnId = turn.turnId ?? newId();
       const pending = new Map<string, (decision: { behavior: "allow" | "deny" | "answer"; message?: string }) => void>();
       let settled = false;
+      let settling = false;
 
       // integrations → stdio MCP servers for the pi-mcp-extension. The config
       // carries credentials (box token, composio key, comms token), so it goes
@@ -321,9 +327,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       const mcpServers = buildMcpServers(turn);
       let mcpTempDir: string | null = null;
       if (mcpServers) {
-        mcpTempDir = mkdtempSync(join(tmpdir(), "omb-pi-mcp-"));
+        const runtime = createProviderTempDirectory("pi-mcp-");
+        mcpTempDir = runtime.path;
         try {
-          writeFileSync(join(mcpTempDir, "mcp.json"), JSON.stringify({ mcpServers }), { mode: 0o600 });
+          writeProviderRuntimeFile(runtime, "mcp.json", JSON.stringify({ mcpServers }));
         } catch (err) {
           // A failed write must not leave the temp dir behind — a partial file
           // could still hold the box token / composio key / comms token.
@@ -346,10 +353,16 @@ export const PiDriver: ProviderDriver<PiConfig> = {
             stdio: ["pipe", "pipe", "pipe"],
             cwd: turn.cwd,
             env: piEnvironment({
-              ...process.env,
               ...input.environment,
               ...(mcpServers && mcpTempDir ? { OMB_MCP_CONFIG: join(mcpTempDir, "mcp.json") } : {}),
             }),
+            providerRuntimePaths: [
+              ...(turn.providerRuntimePaths ?? []),
+              ...(mcpTempDir ? [{ path: mcpTempDir }] : []),
+            ],
+            providerPersistentHome: {
+              ownerKey: turn.isolationKey ?? threadId,
+            },
           });
         } catch (err) {
           if (mcpTempDir) {
@@ -362,8 +375,22 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           throw err;
         }
       })();
-      let buf = "";
+      const stdout = new BoundedJsonLineDecoder();
+      let outputRejected = false;
       let assistantText = "";
+      let cancellationRequested = false;
+      let treeStopProof: Promise<void> | null = null;
+      const proveTreeStopped = (): Promise<void> => {
+        if (treeStopProof) return treeStopProof;
+        const attempt = terminateCliTree(child);
+        treeStopProof = attempt;
+        // A failed proof keeps the turn active and permits an explicit retry;
+        // never cache a rejected promise as if the tree were known stopped.
+        void attempt.catch(() => {
+          if (treeStopProof === attempt) treeStopProof = null;
+        });
+        return attempt;
+      };
       // resolve one-shot RPC responses (new_session / switch_session / set_model)
       const responseWaiters = new Map<string, { resolve: (data: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>();
       const rejectWaiters = (err: Error) => {
@@ -397,47 +424,59 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       };
 
       const settle = (ok: boolean, stopReason?: string | null, usage?: { input?: number; output?: number }) => {
-        if (settled) return;
-        settled = true;
-        flushAssistantText();
-        emit({
-          ...base(threadId, turnId),
-          type: "turn.completed",
-          ok,
-          stopReason: stopReason ?? (ok ? "end_turn" : "failed"),
-          ...(usage ? { usage: { input: usage.input ?? 0, output: usage.output ?? 0 } } : {}),
-        });
+        if (settled || settling) return;
+        settling = true;
+        rejectWaiters(new Error("pi turn settled"));
         try {
           child.stdin.end();
         } catch {
           /* already closed */
         }
-        try {
-          killCliTree(child);
-        } catch {
-          /* already gone */
-        }
-        if (mcpTempDir) {
+        void (async () => {
           try {
-            rmSync(mcpTempDir, { recursive: true, force: true });
-          } catch {
-            /* best effort */
+            await proveTreeStopped();
+          } catch (error) {
+            settling = false;
+            emit({
+              ...base(threadId, turnId),
+              type: "runtime.error",
+              message: `could not prove pi exited: ${error instanceof Error ? error.message : String(error)}`,
+            });
+            return;
           }
-        }
-        active.delete(threadId);
+          settled = true;
+          flushAssistantText();
+          if (mcpTempDir) {
+            try {
+              rmSync(mcpTempDir, { recursive: true, force: true });
+            } catch {
+              /* best effort */
+            }
+          }
+          active.delete(threadId);
+          const finalOk = cancellationRequested ? true : ok;
+          const finalStopReason = cancellationRequested ? "cancelled" : stopReason ?? (ok ? "end_turn" : "failed");
+          emit({
+            ...base(threadId, turnId),
+            type: "turn.completed",
+            ok: finalOk,
+            stopReason: finalStopReason,
+            ...(usage ? { usage: { input: usage.input ?? 0, output: usage.output ?? 0 } } : {}),
+          });
+        })();
       };
 
-      const stop = () => {
+      const stop = async () => {
+        // Set intent before touching stdin or the process tree. `close` can
+        // fire synchronously with termination; it must not win by settling a
+        // user-requested cancellation as a provider failure.
+        cancellationRequested = true;
         try {
           send({ type: "abort" });
         } catch {
           /* ignore */
         }
-        try {
-          killCliTree(child);
-        } catch {
-          /* ignore */
-        }
+        await proveTreeStopped();
         settle(true, "cancelled");
       };
       active.set(threadId, { stop, turnId, pending, child });
@@ -538,28 +577,36 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         }
       };
 
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        buf += chunk;
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (!line.trim()) continue;
-          try {
-            onEvent(JSON.parse(line) as PiEvent);
-          } catch {
-            /* skip non-JSON line */
-          }
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (outputRejected) return;
+        try {
+          for (const { value } of stdout.push(chunk)) onEvent(value as PiEvent);
+        } catch (error) {
+          outputRejected = true;
+          rejectWaiters(error instanceof Error ? error : new Error(String(error)));
+          emit({
+            ...base(threadId, turnId),
+            type: "runtime.error",
+            message: error instanceof Error ? error.message : String(error),
+          });
+          settle(false, "provider_output_limit");
         }
       });
       child.on("error", (err) => {
+        if (cancellationRequested) {
+          rejectWaiters(new Error("pi stopped during cancellation"));
+          return;
+        }
         const fail = describeSpawnFailure(err as NodeJS.ErrnoException, config.cli);
         rejectWaiters(new Error(fail.message));
         emit({ ...base(threadId, turnId), type: "runtime.error", message: fail.message, setup: fail.setup });
         settle(false);
       });
       child.on("close", () => {
+        if (cancellationRequested) {
+          rejectWaiters(new Error("pi stopped during cancellation"));
+          return;
+        }
         // a clean close without a terminal event is a failed turn, never a hang
         rejectWaiters(new Error("pi process exited before replying"));
         settle(false);
@@ -628,11 +675,22 @@ export const PiDriver: ProviderDriver<PiConfig> = {
       const version = await new Promise<string | null>((resolve) => {
         const child = spawnCli(config.cli, ["--version"], {
           stdio: ["ignore", "pipe", "pipe"],
-          env: piEnvironment({ ...process.env, ...input.environment }),
+          env: piEnvironment(input.environment),
         });
-        let out = "";
-        child.stdout?.setEncoding("utf8");
-        child.stdout?.on("data", (c: string) => (out += c));
+        const chunks: Buffer[] = [];
+        let outputBytes = 0;
+        let outputRejected = false;
+        child.stdout?.on("data", (chunk: Buffer) => {
+          if (outputRejected) return;
+          outputBytes += chunk.length;
+          if (outputBytes > 64 * 1024) {
+            outputRejected = true;
+            try { killCliTree(child); } catch {}
+            return;
+          }
+          chunks.push(Buffer.from(chunk));
+        });
+        child.stderr?.on("data", () => {});
         const timer = setTimeout(() => {
           try {
             killCliTree(child);
@@ -648,7 +706,13 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         });
         child.on("close", () => {
           clearTimeout(timer);
-          resolve(out.trim() || null);
+          if (outputRejected) return resolve(null);
+          try {
+            const out = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, outputBytes));
+            resolve(out.trim() || null);
+          } catch {
+            resolve(null);
+          }
         });
       });
       if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
@@ -693,7 +757,10 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           effortLevels: EFFORT_LEVELS,
         },
         sendTurn,
-        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+        interruptTurn: async (threadId) => {
+          const turn = active.get(threadId);
+          if (turn) await turn.stop();
+        },
         respondToRequest: async (threadId, requestId, decision) => {
           const entry = active.get(threadId);
           const answer = entry?.pending.get(requestId);
@@ -711,7 +778,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         },
         hasSession: (threadId) => active.has(threadId),
         stopAll: async () => {
-          for (const { stop } of active.values()) stop();
+          await Promise.all([...active.values()].map(({ stop }) => stop()));
         },
         onEvent: (listener) => {
           listeners.add(listener);
@@ -719,7 +786,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
         },
       },
       dispose: async () => {
-        for (const { stop } of active.values()) stop();
+        await Promise.all([...active.values()].map(({ stop }) => stop()));
         listeners.clear();
       },
     };

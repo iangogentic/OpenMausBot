@@ -25,9 +25,9 @@
 // service, and the snapshot-before-every-turn cadence follows Cline.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, parse, resolve } from "node:path";
+import { isAbsolute, join, parse, resolve, sep } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 
@@ -134,6 +134,10 @@ const GITCONFIG = "[commit]\n\tgpgsign = false\n[core]\n\tautocrlf = false\n[gc]
 /** One failed git call disables checkpoints for that bot until restart —
  * a broken shadow repo must cost the user one log line, not a failed turn. */
 const disabledBots = new Set<string>();
+// Bot ids are never reused.  Retaining this small tombstone prevents a
+// snapshot that was queued before deletion (or a stale caller afterward)
+// from recreating a private checkpoint repository after cleanup completes.
+const deletedBots = new Set<string>();
 
 function disable(botId: string, message: string): void {
   disabledBots.add(botId);
@@ -310,13 +314,15 @@ async function commitAll(cwd: string, env: NodeJS.ProcessEnv, label: string): Pr
  * feature is off for this bot, git is missing, or the folder is refused.
  * Never throws — this is called fire-and-forget on the turn path. */
 export async function snapshot(botId: string, cwd: string, label: string): Promise<string | null> {
-  if (disabledBots.has(botId)) return null;
+  if (disabledBots.has(botId) || deletedBots.has(botId)) return null;
   if (!(await gitAvailable())) return null;
+  if (deletedBots.has(botId)) return null;
   if (refusalReason(cwd) !== null) return null;
   try {
     const worktree = realpathSync(resolve(cwd));
     const shadow = shadowDir(botId, worktree);
     return await serialize(shadow, async () => {
+      if (deletedBots.has(botId)) return null;
       const env = gitEnv(shadow, worktree);
       await ensureShadow(worktree, env, shadow);
       return (await commitAll(worktree, env, label)).hash;
@@ -331,8 +337,9 @@ export async function snapshot(botId: string, cwd: string, label: string): Promi
  * was ever snapshotted (listing never creates the shadow repo). The empty
  * base marker is omitted — it is not a state anyone should return to. */
 export async function listCheckpoints(botId: string, cwd: string): Promise<Checkpoint[]> {
-  if (disabledBots.has(botId)) return [];
+  if (disabledBots.has(botId) || deletedBots.has(botId)) return [];
   if (!(await gitAvailable())) return [];
+  if (deletedBots.has(botId)) return [];
   if (refusalReason(cwd) !== null) return [];
   try {
     const worktree = realpathSync(resolve(cwd));
@@ -357,7 +364,8 @@ export async function listCheckpoints(botId: string, cwd: string): Promise<Check
 
 /** Can this bot take/restore checkpoints in this folder right now? */
 export async function checkpointsEnabled(botId: string, cwd: string): Promise<boolean> {
-  return !disabledBots.has(botId) && (await gitAvailable()) && refusalReason(cwd) === null;
+  return !disabledBots.has(botId) && !deletedBots.has(botId) && (await gitAvailable()) &&
+    !deletedBots.has(botId) && refusalReason(cwd) === null;
 }
 
 /** Move the folder's files back to a checkpoint. The current state is
@@ -365,10 +373,12 @@ export async function checkpointsEnabled(botId: string, cwd: string): Promise<bo
  * checkpoint and can be undone; HEAD never moves backwards, only forward
  * over the "restored" commit. Excluded and gitignored files are untouched. */
 export async function restore(botId: string, cwd: string, hash: string): Promise<RestoreResult> {
+  if (deletedBots.has(botId)) return { ok: false, error: "this bot was deleted" };
   if (disabledBots.has(botId)) {
     return { ok: false, error: "checkpoints are disabled for this bot until the app restarts (an earlier snapshot failed — see the server log)" };
   }
   if (!(await gitAvailable())) return { ok: false, error: "git is not installed on this machine" };
+  if (deletedBots.has(botId)) return { ok: false, error: "this bot was deleted" };
   const reason = refusalReason(cwd);
   if (reason !== null) return { ok: false, error: reason };
   if (!COMMIT_HASH.test(hash)) return { ok: false, error: "hash must be a full 40-character checkpoint hash" };
@@ -415,4 +425,19 @@ export async function restore(botId: string, cwd: string, hash: string): Promise
     disable(botId, message);
     return { ok: false, error: `restore failed: ${message}` };
   }
+}
+
+/** Drain every queued Git operation for this bot, then erase its private
+ * shadow repositories.  The tombstone is installed before waiting so no new
+ * snapshot can enter behind the drain and recreate data afterward. */
+export async function deleteBotCheckpoints(botId: string): Promise<void> {
+  if (!/^[\w-]+$/.test(botId)) throw new Error("invalid checkpoint bot id");
+  deletedBots.add(botId);
+  const root = join(CHECKPOINTS_DIR, botId);
+  const prefix = `${root}${sep}`;
+  const owned = [...chains.entries()].filter(([key]) => key === root || key.startsWith(prefix));
+  await Promise.all(owned.map(([, tail]) => tail.catch(() => {})));
+  rmSync(root, { recursive: true, force: true });
+  for (const [key] of owned) chains.delete(key);
+  disabledBots.delete(botId);
 }

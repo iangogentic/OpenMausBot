@@ -18,6 +18,7 @@ const FAKE_CLAUDE = join(SERVER_DIR, "testing", "fake-claude-cli.ts");
 const FAKE_ACP = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
+const UI_SESSION_TOKEN = `steer-ui-session-${"s".repeat(43)}`;
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 posixOnly("mid-turn steering e2e", () => {
@@ -28,7 +29,10 @@ posixOnly("mid-turn steering e2e", () => {
   const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: body ? { "content-type": "application/json" } : undefined,
+      headers: {
+        "x-openmausbot-session": UI_SESSION_TOKEN,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: res.status, body: await res.json() };
@@ -59,7 +63,14 @@ posixOnly("mid-turn steering e2e", () => {
     );
     child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
       cwd: join(SERVER_DIR, ".."),
-      env: { ...(process.env.PATH ? { PATH: process.env.PATH } : {}), HOME: home, USERPROFILE: home, OMB_PORT: String(PORT) },
+      env: {
+        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+        HOME: home,
+        USERPROFILE: home,
+        VITEST: process.env.VITEST ?? "true",
+        OMB_PORT: String(PORT),
+        OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.stderr!.on("data", (c) => (stderr += c));

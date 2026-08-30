@@ -18,7 +18,7 @@ import { removeTempDir } from "./testing/cleanup.ts";
 const DATA_ROOT = mkdtempSync(join(tmpdir(), "omb-checkpoints-"));
 process.env.OMB_DATA_DIR = join(DATA_ROOT, "data");
 
-const { checkpointsEnabled, listCheckpoints, refusalReason, restore, snapshot } = await import(
+const { CHECKPOINTS_DIR, checkpointsEnabled, deleteBotCheckpoints, listCheckpoints, refusalReason, restore, snapshot } = await import(
   "./checkpoints.ts"
 );
 
@@ -96,6 +96,22 @@ describe("snapshot", () => {
     for (const hash of hashes) expect(hash).toMatch(/^[0-9a-f]{40}$/);
     // all three saw the same unchanged tree → all landed on one commit
     expect(new Set(hashes).size).toBe(1);
+  });
+
+  it("drains and permanently removes a deleted bot's private checkpoint data", async () => {
+    const { bot, cwd } = workspace();
+    writeFileSync(join(cwd, "private.txt"), "private project contents");
+    expect(await snapshot(bot, cwd, "turn before deletion")).toMatch(/^[0-9a-f]{40}$/);
+    const shadowRoot = join(CHECKPOINTS_DIR, bot);
+    expect(existsSync(shadowRoot)).toBe(true);
+
+    await deleteBotCheckpoints(bot);
+
+    expect(existsSync(shadowRoot)).toBe(false);
+    expect(await snapshot(bot, cwd, "stale turn after deletion")).toBeNull();
+    expect(await listCheckpoints(bot, cwd)).toEqual([]);
+    expect(await checkpointsEnabled(bot, cwd)).toBe(false);
+    expect(existsSync(shadowRoot)).toBe(false);
   });
 });
 

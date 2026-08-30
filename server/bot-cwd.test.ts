@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -32,5 +32,24 @@ describe("validateBotCwd", () => {
     expect(validateBotCwd(file)).toEqual({ ok: false, error: expect.stringMatching(/not a folder/) });
     expect(validateBotCwd(join(dir, "nope"))).toEqual({ ok: false, error: expect.stringMatching(/doesn't exist/) });
     expect(validateBotCwd(42)).toEqual({ ok: false, error: expect.stringMatching(/path/) });
+  });
+
+  it.runIf(process.platform !== "win32")("confines hardened remote deployments to the managed workspace root", () => {
+    const root = join(dir, "managed");
+    const project = join(root, "project");
+    const outside = join(dir, "outside");
+    mkdirSync(project, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    expect(validateBotCwd(project, { workspacesRoot: root })).toEqual({ ok: true, cwd: realpathSync(project) });
+    expect(validateBotCwd(outside, { workspacesRoot: root })).toEqual({
+      ok: false,
+      error: expect.stringContaining("managed workspace root"),
+    });
+    const escape = join(root, "escape");
+    symlinkSync(outside, escape);
+    expect(validateBotCwd(escape, { workspacesRoot: root })).toEqual({
+      ok: false,
+      error: expect.stringContaining("managed workspace root"),
+    });
   });
 });

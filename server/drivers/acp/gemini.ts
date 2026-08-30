@@ -40,9 +40,13 @@ const AUTH_PREFERENCE = ["gemini-api-key", "oauth-personal", "vertex-ai"];
  * an enterprise licence may still redeem. A stale consumer credential —
  * the common case since 2026-06-18 — reads as not signed in, which is the
  * truthful answer for an engine that would fail its first turn anyway. */
-function liveOauthCredential(): boolean {
+function geminiHome(env: Record<string, string | undefined>): string {
+  return env.GEMINI_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".gemini");
+}
+
+function liveOauthCredential(env: Record<string, string | undefined>): boolean {
   try {
-    const creds = JSON.parse(readFileSync(join(homedir(), ".gemini", "oauth_creds.json"), "utf8")) as {
+    const creds = JSON.parse(readFileSync(join(geminiHome(env), "oauth_creds.json"), "utf8")) as {
       access_token?: unknown;
       refresh_token?: unknown;
       expiry_date?: unknown;
@@ -69,7 +73,7 @@ export function geminiIsAuthenticated(env: Record<string, string | undefined>): 
   return (
     nonBlank(env.GEMINI_API_KEY) ||
     nonBlank(env.GOOGLE_API_KEY) ||
-    (existsSync(join(homedir(), ".gemini", "oauth_creds.json")) && liveOauthCredential())
+    (existsSync(join(geminiHome(env), "oauth_creds.json")) && liveOauthCredential(env))
   );
 }
 

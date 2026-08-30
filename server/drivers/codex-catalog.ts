@@ -8,7 +8,13 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
 import type { ModelCatalog } from "../contracts.ts";
+import { readBoundedResponseText } from "../bounded-response.ts";
 import { killCliTree, spawnCli } from "../procs.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedJsonLineDecoder,
+  CATALOG_NDJSON_LIMITS,
+} from "./bounded-json-lines.ts";
 import { mergeLocalInject } from "./local-inject.ts";
 
 export const STATIC_CODEX_MODELS: ModelCatalog = {
@@ -74,7 +80,7 @@ export function readCodexAppServerModelCatalog(
       stdio: ["pipe", "pipe", "pipe"],
     });
     let settled = false;
-    let buffer = "";
+    const stdout = new BoundedJsonLineDecoder(CATALOG_NDJSON_LIMITS);
     let nextId = 1;
     const models: CodexAppServerModel[] = [];
     const cursors = new Set<string>();
@@ -102,67 +108,60 @@ export function readCodexAppServerModelCatalog(
     const timer = setTimeout(() => finish(null), timeoutMs);
     timer.unref?.();
 
-    child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      let newline;
-      while ((newline = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        if (!line.trim()) continue;
-        let message: any;
-        try {
-          message = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        const kind = pending.get(message.id);
-        if (!kind) continue;
-        pending.delete(message.id);
-        if (message.error) {
-          finish(null);
-          return;
-        }
-        if (kind === "initialize") {
-          try {
-            child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} })}\n`);
-          } catch {
+      try {
+        for (const { value } of stdout.push(chunk)) {
+          const message: any = value;
+          const kind = pending.get(message.id);
+          if (!kind) continue;
+          pending.delete(message.id);
+          if (message.error) {
             finish(null);
             return;
           }
-          requestModels(null);
-          continue;
-        }
+          if (kind === "initialize") {
+            try {
+              child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized", params: {} })}\n`);
+            } catch {
+              finish(null);
+              return;
+            }
+            requestModels(null);
+            continue;
+          }
 
-        const page = message.result;
-        if (Array.isArray(page?.data)) models.push(...page.data);
-        const cursor = typeof page?.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
-        if (cursor && !cursors.has(cursor)) {
-          cursors.add(cursor);
-          requestModels(cursor);
-          continue;
-        }
+          const page = message.result;
+          if (Array.isArray(page?.data)) models.push(...page.data);
+          const cursor = typeof page?.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
+          if (cursor && !cursors.has(cursor)) {
+            cursors.add(cursor);
+            requestModels(cursor);
+            continue;
+          }
 
-        const options: ModelCatalog["options"] = [];
-        const seen = new Set<string>();
-        let defaultModel: string | null = null;
-        for (const row of models) {
-          if (row.hidden === true || typeof row.id !== "string" || !MODEL_ID.test(row.id) || seen.has(row.id)) continue;
-          seen.add(row.id);
-          options.push({
-            id: row.id,
-            label: typeof row.displayName === "string" && row.displayName.trim() ? row.displayName : row.id,
+          const options: ModelCatalog["options"] = [];
+          const seen = new Set<string>();
+          let defaultModel: string | null = null;
+          for (const row of models) {
+            if (row.hidden === true || typeof row.id !== "string" || !MODEL_ID.test(row.id) || seen.has(row.id)) continue;
+            seen.add(row.id);
+            options.push({
+              id: row.id,
+              label: typeof row.displayName === "string" && row.displayName.trim() ? row.displayName : row.id,
+            });
+            if (row.isDefault === true) defaultModel = row.id;
+          }
+          if (!options.length) {
+            finish(null);
+            return;
+          }
+          finish({
+            default: defaultModel && seen.has(defaultModel) ? defaultModel : options[0].id,
+            options,
           });
-          if (row.isDefault === true) defaultModel = row.id;
         }
-        if (!options.length) {
-          finish(null);
-          return;
-        }
-        finish({
-          default: defaultModel && seen.has(defaultModel) ? defaultModel : options[0].id,
-          options,
-        });
+      } catch {
+        finish(null);
       }
     });
     child.on("error", () => finish(null));
@@ -345,7 +344,10 @@ async function probeProviderModels(
   try {
     const response = await fetchImpl(url, { signal: controller.signal, headers });
     if (!response.ok) return [];
-    return idsFromModelsPayload(await response.json());
+    const raw = await readBoundedResponseText(response, 2 * 1024 * 1024, "model catalog response is too large");
+    const payload: unknown = JSON.parse(raw);
+    assertBoundedJsonShape(payload, CATALOG_NDJSON_LIMITS);
+    return idsFromModelsPayload(payload);
   } catch {
     return [];
   } finally {

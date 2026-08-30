@@ -16,13 +16,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { drainSteeredMessages, queueSteeredMessage, _queuedCount, type SteerStore } from "./steer-queue.ts";
+import { cancelSteeredMessages, drainSteeredMessages, queueSteeredMessage, _queuedCount, type SteerStore } from "./steer-queue.ts";
 import type { BotRecord, Message } from "./store.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
+const UI_SESSION_TOKEN = `steer-test-${"s".repeat(43)}`;
 
 // ── unit: the queue module against a fake store ────────────────────────
 function fakeBot(id: string, threadId: string, busy: boolean): BotRecord {
@@ -148,6 +149,25 @@ describe("steer-queue module", () => {
     expect(_queuedCount("thread-d")).toBe(0);
   });
 
+  it("Stop preserves queued words without launching a successor turn", () => {
+    const bot = fakeBot("bot-stop", "thread-stop", true);
+    const store = fakeStore([bot]);
+    const queued = queueSteeredMessage(bot, "save this, do not run it");
+    const affected = cancelSteeredMessages(store, bot.id);
+    bot.busy = false;
+    const run = vi.fn();
+    drainSteeredMessages(store, run);
+
+    expect(affected).toEqual([bot.threadId]);
+    expect(store.messages).toMatchObject([{
+      role: "user",
+      text: "save this, do not run it",
+      queueId: queued.id,
+    }]);
+    expect(run).not.toHaveBeenCalled();
+    expect(_queuedCount(bot.threadId)).toBe(0);
+  });
+
 });
 
 // ── e2e: the real server on the gated fake ACP fleet ───────────────────
@@ -165,7 +185,10 @@ describe("steer-queue e2e (fake ACP fleet)", () => {
   const api = async (method: string, path: string, body?: ApiBody): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: body ? { "content-type": "application/json" } : undefined,
+      headers: {
+        "x-openmausbot-session": UI_SESSION_TOKEN,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: res.status, body: await res.json() };
@@ -229,6 +252,7 @@ describe("steer-queue e2e (fake ACP fleet)", () => {
       HOME: home,
       USERPROFILE: home,
       OMB_PORT: String(PORT),
+      OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
     };
     if (process.env.PATH) env.PATH = process.env.PATH;
     // Without SystemRoot, winsock fails to initialize in the child.
@@ -325,7 +349,7 @@ describe("steer-queue e2e (fake ACP fleet)", () => {
   );
 
   it(
-    "drains the queue after an interrupt — stop-then-steer",
+    "preserves the queue after Stop without starting a successor turn",
     async () => {
       const bot = await newBot("steerStop", "Stoppable");
 
@@ -346,26 +370,17 @@ describe("steer-queue e2e (fake ACP fleet)", () => {
       }, "the hung prompt");
       expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
 
-      // the interrupt settles the hung turn (ACP cancel grace), and the
-      // drain consumes the queue: its message loses the queued flag while
-      // the steered turn waits on the still-missing gate
+      // Stop preserves the user's words in the transcript, but consumes the
+      // execution queue so they cannot become a hidden successor turn.
       await until(async () => {
         const snapshot = await botById(bot.id);
         const message = snapshot.messages.find((m: any) => m.text === "after stop please");
-        return Boolean(message) && !message.queued;
-      }, "the post-interrupt drain");
+        return Boolean(message) && !message.queued && !snapshot.busy;
+      }, "the stopped turn to settle");
 
-      writeFileSync(stopGate, "open");
-      let snapshot: any;
-      await until(async () => {
-        snapshot = await botById(bot.id);
-        return !snapshot.busy && echoes(snapshot).length >= 1;
-      }, "the steered turn");
-
-      // the interrupted turn produced no reply; the steered one answers
-      const replies = echoes(snapshot);
-      expect(replies).toHaveLength(1);
-      expect(replies[0].text).toContain("after stop please");
+      const snapshot = await botById(bot.id);
+      expect(echoes(snapshot)).toHaveLength(0);
+      expect(snapshot.messages.find((m: any) => m.text === "after stop please")?.queueId).toBeTruthy();
     },
     60_000,
   );

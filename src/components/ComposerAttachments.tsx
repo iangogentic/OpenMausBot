@@ -7,6 +7,7 @@ import { ClipboardPaste, File as FileIcon, Image as ImageIcon, MessageSquareText
 import { cn } from "@/lib/cn";
 import {
   attachmentImageUrl,
+  fileAttachmentFromFile,
   intakeFiles,
   formatSize,
   imageAttachmentFromFile,
@@ -28,6 +29,7 @@ export function ComposerAttachments({
   onRemove,
   onDisplayInChatBox,
   allowImages = true,
+  remote = false,
   notice,
   onNotice,
 }: {
@@ -36,6 +38,8 @@ export function ComposerAttachments({
   onRemove: (id: string) => void;
   onDisplayInChatBox: (attachment: PasteAttachment) => void;
   allowImages?: boolean;
+  /** The screen may be a Mac controller while the bot runs on Razer. */
+  remote?: boolean;
   notice: string | null;
   onNotice: (notice: string | null) => void;
 }) {
@@ -76,6 +80,7 @@ export function ComposerAttachments({
         allowImages,
         getPath: pathForFile,
         uploadImage: imageAttachmentFromFile,
+        uploadFile: remote ? fileAttachmentFromFile : undefined,
       });
       if (!active) return;
       if (attachments.length) onAdd(attachments);
@@ -95,7 +100,7 @@ export function ComposerAttachments({
       window.removeEventListener("dragover", onOver);
       window.removeEventListener("drop", onDrop);
     };
-  }, [onAdd, allowImages, onNotice]);
+  }, [onAdd, allowImages, onNotice, remote]);
 
   return (
     <>

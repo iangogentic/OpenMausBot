@@ -16,17 +16,17 @@
 // `~/.gemini/config/mcp_config.json` before each spawn — see
 // ensureAntigravityComputerMcp below. Full-auto instances only; the host
 // desktop stays off (no approval channel in print mode, ever).
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import { describeSpawnFailure, execCli, spawnCli, terminateCliTree } from "../procs.ts";
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
-import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { DATA_DIR } from "../config.ts";
 import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
-import { injectedApiModel, mergeLocalInject } from "./local-inject.ts";
+import { providerChildEnvironment } from "../provider-child-env.ts";
 
 import type { ChildProcess } from "node:child_process";
 import type {
@@ -41,6 +41,7 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import { BoundedJsonLineDecoder } from "./bounded-json-lines.ts";
 
 const DRIVER_KIND = "antigravityAgent";
 
@@ -69,12 +70,9 @@ export const STATIC_ANTIGRAVITY_MODELS: ModelCatalog = {
 };
 
 function antigravityEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, PATH: augmentedPath(), ...overrides };
-  // The harness process may hold workspace credentials injected by the
-  // desktop shell. Antigravity uses its own login, so none belong in any of
-  // its turn, snapshot, or helper children.
-  stripWorkspaceCredentialEnv(env);
-  return env;
+  // Antigravity uses its own private login/profile. Ambient provider and
+  // workspace credentials therefore have no reason to cross this boundary.
+  return providerChildEnvironment(overrides, { internal: { PATH: augmentedPath() } });
 }
 
 const AGY_MODEL_ID = /^[a-z0-9][a-z0-9._:/-]*$/i;
@@ -140,14 +138,50 @@ export interface AntigravityComputerMcpServer {
 // lifetime so two Antigravity turns cannot see each other's computer tokens.
 let antigravityComputerMcpLease: Promise<void> = Promise.resolve();
 
-async function acquireAntigravityComputerMcpLease(): Promise<() => void> {
+function antigravityDispatchAborted(): Error {
+  const error = new Error("Antigravity turn stopped before acquiring its MCP lease");
+  error.name = "AbortError";
+  return error;
+}
+
+async function acquireAntigravityComputerMcpLease(signal?: AbortSignal): Promise<() => void> {
   const previous = antigravityComputerMcpLease;
   let unlock: (() => void) | undefined;
   const current = new Promise<void>((resolve) => {
     unlock = resolve;
   });
   antigravityComputerMcpLease = previous.then(() => current);
-  await previous;
+  if (signal?.aborted) {
+    unlock?.();
+    throw antigravityDispatchAborted();
+  }
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => reject(antigravityDispatchAborted());
+      signal?.addEventListener("abort", onAbort, { once: true });
+      previous.then(
+        () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        },
+        (error) => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+      if (signal?.aborted) onAbort();
+    });
+  } catch (error) {
+    // Resolve our place in the FIFO even when we leave before reaching its
+    // head. The chained promise still waits for `previous`, but it no longer
+    // blocks every later Antigravity instance behind an abandoned waiter.
+    unlock?.();
+    throw error;
+  }
+  if (signal?.aborted) {
+    unlock?.();
+    throw antigravityDispatchAborted();
+  }
   let released = false;
   return () => {
     if (released) return;
@@ -179,7 +213,8 @@ export function antigravityComputerMcpServer(
       env: {
         ELECTRON_RUN_AS_NODE: "1",
         OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
-        OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
+        OMB_BOX_BROKER_URL: proxyEnv.OMB_BOX_BROKER_URL ?? "",
+        OMB_BOX_CAPABILITY_TOKEN: proxyEnv.OMB_BOX_CAPABILITY_TOKEN ?? "",
         // who-is-driving endpoint, so a person taking the wheel in the
         // panel pauses this bot's hands mid-turn
         OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
@@ -320,7 +355,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     let models = STATIC_ANTIGRAVITY_MODELS;
     const refreshModels = async () => {
       try {
-        const resolved = await mergeLocalInject(readAntigravityModelCatalog(catalogEnv), catalogEnv);
+        // Print mode has no supported per-turn custom-provider endpoint. Keep
+        // Antigravity's own configured custom rows, but never advertise the
+        // shared host::model catalog that this harness cannot safely route.
+        const resolved = readAntigravityModelCatalog(catalogEnv);
         if (resolved.options.length) models = resolved;
       } catch {
         // Keep the last usable catalog when settings.json is unreadable.
@@ -329,8 +367,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
     await refreshModels();
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread; a second send while busy is a caller bug
-    const active = new Map<string, { stop: () => void; turnId: string }>();
-    const pending = new Set<string>();
+    const active = new Map<string, { stop: () => Promise<void>; turnId: string }>();
+    const pending = new Map<string, {
+      controller: AbortController;
+      detachExternal: () => void;
+    }>();
     let disposed = false;
     // every live agy child, tracked independently of `active`: a child can
     // hang AFTER emitting `result` (so it's already removed from `active`), and
@@ -341,22 +382,6 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       for (const l of [...listeners]) l(event);
     };
 
-    // Reap every tracked child's tree (mirrors the per-turn stop()) — POSIX
-    // process group on mac/linux, taskkill /T on Windows. When escalate is
-    // set a SIGKILL follows after a grace for anything that ignored the term;
-    // on Windows killCliTree is already a force kill, so the retry is a no-op.
-    const reapChildren = (escalate: boolean) => {
-      for (const child of children) {
-        killCliTree(child);
-        if (escalate && process.platform !== "win32") {
-          setTimeout(() => {
-            try {
-              process.kill(-child.pid!, "SIGKILL");
-            } catch {}
-          }, 2000).unref?.();
-        }
-      }
-    };
     const base = (threadId: string, turnId: string) => ({
       eventId: newEventId(),
       provider: DRIVER_KIND,
@@ -369,8 +394,24 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const { threadId } = turn;
       if (disposed) throw new Error("Antigravity instance is disposed");
       if (active.has(threadId) || pending.has(threadId)) throw new Error("a turn is already running on this thread");
-      pending.add(threadId);
-      const turnId = newId();
+      if (turn.integrations?.modelRelay) {
+        throw new Error("Antigravity cannot use a turn-scoped local model relay");
+      }
+      if (turn.dispatchSignal?.aborted) throw antigravityDispatchAborted();
+      const dispatchController = new AbortController();
+      const forwardAbort = () => dispatchController.abort();
+      turn.dispatchSignal?.addEventListener("abort", forwardAbort, { once: true });
+      const clearPending = () => {
+        const current = pending.get(threadId);
+        if (current?.controller !== dispatchController) return;
+        pending.delete(threadId);
+        current.detachExternal();
+      };
+      pending.set(threadId, {
+        controller: dispatchController,
+        detachExternal: () => turn.dispatchSignal?.removeEventListener("abort", forwardAbort),
+      });
+      const turnId = turn.turnId ?? newId();
 
       // Default cwd to a per-thread workspace under DATA_DIR — deliberately
       // NOT homedir(): a bot running unattended should not get the whole home
@@ -383,7 +424,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       try {
         mkdirSync(workspace, { recursive: true });
       } catch (error) {
-        pending.delete(threadId);
+        clearPending();
         throw error;
       }
       const cwd = turn.cwd ?? workspace;
@@ -397,25 +438,39 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       const resumeCursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
 
       let settled = false;
+      let settling = false;
       // backstop watchdog: if agy hangs without emitting `result` and without
       // exiting, the bot would stay busy forever (agy's own --print-timeout 10m
       // is the only other net). Assigned just below; settle() always clears it.
       let watchdog: ReturnType<typeof setTimeout> | undefined;
       // Assigned once the child exists. A child can emit `result` and then
       // hang, so settling must still arrange for process and MCP cleanup.
-      let armPostSettleCleanup = () => {};
+      let provePostSettleCleanup = async () => {};
       const settle = (
         ok: boolean,
         stopReason: string | null,
         cost: number | null = null,
         usage?: { input: number; output: number },
       ) => {
-        if (settled) return;
-        settled = true;
+        if (settled || settling) return;
+        settling = true;
         clearTimeout(watchdog);
-        active.delete(threadId);
-        armPostSettleCleanup();
-        emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost, ...(usage ? { usage } : {}) });
+        void (async () => {
+          try {
+            await provePostSettleCleanup();
+          } catch (error) {
+            settling = false;
+            emit({
+              ...base(threadId, turnId),
+              type: "runtime.error",
+              message: `could not prove Antigravity exited: ${error instanceof Error ? error.message : String(error)}`,
+            });
+            return;
+          }
+          settled = true;
+          active.delete(threadId);
+          emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost, ...(usage ? { usage } : {}) });
+        })();
       };
 
       // agy's print mode is argv-only, so a prompt beyond ARG_MAX would fail the
@@ -428,7 +483,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           message: `prompt too large for Antigravity's argv-only print mode (${Buffer.byteLength(prompt)} bytes)`,
         });
         settle(false, "prompt_too_large");
-        pending.delete(threadId);
+        clearPending();
         return { turnId };
       }
 
@@ -436,10 +491,16 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       // computer — owns the mount for its complete child lifetime. This keeps
       // overlapping turns from inheriting, replacing, or removing each
       // other's tools and credentials.
-      const releaseMcpLease = await acquireAntigravityComputerMcpLease();
+      let releaseMcpLease: () => void;
+      try {
+        releaseMcpLease = await acquireAntigravityComputerMcpLease(dispatchController.signal);
+      } catch (error) {
+        clearPending();
+        throw error;
+      }
       if (disposed) {
         releaseMcpLease();
-        pending.delete(threadId);
+        clearPending();
         settle(false, "disposed");
         return { turnId };
       }
@@ -448,7 +509,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         restoreMcp = ensureAntigravityComputerMcp(antigravityComputerMcpServer(turn.integrations), env);
       } catch (error) {
         releaseMcpLease();
-        pending.delete(threadId);
+        clearPending();
         emit({
           ...base(threadId, turnId),
           type: "runtime.error",
@@ -470,7 +531,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         config.fullAuto ? "--dangerously-skip-permissions" : "--mode",
       ];
       if (!config.fullAuto) args.push("accept-edits");
-      if (turn.model) args.push("--model", injectedApiModel(turn.model) ?? turn.model);
+      if (turn.model) args.push("--model", turn.model);
       if (resumeCursor) args.push("--conversation", resumeCursor);
 
       // spawnCli resolves npm .cmd shims / shebang scripts on Windows and
@@ -481,6 +542,10 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           cwd,
           env,
           stdio: ["ignore", "pipe", "pipe"], // prompt is on argv; stdin is unused
+          providerRuntimePaths: turn.providerRuntimePaths,
+          providerPersistentHome: {
+            ownerKey: turn.isolationKey ?? threadId,
+          },
         });
       } catch (error) {
         try {
@@ -500,8 +565,6 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       children.add(child);
 
       let childClosed = false;
-      let postSettleReaper: ReturnType<typeof setTimeout> | undefined;
-      let terminationEscalation: ReturnType<typeof setTimeout> | undefined;
       let mcpFinalized = false;
       const finalizeMcp = () => {
         if (mcpFinalized) return;
@@ -518,38 +581,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           releaseMcpLease();
         }
       };
-      const armTerminationEscalation = () => {
-        if (childClosed || terminationEscalation) return;
-        terminationEscalation = setTimeout(() => {
-          if (childClosed) return;
-          if (process.platform === "win32") {
-            killCliTree(child); // taskkill /T /F is already forceful
-            return;
-          }
-          try {
-            const pid = child.pid;
-            if (pid) process.kill(-pid, "SIGKILL");
-            else child.kill("SIGKILL");
-          } catch {
-            try {
-              child.kill("SIGKILL");
-            } catch {}
-          }
-        }, 3_000);
-        terminationEscalation.unref?.();
-      };
-      const stop = () => {
-        killCliTree(child); // process groups are POSIX-only
-        armTerminationEscalation();
-      };
-      armPostSettleCleanup = () => {
-        if (childClosed || postSettleReaper) return;
-        // A normal agy process exits immediately after `result`. Give it a
-        // short grace, then reap a zombie. Explicit stops use the same bounded
-        // SIGKILL escalation so an uncooperative child cannot retain the lease.
-        postSettleReaper = setTimeout(stop, 2_000);
-        postSettleReaper.unref?.();
-      };
+      const stop = () => terminateCliTree(child);
+      // Terminal/idle cannot become visible while this process still owns the
+      // hardened per-bot HOME lock. A normal agy exits immediately; the same
+      // bounded tree terminator handles a hung result path.
+      provePostSettleCleanup = () => childClosed ? Promise.resolve() : stop();
 
       // conversation_id from the init event → the resumeCursor (session.started
       // is what the harness persists as the cursor). Also seeds tool item ids.
@@ -628,15 +664,20 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         }
       };
 
-      let buf = "";
-      child.stdout.setEncoding("utf8"); // decode multibyte across chunk splits
+      const stdout = new BoundedJsonLineDecoder();
+      let outputRejected = false;
       child.stdout.on("data", (chunk) => {
-        buf += chunk;
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (line.trim()) handleLine(line);
+        if (outputRejected) return;
+        try {
+          for (const { line } of stdout.push(chunk)) handleLine(line);
+        } catch (error) {
+          outputRejected = true;
+          emit({
+            ...base(threadId, turnId),
+            type: "runtime.error",
+            message: error instanceof Error ? error.message : String(error),
+          });
+          settle(false, "provider_output_limit");
         }
       });
 
@@ -654,10 +695,8 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       child.on("close", (code) => {
         childClosed = true;
         children.delete(child); // close is the true process-exit signal
-        clearTimeout(postSettleReaper);
-        clearTimeout(terminationEscalation);
         finalizeMcp();
-        if (!settled) {
+        if (!settled && !settling) {
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
@@ -668,7 +707,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       });
 
       active.set(threadId, { stop, turnId });
-      pending.delete(threadId);
+      clearPending();
 
       // 11 min — just above agy's own 10m --print-timeout, so agy normally
       // settles first; this is the backstop for a fully wedged child.
@@ -726,12 +765,16 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           computerMcp: config.fullAuto,
         },
         sendTurn,
-        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+        interruptTurn: async (threadId) => {
+          pending.get(threadId)?.controller.abort();
+          const turn = active.get(threadId);
+          if (turn) await turn.stop();
+        },
         respondToRequest: async () => "unavailable" as const, // this engine has no asks to answer
         hasSession: (threadId) => active.has(threadId),
         stopAll: async () => {
-          for (const { stop } of active.values()) stop();
-          reapChildren(false); // also reap children that hung post-result
+          for (const entry of pending.values()) entry.controller.abort();
+          await Promise.all([...children].map((child) => terminateCliTree(child)));
         },
         onEvent: (listener) => {
           listeners.add(listener);
@@ -749,8 +792,8 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         }),
       dispose: async () => {
         disposed = true;
-        for (const { stop } of active.values()) stop();
-        reapChildren(true); // escalate to SIGKILL — disposal must reap every child
+        for (const entry of pending.values()) entry.controller.abort();
+        await Promise.all([...children].map((child) => terminateCliTree(child)));
         listeners.clear();
       },
     };

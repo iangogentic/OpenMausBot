@@ -451,6 +451,33 @@ describe("ACP turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.localComputerMcp).toBe(true);
   });
 
+  it("mounts Ian Brain in every generic MCP-capable ACP session", async () => {
+    await create();
+    const dump = join(scratch, "ian-brain-dump.json");
+    process.env.FAKE_ACP_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-ian-brain",
+      text: "read my wiki",
+      integrations: {
+        ianBrain: {
+          url: "http://127.0.0.1:8799/api/internal/ian-brain/mcp",
+          token: "ian-brain-turn-token",
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.mcpServers).toContainEqual({
+      name: "ian_brain",
+      command: process.execPath,
+      args: [expect.stringContaining("ian-brain-proxy")],
+      env: expect.arrayContaining([
+        { name: "OMB_IAN_BRAIN_URL", value: "http://127.0.0.1:8799/api/internal/ian-brain/mcp" },
+        { name: "OMB_IAN_BRAIN_CAPABILITY_TOKEN", value: "ian-brain-turn-token" },
+      ]),
+    });
+  });
+
   it("surfaces a permission ask as request.opened and completes once allowed", async () => {
     await create(GrokAgentDriver, "permission");
     await instance.adapter.sendTurn({
@@ -529,6 +556,36 @@ describe("ACP turns (fake CLI)", () => {
     await expect(instance.adapter.sendTurn({ threadId: "t-busy", text: "two" })).rejects.toThrow(/already running/);
     await instance.adapter.interruptTurn("t-busy");
     await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("terminates only the exact child on a fragmented no-newline output overflow", async () => {
+    instance = await GrokAgentDriver.create({
+      instanceId: "acp-output-isolation",
+      displayName: "ACP Output Isolation",
+      environment: { FAKE_ACP_MODE: "output-by-prompt" },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    recorder = recordEvents(instance.adapter);
+    await Promise.all([
+      instance.adapter.sendTurn({ threadId: "t-hostile-output", text: "[hostile-output] flood" }),
+      instance.adapter.sendTurn({ threadId: "t-output-sibling", text: "reply normally" }),
+    ]);
+    const [hostileDone, siblingDone] = await Promise.all([
+      recorder.until((event) => event.threadId === "t-hostile-output" && event.type === "turn.completed", 15_000),
+      recorder.until((event) => event.threadId === "t-output-sibling" && event.type === "turn.completed", 15_000),
+    ]);
+    expect(hostileDone).toMatchObject({ ok: false, stopReason: "provider_output_limit" });
+    const hostileError = recorder.events.find(
+      (event) => event.threadId === "t-hostile-output" && event.type === "runtime.error",
+    );
+    expect(hostileError).toBeDefined();
+    if (hostileError?.type !== "runtime.error") throw new Error("missing hostile-output runtime.error");
+    expect(hostileError.message).toMatch(/line_bytes/);
+    expect(siblingDone).toMatchObject({ ok: true });
+    expect(recorder.events.some((event) =>
+      event.threadId === "t-output-sibling" && event.type === "item.completed" && event.itemType === "assistant_text"
+    )).toBe(true);
   });
 
   it("interrupt settles a hung turn as cancelled", async () => {
@@ -627,7 +684,13 @@ describe("ACP turns (fake CLI)", () => {
       ...SELECT_MODEL_SUPPORT,
       driverKind: "turnEnvTest",
       selectModel: undefined,
-      resolveTurnModel: (model) => (model ? `resolved/${model}` : model),
+      prepareTurnEnv: (env, { turn }) => {
+        env.TEST_PREPARED_ISOLATION = turn.isolationKey;
+      },
+      resolveTurnModel: (model, env) => {
+        expect(env.TEST_PREPARED_ISOLATION).toBe("bot-turn-env");
+        return model ? `resolved/${model}` : model;
+      },
       applyTurnEnv: (env, { model, requestedModel }) => {
         env.TEST_TURN_MODEL = `${model ?? ""}|${requestedModel ?? ""}`;
       },
@@ -643,6 +706,7 @@ describe("ACP turns (fake CLI)", () => {
 
     await instance.adapter.sendTurn({
       threadId: "t-turn-env",
+      isolationKey: "bot-turn-env",
       text: "go",
       model: "ollama::ornith:35b-bf16",
     });
@@ -650,6 +714,9 @@ describe("ACP turns (fake CLI)", () => {
 
     expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_TURN_MODEL).toBe(
       "resolved/ollama::ornith:35b-bf16|ollama::ornith:35b-bf16",
+    );
+    expect(JSON.parse(readFileSync(dump, "utf8")).env.TEST_PREPARED_ISOLATION).toBe(
+      "bot-turn-env",
     );
   });
 

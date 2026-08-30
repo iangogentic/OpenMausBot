@@ -9,14 +9,22 @@
 //   - the bot's cloud computer (box.ascii.dev) via server/computer-proxy.ts
 //     — screenshot/exec/open_url, the CUA-on-the-box bridge
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
-import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { DATA_DIR } from "../config.ts";
 import { augmentedPath } from "../env-path.ts";
-import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
+import { providerChildEnvironment } from "../provider-child-env.ts";
+import {
+  brokerSocketPath,
+  describeSpawnFailure,
+  execCli,
+  killCliTree,
+  spawnCli,
+  terminateCliTree,
+} from "../procs.ts";
 
 import type {
   DriverCreateInput,
@@ -33,13 +41,26 @@ import { newEventId, newId } from "../contracts.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import {
   applyClaudeInject,
+  applyModelRelayEnvironment,
   decodeInjectId,
   mergeLocalInject,
   probeLocalInjects,
   resolveInjectId,
 } from "./local-inject.ts";
 import { appendNative } from "./native.ts";
+import {
+  BoundedJsonLineDecoder,
+  PERMISSION_NDJSON_LIMITS,
+  ProviderOutputLimitError,
+} from "./bounded-json-lines.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
+import {
+  createProviderTempDirectory,
+  providerRuntimeBase,
+  providerRuntimeSocketBase,
+  publishProviderRuntimeSocket,
+  writeProviderRuntimeFile,
+} from "../provider-runtime.ts";
 
 /** Whether `claude` has been signed in.
  *
@@ -76,14 +97,13 @@ export function claudeSignedIn(
  */
 function claudeEnvironment(
   model?: string | null,
-  source: NodeJS.ProcessEnv = process.env,
+  explicit: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...source, PATH: augmentedPath(), NPM_CONFIG_LOGLEVEL: "error" };
+  const env = providerChildEnvironment(explicit, {
+    internal: { PATH: augmentedPath(), NPM_CONFIG_LOGLEVEL: "error" },
+  });
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
-  // The harness process may hold workspace credentials (xai/box/voice keys,
-  // env-injected at boot); none of them are this CLI's to see.
-  stripWorkspaceCredentialEnv(env);
   const applied = applyClaudeInject(env, model);
   if (!applied.injected) delete env.ANTHROPIC_API_KEY;
   return env;
@@ -231,17 +251,54 @@ function askSummary(ask: Ask): string {
 
 export function permissionSocketPath(threadId: string) {
   // A readable prefix alone is not unique: ids that agree on their first
-  // characters ("t-perm-dup-1", "t-perm-dup-2") would share a socket. POSIX
-  // hides that — a new broker's listen replaces the socket FILE, so the name
-  // always points at the fresh server — but Windows named pipes live in a
-  // global namespace that is never unlinked, and a reused name races the
-  // previous broker's async teardown. Half the tag is a digest of the FULL
-  // id so distinct threads get distinct sockets; the tag stays at 8 chars
-  // total because the POSIX path already brushes the 104-byte sun_path
-  // limit under deep tmp home dirs.
+  // characters ("t-perm-dup-1", "t-perm-dup-2") would share a socket. A
+  // 16-bit suffix also collides surprisingly quickly in a fleet, so use a
+  // 64-bit digest of the full id. The POSIX directory layout keeps this well
+  // below sun_path on the supported deployment and normal desktop data roots.
   const prefix = threadId.replace(/[^\w-]/g, "").slice(0, 4);
-  const digest = createHash("sha256").update(threadId).digest("hex").slice(0, 4);
-  return brokerSocketPath(DATA_DIR, `${prefix}${digest}`);
+  const digest = createHash("sha256").update(threadId).digest("hex").slice(0, 16);
+  if (process.platform === "win32") {
+    return brokerSocketPath(providerRuntimeSocketBase(DATA_DIR), `${prefix}${digest}`);
+  }
+  // The OS sandbox can mount an exact directory FD but cannot reopen an
+  // O_PATH Unix-socket FD. Give each thread a tiny server-owned directory so
+  // mounting the broker never exposes sibling runtime artifacts.
+  // macOS has a very small sockaddr_un path limit. DATA_DIR may sit below a
+  // long test/user home, so the non-isolated desktop fallback uses a short
+  // per-process namespace in the OS temp directory. The production runtime
+  // root is already short, canonical, and server-owned.
+  const runtimeBase = providerRuntimeBase();
+  const fallbackBase = join(
+    tmpdir(),
+    `ombp-${process.pid}-${createHash("sha256").update(DATA_DIR).digest("hex").slice(0, 8)}`,
+  );
+  return join(runtimeBase ?? fallbackBase, `p-${digest}`, "s");
+}
+
+function preparePermissionSocketDirectory(socketPath: string): void {
+  if (process.platform === "win32") return;
+  const directory = dirname(socketPath);
+  const sharedAcrossUid = Boolean(providerRuntimeBase());
+  try {
+    mkdirSync(directory, { recursive: true, mode: sharedAcrossUid ? 0o2750 : 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const stat = lstatSync(directory);
+  // A configured cross-UID runtime root is a security boundary and is
+  // required to be canonical by providerRuntimeBase(). In ordinary desktop
+  // and test mode DATA_DIR can legitimately live below macOS's /var ->
+  // /private/var alias; rejecting that platform alias breaks every local
+  // Claude turn without buying any isolation. We still reject a symlink at
+  // the per-turn directory itself in both modes.
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    (sharedAcrossUid && realpathSync(directory) !== directory)
+  ) {
+    throw new Error("permission broker directory is not a canonical directory");
+  }
+  chmodSync(directory, sharedAcrossUid ? 0o2750 : 0o700);
 }
 
 function createPermissionBroker(opts: {
@@ -249,6 +306,7 @@ function createPermissionBroker(opts: {
   onAsk: (ask: Ask) => void;
   onResolve: (resolved: Ask & { behavior: AskBehavior; source: AskResolutionSource }) => void;
   isActive?: () => boolean;
+  onViolation?: (error: Error) => void;
   timeoutMs?: number;
 }) {
   const timeoutMs = opts.timeoutMs ?? 15 * 60_000;
@@ -264,24 +322,71 @@ function createPermissionBroker(opts: {
   // driver already forgot (`active.delete(threadId)` already ran), which can
   // never be answered — the "zombie card" in issue #211.
   let closed = false;
+  let violated = false;
+  let liveConnections = 0;
+  let totalInputBytes = 0;
+  let totalInputFrames = 0;
+  let rateWindowStartedAt = Date.now();
+  let rateWindowFrames = 0;
+  const violate = (error: Error) => {
+    if (violated) return;
+    violated = true;
+    opts.onViolation?.(error);
+  };
+  preparePermissionSocketDirectory(opts.socketPath);
   try {
     unlinkSync(opts.socketPath);
   } catch {}
   const server = createNetServer((conn) => {
     conn.on("error", () => {});
-    let buf = "";
+    liveConnections += 1;
+    let connectionClosed = false;
+    conn.on("close", () => {
+      if (connectionClosed) return;
+      connectionClosed = true;
+      liveConnections -= 1;
+    });
+    if (violated || liveConnections > 4) {
+      conn.destroy();
+      violate(new ProviderOutputLimitError("frame_rate", "permission broker accepted too many simultaneous connections"));
+      return;
+    }
+    const input = new BoundedJsonLineDecoder(PERMISSION_NDJSON_LIMITS);
+    let rejected = false;
     conn.on("data", (chunk) => {
-      buf += chunk;
-      let nl;
-      while ((nl = buf.indexOf("\n")) !== -1) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        let msg: any;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          continue;
+      if (rejected) return;
+      try {
+        totalInputBytes += Buffer.byteLength(chunk);
+        if (totalInputBytes > PERMISSION_NDJSON_LIMITS.maxTotalBytes) {
+          throw new ProviderOutputLimitError(
+            "total_bytes",
+            `permission broker exceeded ${PERMISSION_NDJSON_LIMITS.maxTotalBytes} bytes`,
+          );
         }
+        const framesBefore = input.framesSeen;
+        const decoded = input.push(chunk);
+        const acceptedFrames = input.framesSeen - framesBefore;
+        totalInputFrames += acceptedFrames;
+        if (totalInputFrames > PERMISSION_NDJSON_LIMITS.maxFrames) {
+          throw new ProviderOutputLimitError(
+            "frame_count",
+            `permission broker exceeded ${PERMISSION_NDJSON_LIMITS.maxFrames} frames`,
+          );
+        }
+        const now = Date.now();
+        if (now - rateWindowStartedAt >= PERMISSION_NDJSON_LIMITS.frameWindowMs) {
+          rateWindowStartedAt = now;
+          rateWindowFrames = 0;
+        }
+        rateWindowFrames += acceptedFrames;
+        if (rateWindowFrames > PERMISSION_NDJSON_LIMITS.maxFramesPerWindow) {
+          throw new ProviderOutputLimitError(
+            "frame_rate",
+            `permission broker exceeded ${PERMISSION_NDJSON_LIMITS.maxFramesPerWindow} frames per window`,
+          );
+        }
+        for (const { value } of decoded) {
+          const msg: any = value;
         if (msg.t !== "ask") continue;
         const askId = String(msg.id ?? newId());
         const kind = msg.kind === "question" ? ("question" as const) : ("permission" as const);
@@ -340,16 +445,36 @@ function createPermissionBroker(opts: {
         timer.unref?.();
         pending.set(askId, { ask, finish });
         opts.onAsk(ask);
+        }
+      } catch (error) {
+        rejected = true;
+        conn.destroy();
+        violate(error instanceof Error ? error : new Error(String(error)));
       }
     });
   });
   // A broker that never came up used to be silent — every approval then
   // timed out into a deny nobody could explain. Keep the turn fail-closed,
   // but leave an actionable diagnostic.
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
   server.on("error", (error) => {
     console.error(`permission broker unavailable on ${opts.socketPath}: ${error.message}`);
+    rejectReady(error);
   });
-  server.listen(opts.socketPath);
+  server.listen(opts.socketPath, () => {
+    try {
+      publishProviderRuntimeSocket(opts.socketPath);
+      resolveReady();
+    } catch (error) {
+      server.close();
+      rejectReady(error as Error);
+    }
+  });
   const drain = () => {
     for (const p of [...pending.values()]) {
       const { behavior, message } = systemEndedReply(p.ask.kind);
@@ -357,6 +482,7 @@ function createPermissionBroker(opts: {
     }
   };
   return {
+    ready,
     answer(askId: string, behavior: AskBehavior, message?: string): boolean {
       const p = pending.get(askId);
       if (!p) return false;
@@ -376,6 +502,11 @@ function createPermissionBroker(opts: {
       try {
         unlinkSync(opts.socketPath);
       } catch {}
+      if (process.platform !== "win32") {
+        try {
+          rmSync(dirname(opts.socketPath), { recursive: false, force: true });
+        } catch {}
+      }
     },
   };
 }
@@ -445,7 +576,31 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
 
   async create(input: DriverCreateInput<ClaudeConfig>): Promise<ProviderInstance> {
     const { instanceId, config } = input;
-    const catalogEnv: Record<string, string | undefined> = { ...process.env, ...input.environment };
+    // A hardened provider process owns the per-bot HOME flock for its whole
+    // lifetime. It must be reaped before terminal/idle is published, or a
+    // second task for the same bot would collide with the retained process.
+    const isolatedProviderLifetime = Boolean(input.environment.OMB_PROVIDER_INSTANCE_HOME);
+    // Deterministic integration-test seam for Stop and provider disposal: a
+    // positive file counter fails before shutdown, while a negative one fails
+    // after the child exits. The latter reproduces a terminal event clearing
+    // visible busy state before the caller learns that shutdown proof failed.
+    // This is disabled outside NODE_ENV=test and exposes no production API.
+    const fixtureInterruptFailureFile = process.env.NODE_ENV === "test"
+      ? input.environment.FAKE_CLAUDE_INTERRUPT_FAILURE_FILE
+      : undefined;
+    const fixtureShutdownFailure = (): "before" | "after" | null => {
+      if (!fixtureInterruptFailureFile) return null;
+      let remaining = 0;
+      try {
+        remaining = Number(readFileSync(fixtureInterruptFailureFile, "utf8")) || 0;
+      } catch {
+        return null;
+      }
+      if (remaining === 0) return null;
+      writeFileSync(fixtureInterruptFailureFile, String(remaining + (remaining < 0 ? 1 : -1)));
+      return remaining < 0 ? "after" : "before";
+    };
+    const catalogEnv = claudeEnvironment(undefined, input.environment);
     let models = STATIC_CLAUDE_MODELS;
     const refreshModels = async () => {
       try {
@@ -458,7 +613,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     await refreshModels();
     const listeners = new Set<RuntimeEventListener>();
     // one active turn per thread; a second send while busy is a caller bug
-    const active = new Map<string, { stop: () => void; turnId: string; broker?: ReturnType<typeof createPermissionBroker> }>();
+    const active = new Map<string, {
+      stop: () => Promise<void>;
+      turnId: string;
+      broker?: ReturnType<typeof createPermissionBroker>;
+    }>();
 
     // One live CLI process per thread, kept across turns. Under
     // --input-format stream-json the CLI settles a turn with `result` while
@@ -554,7 +713,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (controlsHost && config.permissionMode === "bypassPermissions") {
         throw new Error("local computer control requires the interactive approval broker");
       }
-      const turnId = newId();
+      const turnId = turn.turnId ?? newId();
       const retryAbort = new AbortController();
       const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false };
       retry.cancelled = false;
@@ -579,9 +738,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (config.disallowedTools?.length) {
         args.push("--disallowedTools", config.disallowedTools.join(","));
       }
-      const turnEnvironment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
+      const turnEnvironment = claudeEnvironment(undefined, input.environment);
       const turnModel = await resolveClaudeTurnModel(turn.model, turnEnvironment);
-      const injected = applyClaudeInject({ ...turnEnvironment }, turnModel);
+      applyModelRelayEnvironment(turnEnvironment, turnModel, turn.integrations?.modelRelay);
+      const injected = applyClaudeInject(turnEnvironment, turnModel);
       if (injected.model) args.push("--model", injected.model);
       if (turn.effort) args.push("--effort", turn.effort);
       if (turn.system) args.push("--append-system-prompt", turn.system);
@@ -620,6 +780,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         mcpServers.agents = { ...turn.integrations.agents };
         allowed.push("mcp__agents");
       }
+      if (turn.integrations?.ianBrain) {
+        mcpServers.ian_brain = {
+          command: process.execPath,
+          args: [SPAWNED_PROXIES.ianBrain],
+          env: {
+            ...NODE_ENV_FLAG,
+            OMB_IAN_BRAIN_URL: turn.integrations.ianBrain.url,
+            OMB_IAN_BRAIN_CAPABILITY_TOKEN: turn.integrations.ianBrain.token,
+          },
+        };
+        allowed.push("mcp__ian_brain");
+      }
       if (turn.integrations?.phone) {
         mcpServers.phone = { ...turn.integrations.phone };
         allowed.push("mcp__phone");
@@ -641,6 +813,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // an Allow/Deny card in chat, and the agent gets ask_user. Skipped in
       // bypassPermissions (fullAuto) — nothing would ever ask.
       let broker: ReturnType<typeof createPermissionBroker> | undefined;
+      // Wired after the exact session exists. The broker is ready before its
+      // child can connect, so no provider byte can reach this placeholder.
+      let rejectProviderOutput: (error: Error) => void = () => {};
       let socketPath: string | null = null;
       if (config.permissionMode !== "bypassPermissions") {
         socketPath = permissionSocketPath(threadId);
@@ -656,19 +831,34 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // is removed when the turn settles.
       let mcpConfigPath: string | null = null;
       if (Object.keys(mcpServers).length) {
-        mcpConfigPath = join(mkdtempSync(join(tmpdir(), "omb-mcp-")), "mcp.json");
-        writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers }), { mode: 0o600 });
+        const runtime = createProviderTempDirectory("omb-mcp-");
+        mcpConfigPath = writeProviderRuntimeFile(runtime, "mcp.json", JSON.stringify({ mcpServers }));
         args.push("--mcp-config", mcpConfigPath);
         args.push("--allowedTools", allowed.join(","));
       }
 
-      const env = claudeEnvironment(turnModel, turnEnvironment);
+      const env = turnEnvironment;
       const cwd = turn.cwd ?? homedir();
       // everything that shapes the process, minus session/turn specifics
       // (the --mcp-config file is a fresh temp path each time; its CONTENT
       // is what matters and mcpServers carries that)
       const keyArgs = args.filter((a, i) => a !== "--mcp-config" && args[i - 1] !== "--mcp-config");
-      const argsKey = JSON.stringify({ args: keyArgs, mcpServers, cwd, model: injected.model ?? null, base: env.ANTHROPIC_BASE_URL ?? null });
+      const argsKey = JSON.stringify({
+        args: keyArgs,
+        mcpServers,
+        cwd,
+        model: injected.model ?? null,
+        base: env.ANTHROPIC_BASE_URL ?? null,
+        // An exact-turn relay token must never be reused by a retained Claude
+        // process. Including it in the spawn contract forces a clean resume on
+        // the next turn even though the relay URL and selected model are equal.
+        modelRelayToken: turn.integrations?.modelRelay?.token ?? null,
+        // bwrap mounts are immutable for the life of this retained process.
+        // A new exact-turn attachment directory therefore changes the spawn
+        // contract and forces a resumed replacement instead of writing an
+        // inaccessible staged path to the old process's stdin.
+        providerRuntimePaths: turn.providerRuntimePaths ?? [],
+      });
 
       // Reuse the live process when it is idle, unchanged, and is the session
       // the harness wants resumed. Anything else: close it and spawn fresh
@@ -677,7 +867,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
         live.turn = { turnId, settled: false, sawStreamDelta: false };
-        active.set(threadId, { stop: () => killCliTree(live.child), turnId, broker: live.broker });
+        active.set(threadId, { stop: () => terminateCliTree(live.child), turnId, broker: live.broker });
         emit({ ...base(threadId, turnId), type: "turn.started" });
         const written = await writeUser(live, threadId, turn.text);
         if (!written) {
@@ -705,6 +895,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         broker = createPermissionBroker({
           socketPath,
           isActive: () => Boolean(sessions.get(threadId)?.turn),
+          onViolation: (error) => rejectProviderOutput(error),
           onAsk: (ask) => {
             const eventTurnId = sessions.get(threadId)?.turn?.turnId ?? turnId;
             askTools.set(ask.id, typeof ask.tool === "string" ? ask.tool : undefined);
@@ -736,6 +927,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             askTools.delete(resolved.id);
           },
         });
+        await broker.ready;
       }
       if (sessionId) args.push("--resume", sessionId);
       else args.push("--session-id", newSessionId!);
@@ -744,6 +936,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         cwd,
         env,
         stdio: ["pipe", "pipe", "pipe"],
+        providerRuntimePaths: [
+          ...(turn.providerRuntimePaths ?? []),
+          ...(mcpConfigPath ? [{ path: dirname(mcpConfigPath) }] : []),
+          ...(socketPath && process.platform !== "win32" ? [{ path: dirname(socketPath) }] : []),
+        ],
+        providerPersistentHome: {
+          ownerKey: turn.isolationKey ?? threadId,
+        },
       });
       const session: Session = {
         child,
@@ -758,8 +958,92 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       };
       sessions.set(threadId, session);
 
-      // settles the TURN, not the process: the CLI stays for the next
-      // message until it has been quiet for SESSION_IDLE_MS
+      type TerminalOutcome = {
+        turnId: string;
+        ok: boolean;
+        stopReason: string | null;
+        cost: number | null;
+        usage?: { input: number; output: number };
+      };
+      let pendingAttachmentTerminal: TerminalOutcome | null = null;
+      let attachmentTeardown: Promise<void> | null = null;
+      const finishTerminal = (outcome: TerminalOutcome, retainSession: boolean) => {
+        active.delete(threadId);
+        session.turn = null;
+        // A settled turn owns no retry budget. Retained CLI sessions may run
+        // many later turns on this thread, and each must start fresh.
+        retryState.delete(threadId);
+        emit({
+          ...base(threadId, outcome.turnId),
+          type: "turn.completed",
+          ok: outcome.ok,
+          stopReason: outcome.stopReason,
+          cost: outcome.cost,
+          ...(outcome.usage ? { usage: outcome.usage } : {}),
+        });
+        if (retainSession && session.child.exitCode === null && !session.closing) armIdle(threadId);
+      };
+      const finishAttachmentTerminal = () => {
+        const outcome = pendingAttachmentTerminal;
+        if (!outcome) return;
+        pendingAttachmentTerminal = null;
+        if (sessions.get(threadId) === session) sessions.delete(threadId);
+        finishTerminal(outcome, false);
+      };
+      let providerOutputShutdown: Promise<void> | null = null;
+      rejectProviderOutput = (error) => {
+        const t = session.turn;
+        if (!t || t.settled || providerOutputShutdown) return;
+        t.settled = true;
+        session.closing = true;
+        retry.cancelled = true;
+        retryAbort.abort();
+        retryState.delete(threadId);
+        emit({ ...base(threadId, t.turnId), type: "runtime.error", message: error.message });
+        session.broker?.pause();
+        const heldBroker = session.broker;
+        session.broker = undefined;
+        heldBroker?.close();
+        if (session.mcpConfigPath) {
+          try {
+            rmSync(dirname(session.mcpConfigPath), { recursive: true, force: true });
+          } catch {}
+          session.mcpConfigPath = null;
+        }
+        const outcome = { turnId: t.turnId, ok: false, stopReason: "provider_output_limit", cost: null };
+        const attempt = terminateCliTree(session.child)
+          .then(() => {
+            if (sessions.get(threadId) === session) sessions.delete(threadId);
+            finishTerminal(outcome, false);
+          })
+          .catch((shutdownError) => {
+            if (providerOutputShutdown === attempt) providerOutputShutdown = null;
+            emit({
+              ...base(threadId, t.turnId),
+              type: "runtime.error",
+              message: `provider output was rejected but shutdown could not be verified: ${shutdownError instanceof Error ? shutdownError.message : String(shutdownError)}`,
+            });
+          });
+        providerOutputShutdown = attempt;
+      };
+      const proveAttachmentSessionStopped = (): Promise<void> => {
+        if (!pendingAttachmentTerminal) return Promise.resolve();
+        if (attachmentTeardown) return attachmentTeardown;
+        const attempt = terminateCliTree(session.child)
+          .then(() => finishAttachmentTerminal())
+          .catch((error) => {
+            if (attachmentTeardown === attempt) attachmentTeardown = null;
+            throw error;
+          });
+        attachmentTeardown = attempt;
+        return attempt;
+      };
+
+      // Settles the TURN. Ordinary turns retain the process until the idle
+      // timer, but a process that received an exact-turn attachment mount is
+      // reaped before its terminal event. Unlinking the host staging path
+      // alone would leave the deleted inode readable through bwrap's still-
+      // live bind mount.
       const settle = (
         ok: boolean,
         stopReason: string | null,
@@ -781,13 +1065,23 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           } catch {}
           session.mcpConfigPath = null;
         }
-        active.delete(threadId);
-        session.turn = null;
-        // A settled turn owns no retry budget. Retained CLI sessions may run
-        // many later turns on this thread, and each must start fresh.
-        retryState.delete(threadId);
-        emit({ ...base(threadId, t.turnId), type: "turn.completed", ok, stopReason, cost, ...(usage ? { usage } : {}) });
-        if (session.child.exitCode === null && !session.closing) armIdle(threadId);
+        const outcome = { turnId: t.turnId, ok, stopReason, cost, ...(usage ? { usage } : {}) };
+        if (turn.providerRuntimePaths?.length || isolatedProviderLifetime) {
+          pendingAttachmentTerminal = outcome;
+          session.closing = true;
+          const heldBroker = session.broker;
+          session.broker = undefined;
+          heldBroker?.close();
+          void proveAttachmentSessionStopped().catch((error) => {
+            emit({
+              ...base(threadId, t.turnId),
+              type: "runtime.error",
+              message: `provider session shutdown could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+            });
+          });
+          return;
+        }
+        finishTerminal(outcome, true);
       };
       const currentTurnId = () => session.turn?.turnId ?? turnId;
 
@@ -875,17 +1169,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         }
       };
 
-      let buf = "";
-      // decode as UTF-8 across chunk boundaries — a raw `buf += chunk` splits
-      // multibyte characters that straddle two reads and corrupts the text
-      child.stdout.setEncoding("utf8");
+      const stdout = new BoundedJsonLineDecoder();
+      let outputRejected = false;
       child.stdout.on("data", (chunk) => {
-        buf += chunk;
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          if (line.trim()) handleLine(line);
+        if (outputRejected) return;
+        try {
+          for (const { line } of stdout.push(chunk)) handleLine(line);
+        } catch (error) {
+          outputRejected = true;
+          rejectProviderOutput(error instanceof Error ? error : new Error(String(error)));
         }
       });
 
@@ -997,10 +1289,14 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         if (sessions.get(threadId) === session) sessions.delete(threadId);
       });
 
-      const stop = () => {
+      const stop = async () => {
         retry.cancelled = true;
         retryAbort.abort();
-        killCliTree(child);
+        await terminateCliTree(child);
+        // A result-bearing attachment turn deliberately withholds its
+        // terminal event until process-tree teardown is proven. Stop/dispose
+        // may be the successful retry after an earlier bounded proof failure.
+        finishAttachmentTerminal();
       };
       active.set(threadId, { stop, turnId, broker });
       emit({ ...base(threadId, turnId), type: "turn.started" });
@@ -1025,7 +1321,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     };
 
     const snapshot = async (): Promise<ProviderSnapshot> => {
-      const env = claudeEnvironment(undefined, { ...process.env, ...input.environment });
+      const env = claudeEnvironment(undefined, input.environment);
       const version = await new Promise<string | null>((resolve) => {
         execCli(config.cli, ["--version"], { timeout: 8000, env }, (err, stdout) =>
           resolve(err ? null : stdout.trim()),
@@ -1064,7 +1360,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         },
         sendTurn,
         steer,
-        interruptTurn: async (threadId) => active.get(threadId)?.stop(),
+        interruptTurn: async (threadId) => {
+          const fixtureFailure = fixtureShutdownFailure();
+          if (fixtureFailure === "before") throw new Error("fixture interrupt failed before shutdown proof");
+          const turn = active.get(threadId);
+          if (turn) await turn.stop();
+          if (fixtureFailure === "after") throw new Error("fixture interrupt failed after terminal cleanup");
+        },
         respondToRequest: async (threadId, requestId, decision) => {
           // fail-closed by construction: no broker, or an ask that already
           // timed out / settled, is `unavailable` — the caller denies
@@ -1076,8 +1378,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         },
         hasSession: (threadId) => active.has(threadId),
         stopAll: async () => {
-          for (const { stop } of active.values()) stop();
+          const activeStops = [...active.values()].map(({ stop }) => stop());
           for (const threadId of [...sessions.keys()]) closeSession(threadId, "stopAll");
+          const sessionStops = [...sessions.values()].map((session) => terminateCliTree(session.child));
+          await Promise.all([...activeStops, ...sessionStops]);
         },
         onEvent: (listener) => {
           listeners.add(listener);
@@ -1089,13 +1393,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           execCli(
             config.cli,
             ["-p", prompt, "--model", "claude-haiku-4-5", "--output-format", "text"],
-            { timeout: 60_000, env: claudeEnvironment("claude-haiku-4-5") },
+            { timeout: 60_000, env: claudeEnvironment("claude-haiku-4-5", input.environment) },
             (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
           );
         }),
       dispose: async () => {
-        for (const { stop } of active.values()) stop();
+        const fixtureFailure = fixtureShutdownFailure();
+        if (fixtureFailure === "before") throw new Error("fixture dispose failed before shutdown proof");
+        const activeStops = [...active.values()].map(({ stop }) => stop());
         for (const threadId of [...sessions.keys()]) closeSession(threadId, "dispose");
+        const sessionStops = [...sessions.values()].map((session) => terminateCliTree(session.child));
+        await Promise.all([...activeStops, ...sessionStops]);
+        if (fixtureFailure === "after") throw new Error("fixture dispose failed after terminal cleanup");
         listeners.clear();
       },
     };

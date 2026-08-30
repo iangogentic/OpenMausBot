@@ -102,6 +102,9 @@ export interface Message {
   /** screen messages: a frame of the bot's computer (base64 image) */
   png?: string;
   mime?: string;
+  /** Exact computer and per-turn generation that produced this frame. */
+  targetKey?: string;
+  targetGeneration?: string;
   at: number;
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */

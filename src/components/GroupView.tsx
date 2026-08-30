@@ -31,6 +31,7 @@ import { ManageMembersPanel } from "./ManageMembersPanel";
 import { groupActivityRuns } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { canUseNativeWorkingFolderPicker, workingFolderPlaceholder } from "@/lib/working-folder";
 import { cn } from "@/lib/cn";
 import { useFocusMessage } from "@/lib/focus-message";
 import { shortPath } from "@/lib/short-path";
@@ -330,7 +331,10 @@ function RoomWorkingFolder({ group }: { group: Group }) {
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const canPick = Boolean(window.ogb?.pickFolder);
+  const canPick = canUseNativeWorkingFolderPicker(
+    capabilities.connection?.mode,
+    Boolean(window.ogb?.pickFolder),
+  );
   const pinned = group.pinnedCwd; // undefined = not yet, null = each bot's own, string = folder
   const locked = pinned !== undefined;
   const shownCwd = locked ? (pinned ?? undefined) : group.cwd;
@@ -390,7 +394,11 @@ function RoomWorkingFolder({ group }: { group: Group }) {
         >
           <input
             className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2.5 font-mono text-[12.5px] text-ink placeholder:text-ink-secondary focus:outline-none focus:border-hairline"
-            placeholder="Each bot's own folder — or an absolute path"
+            placeholder={workingFolderPlaceholder(
+              capabilities.connection?.mode,
+              capabilities.connection?.serverName,
+              "Each bot's own folder",
+            )}
             value={draft ?? group.cwd ?? ""}
             onChange={(e) => setDraft(e.target.value)}
           />
@@ -472,6 +480,11 @@ function roomNeedsSetup(group: Group): boolean {
 
 function RoomSetup({ group, members }: { group: Group; members: Bot[] }) {
   const { dispatch } = useStore();
+  const { capabilities } = useDesktopCapabilities();
+  const canPick = canUseNativeWorkingFolderPicker(
+    capabilities.connection?.mode,
+    Boolean(window.ogb?.pickFolder),
+  );
   const [folder, setFolder] = useState(group.cwd ?? "");
   const [behavior, setBehavior] = useState<RoomResponderMode>(setupResponderMode(group.defaultResponder));
   const [leadId, setLeadId] = useState(
@@ -577,10 +590,14 @@ function RoomSetup({ group, members }: { group: Group; members: Bot[] }) {
             <input
               value={folder}
               onChange={(event) => setFolder(event.target.value)}
-              placeholder="Each bot's own folder"
+              placeholder={workingFolderPlaceholder(
+                capabilities.connection?.mode,
+                capabilities.connection?.serverName,
+                "Each bot's own folder",
+              )}
               className="min-w-0 flex-1 rounded-xl border border-hairline/50 bg-inset px-3 py-2.5 font-mono text-[12.5px] text-ink placeholder:text-ink-secondary focus:border-accent focus:outline-none"
             />
-            {window.ogb?.pickFolder && (
+            {canPick && (
               <button
                 type="button"
                 onClick={() => void pickFolder()}

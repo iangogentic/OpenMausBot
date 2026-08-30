@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+"""Fail closed unless the loaded aggregate provider slice has exact ceilings."""
+
+from __future__ import annotations
+
+import os
+import stat
+import subprocess
+import sys
+
+
+SYSTEMCTL = "/usr/bin/systemctl"
+FRAGMENT = "/etc/systemd/system/openmaus-provider.slice"
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+EXPECTED = {
+    "LoadState": "loaded",
+    "ActiveState": "active",
+    "FragmentPath": FRAGMENT,
+    "MemoryHigh": str(12 * 1024**3),
+    "MemoryMax": str(16 * 1024**3),
+    "MemorySwapMax": "0",
+    "CPUQuotaPerSecUSec": "4s",
+    "TasksMax": "1024",
+}
+
+
+def property_value(name: str) -> str:
+    result = subprocess.run(
+        [SYSTEMCTL, "show", "openmaus-provider.slice", f"--property={name}", "--value"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=SAFE_ENV,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("aggregate provider slice is not loaded")
+    return result.stdout.strip()
+
+
+def main() -> int:
+    if os.geteuid() != 0 or sys.argv[1:] != ["--check"]:
+        return 64
+    try:
+        info = os.lstat(FRAGMENT)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or os.path.realpath(FRAGMENT) != FRAGMENT
+            or info.st_uid != 0
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o644
+        ):
+            raise RuntimeError("aggregate provider slice asset is not root-owned mode 0644")
+        for name, expected in EXPECTED.items():
+            if property_value(name) != expected:
+                raise RuntimeError(f"aggregate provider slice {name} does not match this release")
+        # Any drop-in can weaken a limit after the checked fragment is
+        # installed. This deployment intentionally has no tuning drop-ins.
+        if property_value("DropInPaths"):
+            raise RuntimeError("aggregate provider slice has an unreviewed drop-in")
+        return 0
+    except (OSError, RuntimeError) as error:
+        print(f"openmaus provider slice refused: {error}", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

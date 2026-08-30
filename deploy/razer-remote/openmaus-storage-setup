@@ -1,0 +1,333 @@
+#!/usr/bin/python3
+"""Provision and validate bounded OpenMaus writable filesystems.
+
+This helper is installed root-owned and is never sudoable by the harness or a
+provider.  Existing images are validation-only: no normal invocation ever
+truncates, reformats, or replaces one.  New images are built under a private
+temporary name and renamed into place only after mkfs succeeds.
+"""
+
+from __future__ import annotations
+
+import grp
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+
+
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+BTRFS = "/usr/bin/btrfs"
+BLKID = "/usr/sbin/blkid"
+CHATTR = "/usr/bin/chattr"
+FINDMNT = "/usr/bin/findmnt"
+LOSETUP = "/usr/sbin/losetup"
+MKFS = "/usr/bin/mkfs.btrfs"
+MOUNT = "/usr/bin/mount"
+UMOUNT = "/usr/bin/umount"
+
+
+@dataclass(frozen=True)
+class Volume:
+    image: str
+    mountpoint: str
+    label: str
+    size: int
+    owner: str
+    group: str
+    mode: int
+    quotas: bool = False
+
+
+VOLUMES = (
+    Volume(
+        "/var/lib/openmaus-provider-state.btrfs",
+        "/var/lib/openmaus-provider/state",
+        "openmaus-provider-state",
+        10 * 1024**3,
+        "root",
+        "openmaus-runtime",
+        0o750,
+        True,
+    ),
+    Volume(
+        "/var/lib/openmaus-workspaces.btrfs",
+        "/var/lib/openmausbot-workspaces",
+        "openmaus-workspaces",
+        20 * 1024**3,
+        "openmaus-server",
+        "openmaus-workspace",
+        0o3770,
+        True,
+    ),
+    Volume(
+        "/var/lib/openmaus-vm-homes.btrfs",
+        "/var/lib/openmausbot-vm-homes",
+        "openmaus-vm-homes",
+        40 * 1024**3,
+        "root",
+        "openmaus-runtime",
+        0o730,
+        True,
+    ),
+)
+
+
+def run(argv: list[str], *, capture: bool = False) -> str:
+    result = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=SAFE_ENV,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(f"storage command failed: {argv[0]}{': ' + detail if detail else ''}")
+    return (result.stdout or "").strip()
+
+
+def checked_parent(path: str) -> None:
+    parent = os.path.dirname(path)
+    info = os.lstat(parent)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or os.path.realpath(parent) != parent:
+        raise RuntimeError(f"unsafe storage parent: {parent}")
+
+
+def checked_image(volume: Volume) -> None:
+    info = os.lstat(volume.image)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or os.path.realpath(volume.image) != volume.image
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size != volume.size
+        or info.st_nlink != 1
+    ):
+        raise RuntimeError(f"unsafe or unexpected storage image: {volume.image}")
+    if run([BLKID, "-p", "-s", "TYPE", "-o", "value", volume.image], capture=True) != "btrfs":
+        raise RuntimeError(f"storage image is not Btrfs: {volume.image}")
+    if run([BLKID, "-p", "-s", "LABEL", "-o", "value", volume.image], capture=True) != volume.label:
+        raise RuntimeError(f"storage image label mismatch: {volume.image}")
+
+
+def provision_image(volume: Volume) -> None:
+    checked_parent(volume.image)
+    if os.path.lexists(volume.image):
+        checked_image(volume)
+        return
+    temporary = f"{volume.image}.new-{os.getpid()}"
+    if os.path.lexists(temporary):
+        raise RuntimeError(f"refusing unexpected temporary image: {temporary}")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.close(fd)
+        fd = -1
+        # No-CoW must be selected while the file is empty, before allocation.
+        run([CHATTR, "+C", "--", temporary])
+        with open(temporary, "r+b", buffering=0) as image:
+            os.ftruncate(image.fileno(), volume.size)
+            os.fsync(image.fileno())
+        run([MKFS, "-q", "-f", "-L", volume.label, temporary])
+        candidate = Volume(temporary, volume.mountpoint, volume.label, volume.size, volume.owner, volume.group, volume.mode)
+        checked_image(candidate)
+        os.rename(temporary, volume.image)
+        directory_fd = os.open(os.path.dirname(volume.image), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        checked_image(volume)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+def checked_mountpoint(volume: Volume) -> None:
+    info = os.lstat(volume.mountpoint)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or os.path.realpath(volume.mountpoint) != volume.mountpoint:
+        raise RuntimeError(f"unsafe storage mountpoint: {volume.mountpoint}")
+    if run([FINDMNT, "-n", "-o", "FSTYPE", "--target", volume.mountpoint], capture=True) != "btrfs":
+        raise RuntimeError(f"storage mount is not Btrfs: {volume.mountpoint}")
+    mounted_source = run([FINDMNT, "-n", "-o", "SOURCE", "--target", volume.mountpoint], capture=True)
+    loop_devices = {
+        line.strip()
+        for line in run([LOSETUP, "--noheadings", "--output", "NAME", "--associated", volume.image], capture=True).splitlines()
+        if line.strip()
+    }
+    if mounted_source not in loop_devices:
+        raise RuntimeError(f"storage mount uses the wrong backing image: {volume.mountpoint}")
+
+
+def preflight_unmounted(volume: Volume) -> None:
+    checked_image(volume)
+    info = os.lstat(volume.mountpoint)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or os.path.realpath(volume.mountpoint) != volume.mountpoint:
+        raise RuntimeError(f"unsafe storage mountpoint: {volume.mountpoint}")
+    mounted = subprocess.run(
+        [FINDMNT, "-n", "--target", volume.mountpoint],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=SAFE_ENV,
+    ).returncode == 0
+    if mounted:
+        checked_mountpoint(volume)
+        return
+    # Never hide a legacy workspace or VM tree behind a new empty mount. A
+    # root administrator must make a verified stopped-service backup/migration
+    # and leave the mountpoint empty before first activation.
+    with os.scandir(volume.mountpoint) as entries:
+        if next(entries, None) is not None:
+            raise RuntimeError(f"unmounted storage path is not empty; migrate it before mounting: {volume.mountpoint}")
+
+
+def prepare_mounted(volume: Volume) -> None:
+    checked_image(volume)
+    checked_mountpoint(volume)
+    uid = pwd.getpwnam(volume.owner).pw_uid
+    gid = grp.getgrnam(volume.group).gr_gid
+    os.chown(volume.mountpoint, uid, gid, follow_symlinks=False)
+    os.chmod(volume.mountpoint, volume.mode, follow_symlinks=False)
+    if volume.quotas:
+        probe = subprocess.run(
+            [BTRFS, "qgroup", "show", "--raw", volume.mountpoint],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            env=SAFE_ENV,
+        )
+        if probe.returncode != 0:
+            run([BTRFS, "quota", "enable", volume.mountpoint])
+            run([BTRFS, "quota", "rescan", "-w", volume.mountpoint])
+        run([BTRFS, "qgroup", "show", "--raw", volume.mountpoint])
+
+
+def check_prepared(volume: Volume) -> None:
+    """Validate the live bounded mount without repairing any drift."""
+    checked_image(volume)
+    checked_mountpoint(volume)
+    uid = pwd.getpwnam(volume.owner).pw_uid
+    gid = grp.getgrnam(volume.group).gr_gid
+    info = os.lstat(volume.mountpoint)
+    if (
+        info.st_uid != uid
+        or info.st_gid != gid
+        or stat.S_IMODE(info.st_mode) != volume.mode
+        or not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+    ):
+        raise RuntimeError(f"storage mount ownership or mode drifted: {volume.mountpoint}")
+    if volume.quotas:
+        run([BTRFS, "qgroup", "show", "--raw", volume.mountpoint])
+
+
+def integration_test() -> None:
+    root = tempfile.mkdtemp(prefix="openmaus-storage-integration-", dir="/var/tmp")
+    images = os.path.join(root, "images")
+    mounts = os.path.join(root, "mounts")
+    os.mkdir(images, 0o700)
+    os.mkdir(mounts, 0o700)
+    mounted: list[str] = []
+    try:
+        for index in range(3):
+            mountpoint = os.path.join(mounts, str(index))
+            os.mkdir(mountpoint, 0o700)
+            volume = Volume(
+                os.path.join(images, f"{index}.btrfs"),
+                mountpoint,
+                f"openmaus-test-{index}",
+                256 * 1024**2,
+                "root",
+                "root",
+                0o700,
+                True,
+            )
+            provision_image(volume)
+            legacy = os.path.join(mountpoint, "legacy-must-not-be-hidden")
+            with open(legacy, "x", encoding="ascii") as output:
+                output.write("legacy\n")
+            try:
+                preflight_unmounted(volume)
+            except RuntimeError as error:
+                if "not empty" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("storage preflight allowed a mount to hide legacy data")
+            os.unlink(legacy)
+            preflight_unmounted(volume)
+            run([MOUNT, "-o", "loop,nodev,nosuid,noatime", volume.image, volume.mountpoint])
+            mounted.append(mountpoint)
+            prepare_mounted(volume)
+            check_prepared(volume)
+            marker = os.path.join(mountpoint, "must-survive-rerun")
+            with open(marker, "x", encoding="ascii") as output:
+                output.write("preserved\n")
+            # The second provision is validation-only. A truncate/mkfs bug
+            # would destroy this marker and fail after the remount.
+            provision_image(volume)
+            run([UMOUNT, volume.mountpoint])
+            mounted.pop()
+            run([MOUNT, "-o", "loop,nodev,nosuid,noatime", volume.image, volume.mountpoint])
+            mounted.append(mountpoint)
+            prepare_mounted(volume)
+            check_prepared(volume)
+            with open(marker, "r", encoding="ascii") as source:
+                if source.read() != "preserved\n":
+                    raise RuntimeError("storage provisioning rerun changed existing data")
+            run([UMOUNT, volume.mountpoint])
+            mounted.pop()
+        print("openmaus bounded-storage integration passed")
+    finally:
+        for mountpoint in reversed(mounted):
+            subprocess.run([UMOUNT, mountpoint], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=SAFE_ENV)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("openmaus storage setup must run as root", file=sys.stderr)
+        return 77
+    if len(sys.argv) != 2:
+        return 64
+    try:
+        if sys.argv[1] == "--provision-images":
+            for volume in VOLUMES:
+                provision_image(volume)
+            return 0
+        if sys.argv[1] == "--prepare-mounted":
+            for volume in VOLUMES:
+                prepare_mounted(volume)
+            return 0
+        if sys.argv[1] == "--check-mounted":
+            for volume in VOLUMES:
+                check_prepared(volume)
+            return 0
+        if sys.argv[1] == "--preflight-unmounted":
+            for volume in VOLUMES:
+                preflight_unmounted(volume)
+            return 0
+        if sys.argv[1] == "--integration-test":
+            integration_test()
+            return 0
+        return 64
+    except (OSError, RuntimeError, KeyError) as error:
+        print(f"openmaus storage setup refused: {error}", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

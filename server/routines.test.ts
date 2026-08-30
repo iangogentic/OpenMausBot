@@ -72,9 +72,37 @@ describe("nextOccurrence", () => {
     expect(nextOccurrence({ type: "once", at: 200 }, 100)).toBe(200);
     expect(nextOccurrence({ type: "once", at: 100 }, 100)).toBeNull();
   });
+
+  it("persists and honors the controller timezone on an always-on remote server", () => {
+    const after = Date.parse("2026-08-17T12:00:00Z");
+    expect(nextOccurrence({
+      type: "daily",
+      time: "09:00",
+      weekdays: [1],
+      timeZone: "America/Los_Angeles",
+    }, after)).toBe(Date.parse("2026-08-17T16:00:00Z"));
+  });
 });
 
 describe("RoutineManager", () => {
+  it("saves the creator's IANA timezone with repeating schedules", () => {
+    const h = harness();
+    const routine = h.manager.create({
+      name: "Local morning",
+      prompt: "Run on my wall clock",
+      botId: "maus-1",
+      schedule: {
+        type: "daily",
+        time: "09:00",
+        weekdays: [1, 2, 3, 4, 5],
+        timeZone: "America/Chicago",
+      },
+    });
+    expect(routine.schedule).toMatchObject({ timeZone: "America/Chicago" });
+    expect(JSON.parse(readFileSync(h.options.file!, "utf8")).routines[0].schedule.timeZone)
+      .toBe("America/Chicago");
+  });
+
   it("persists definitions separately from permanent run receipts", async () => {
     const h = harness();
     const routine = h.manager.create({
@@ -154,6 +182,35 @@ describe("RoutineManager", () => {
 
     expect(h.manager.listRuns()[0]).toMatchObject({ status: "cancelled" });
     expect(h.started).toHaveLength(0);
+  });
+
+  it("cancels every queued routine and webhook for a bot on Stop", async () => {
+    const h = harness();
+    h.setBot("busy");
+    const routine = h.manager.create({
+      name: "Queued schedule",
+      prompt: "scheduled work",
+      botId: "maus-2",
+      schedule: { type: "once", at: new Date(2026, 7, 17, 8, 1).getTime() },
+    });
+    h.setNow(routine.nextRunAt!);
+    await h.manager.tick();
+    h.manager.enqueueWebhook({
+      webhookId: "webhook-1",
+      webhookName: "Queued webhook",
+      prompt: "webhook work",
+      botId: "maus-2",
+      runOn: "maus",
+      deliveryId: "delivery-1",
+      receivedAt: routine.nextRunAt!,
+    });
+
+    expect(h.manager.cancelQueuedForBot("maus-2")).toBe(2);
+    h.setBot("ready");
+    await h.manager.tick();
+
+    expect(h.started).toHaveLength(0);
+    expect(h.manager.listRuns().map((run) => run.status)).toEqual(["cancelled", "cancelled"]);
   });
 
   it("snapshots queued instructions so later edits do not rewrite a receipt", async () => {

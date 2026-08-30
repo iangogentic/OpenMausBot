@@ -3,8 +3,9 @@
 // Everything the phone can do to the harness, in one place. The rules it
 // encodes come from the default-deny policy in `companion/src/routes.ts`: a
 // paired phone may chat, answer approvals, and read rooms — it may not touch
-// credentials, pairing, or the Local VM. Those routes are simply absent here
-// rather than present and failing at runtime.
+// credentials or Local VM lifecycle/setup. Interactive access to a bot's
+// already-running server-hosted VM is the one narrow Local VM exception: it
+// uses the same device-bound lease as Box and a companion-scoped viewer.
 import Foundation
 
 /// Where a companion connects, and with what. The token is *not* held here
@@ -924,15 +925,98 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("POST", "/api/bots/\(botId)/interrupt"))
     }
 
-    /// Mint a fresh interactive viewer for an existing cloud computer. The
-    /// response URL is a bearer credential: the caller presents it directly
-    /// and never stores it. The sidecar additionally requires this paired
-    /// device's cloud-desktop capability to be enabled on the Mac.
-    public func cloudDesktop(botId: String) async throws -> CloudDesktopSession {
-        try await send(
-            try makeRequest("POST", "/api/bots/\(botId)/computer/join"),
-            as: CloudDesktopSession.self
+    /// Take the same short human-control lease used by the desktop app. The
+    /// sidecar binds the owner to the authenticated paired device; ownerId is
+    /// still sent for compatibility with older harnesses and direct tests.
+    public func takeCloudDesktopControl(
+        botId: String,
+        ownerId: String,
+        surface: String = "cloud"
+    ) async throws -> CloudDesktopControl {
+        guard surface == "cloud" || surface == "vm" else {
+            throw APIError.transport("That computer surface is not available on the phone.")
+        }
+        let control = try await send(
+            try makeRequest(
+                "POST",
+                "/api/bots/\(botId)/computer/control",
+                body: ["action": "take", "ownerId": ownerId, "surface": surface]
+            ),
+            as: CloudDesktopControl.self
         )
+        guard control.held, control.leaseToken?.isEmpty == false else {
+            throw APIError.transport("The computer did not grant this phone control.")
+        }
+        return control
+    }
+
+    public func heartbeatCloudDesktopControl(botId: String, ownerId: String, leaseToken: String) async throws -> CloudDesktopControl {
+        var request = try makeRequest(
+            "POST",
+            "/api/bots/\(botId)/computer/control",
+            body: ["action": "heartbeat", "ownerId": ownerId, "leaseToken": leaseToken]
+        )
+        // A safety heartbeat must fail back to the local monotonic deadline
+        // well before the server's short lease can expire.
+        request.timeoutInterval = 2
+        return try await send(request, as: CloudDesktopControl.self)
+    }
+
+    public func releaseCloudDesktopControl(botId: String, ownerId: String, leaseToken: String) async throws {
+        _ = try await send(
+            try makeRequest(
+                "POST",
+                "/api/bots/\(botId)/computer/control",
+                body: ["action": "release", "ownerId": ownerId, "leaseToken": leaseToken]
+            ),
+            as: CloudDesktopControl.self
+        )
+    }
+
+    /// Mint a fresh interactive viewer only after the exact lease above was
+    /// granted. The response URL is a bearer credential and is never stored.
+    public func cloudDesktop(
+        botId: String,
+        ownerId: String,
+        leaseToken: String,
+        surface: String = "cloud"
+    ) async throws -> CloudDesktopSession {
+        guard surface == "cloud" || surface == "vm" else {
+            throw APIError.transport("That computer surface is not available on the phone.")
+        }
+        if surface == "cloud" {
+            return try await send(
+                try makeRequest(
+                    "POST",
+                    "/api/bots/\(botId)/computer/join",
+                    body: ["ownerId": ownerId, "leaseToken": leaseToken]
+                ),
+                as: CloudDesktopSession.self
+            )
+        }
+        struct LocalViewerWire: Decodable {
+            let joinUrl: String
+            let viewerKind: String
+        }
+        let response = try await send(
+            try makeRequest(
+                "POST",
+                "/api/bots/\(botId)/local-computer/join",
+                body: ["ownerId": ownerId, "leaseToken": leaseToken]
+            ),
+            as: LocalViewerWire.self
+        )
+        guard response.viewerKind == "local-vm",
+              let baseURL = connection.baseURL,
+              let url = trustedPhoneLocalVmViewerURL(
+                  response.joinUrl,
+                  companionBaseURL: baseURL,
+                  botId: botId
+              )
+        else {
+            throw APIError.transport("The computer returned an invalid Local VM viewer.")
+        }
+        return CloudDesktopSession(url: url)
     }
 
     public func markRead(botId: String) async throws {

@@ -181,6 +181,18 @@ describe("room turn timeout", () => {
     expect(nextTurn).toHaveBeenCalledOnce();
   });
 
+  it("settles a provider reload only for the exact dispatch generation", () => {
+    const completions = new RoomTurnStallRegistry();
+    const finished = vi.fn();
+    completions.register("room-thread", finished, "generation-new");
+
+    expect(completions.providerReloaded("room-thread", "generation-old")).toBe(false);
+    expect(finished).not.toHaveBeenCalled();
+    expect(completions.providerReloaded("room-thread", "generation-new")).toBe(true);
+    expect(finished).toHaveBeenCalledWith("provider_reloaded");
+    expect(completions.providerReloaded("room-thread", "generation-new")).toBe(false);
+  });
+
   it("formats singular and plural timeout messages", () => {
     expect(roomTurnTimeoutMessage("Atlas", 1)).toBe(
       "Atlas's room turn exceeded 1 minute and was stopped",

@@ -10,7 +10,11 @@
 //   - stop→archived ~5s, resume→idle ~8s; disk persists, tmux does not.
 //   - X11 desktop with Chrome + Ghostty; passwordless sudo; node 24.
 //   - the dedicated IP rotates across archive/resume — never persist it.
+import { createHash } from "node:crypto";
+
 import type { AppConfig } from "./config.ts";
+import { readBoundedResponseBytes, readBoundedResponseText } from "./bounded-response.ts";
+import { assertBoundedJsonShape, PROVIDER_NDJSON_LIMITS } from "./drivers/bounded-json-lines.ts";
 import { ensureRemoteCuaCommand, remoteComputerBootstrapCommand } from "./remote-computer.ts";
 
 // overridable so tests can point at a stub instead of the live provider
@@ -18,6 +22,72 @@ const BOX_API = process.env.OMB_BOX_API || "https://ascii.dev/api/box/v1";
 const READY = new Set(["idle", "ready", "running"]);
 const DEFAULT_BOX_TTL_SECONDS = 8 * 60 * 60;
 const TRIAL_BOX_TTL_SECONDS = 2 * 60 * 60;
+const MAX_BOX_DESKTOP_URL_LENGTH = 4_096;
+const MAX_BOX_JSON_BYTES = 4 * 1024 * 1024;
+const MAX_BOX_ARTIFACT_BYTES = 8 * 1024 * 1024;
+
+export const BOX_CREDENTIAL_CHANGE_ERROR =
+  "wait for the active Box computer operation to finish before changing the Box token";
+
+let boxCredentialMutation = false;
+let activeBoxCredentialUses = 0;
+
+export type BoxCredentialUse = {
+  config: AppConfig;
+  release: () => void;
+};
+
+/** Pin one Box account for a complete multi-await operation. The app config
+ * object is intentionally mutable, so merely assigning `const cfg = config`
+ * is not a snapshot: a token save can replace `cfg.box` between requests. */
+export function acquireBoxCredentialUse(cfg: AppConfig): BoxCredentialUse {
+  if (boxCredentialMutation) {
+    throw Object.assign(new Error("Box settings are being updated; retry the computer action"), { status: 409 });
+  }
+  activeBoxCredentialUses += 1;
+  const config: AppConfig = {
+    ...cfg,
+    box: cfg.box ? { ...cfg.box } : undefined,
+  };
+  let released = false;
+  return {
+    config,
+    release: () => {
+      if (released) return;
+      released = true;
+      activeBoxCredentialUses = Math.max(0, activeBoxCredentialUses - 1);
+    },
+  };
+}
+
+/** Atomically exclude new account-bound work while a token rotation is
+ * validated and committed. Callers must release the returned mutation in a
+ * finally block. A same-token save is deliberately a no-op. */
+export function beginBoxCredentialMutation(
+  currentToken: string | undefined,
+  nextToken: string | undefined,
+): { allowed: true; changing: boolean; release: () => void } | { allowed: false; error: string } {
+  if (currentToken === nextToken) return { allowed: true, changing: false, release: () => {} };
+  if (boxCredentialMutation || activeBoxCredentialUses > 0) {
+    return { allowed: false, error: BOX_CREDENTIAL_CHANGE_ERROR };
+  }
+  boxCredentialMutation = true;
+  let released = false;
+  return {
+    allowed: true,
+    changing: true,
+    release: () => {
+      if (released) return;
+      released = true;
+      boxCredentialMutation = false;
+    },
+  };
+}
+
+function boxRequestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
 
 function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}) {
   return fetch(`${BOX_API}${path}`, {
@@ -27,13 +97,63 @@ function boxFetch(cfg: AppConfig, path: string, opts: RequestInit = {}) {
       "content-type": "application/json",
       ...opts.headers,
     },
+    redirect: "error",
+    signal: opts.signal ?? AbortSignal.timeout(60_000),
   });
+}
+
+export function parseBoxProviderJson(raw: string): any | null {
+  try {
+    const body: unknown = JSON.parse(raw);
+    assertBoundedJsonShape(body, PROVIDER_NDJSON_LIMITS);
+    return body;
+  } catch {
+    return null;
+  }
 }
 
 async function boxJson(cfg: AppConfig, path: string, opts: RequestInit = {}) {
   const res = await boxFetch(cfg, path, opts);
-  const body: any = await res.json().catch(() => null);
+  const raw = await readBoundedResponseText(res, MAX_BOX_JSON_BYTES, "Box response exceeded 4 MB").catch(() => "");
+  const body = parseBoxProviderJson(raw);
   return { ok: res.ok && body?.ok !== false, status: res.status, body };
+}
+
+/** Validate the short-lived viewer bearer credential before it crosses the
+ * provider boundary. Keep failures deliberately generic: the rejected value
+ * may itself contain a live token and must never appear in an error or log. */
+export function validBoxDesktopUrl(value: unknown): string | null {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    new TextEncoder().encode(value).byteLength > MAX_BOX_DESKTOP_URL_LENGTH
+  ) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  const normalized = parsed.toString();
+  const raw = value.trim();
+  const authority = raw.slice(raw.indexOf("//") + 2).split(/[/?#]/, 1)[0] ?? "";
+  const hostname = parsed.hostname.toLowerCase();
+  if (
+    parsed.protocol !== "https:" ||
+    authority.includes("@") ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    (hostname !== "ascii.dev" && !hostname.endsWith(".ascii.dev"))
+  ) return null;
+  return new TextEncoder().encode(normalized).byteLength <= MAX_BOX_DESKTOP_URL_LENGTH ? normalized : null;
+}
+
+function providerDesktopUrl(body: any): string | null {
+  const candidate = body?.desktopUrl ?? body?.url;
+  if (candidate == null || candidate === "") return null;
+  const validated = validBoxDesktopUrl(candidate);
+  if (!validated) throw new Error("box desktop link was rejected by the trusted-host policy");
+  return validated;
 }
 
 // deterministic per-bot name; the hash kills truncated-uuid collisions
@@ -46,15 +166,23 @@ async function boxNameFor(botId: string) {
   return `ogb-${botId.slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, "")}-${hash}`;
 }
 
-export async function runCommand(cfg: AppConfig, boxId: string, command: string, { timeoutMs = 120_000 } = {}) {
+export async function runCommand(
+  cfg: AppConfig,
+  boxId: string,
+  command: string,
+  { timeoutMs = 120_000, signal }: { timeoutMs?: number; signal?: AbortSignal } = {},
+) {
   const res = await boxFetch(cfg, `/boxes/${boxId}/commands`, {
     method: "POST",
     body: JSON.stringify({ command }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: boxRequestSignal(timeoutMs, signal),
   });
-  const body: any = await res.json().catch(() => null);
+  const raw = await readBoundedResponseText(res, MAX_BOX_JSON_BYTES, "Box command response exceeded 4 MB").catch(() => "");
+  const body = parseBoxProviderJson(raw);
   return {
     ok: res.ok && body?.exitCode === 0,
+    status: res.status,
+    code: body?.code ?? body?.error?.code ?? null,
     exitCode: body?.exitCode ?? null,
     stdout: body?.stdout ?? "",
     stderr: body?.stderr ?? "",
@@ -70,13 +198,13 @@ async function mintDesktopUrl(cfg: AppConfig, boxId: string, { vncBudgetMs = 60_
   const t0 = Date.now();
   while (Date.now() - t0 < vncBudgetMs) {
     const { body } = await boxJson(cfg, `/boxes/${boxId}/desktop?vnc=1`, { method: "POST" });
-    const url = body?.desktopUrl ?? body?.url;
+    const url = providerDesktopUrl(body);
     if (url) return url;
     if (!body?.provisioning) break;
     await new Promise((r) => setTimeout(r, 3000));
   }
   const { body } = await boxJson(cfg, `/boxes/${boxId}/desktop`, { method: "POST" });
-  return body?.desktopUrl ?? body?.url ?? null;
+  return providerDesktopUrl(body);
 }
 
 async function waitReady(cfg: AppConfig, boxId: string, budgetMs = 90_000) {
@@ -100,19 +228,69 @@ async function waitReady(cfg: AppConfig, boxId: string, budgetMs = 90_000) {
 // the live state so callers can still see "archived".
 const boxIdCache = new Map<string, string>();
 
+function boxIdCacheKey(cfg: AppConfig, botId: string): string {
+  // Account rotation must never reuse an id resolved under the previous
+  // account. Hashing keeps the credential itself out of diagnostic heap/map
+  // output while still making the cache namespace account-specific.
+  const account = createHash("sha256").update(cfg.box?.token ?? "").digest("hex").slice(0, 16);
+  return `${account}:${botId}`;
+}
+
 export async function findBox(cfg: AppConfig, botId: string) {
-  const cachedId = boxIdCache.get(botId);
+  const cacheKey = boxIdCacheKey(cfg, botId);
+  const cachedId = boxIdCache.get(cacheKey);
   if (cachedId) {
     const { ok, body } = await boxJson(cfg, `/boxes/${cachedId}`);
     const box = body?.box;
     if (ok && box?.id && box.state !== "error") return box;
-    boxIdCache.delete(botId); // gone or broken — fall back to the listing
+    boxIdCache.delete(cacheKey); // gone or broken — fall back to the listing
   }
   const name = await boxNameFor(botId);
   const { body } = await boxJson(cfg, "/boxes");
   const found = (body?.boxes ?? []).find((b: any) => b.name === name && b.state !== "error") ?? null;
-  if (found?.id) boxIdCache.set(botId, found.id);
+  if (found?.id) boxIdCache.set(cacheKey, found.id);
   return found;
+}
+
+/** Strict provider inventory used by destructive workflows.  Ordinary
+ * readiness can treat an absent Box as "not provisioned", but bot deletion
+ * must distinguish that from a provider outage or rejected credential.  A
+ * failed lookup therefore throws instead of silently turning into `null`.
+ * Error-state Boxes still count as resources: they may contain durable data
+ * and must remain reachable through the explicit permanent-delete action. */
+export async function inventoryBox(cfg: AppConfig, botId: string) {
+  if (!boxConfigured(cfg)) return { configured: false, box: null };
+  const cacheKey = boxIdCacheKey(cfg, botId);
+  const cachedId = boxIdCache.get(cacheKey);
+  if (cachedId) {
+    const direct = await boxJson(cfg, `/boxes/${cachedId}`);
+    if (direct.ok) {
+      if (!direct.body?.box?.id) {
+        throw Object.assign(new Error("ascii.dev returned an invalid Box inventory response — retry in a moment"), {
+          status: 409,
+        });
+      }
+      return { configured: true, box: direct.body.box };
+    }
+    if (direct.status !== 404) {
+      throw Object.assign(new Error(boxErrorMessage(direct.status, "box inventory", direct.body)), { status: 409 });
+    }
+    boxIdCache.delete(cacheKey);
+  }
+
+  const name = await boxNameFor(botId);
+  const listed = await boxJson(cfg, "/boxes");
+  if (!listed.ok) {
+    throw Object.assign(new Error(boxErrorMessage(listed.status, "box inventory", listed.body)), { status: 409 });
+  }
+  if (!Array.isArray(listed.body?.boxes)) {
+    throw Object.assign(new Error("ascii.dev returned an invalid Box inventory response — retry in a moment"), {
+      status: 409,
+    });
+  }
+  const found = listed.body.boxes.find((candidate: any) => candidate?.name === name && candidate?.id) ?? null;
+  if (found?.id) boxIdCache.set(cacheKey, found.id);
+  return { configured: true, box: found };
 }
 
 /** Ready-or-null without the LIST when we already know the box. */
@@ -134,9 +312,14 @@ export async function verifyToken(token: string): Promise<{ ok: true } | { ok: f
   try {
     const res = await fetch(`${BOX_API}/boxes`, {
       headers: { authorization: `Bearer ${token}` },
+      redirect: "error",
       signal: AbortSignal.timeout(20_000),
     });
-    if (res.ok) return { ok: true };
+    if (res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return { ok: true };
+    }
+    await res.body?.cancel().catch(() => {});
     if (res.status === 401 || res.status === 403) {
       // the common mistake is pasting some other credential entirely —
       // box API keys are prefixed, so say which thing is wrong
@@ -204,11 +387,40 @@ async function createBox(cfg: AppConfig) {
 
 /** Box state for the Computer panel. */
 export async function boxStatus(cfg: AppConfig, botId: string) {
-  if (!boxConfigured(cfg)) return { configured: false, box: null };
-  const box = await findBox(cfg, botId);
+  const inventory = await inventoryBox(cfg, botId);
+  if (!inventory.configured) return inventory;
+  const box = inventory.box;
   return {
     configured: true,
     box: box ? { boxId: box.id, state: box.state, desktopAvailable: box.desktopAvailable ?? null } : null,
+  };
+}
+
+/** Permanently erase this bot's provider-owned Box.  Deletion is deliberately
+ * separate from sleep/archive: it destroys the disk and browser profile. The
+ * provider requires the exact id in a confirmation header; 202/operation
+ * responses mean the deletion was accepted asynchronously, not that it
+ * failed. No provider response or credential is reflected back to the UI. */
+export async function deleteBox(cfg: AppConfig, botId: string) {
+  const inventory = await inventoryBox(cfg, botId);
+  if (!inventory.configured || !inventory.box) {
+    return { ok: true, deleted: false, missing: true, pending: false };
+  }
+  const boxId = String(inventory.box.id);
+  const removed = await boxJson(cfg, `/boxes/${boxId}`, {
+    method: "DELETE",
+    headers: { "X-Ascii-Confirm-Delete": boxId },
+  });
+  if (!removed.ok) {
+    throw Object.assign(new Error(boxErrorMessage(removed.status, "box delete", removed.body)), { status: 409 });
+  }
+  boxIdCache.delete(boxIdCacheKey(cfg, botId));
+  const operationId = removed.body?.operationId ?? removed.body?.operation?.id;
+  return {
+    ok: true,
+    deleted: true,
+    missing: false,
+    pending: removed.status === 202 || (typeof operationId === "string" && operationId.length > 0),
   };
 }
 
@@ -267,7 +479,7 @@ export async function provisionBox(cfg: AppConfig, botId: string, botName: strin
       method: "DELETE",
       headers: { "X-Ascii-Confirm-Delete": box.id },
     }).catch(() => null);
-    boxIdCache.delete(botId);
+    boxIdCache.delete(boxIdCacheKey(cfg, botId));
     if (cleanup?.ok) throw error;
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`${message}. The new computer could not be removed automatically; delete box ${box.id} in ascii.dev.`);
@@ -283,11 +495,15 @@ export async function joinBox(cfg: AppConfig, botId: string) {
   // Provider archive/resume preserves disk but not processes. Reattach the
   // driver daemon before handing the desktop back to the user.
   await runCommand(cfg, box.id, ensureRemoteCuaCommand(), { timeoutMs: 15_000 }).catch(() => null);
-  return { joinUrl: await mintDesktopUrl(cfg, box.id), state: ready.state ?? null };
+  const joinUrl = await mintDesktopUrl(cfg, box.id);
+  if (!joinUrl) throw new Error("box desktop link could not be created");
+  return { joinUrl, state: ready.state ?? null };
 }
 
-/** Archive the bot's box now (billing pauses, disk survives). */
-export async function sleepBox(cfg: AppConfig, botId: string) {
+/** Archive the bot's box now (billing pauses, disk survives). A successful
+ * POST is not enough for takeover recovery: poll until the provider proves
+ * the machine is non-running before callers clear quarantined actions. */
+export async function sleepBox(cfg: AppConfig, botId: string, budgetMs = 30_000) {
   const box = await findBox(cfg, botId);
   if (!box) throw new Error("no computer for this bot");
   // Ask the browser's oldest (main) process to exit before the provider
@@ -298,18 +514,24 @@ export async function sleepBox(cfg: AppConfig, botId: string) {
     'for i in 1 2 3 4 5 6 7 8; do if ! pgrep -x chrome >/dev/null 2>&1 && ! pgrep -x google-chrome >/dev/null 2>&1 && ! pgrep -x chromium >/dev/null 2>&1 && ! pgrep -x chromium-browser >/dev/null 2>&1; then break; fi; sleep 0.25; done',
   ].join("; ");
   await runCommand(cfg, box.id, quiesceBrowser, { timeoutMs: 5_000 }).catch(() => null);
-  await boxJson(cfg, `/boxes/${box.id}/stop`, { method: "POST" }).catch(() => {});
-  return { ok: true };
-}
+  const stopped = await boxJson(cfg, `/boxes/${box.id}/stop`, {
+    method: "POST",
+    signal: AbortSignal.timeout(Math.max(100, Math.min(budgetMs, 15_000))),
+  });
+  if (!stopped.ok) throw new Error(boxErrorMessage(stopped.status, "box stop", stopped.body));
 
-/** Owner-scoped shell for the Computer panel's console. */
-export async function execOnBox(cfg: AppConfig, botId: string, command: string) {
-  const box = await findBox(cfg, botId);
-  if (!box) throw new Error("no computer for this bot yet");
-  const ready = await waitReady(cfg, box.id, 60_000);
-  if (!ready) throw new Error("box did not wake");
-  const out = await runCommand(cfg, box.id, String(command ?? "").slice(0, 4000));
-  return { exitCode: out.exitCode, stdout: out.stdout.slice(-4000), stderr: out.stderr.slice(-2000) };
+  const deadline = Date.now() + Math.max(100, budgetMs);
+  while (Date.now() < deadline) {
+    const status = await boxJson(cfg, `/boxes/${box.id}`, {
+      signal: AbortSignal.timeout(Math.max(100, Math.min(deadline - Date.now(), 5_000))),
+    });
+    if (!status.ok) throw new Error(boxErrorMessage(status.status, "box stop verification", status.body));
+    const state = status.body?.box?.state;
+    if (state === "archived" || state === "stopped") return { ok: true, state };
+    if (state === "error") throw new Error("box entered an error state while stopping");
+    await new Promise((resolve) => setTimeout(resolve, Math.min(1_000, Math.max(1, deadline - Date.now()))));
+  }
+  throw new Error("box stop was not verified before the timeout");
 }
 
 // Screenshot for the Computer panel + screen-in-chat. Two hops: capture
@@ -330,21 +552,42 @@ const SHOT_CMD = [
   'test -s "$f" && echo captured',
 ].join("; ");
 
+/** Validate a complete provider screenshot before exposing it as image data. */
+export function wholeBoxScreenshot(data: string): string | null {
+  if (
+    !data ||
+    data.length % 4 !== 0 ||
+    data.length > Math.ceil(MAX_BOX_ARTIFACT_BYTES / 3) * 4 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(data)
+  ) return null;
+  const bytes = Buffer.from(data, "base64");
+  if (bytes.length < 512 || bytes.length > MAX_BOX_ARTIFACT_BYTES) return null;
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  const tail = bytes.subarray(Math.max(0, bytes.length - 32));
+  if (!tail.includes(Buffer.from([0xff, 0xd9]))) return null;
+  return bytes.toString("base64");
+}
+
 /** Read a file off the box as base64 — raw artifact bytes when the API
  * supports it (33% less transfer, no JSON envelope), else the files API. */
 async function readFileBase64(cfg: AppConfig, boxId: string, path: string): Promise<string | null> {
   try {
     const res = await boxFetch(cfg, `/boxes/${boxId}/artifacts?path=${encodeURIComponent(path)}`);
     if (res.ok) {
-      const bytes = Buffer.from(await res.arrayBuffer());
-      if (bytes.length) return bytes.toString("base64");
+      const bytes = Buffer.from(await readBoundedResponseBytes(
+        res,
+        MAX_BOX_ARTIFACT_BYTES,
+        "Box artifact exceeded 8 MB",
+      ));
+      const image = wholeBoxScreenshot(bytes.toString("base64"));
+      if (image) return image;
     }
   } catch {
     /* fall through */
   }
   const { ok, body } = await boxJson(cfg, `/boxes/${boxId}/files?path=${encodeURIComponent(path)}&encoding=base64`);
   const content = body?.content;
-  return ok && typeof content === "string" && content ? content : null;
+  return ok && typeof content === "string" ? wholeBoxScreenshot(content) : null;
 }
 
 /** `knownBoxId` skips box resolution entirely — the screen poller holds
@@ -364,4 +607,111 @@ export async function screenshotBox(cfg: AppConfig, botId: string, knownBoxId?: 
   const data = await readFileBase64(cfg, boxId, PANEL_PATH);
   if (!data) throw new Error("could not read the frame back from the box");
   return { png: data, format: "jpeg" };
+}
+
+export type ScopedBoxOperation =
+  | "command"
+  | "resume"
+  | "state"
+  | "read-file"
+  | "prompt"
+  | "prompt-status"
+  | "events"
+  | "interrupt";
+
+export const SCOPED_BOX_MAX_COMMAND_CHARS = 32_768;
+export const SCOPED_BOX_MAX_PROMPT_CHARS = 131_072;
+
+/** Execute the deliberately narrow Box API surface exposed by a turn-bound
+ * harness capability. `boxId` is server-owned metadata from the capability,
+ * never a request field, so there is no account-wide list operation and no
+ * way for a child to select another bot's machine. */
+export async function scopedBoxOperation(
+  cfg: AppConfig,
+  boxId: string,
+  request: Record<string, unknown>,
+  options: { signal?: AbortSignal } = {},
+): Promise<Record<string, unknown>> {
+  const op = request.op as ScopedBoxOperation;
+  if (!boxId) throw Object.assign(new Error("scoped Box id is missing"), { status: 403 });
+  if (op === "command") {
+    const command = typeof request.command === "string" ? request.command : "";
+    if (!command || command.length > SCOPED_BOX_MAX_COMMAND_CHARS) {
+      throw Object.assign(new Error("a bounded command is required"), { status: 400 });
+    }
+    const requestedTimeout = Number(request.timeoutMs);
+    const timeoutMs = Number.isFinite(requestedTimeout)
+      ? Math.max(100, Math.min(Math.trunc(requestedTimeout), 180_000))
+      : 60_000;
+    return runCommand(cfg, boxId, command, { timeoutMs, signal: options.signal });
+  }
+  if (op === "resume") {
+    const result = await boxJson(cfg, `/boxes/${boxId}/resume`, { method: "POST", signal: options.signal });
+    return { ok: result.ok, status: result.status, body: result.body };
+  }
+  if (op === "state") {
+    const result = await boxJson(cfg, `/boxes/${boxId}`, { signal: options.signal });
+    return { ok: result.ok, status: result.status, body: result.body };
+  }
+  if (op === "read-file") {
+    const path = typeof request.path === "string" ? request.path : "";
+    if (path !== "/tmp/ogb-shot.jpg") {
+      throw Object.assign(new Error("that Box artifact is outside the scoped computer bridge"), { status: 403 });
+    }
+    const transport = request.transport === "files" ? "files" : "artifacts";
+    if (transport === "artifacts") {
+      const response = await boxFetch(cfg, `/boxes/${boxId}/artifacts?path=${encodeURIComponent(path)}`, {
+        signal: options.signal,
+      });
+      const bytes = response.ok
+        ? Buffer.from(await readBoundedResponseBytes(
+            response,
+            MAX_BOX_ARTIFACT_BYTES,
+            "Box artifact exceeded 8 MB",
+          ))
+        : Buffer.alloc(0);
+      return { ok: response.ok, status: response.status, data: bytes.length ? bytes.toString("base64") : null };
+    }
+    const result = await boxJson(cfg, `/boxes/${boxId}/files?path=${encodeURIComponent(path)}&encoding=base64`, {
+      signal: options.signal,
+    });
+    return {
+      ok: result.ok,
+      status: result.status,
+      data: typeof result.body?.content === "string" ? result.body.content : null,
+    };
+  }
+  if (op === "prompt") {
+    const provider = request.provider === "codex" ? "codex" : request.provider === "claude-code" ? "claude-code" : null;
+    const model = typeof request.model === "string" ? request.model.trim() : "";
+    const prompt = typeof request.prompt === "string" ? request.prompt : "";
+    if (!provider || !model || model.length > 128 || !prompt || prompt.length > SCOPED_BOX_MAX_PROMPT_CHARS) {
+      throw Object.assign(new Error("valid provider, model, and bounded prompt are required"), { status: 400 });
+    }
+    const result = await boxJson(cfg, `/boxes/${boxId}/prompt`, {
+      method: "POST",
+      body: JSON.stringify({ provider, model, prompt }),
+      signal: options.signal,
+    });
+    return { ok: result.ok, status: result.status, body: result.body };
+  }
+  if (op === "prompt-status") {
+    const promptId = typeof request.promptId === "string" ? request.promptId : "";
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(promptId)) {
+      throw Object.assign(new Error("invalid Box prompt id"), { status: 400 });
+    }
+    const result = await boxJson(cfg, `/boxes/${boxId}/prompts/${encodeURIComponent(promptId)}`, {
+      signal: options.signal,
+    });
+    return { ok: result.ok, status: result.status, body: result.body };
+  }
+  if (op === "events") {
+    const result = await boxJson(cfg, `/boxes/${boxId}/events`, { signal: options.signal });
+    return { ok: result.ok, status: result.status, body: result.body };
+  }
+  if (op === "interrupt") {
+    const result = await boxJson(cfg, `/boxes/${boxId}/interrupt`, { method: "POST", signal: options.signal });
+    return { ok: result.ok, status: result.status, body: result.body };
+  }
+  throw Object.assign(new Error("unsupported scoped Box operation"), { status: 400 });
 }

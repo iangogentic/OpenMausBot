@@ -99,6 +99,7 @@ export function PendingApprovalActions({
       type: "decideRequest",
       threadId,
       requestId: pending.requestId,
+      messageId: pending.message.id,
       behavior,
       message: behavior === "deny" ? "Denied by the user." : undefined,
       alwaysAllow: always && bot && pending.allowKey ? { botId: bot.id, key: pending.allowKey } : undefined,

@@ -9,6 +9,7 @@ import {
   composeMessage,
   isImageFile,
   splitAttachedImages,
+  uploadFileNameHeader,
   type ImageAttachment,
 } from "./composer-attachments";
 
@@ -112,5 +113,13 @@ describe("isImageFile", () => {
     expect(isImageFile({ type: "image/webp", size: 10 })).toBe(true);
     expect(isImageFile({ type: "image/svg+xml", size: 10 })).toBe(false);
     expect(isImageFile({ type: "text/plain", size: 10 })).toBe(false);
+  });
+});
+
+describe("remote file-name metadata", () => {
+  it("encodes emoji and CJK Finder names as ASCII-only UTF-8 base64url", () => {
+    const encoded = uploadFileNameHeader("📄-报告.txt");
+    expect(encoded).toBe("8J-ThC3miqXlkYoudHh0");
+    expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 });

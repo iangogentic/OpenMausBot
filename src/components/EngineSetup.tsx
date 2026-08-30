@@ -5,13 +5,14 @@ import { useState } from "react";
 import { Check, Copy, Download, ExternalLink, LogIn, TerminalSquare } from "lucide-react";
 import type { EngineInstall, InstanceInfo } from "@/state/store";
 import { cn } from "@/lib/cn";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
 
 type Platform = "darwin" | "win32" | "linux";
 
 function hostPlatform(): Platform {
-  const platform = window.ogb?.platform;
+  const platform = typeof window === "undefined" ? undefined : window.ogb?.platform;
   if (platform === "darwin" || platform === "win32" || platform === "linux") return platform;
-  const userAgent = navigator.userAgent;
+  const userAgent = typeof navigator === "undefined" ? "" : navigator.userAgent;
   if (userAgent.includes("Mac")) return "darwin";
   if (userAgent.includes("Win")) return "win32";
   return "linux";
@@ -19,8 +20,22 @@ function hostPlatform(): Platform {
 
 /** The install command for this machine, or null when the engine has none
  * here (a GUI download, or a POSIX-only installer viewed on Windows). */
-export function installCommandFor(install: EngineInstall | undefined): string | null {
-  return install?.command?.[hostPlatform()] ?? null;
+export function installCommandFor(install: EngineInstall | undefined, platform = hostPlatform()): string | null {
+  return install?.command?.[platform] ?? null;
+}
+
+export function engineSetupPlan(
+  install: EngineInstall | undefined,
+  connection: "local" | "remote" | "browser",
+  serverPlatform?: Platform,
+): { command: string | null; runOnServer: boolean } {
+  // A remote server is the sole authority for engine installation. If an old
+  // harness has not reported its platform yet, withhold the command rather
+  // than guessing from the controller Mac and launching the wrong terminal.
+  if (connection === "remote") {
+    return { command: serverPlatform ? installCommandFor(install, serverPlatform) : null, runOnServer: true };
+  }
+  return { command: installCommandFor(install), runOnServer: false };
 }
 
 /** Installed but missing the cloud account session. */
@@ -34,9 +49,9 @@ export function needsCli(instance: InstanceInfo | undefined): boolean {
   return instance?.snapshot.state !== "available";
 }
 
-function CommandRow({ command, actionLabel }: { command: string; actionLabel: string }) {
+function CommandRow({ command, actionLabel, canOpenTerminal }: { command: string; actionLabel: string; canOpenTerminal: boolean }) {
   const [status, setStatus] = useState<"copied" | "opened" | null>(null);
-  const canOpen = Boolean(window.ogb?.openInstallTerminal);
+  const canOpen = canOpenTerminal && Boolean(window.ogb?.openInstallTerminal);
 
   const settle = (next: "copied" | "opened") => {
     setStatus(next);
@@ -115,17 +130,26 @@ export function EngineSetup({
   /** `inject` installs the CLI but deliberately skips cloud sign-in. */
   intent?: "cloud" | "inject";
 }) {
+  const { capabilities } = useDesktopCapabilities();
   const install = instance.install;
-  const installCommand = installCommandFor(install);
+  const remote = capabilities.connection?.mode === "remote";
+  const plan = engineSetupPlan(install, remote ? "remote" : capabilities.connection?.mode ?? "browser", instance.hostPlatform);
+  const installCommand = plan.command;
   const signInCommand = install?.signInCommand;
   const signInOnly = intent === "cloud" && needsSignIn(instance);
   const command = signInOnly ? signInCommand : installCommand;
   const title = signInOnly ? `Sign in to ${instance.displayName}` : `Install ${instance.displayName}`;
   const description = signInOnly
-    ? "Finish the account sign-in in Terminal. Reopen this menu afterward and we’ll check again."
+    ? remote
+      ? "Run this on the Razer server, then return here and check again."
+      : "Finish the account sign-in in Terminal. Reopen this menu afterward and we’ll check again."
     : intent === "inject"
-      ? "Install the agent once, then you can run it with local models—no cloud sign-in required."
-      : `Install the command-line app once. Models will appear here as soon as it’s ready${signInCommand ? "; sign-in may follow" : ""}.`;
+      ? remote
+        ? "Install this on the Razer server once, then you can run it with local models—no cloud sign-in required."
+        : "Install the agent once, then you can run it with local models—no cloud sign-in required."
+      : remote
+        ? `Install the command-line app on Razer. Models will appear here as soon as its server detects it${signInCommand ? "; sign-in may follow" : ""}.`
+        : `Install the command-line app once. Models will appear here as soon as it’s ready${signInCommand ? "; sign-in may follow" : ""}.`;
 
   // Some engines are configured elsewhere (for example, a cloud computer
   // token) and intentionally have no install descriptor.
@@ -153,10 +177,28 @@ export function EngineSetup({
       </div>
 
       {command ? (
-        <CommandRow command={command} actionLabel={signInOnly ? "Open sign-in in Terminal" : "Open install in Terminal"} />
+        <CommandRow
+          command={command}
+          canOpenTerminal={!plan.runOnServer}
+          actionLabel={
+            plan.runOnServer
+              ? "Copy command for Razer"
+              : signInOnly
+                ? "Open sign-in in Terminal"
+                : "Open install in Terminal"
+          }
+        />
       ) : (
         <p className="mt-3 rounded-lg bg-inset px-2.5 py-2 text-[12px] leading-relaxed text-ink-secondary">
-          There isn’t a one-line installer for this platform. Use the setup guide below.
+          {plan.runOnServer
+            ? "Razer has not reported a supported install command yet. Use the setup guide on Razer; this Mac will not open a local terminal."
+            : "There isn’t a one-line installer for this platform. Use the setup guide below."}
+        </p>
+      )}
+
+      {plan.runOnServer && command && (
+        <p className="mt-2 text-[11px] leading-relaxed text-ink-secondary/70">
+          Copy this, SSH to Razer, and run it there. This controller never installs engines on your Mac.
         </p>
       )}
 

@@ -4,20 +4,70 @@
 // without an OpenRouter key — that is the "HTTP 401: Missing Authentication
 // header" failure. Inject writes providers.<host> and session/set_model
 // `custom:<host>:<model>` instead.
-import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import type { ModelCatalog } from "../../contracts.ts";
-import { decodeInjectId, hostApiKey, INJECT_SEP, localHost, mergeLocalInject } from "../local-inject.ts";
+import { DATA_DIR } from "../../config.ts";
+import { providerRuntimeBase } from "../../provider-runtime.ts";
+import { findCliCandidates } from "../../env-path.ts";
+import { resolveCli, spawnCli } from "../../procs.ts";
+import { decodeInjectId, INJECT_SEP, localHost, localInjectConnection, mergeLocalInject } from "../local-inject.ts";
+import { BoundedJsonLineDecoder, CATALOG_NDJSON_LIMITS } from "../bounded-json-lines.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
+import {
+  prepareHermesPolicyEnvironment,
+  resolveManagedHermesPython,
+  verifyHermesPolicyProof,
+  type HermesPolicyProof,
+} from "./hermes-policy.ts";
 
 const EMPTY: ModelCatalog = { default: "", options: [] };
+const turnPolicyProofs = new Map<string, HermesPolicyProof>();
+
+function discardTurnPolicyProof(threadId: string): void {
+  const previous = turnPolicyProofs.get(threadId);
+  turnPolicyProofs.delete(threadId);
+  if (!previous) return;
+  try {
+    unlinkSync(previous.path);
+  } catch {
+    /* the child may already have consumed/replaced it */
+  }
+}
 
 function hermesHome(env: Record<string, string | undefined>): string {
   return env.HERMES_HOME || join(env.HOME || env.USERPROFILE || homedir(), ".hermes");
+}
+
+export function isOfficialHermesLauncher(
+  command: string,
+  sourceHome: string,
+  env: Record<string, string | undefined>,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const pathApi = platform === "win32" ? win32 : posix;
+  const names = platform === "win32"
+    ? ["hermes", "hermes.exe", "hermes.cmd", "hermes.bat"]
+    : ["hermes"];
+  const bare = platform === "win32" ? command.toLowerCase() : command;
+  if (names.includes(bare)) return true;
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const directories = [
+    pathApi.join(home, ".local", "bin"),
+    pathApi.join(sourceHome, "bin"),
+    ...(platform === "win32" && env.LOCALAPPDATA
+      ? [pathApi.join(env.LOCALAPPDATA, "hermes", "bin")]
+      : [pathApi.join("/usr", "local", "bin")]),
+  ];
+  const documented = directories.flatMap((directory) => names.map((name) => pathApi.join(directory, name)));
+  const comparable = (value: string) => {
+    const normalized = pathApi.normalize(value);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
+  return documented.some((candidate) => comparable(candidate) === comparable(command));
 }
 
 function quoteYaml(value: string): string {
@@ -62,6 +112,7 @@ export function ensureHermesInjectProvider(
   if (!inject) return modelId;
   const host = localHost(inject.host);
   if (!host) return modelId;
+  const connection = localInjectConnection(host, inject.model, env);
 
   const dir = hermesHome(env);
   mkdirSync(dir, { recursive: true });
@@ -72,7 +123,7 @@ export function ensureHermesInjectProvider(
   } catch {
     text = "";
   }
-  const next = upsertHermesProvider(text, inject.host, host.baseUrl, hostApiKey(host, env));
+  const next = upsertHermesProvider(text, inject.host, connection.openaiBaseUrl, connection.apiKey);
   if (next !== text) writeFileSync(path, next);
   return hermesAcpModelId(modelId) ?? modelId;
 }
@@ -249,9 +300,9 @@ async function fetchHermesAcpModels(
   env: Record<string, string | undefined>,
 ): Promise<{ id: string; label: string; custom: true }[]> {
   return await new Promise((resolve) => {
-    let child: ReturnType<typeof spawn>;
+    let child: ReturnType<typeof spawnCli>;
     try {
-      child = spawn(cli, ["acp"], { stdio: ["pipe", "pipe", "ignore"], env: env as NodeJS.ProcessEnv });
+      child = spawnCli(cli, ["acp"], { stdio: ["pipe", "pipe", "pipe"], env: env as NodeJS.ProcessEnv });
     } catch {
       return resolve([]);
     }
@@ -285,7 +336,7 @@ async function fetchHermesAcpModels(
       done([]);
     });
 
-    let buf = "";
+    const stdout = new BoundedJsonLineDecoder(CATALOG_NDJSON_LIMITS);
     let id = 0;
     const send = (method: string, params: unknown) => {
       id += 1;
@@ -306,35 +357,30 @@ async function fetchHermesAcpModels(
     let initId = 0;
     let sessionId = 0;
     child.stdout?.on("data", (chunk) => {
-      buf += String(chunk);
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        let msg: any;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          continue;
+      try {
+        for (const { value } of stdout.push(chunk)) {
+          const msg: any = value;
+          if (msg?.id === initId) {
+            if (!msg.result) return done([]);
+            sessionId = send("session/new", { cwd: env.HOME || env.USERPROFILE || homedir(), mcpServers: [] });
+          } else if (sessionId && msg?.id === sessionId) {
+            const list = Array.isArray(msg.result?.models?.availableModels)
+              ? msg.result.models.availableModels
+              : [];
+            done(
+              list
+                .filter((m: any) => typeof m?.modelId === "string" && m.modelId)
+                .map((m: any) => ({
+                  id: m.modelId as string,
+                  // Hermes labels these "OpenRouter · <model>"; keep its wording.
+                  label: (typeof m.name === "string" && m.name.trim()) || (m.modelId as string),
+                  custom: true as const,
+                })),
+            );
+          }
         }
-        if (msg?.id === initId) {
-          if (!msg.result) return done([]);
-          sessionId = send("session/new", { cwd: env.HOME || env.USERPROFILE || homedir(), mcpServers: [] });
-        } else if (sessionId && msg?.id === sessionId) {
-          const list = Array.isArray(msg.result?.models?.availableModels)
-            ? msg.result.models.availableModels
-            : [];
-          done(
-            list
-              .filter((m: any) => typeof m?.modelId === "string" && m.modelId)
-              .map((m: any) => ({
-                id: m.modelId as string,
-                // Hermes labels these "OpenRouter · <model>"; keep its wording.
-                label: (typeof m.name === "string" && m.name.trim()) || (m.modelId as string),
-                custom: true as const,
-              })),
-          );
-        }
+      } catch {
+        done([]);
       }
     });
     initId = send("initialize", {
@@ -406,10 +452,83 @@ const support: AcpSupport = {
     delete env.OPENAI_API_KEY;
     delete env.OPENROUTER_API_KEY;
   },
+  prepareTurnEnv: (env, { turn, config }) => {
+    discardTurnPolicyProof(turn.threadId);
+    const sourceHome = hermesHome(env);
+    // Hermes runs in the host OS process, not a per-turn OS sandbox. Native
+    // terminal/file/browser tools would therefore expose the Razer host and
+    // the model-provider credentials Hermes itself needs in its private .env,
+    // even when Computer is Off. Every OpenMaus-managed Hermes turn is
+    // restricted; mounted MCPs are the only computer/Ian Brain authorities.
+    const restricted = true;
+    const computerMounted = Boolean(turn.integrations?.computer || turn.integrations?.localComputer);
+    // The Ian Brain credential deny applies even when Computer is Off. The
+    // official Hermes launcher strips PYTHONPATH, so every turn must bypass it
+    // through the managed interpreter when one can be verified.
+    const resolvedCommand = resolveCli(config.cli).command;
+    const cliCandidates = findCliCandidates(resolvedCommand);
+    if (cliCandidates.length === 0) cliCandidates.push(resolvedCommand);
+    const managed = resolveManagedHermesPython({
+      sourceHome,
+      cliCandidates,
+      env,
+      allowDefaultLocations: isOfficialHermesLauncher(resolvedCommand, sourceHome, env),
+    });
+    if (managed) env.OPENMAUSBOT_HERMES_POLICY_PYTHON = managed.cli;
+    const providerRuntime = providerRuntimeBase();
+    const proof = prepareHermesPolicyEnvironment({
+      env,
+      sourceHome,
+      dataDir: providerRuntime ?? DATA_DIR,
+      isolationKey: turn.isolationKey || turn.threadId,
+      restricted,
+      computerMounted,
+      ianBrain: turn.integrations?.ianBrain,
+      sharedAcrossUid: Boolean(providerRuntime),
+    });
+    if (proof) turnPolicyProofs.set(turn.threadId, proof);
+  },
+  providerRuntimePaths: (_env, { turn }) => {
+    const proof = turnPolicyProofs.get(turn.threadId);
+    if (!proof) return [];
+    return [
+      { path: dirname(proof.path) },
+      { path: proof.path, writable: true },
+    ];
+  },
+  providerHomeImports: (env, { turn }) => {
+    const proof = turnPolicyProofs.get(turn.threadId);
+    // Local desktop mode uses the already-staged profile directly. Imports
+    // exist only for the hardened cross-UID persistent HOME contract.
+    if (!proof || !env.OMB_PROVIDER_INSTANCE_HOME) return [];
+    const home = env.HOME || env.USERPROFILE;
+    if (!home) throw new Error("Hermes persistent HOME is unavailable");
+    const imports = [
+      { source: join(proof.home, "config.yaml"), destination: ".hermes/config.yaml", replace: true },
+      { source: join(proof.home, ".env"), destination: ".hermes/.env", replace: true },
+      { source: join(proof.home, "auth.json"), destination: ".hermes/auth.json", replace: false },
+    ].filter((item) => existsSync(item.source));
+    env.HERMES_HOME = join(home, ".hermes");
+    return imports;
+  },
+  resolveSpawnTarget: ({ cli, args, env }) => {
+    const managedPython = env.OPENMAUSBOT_HERMES_POLICY_PYTHON;
+    delete env.OPENMAUSBOT_HERMES_POLICY_PYTHON;
+    return managedPython
+      ? { cli: managedPython, args: ["-m", "hermes_cli.main", ...args] }
+      : { cli, args };
+  },
   pickAuthMethod: () => null,
   authFailure: "continue",
   isAuthenticated: () => true,
   async configureSession({ request, sessionId, turn }) {
+    const proof = turnPolicyProofs.get(turn.threadId);
+    if (proof) {
+      turnPolicyProofs.delete(turn.threadId);
+      verifyHermesPolicyProof(proof);
+    } else {
+      throw new Error("Hermes containment policy was not prepared; refusing to send the prompt");
+    }
     // Decode only — resolveTurnModel already wrote the named provider using
     // the instance HOME. Calling ensure* again here would hit process.env
     // and rewrite the user's real ~/.hermes/config.yaml.

@@ -12,6 +12,7 @@ import type {
   ProviderInstance,
   ProviderSnapshot,
 } from "../contracts.ts";
+import { providerInstanceEnvironment } from "../provider-runtime.ts";
 
 export interface ShadowInstance {
   instanceId: InstanceId;
@@ -84,7 +85,11 @@ export class ProviderRegistry {
         const live = await driver.create({
           instanceId,
           displayName: entry.displayName ?? driver.metadata.displayName,
-          environment: entry.environment ?? {},
+          environment: providerInstanceEnvironment(
+            entry.environment ?? {},
+            process.env,
+            { driverKind: entry.driver, instanceId },
+          ),
           enabled: entry.enabled ?? true,
           config,
         });
@@ -190,7 +195,16 @@ export class ProviderRegistry {
   }
 
   async disposeAll() {
-    await Promise.allSettled(this.instances().map((i) => i.dispose()));
+    // A provider that cannot prove its child stopped is not disposable.
+    // Surface that failure so reload/delete/shutdown cannot replace the
+    // registry and declare success while remote work is still running.
+    const settled = await Promise.allSettled(this.instances().map((i) => i.dispose()));
+    const failures = settled
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    // Keep the registry intact on any failure: callers quarantine the fleet
+    // and may retry proof, but must never publish a half-disposed replacement.
+    if (failures.length) throw new AggregateError(failures, "one or more providers could not be disposed");
     this.byId.clear();
     this.cliByInstance.clear();
   }

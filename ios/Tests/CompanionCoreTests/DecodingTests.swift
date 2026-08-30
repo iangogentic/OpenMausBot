@@ -424,6 +424,19 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(kind, "routine.run")
     }
 
+    func testDecodesComputerControlRevocationFrame() throws {
+        let frame = try JSONDecoder().decode(
+            StreamFrame.self,
+            from: Data(#"{"kind":"computer-control","botId":"b1","held":false,"helpReason":null,"seq":14}"#.utf8)
+        )
+        guard case let .computerControl(botId, held, reason) = frame.frame else {
+            return XCTFail("expected computer-control frame")
+        }
+        XCTAssertEqual(botId, "b1")
+        XCTAssertFalse(held)
+        XCTAssertNil(reason)
+    }
+
     func testDecodesANotifyFrame() throws {
         let json = """
         {"kind":"notify","seq":12,"notification":{

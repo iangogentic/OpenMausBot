@@ -1,10 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { createServer, type Server } from "node:net";
+import { PassThrough } from "node:stream";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
+
+vi.mock("node:child_process", async () => ({
+  ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
+  spawn: spawnMock,
+}));
 
 import {
   BASE_IMAGE,
   BASE_IMAGE_DIGEST,
   BASE_IMAGE_LABEL,
   CUA_DRIVER_VERSION,
+  CUA_SOCKET,
   DRIVER_LABEL,
   DISPLAY,
   IMAGE_LAYER_LABEL,
@@ -17,10 +28,15 @@ import {
   VPS_IMAGE,
   VPS_MANAGED_LABEL,
   VPS_VIEWER_LABEL,
+  acquireVpsConfigUse,
+  beginVpsConfigMutation,
+  closeVpsDesktopTunnel,
+  openVpsViewerTunnel,
   vpsComputerAction,
   vpsComputerScreenshot,
   vpsComputerStatus,
   vpsComputerMcp,
+  vpsControlTargetKey,
   vpsContainerMcpArgs,
   vpsContainerName,
   vpsContainerRunArgs,
@@ -40,6 +56,49 @@ const screenshot = Buffer.concat([
   Buffer.alloc(600),
   Buffer.from("IEND", "ascii"),
 ]);
+const sshServers = new Set<Server>();
+
+function fakeSshTunnel(listenAfter: Promise<void> = Promise.resolve()) {
+  spawnMock.mockImplementation((_command: string, args: string[]) => {
+    const forward = args[args.indexOf("-L") + 1] ?? "";
+    const port = Number(forward.split(":")[1]);
+    const child = new EventEmitter() as EventEmitter & {
+      stderr: PassThrough;
+      exitCode: number | null;
+      killed: boolean;
+      kill: ReturnType<typeof vi.fn>;
+    };
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    child.killed = false;
+    const server = createServer((socket) => socket.destroy());
+    sshServers.add(server);
+    void listenAfter.then(() => {
+      if (child.killed) return;
+      server.listen(port, "127.0.0.1");
+    });
+    child.kill = vi.fn(() => {
+      if (child.killed) return true;
+      child.killed = true;
+      child.exitCode = 0;
+      server.close();
+      sshServers.delete(server);
+      queueMicrotask(() => child.emit("close", 0));
+      return true;
+    });
+    return child;
+  });
+}
+
+beforeEach(() => {
+  spawnMock.mockReset();
+});
+
+afterEach(() => {
+  closeVpsDesktopTunnel(BOT_ID);
+  for (const server of sshServers) server.close();
+  sshServers.clear();
+});
 
 function fixture({
   image = true,
@@ -234,6 +293,18 @@ describe("VPS computer", () => {
     expect(vpsContainerName(BOT_ID)).toBe(vpsContainerName(BOT_ID));
     expect(vpsContainerName(BOT_ID)).not.toBe(vpsContainerName("another-bot"));
     expect(vpsContainerName(BOT_ID)).toMatch(/^openmausbot-vps-[a-z0-9-]+$/);
+  });
+
+  it("scopes human control to the exact VPS alias and managed bot container", () => {
+    expect(vpsControlTargetKey(CONFIG, BOT_ID)).toBe(
+      `vps:production-vps:${vpsContainerName(BOT_ID)}`,
+    );
+    expect(vpsControlTargetKey({ vps: { sshAlias: "backup-vps" } }, BOT_ID)).not.toBe(
+      vpsControlTargetKey(CONFIG, BOT_ID),
+    );
+    expect(vpsControlTargetKey(CONFIG, "another-bot")).not.toBe(
+      vpsControlTargetKey(CONFIG, BOT_ID),
+    );
   });
 
   it("passes the SSH target as one validated Docker argv value", () => {
@@ -459,7 +530,7 @@ describe("VPS computer", () => {
       "/usr/local/libexec/openmausbot/cua-driver",
       "mcp",
       "--socket",
-      "/run/user/1000/openmausbot-cua.sock",
+      CUA_SOCKET,
     ]);
   });
 
@@ -486,6 +557,41 @@ describe("VPS computer", () => {
 
   it("fails cleanly when no VPS alias is configured", async () => {
     await expect(vpsComputerAction("provision", {}, BOT_ID, fixture().runner)).rejects.toThrow(/not configured/);
+  });
+
+  it("pins alias A while a paused operation blocks rotation to alias B", async () => {
+    const liveConfig = { vps: { sshAlias: "vps-a" } } as AppConfig;
+    const operation = acquireVpsConfigUse(liveConfig);
+    const fake = fixture();
+    let markStarted!: () => void;
+    let releaseRunner!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const runnerGate = new Promise<void>((resolve) => { releaseRunner = resolve; });
+    let first = true;
+    const pausedRunner: VpsCommandRunner = async (args, options) => {
+      if (first) {
+        first = false;
+        markStarted();
+        await runnerGate;
+      }
+      return fake.runner(args, options);
+    };
+    const status = vpsComputerStatus(operation.config, BOT_ID, pausedRunner);
+    await started;
+    liveConfig.vps!.sshAlias = "vps-b";
+
+    expect(vpsControlTargetKey(operation.config, BOT_ID)).toContain("vps:vps-a:");
+    expect(beginVpsConfigMutation("vps-a", "vps-b")).toMatchObject({ allowed: false });
+
+    releaseRunner();
+    expect((await status).ready).toBe(true);
+    expect(fake.calls.length).toBeGreaterThan(1);
+    expect(fake.calls.every(({ args }) => args.includes("ssh://vps-a") && !args.includes("ssh://vps-b"))).toBe(true);
+    operation.release();
+    const mutation = beginVpsConfigMutation("vps-a", "vps-b");
+    expect(mutation).toMatchObject({ allowed: true, changing: true });
+    expect(() => acquireVpsConfigUse(liveConfig)).toThrow(/settings are being updated/i);
+    if (mutation.allowed) mutation.release();
   });
 
   it("attributes a transport failure to the link, never to a missing container", async () => {
@@ -602,5 +708,42 @@ describe("VPS computer", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("single-flights overlapping viewer joins for the same exact lease", async () => {
+    fakeSshTunnel();
+    const fake = fixture();
+    const authorization = { id: "lease-owner-a", stillAuthorized: () => true };
+
+    const first = openVpsViewerTunnel(CONFIG, BOT_ID, authorization, fake.runner);
+    const second = openVpsViewerTunnel(CONFIG, BOT_ID, authorization, fake.runner);
+    const [a, b] = await Promise.all([first, second]);
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(b).toEqual(a);
+    expect(closeVpsDesktopTunnel(BOT_ID, a.generation)).toEqual({ closed: true });
+  });
+
+  it("kills an SSH opening whose exact control lease expires before publish", async () => {
+    let allowListen!: () => void;
+    const listenGate = new Promise<void>((resolve) => {
+      allowListen = resolve;
+    });
+    fakeSshTunnel(listenGate);
+    const fake = fixture();
+    let authorized = true;
+    const opening = openVpsViewerTunnel(
+      CONFIG,
+      BOT_ID,
+      { id: "lease-owner-expiring", stillAuthorized: () => authorized },
+      fake.runner,
+    );
+
+    await expect.poll(() => spawnMock.mock.calls.length).toBe(1);
+    authorized = false;
+    allowListen();
+    await expect(opening).rejects.toThrow(/lease expired while the tunnel opened/i);
+    expect(spawnMock.mock.results[0]?.value.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(closeVpsDesktopTunnel(BOT_ID)).toEqual({ closed: false });
   });
 });

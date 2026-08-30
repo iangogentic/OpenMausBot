@@ -175,6 +175,51 @@ env_key = "UNSLOTH_STUDIO_AUTH_TOKEN"
     expect(catalog.options.map((option) => option.id)).not.toContain(encodeCodexSelection("omlx", "ignored"));
   });
 
+  it("cancels an oversized streaming /models response before JSON parsing", async () => {
+    const home = scratchHome({
+      "config.toml": `
+[model_providers.hostile]
+name = "Hostile"
+base_url = "http://127.0.0.1:7777/v1"
+`,
+    });
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(1024 * 1024));
+        controller.enqueue(new Uint8Array(1024 * 1024));
+        controller.enqueue(new Uint8Array(1));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const catalog = await readCodexModelCatalog(
+      { HOME: home },
+      async () => new Response(body, { status: 200 }),
+    );
+
+    expect(cancelled).toBe(true);
+    expect(catalog.options.some((option) => option.id.includes("hostile"))).toBe(false);
+  });
+
+  it("rejects an over-deep /models JSON document", async () => {
+    const home = scratchHome({
+      "config.toml": `
+[model_providers.hostile]
+name = "Hostile"
+base_url = "http://127.0.0.1:7777/v1"
+`,
+    });
+    let payload: unknown = { data: [{ id: "must-not-appear" }] };
+    for (let i = 0; i < 40; i++) payload = { nested: payload };
+    const catalog = await readCodexModelCatalog(
+      { HOME: home },
+      async () => new Response(JSON.stringify(payload), { status: 200 }),
+    );
+    expect(catalog.options.some((option) => option.id.includes("must-not-appear"))).toBe(false);
+  });
+
   it("ignores invalid slugs and a default that is not in the catalog", async () => {
     const home = scratchHome({
       "config.toml": `

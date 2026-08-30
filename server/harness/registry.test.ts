@@ -133,4 +133,27 @@ describe("ProviderRegistry", () => {
     expect(registry.entries()).toHaveLength(0);
     expect(registry.get("a")).toBeNull();
   });
+
+  it("waits for every sibling disposal and retains the fleet when any proof fails", async () => {
+    const fake = makeFakeDriver();
+    const registry = new ProviderRegistry([fake.driver]);
+    await registry.load({ a: { driver: "fake" }, b: { driver: "fake" } });
+    let release = () => {};
+    let slowSettled = false;
+    registry.get("a")!.dispose = async () => { throw new Error("a refused to stop"); };
+    registry.get("b")!.dispose = async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      slowSettled = true;
+    };
+
+    let finished = false;
+    const disposing = registry.disposeAll().finally(() => { finished = true; });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(finished).toBe(false);
+    release();
+    await expect(disposing).rejects.toThrow(/providers could not be disposed/);
+    expect(slowSettled).toBe(true);
+    expect(registry.get("a")).not.toBeNull();
+    expect(registry.get("b")).not.toBeNull();
+  });
 });

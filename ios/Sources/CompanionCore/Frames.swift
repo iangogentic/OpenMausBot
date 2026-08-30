@@ -50,6 +50,9 @@ public enum Frame: Sendable {
     case screen(botId: String, png: String, mime: String)
     /// The bot's cloud computer is being provisioned.
     case computer(botId: String, state: String)
+    /// Server-owned human-control state. A false transition is the authority
+    /// boundary that closes an already-open phone viewer.
+    case computerControl(botId: String, held: Bool, helpReason: String?)
     case config
     case runtime(RuntimeEvent)
     case unknown(kind: String)
@@ -59,6 +62,7 @@ extension Frame: Decodable {
     private enum CodingKeys: String, CodingKey {
         case kind, cursor, resumed, threadId, message, activeLeafId
         case bot, botId, group, groupId, notification, png, mime, state, event
+        case held, helpReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -106,6 +110,12 @@ extension Frame: Decodable {
             self = .computer(
                 botId: try container.decode(String.self, forKey: .botId),
                 state: try container.decodeIfPresent(String.self, forKey: .state) ?? ""
+            )
+        case "computer-control":
+            self = .computerControl(
+                botId: try container.decode(String.self, forKey: .botId),
+                held: try container.decode(Bool.self, forKey: .held),
+                helpReason: try container.decodeIfPresent(String.self, forKey: .helpReason)
             )
         case "config":
             self = .config

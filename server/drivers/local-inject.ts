@@ -6,7 +6,10 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { ModelCatalog } from "../contracts.ts";
+import type { ModelCatalog, SendTurnInput } from "../contracts.ts";
+import { readBoundedResponseText } from "../bounded-response.ts";
+import { normalizedPinnedModelBaseUrl } from "../model-relay.ts";
+import { assertBoundedJsonShape, CATALOG_NDJSON_LIMITS } from "./bounded-json-lines.ts";
 
 export interface LocalHost {
   id: string;
@@ -15,6 +18,18 @@ export interface LocalHost {
   apiKey?: string;
   apiKeyEnv?: string;
 }
+
+export type LocalModelRelayConnection = NonNullable<
+  NonNullable<SendTurnInput["integrations"]>["modelRelay"]
+>;
+
+export const MODEL_RELAY_ENV = Object.freeze({
+  openaiBaseUrl: "OMB_MODEL_RELAY_OPENAI_BASE_URL",
+  anthropicBaseUrl: "OMB_MODEL_RELAY_ANTHROPIC_BASE_URL",
+  token: "OMB_MODEL_RELAY_TOKEN",
+  host: "OMB_MODEL_RELAY_HOST",
+  model: "OMB_MODEL_RELAY_MODEL",
+} as const);
 
 export const LOCAL_HOSTS: LocalHost[] = [
   {
@@ -41,7 +56,11 @@ export const LOCAL_HOSTS: LocalHost[] = [
 export const INJECT_SEP = "::";
 
 const HOST_BY_ID = new Map(LOCAL_HOSTS.map((host) => [host.id, host]));
-const MODEL_ID = /^[\w][\w./:+-]*$/;
+export const LOCAL_MODEL_ID_MAX_CHARS = 256;
+export const LOCAL_MODEL_CATALOG_MAX_RECORDS = 512;
+export const LOCAL_MODEL_CATALOG_MAX_RESPONSE_BYTES = 1024 * 1024;
+export const LOCAL_MODEL_CATALOG_MAX_TOTAL_MODELS = 2_048;
+const MODEL_ID = new RegExp(`^[\\w][\\w./:+-]{0,${LOCAL_MODEL_ID_MAX_CHARS - 1}}$`);
 
 export interface InjectedModel {
   id: string;
@@ -63,7 +82,7 @@ export function contextWindowsFromPs(extra: unknown): Map<string, number> {
   const out = new Map<string, number>();
   const rec = extra && typeof extra === "object" ? (extra as { models?: unknown }) : null;
   if (!rec || !Array.isArray(rec.models)) return out;
-  for (const m of rec.models) {
+  for (const m of rec.models.slice(0, LOCAL_MODEL_CATALOG_MAX_RECORDS)) {
     if (!m || typeof m !== "object") continue;
     const row = m as { name?: unknown; model?: unknown; context_length?: unknown };
     const id = typeof row.model === "string" ? row.model : typeof row.name === "string" ? row.name : null;
@@ -123,13 +142,110 @@ export function anthropicBaseUrl(host: LocalHost): string {
 }
 
 export function hostApiKey(host: LocalHost, env: Record<string, string | undefined> = process.env): string {
-  if (host.apiKeyEnv && env[host.apiKeyEnv]) return env[host.apiKeyEnv]!;
+  // Positive provider environments deliberately exclude ambient secrets. The
+  // trusted harness may still read the one key declared by the *selected*
+  // local host and remap it into the child's generated target variable.
+  if (host.apiKeyEnv) {
+    const selected = env[host.apiKeyEnv] ?? process.env[host.apiKeyEnv];
+    if (selected) return selected;
+  }
   if (host.apiKey) return host.apiKey;
   if (host.id === "unsloth" || host.id === "unsloth_api") {
     const fromFile = readUnslothKey(env);
     if (fromFile) return fromFile;
   }
   return "local";
+}
+
+export interface LocalInjectConnection {
+  readonly openaiBaseUrl: string;
+  readonly anthropicBaseUrl: string;
+  readonly apiKey: string;
+  readonly relayed: boolean;
+}
+
+function checkedProviderRelayUrl(value: string, expectedPath: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("the local model relay URL is invalid");
+  }
+  if (
+    url.protocol !== "http:" ||
+    !["127.0.0.1", "10.0.2.2"].includes(url.hostname) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname.replace(/\/+$/, "") !== expectedPath
+  ) throw new Error("the local model relay URL is not an approved provider-harness route");
+  return url.toString().replace(/\/$/, "");
+}
+
+/** Install the server-generated connection after the positive provider env is
+ * constructed. User-configured instance env cannot forge these reserved
+ * fields, and every writer below fails closed on a partial/mismatched relay. */
+export function applyModelRelayEnvironment(
+  env: Record<string, string | undefined>,
+  modelId: string | null | undefined,
+  relay: LocalModelRelayConnection | undefined,
+): void {
+  if (!relay) return;
+  const inject = decodeInjectId(modelId);
+  if (!inject || inject.host !== relay.host || inject.model !== relay.model) {
+    throw new Error("the local model relay does not match the selected host and model");
+  }
+  const openaiBaseUrl = checkedProviderRelayUrl(relay.openaiBaseUrl, "/api/internal/model-relay/v1");
+  const anthropicBaseUrl = checkedProviderRelayUrl(relay.anthropicBaseUrl, "/api/internal/model-relay");
+  if (new URL(openaiBaseUrl).origin !== new URL(anthropicBaseUrl).origin) {
+    throw new Error("the local model relay URLs must share one provider-harness origin");
+  }
+  if (!relay.token || relay.token.trim() !== relay.token || relay.token.length < 16) {
+    throw new Error("the local model relay token is invalid");
+  }
+  env[MODEL_RELAY_ENV.openaiBaseUrl] = openaiBaseUrl;
+  env[MODEL_RELAY_ENV.anthropicBaseUrl] = anthropicBaseUrl;
+  env[MODEL_RELAY_ENV.token] = relay.token;
+  env[MODEL_RELAY_ENV.host] = relay.host;
+  env[MODEL_RELAY_ENV.model] = relay.model;
+}
+
+export function localInjectConnection(
+  host: LocalHost,
+  model: string,
+  env: Record<string, string | undefined>,
+): LocalInjectConnection {
+  const values = {
+    openaiBaseUrl: env[MODEL_RELAY_ENV.openaiBaseUrl],
+    anthropicBaseUrl: env[MODEL_RELAY_ENV.anthropicBaseUrl],
+    token: env[MODEL_RELAY_ENV.token],
+    host: env[MODEL_RELAY_ENV.host],
+    model: env[MODEL_RELAY_ENV.model],
+  };
+  const present = Object.values(values).filter((value) => value !== undefined).length;
+  if (present === 0) {
+    return {
+      openaiBaseUrl: host.baseUrl,
+      anthropicBaseUrl: anthropicBaseUrl(host),
+      apiKey: hostApiKey(host, env),
+      relayed: false,
+    };
+  }
+  if (
+    present !== Object.keys(values).length ||
+    values.host !== host.id ||
+    values.model !== model ||
+    !values.token ||
+    values.token.trim() !== values.token ||
+    values.token.length < 16
+  ) throw new Error("the local model relay environment is incomplete or belongs to another model");
+  return {
+    openaiBaseUrl: checkedProviderRelayUrl(values.openaiBaseUrl!, "/api/internal/model-relay/v1"),
+    anthropicBaseUrl: checkedProviderRelayUrl(values.anthropicBaseUrl!, "/api/internal/model-relay"),
+    apiKey: values.token,
+    relayed: true,
+  };
 }
 
 const CODEX_RESERVED_PROVIDERS = new Set(["openai", "ollama", "lmstudio"]);
@@ -144,19 +260,39 @@ export function codexLocalProviderArgs(
   modelId: string | null | undefined,
 ): string[] {
   const inject = decodeInjectId(modelId);
-  if (!inject || CODEX_RESERVED_PROVIDERS.has(inject.host)) return [];
+  if (!inject) return [];
   const host = localHost(inject.host);
   if (!host) return [];
-  const envKey = `OPENMAUSBOT_LOCAL_${host.id.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
-  env[envKey] = hostApiKey(host, env);
+  const connection = localInjectConnection(host, inject.model, env);
+  if (!connection.relayed && CODEX_RESERVED_PROVIDERS.has(inject.host)) return [];
+  const providerId = connection.relayed ? `openmaus_${host.id}` : host.id;
+  const envKey = `OPENMAUSBOT_LOCAL_${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
+  env[envKey] = connection.apiKey;
   return [
     "-c",
-    `model_providers.${host.id}.name=${JSON.stringify(host.label)}`,
+    `model_providers.${providerId}.name=${JSON.stringify(host.label)}`,
     "-c",
-    `model_providers.${host.id}.base_url=${JSON.stringify(host.baseUrl)}`,
+    `model_providers.${providerId}.base_url=${JSON.stringify(connection.openaiBaseUrl)}`,
     "-c",
-    `model_providers.${host.id}.env_key=${JSON.stringify(envKey)}`,
+    `model_providers.${providerId}.env_key=${JSON.stringify(envKey)}`,
   ];
+}
+
+/** Codex has built-in `ollama`/`lmstudio` providers that cannot be safely
+ * repointed per turn. Relay-backed turns use a private provider id instead. */
+export function codexLocalProviderSelection(
+  env: Record<string, string | undefined>,
+  modelId: string | null | undefined,
+): { model: string | null; modelProvider: string | null } | null {
+  const inject = decodeInjectId(modelId);
+  if (!inject) return null;
+  const host = localHost(inject.host);
+  if (!host) return null;
+  const connection = localInjectConnection(host, inject.model, env);
+  return {
+    model: inject.model,
+    modelProvider: connection.relayed ? `openmaus_${host.id}` : host.id,
+  };
 }
 
 function firstUnslothToken(row: unknown): string | null {
@@ -210,15 +346,33 @@ function idsFromModelsPayload(payload: unknown): string[] {
       : payload && typeof payload === "object" && Array.isArray((payload as { models?: unknown }).models)
         ? (payload as { models: unknown[] }).models
         : [];
-  return records.flatMap((record) => {
-    if (typeof record === "string") return MODEL_ID.test(record) ? [record] : [];
+  return records.slice(0, LOCAL_MODEL_CATALOG_MAX_RECORDS).flatMap((record) => {
+    const validChatId = (id: string) => {
+      if (!MODEL_ID.test(id)) return false;
+      const low = id.toLowerCase();
+      return !low.includes("embed") && !low.includes("bge-") && !low.includes("nomic");
+    };
+    if (typeof record === "string") return validChatId(record) ? [record] : [];
     if (!record || typeof record !== "object") return [];
     const id = (record as { id?: unknown; name?: unknown }).id ?? (record as { name?: unknown }).name;
-    if (typeof id !== "string" || !MODEL_ID.test(id)) return [];
-    const low = id.toLowerCase();
-    if (low.includes("embed") || low.includes("bge-") || low.includes("nomic")) return [];
+    if (typeof id !== "string" || !validChatId(id)) return [];
     return [id];
   });
+}
+
+export async function boundedLocalCatalogJson(response: Response): Promise<unknown | null> {
+  try {
+    const text = await readBoundedResponseText(
+      response,
+      LOCAL_MODEL_CATALOG_MAX_RESPONSE_BYTES,
+      "local model catalog exceeded 1 MB",
+    );
+    const parsed: unknown = JSON.parse(text);
+    assertBoundedJsonShape(parsed, CATALOG_NDJSON_LIMITS);
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
 async function timedJson(
@@ -233,10 +387,17 @@ async function timedJson(
   try {
     const response = await fetchImpl(url, {
       signal: controller.signal,
-      headers: { Authorization: `Bearer ${hostApiKey(host, env)}` },
+      redirect: "error",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${hostApiKey(host, env)}`,
+      },
     });
-    if (!response.ok) return null;
-    return await response.json();
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      return null;
+    }
+    return await boundedLocalCatalogJson(response);
   } catch {
     return null;
   } finally {
@@ -274,7 +435,7 @@ export function loadedIdsFromPayloads(_host: LocalHost, catalog: unknown, extra:
       (row) => row && typeof row === "object" && ("loaded" in row || "state" in row),
     );
     if (!hasLoadedFlags && typeof rec.default_model === "string") add(rec.default_model);
-    for (const row of running) {
+    for (const row of running.slice(0, LOCAL_MODEL_CATALOG_MAX_RECORDS)) {
       if (typeof row === "string") {
         if (!hasLoadedFlags) add(row);
         continue;
@@ -298,7 +459,9 @@ export function loadedIdsFromPayloads(_host: LocalHost, catalog: unknown, extra:
   if (!loaded.size && catalog && typeof catalog === "object") {
     const rec = catalog as { default_model?: unknown; data?: unknown };
     if (typeof rec.default_model === "string") add(rec.default_model);
-    const records = Array.isArray(rec.data) ? rec.data : [];
+    const records = Array.isArray(rec.data)
+      ? rec.data.slice(0, LOCAL_MODEL_CATALOG_MAX_RECORDS)
+      : [];
     for (const row of records) {
       if (!row || typeof row !== "object") continue;
       const item = row as { id?: unknown; state?: unknown; loaded?: unknown };
@@ -325,12 +488,21 @@ export async function probeLocalInjects(
   fetchImpl: typeof fetch = fetch,
 ): Promise<InjectedModel[]> {
   const seenHosts = new Set<string>();
-  const hosts = LOCAL_HOSTS.filter((host) => {
-    const key = host.baseUrl.replace(/\/$/, "");
-    if (seenHosts.has(key)) return false;
+  const hosts: LocalHost[] = [];
+  for (const configured of LOCAL_HOSTS) {
+    let baseUrl: string;
+    try {
+      baseUrl = normalizedPinnedModelBaseUrl(configured.baseUrl);
+    } catch {
+      // Discovery is read-only convenience. A DNS/public/malformed source is
+      // never probed with a host credential and simply does not appear.
+      continue;
+    }
+    const key = baseUrl.replace(/\/$/, "");
+    if (seenHosts.has(key)) continue;
     seenHosts.add(key);
-    return true;
-  });
+    hosts.push({ ...configured, baseUrl });
+  }
   const found: InjectedModel[] = [];
   const pages = await Promise.all(
     hosts.map(async (host) => {
@@ -343,13 +515,15 @@ export async function probeLocalInjects(
       const catalogIds = catalog ? idsFromModelsPayload(catalog) : [];
       const extraIds = extra ? idsFromModelsPayload(extra) : [];
       const loaded = loadedIdsFromPayloads(host, catalog ?? extra, extra);
-      const ids = [...new Set([...catalogIds, ...extraIds, ...loaded])];
+      const ids = [...new Set([...catalogIds, ...extraIds, ...loaded])]
+        .slice(0, LOCAL_MODEL_CATALOG_MAX_RECORDS);
       const windows = contextWindowsFromPs(extra);
       return { host, ids, loaded, windows };
     }),
   );
   for (const { host, ids, loaded, windows } of pages) {
     for (const model of ids) {
+      if (found.length >= LOCAL_MODEL_CATALOG_MAX_TOTAL_MODELS) return found;
       const contextWindow = windows.get(model);
       found.push({
         id: encodeInjectId(host.id, model),
@@ -410,9 +584,9 @@ export function applyOpenAIInject(
   if (!inject) return { model: modelId ?? null, injected: false };
   const host = localHost(inject.host);
   if (!host) return { model: modelId ?? null, injected: false };
-  const key = hostApiKey(host, env);
-  env.OPENAI_BASE_URL = host.baseUrl;
-  env.OPENAI_API_KEY = key;
+  const connection = localInjectConnection(host, inject.model, env);
+  env.OPENAI_BASE_URL = connection.openaiBaseUrl;
+  env.OPENAI_API_KEY = connection.apiKey;
   return { model: inject.model, injected: true };
 }
 
@@ -425,10 +599,10 @@ export function applyClaudeInject(
   if (!inject) return { model: modelId ?? null, injected: false };
   const host = localHost(inject.host);
   if (!host) return { model: modelId ?? null, injected: false };
-  const key = hostApiKey(host, env);
-  env.ANTHROPIC_BASE_URL = anthropicBaseUrl(host);
-  env.ANTHROPIC_AUTH_TOKEN = key;
-  env.ANTHROPIC_API_KEY = key;
+  const connection = localInjectConnection(host, inject.model, env);
+  env.ANTHROPIC_BASE_URL = connection.anthropicBaseUrl;
+  env.ANTHROPIC_AUTH_TOKEN = connection.apiKey;
+  env.ANTHROPIC_API_KEY = connection.apiKey;
   env.ANTHROPIC_MODEL = inject.model;
   return { model: inject.model, injected: true };
 }

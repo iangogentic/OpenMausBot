@@ -71,6 +71,7 @@ import {
   tailWindowStart,
 } from "@/lib/transcript-window";
 import { timelineEvents } from "@/lib/taskTimeline";
+import { ComputerSessionStrip } from "./ComputerSessionStrip";
 
 /** Long user messages collapse behind a fade so pasted walls of text don't
  * bury the conversation; bots get full markdown. */
@@ -1081,6 +1082,10 @@ export function ChatView({ bot }: { bot: Bot }) {
           <CallButton bot={bot} />
           <button
             onClick={() => dispatch({ type: "toggleComputer" })}
+            data-computer-toggle
+            aria-label={state.computerOpen ? "Collapse bot computer" : "Open bot computer"}
+            aria-pressed={state.computerOpen}
+            aria-expanded={state.computerOpen}
             className={cn(
               "rounded-md p-1.5 hover:bg-raised",
               state.computerOpen ? "text-accent" : "text-ink-secondary hover:text-ink",
@@ -1103,6 +1108,14 @@ export function ChatView({ bot }: { bot: Bot }) {
           </button>
         </div>
       </div>
+
+      <ComputerSessionStrip
+        bots={state.bots}
+        screens={state.screens}
+        computerControl={state.computerControl}
+        selectedBotId={bot.id}
+        dispatch={dispatch}
+      />
 
       {findOpen && <ChatFindBar threadId={bot.threadId} onClose={() => setFindOpen(false)} />}
 

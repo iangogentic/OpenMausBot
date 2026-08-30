@@ -2,19 +2,20 @@
 //
 // OpenMausBot owns only the sandbox boundary: image preparation, container
 // lifecycle, resource limits, loopback viewer, and target-scoped lease in the
-// harness. Desktop automation itself is Cua Driver. Agents connect directly to
-// `cua-driver mcp` inside the container; this module never reimplements clicks,
-// typing, screenshots, accessibility, or window discovery.
+// harness. Desktop automation itself is Cua Driver. Agents reach it only
+// through the trusted server-owned Local VM broker; this module never
+// reimplements clicks, typing, screenshots, accessibility, or window discovery.
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { augmentedPath } from "./env-path.ts";
 import { DATA_DIR } from "./config.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import { ensureStorageLeafSync, retireStorageLeaf } from "./storage-leaf.ts";
 
 const run = promisify(execFile);
 const SCREENSHOT_STATUS_TTL_MS = 10_000;
@@ -36,7 +37,7 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // Image and container labels below remain the authoritative compatibility
 // check, not the mutable tag.
 export const IMAGE_REPOSITORY = "localhost/openmausbot/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "4";
+export const IMAGE_LAYER_VERSION = "5";
 export const IMAGE_LAYER_LABEL = "com.openmausbot.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export const CONTAINER = "openmausbot-computer";
@@ -45,10 +46,41 @@ export const DRIVER_LABEL = "com.openmausbot.cua-driver";
 export const BASE_IMAGE_LABEL = "com.openmausbot.cua-base";
 export const WORKSPACE_LABEL = "com.openmausbot.workspace";
 export const TARGET_LABEL = "com.openmausbot.local-vm-target";
-export const VM_WORKSPACE_DIR = join(DATA_DIR, "vm-home");
+export const NETWORK_MANAGED_LABEL = "com.openmausbot.local-vm-network";
+export const NETWORK_TARGET_LABEL = "com.openmausbot.local-vm-network-target";
+export const NETWORK_LAYER_LABEL = "com.openmausbot.local-vm-network-layer";
+export const CONTAINER_NETWORK_LABEL = "com.openmausbot.local-vm-network-name";
+export const NETWORK_LAYER_VERSION = "1";
+export const LOCAL_VM_NETWORK_POLICY = "openmaus-vm-private-v1";
+export const LOCAL_VM_GUEST_ACCOUNT = "openmaus-vm-guest";
+// The upstream image's UID 1000 aliases Ian's ordinary host account on Razer.
+// The pinned derivative moves `cua` to this deployment-reserved, login-disabled
+// identity before it can create a bind-mounted file.
+export const VM_WORKSPACE_GUEST_UID = 61_000;
+export const VM_WORKSPACE_GUEST_GID = 61_000;
+
+/** A deployment can put durable VM homes on a separately bounded filesystem.
+ * Reject relative values at process startup; a service-owned environment is
+ * the only input, never an HTTP body. */
+export function configuredLocalVmWorkspaceRoot(
+  environment: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const raw = environment.OMB_LOCAL_VM_HOME_DIR?.trim();
+  if (!raw) return null;
+  if (!isAbsolute(raw) || raw.includes("\0")) {
+    throw new Error("OMB_LOCAL_VM_HOME_DIR must be an absolute path");
+  }
+  return resolve(raw);
+}
+
+const CONFIGURED_VM_WORKSPACE_ROOT = configuredLocalVmWorkspaceRoot();
+export const VM_WORKSPACE_ROOT = CONFIGURED_VM_WORKSPACE_ROOT ?? join(DATA_DIR, "vm-homes");
+export const VM_WORKSPACE_DIR = CONFIGURED_VM_WORKSPACE_ROOT
+  ? join(VM_WORKSPACE_ROOT, "shared")
+  : join(DATA_DIR, "vm-home");
 export const VM_WORKSPACE_GUEST = "/home/cua/workspace";
 export const DISPLAY = ":1";
-export const CUA_SOCKET = "/run/user/1000/openmausbot-cua.sock";
+export const CUA_SOCKET = "/home/cua/.openmausbot/cua.sock";
 export const CUA_EXECUTABLE = "/usr/local/libexec/openmausbot/cua-driver";
 
 const RUNTIMES = ["docker", "podman", "container"] as const;
@@ -89,10 +121,48 @@ export function perBotLocalVmTarget(botId: string): LocalVmTarget {
   return {
     key: `bot:${digest}`,
     containerName: `${CONTAINER}-${short}`,
-    workspaceDir: join(DATA_DIR, "vm-homes", short),
+    workspaceDir: join(VM_WORKSPACE_ROOT, short),
     viewerPort: null,
     label: digest,
   };
+}
+
+export interface LocalVmNetworkIdentity {
+  name: string;
+  bridge: string;
+  digest: string;
+}
+
+/** Network identities are derived only from the already-scoped target.  In
+ * particular, `target.key` is never interpolated into an interface name: a
+ * bot key contains a colon and Linux interface names are limited to 15
+ * bytes. */
+export function localVmNetworkIdentity(target: LocalVmTarget): LocalVmNetworkIdentity {
+  const digest = createHash("sha256")
+    .update("openmaus-local-vm-network-v1\0")
+    .update(target.key)
+    .update("\0")
+    .update(target.label)
+    .digest("hex");
+  return {
+    name: `openmaus-vm-${digest.slice(0, 16)}`,
+    // `ombvm` + ten hex digits is exactly Linux IFNAMSIZ - 1.
+    bridge: `ombvm${digest.slice(0, 10)}`,
+    digest,
+  };
+}
+
+/** Erase the durable home for one derived per-bot VM after the caller has
+ * proved its container is gone.  The path is hash-derived here rather than
+ * accepted from an HTTP body. */
+export async function deletePerBotLocalVmWorkspace(botId: string): Promise<void> {
+  const target = perBotLocalVmTarget(botId);
+  let runtime: Runtime | null = null;
+  if (process.platform === "linux") {
+    const detected = await containerRuntimeStatus();
+    runtime = detected.daemonUp ? detected.runtime : null;
+  }
+  await deleteLocalVmWorkspace(target, runtime);
 }
 
 const LINUX_WHEELS = {
@@ -118,6 +188,16 @@ const LINUX_WHEELS = {
 export function managedImageDockerfile(): string {
   return `FROM ${BASE_IMAGE}
 USER root
+RUN set -eux; \\
+    old_uid="$(id -u cua)"; old_gid="$(id -g cua)"; \\
+    test "$old_uid" = "1000"; test "$old_gid" = "1000"; \\
+    groupmod -g ${VM_WORKSPACE_GUEST_GID} cua; \\
+    usermod -u ${VM_WORKSPACE_GUEST_UID} -g ${VM_WORKSPACE_GUEST_GID} cua; \\
+    find / -xdev -uid "$old_uid" -exec chown -h ${VM_WORKSPACE_GUEST_UID} {} +; \\
+    find / -xdev -gid "$old_gid" -exec chgrp -h ${VM_WORKSPACE_GUEST_GID} {} +; \\
+    install -d -o cua -g cua -m 0700 /home/cua/.openmausbot; \\
+    test "$(id -u cua)" = "${VM_WORKSPACE_GUEST_UID}"; \\
+    test "$(id -g cua)" = "${VM_WORKSPACE_GUEST_GID}"
 RUN set -eux; \\
     arch="$(uname -m)"; \\
     case "$arch" in \\
@@ -286,6 +366,9 @@ export interface ContainerComputerStatus {
   problem: string | null;
   image_ref: string;
   image_id: string | null;
+  /** Opaque identity for this exact running container epoch. A replacement
+   * with the same managed name gets a different value. */
+  vm_generation: string | null;
   base_image_ref: string;
   driver_version: string;
   container_name: string;
@@ -316,6 +399,7 @@ function emptyStatus(platform: NodeJS.Platform, target: LocalVmTarget): Containe
     problem: "Install a supported container runtime first",
     image_ref: IMAGE,
     image_id: null,
+    vm_generation: null,
     base_image_ref: BASE_IMAGE,
     driver_version: CUA_DRIVER_VERSION,
     container_name: target.containerName,
@@ -337,10 +421,13 @@ function statusProblem(status: ContainerComputerStatus): string | null {
   if (status.container === "missing") return "Create the Local VM";
   if (!status.imageMatches) return "The existing Local VM uses an older desktop or Cua Driver; recreate it";
   if (!status.managed) return "The existing container was not created by OpenMausBot; recreate it";
-  if (status.network === "unsafe") return "The existing Local VM exposes its viewer publicly; recreate it";
+  if (status.network === "unsafe") {
+    return "The existing Local VM lacks its exact private network or exposes its viewer publicly; recreate it";
+  }
   if (status.security === "unsafe") return "The existing Local VM is missing safety limits; recreate it";
   if (status.persistence === "unsafe") return "The existing Local VM is missing its durable workspace; recreate it";
   if (status.container === "stopped") return "This desktop image cannot safely resume; recreate the Local VM";
+  if (!status.vm_generation) return "The Local VM identity could not be verified; recreate it";
   if (status.desktop_error) return `The Local VM desktop failed to start: ${status.desktop_error}`;
   if (!status.desktopReady) return "The Local VM started, but Cua Driver is not ready yet";
   return null;
@@ -361,9 +448,12 @@ function containerLabelsMatch(
   labels: Record<string, string> | undefined,
   target: LocalVmTarget,
 ): boolean {
+  const network = localVmNetworkIdentity(target);
   return (
     imageLabelsMatch(labels) &&
     labels?.[WORKSPACE_LABEL] === "1" &&
+    labels?.[CONTAINER_NETWORK_LABEL] === network.name &&
+    labels?.[NETWORK_LAYER_LABEL] === NETWORK_LAYER_VERSION &&
     (target.key === SHARED_LOCAL_VM_TARGET.key
       ? labels?.[TARGET_LABEL] === undefined || labels?.[TARGET_LABEL] === target.label
       : labels?.[TARGET_LABEL] === target.label)
@@ -406,6 +496,166 @@ function viewerUrl(password: string | null, port: number | null): string {
   if (!password) return base;
   const fragment = new URLSearchParams({ autoconnect: "true", resize: "scale", password });
   return `${base}#${fragment.toString()}`;
+}
+
+type ContainerNetworkSettings = {
+  Ports?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
+  Networks?: Record<string, { NetworkID?: string; NetworkId?: string; IPAddress?: string }> | null;
+};
+
+/** The Razer unit's root-owned nftables preflight attests this named policy.
+ * A required production service fails closed if its environment and installed
+ * firewall release drift. Development hosts still get a unique bridge and
+ * ICC=false, but must opt into the deployment assertion before that is treated
+ * as the Razer host/LAN/Tailscale boundary. */
+export function localVmNetworkPolicyIsValid(
+  platform: NodeJS.Platform,
+  runtime: Runtime,
+  environment: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (platform !== "linux" || runtime !== "docker") return true;
+  const configured = environment.OMB_LOCAL_VM_NETWORK_POLICY?.trim() ?? "";
+  if (configured && configured !== LOCAL_VM_NETWORK_POLICY) return false;
+  return environment.OMB_REQUIRE_LOCAL_VM_NETWORK_ISOLATION !== "1" || configured === LOCAL_VM_NETWORK_POLICY;
+}
+
+function attachedNetworkIdentity(
+  hostConfig: { NetworkMode?: string } | undefined,
+  networkSettings: ContainerNetworkSettings | undefined,
+  target: LocalVmTarget,
+): string | null {
+  const expected = localVmNetworkIdentity(target);
+  if (hostConfig?.NetworkMode !== expected.name) return null;
+  const attached = networkSettings?.Networks ?? {};
+  const names = Object.keys(attached);
+  if (names.length !== 1 || names[0] !== expected.name) return null;
+  const rawId = attached[expected.name]?.NetworkID ?? attached[expected.name]?.NetworkId;
+  const networkId = rawId?.trim() ?? "";
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(networkId)) return null;
+  return `${expected.name}:${networkId}`;
+}
+
+export function dockerNetworkIsIsolated(
+  hostConfig: { NetworkMode?: string; PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null> } | undefined,
+  networkSettings: ContainerNetworkSettings | undefined,
+  target: LocalVmTarget,
+  platform: NodeJS.Platform,
+  runtime: Runtime,
+  environment: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return Boolean(
+    dockerPortsAreLocal(hostConfig?.PortBindings) &&
+    attachedNetworkIdentity(hostConfig, networkSettings, target) &&
+    localVmNetworkPolicyIsValid(platform, runtime, environment)
+  );
+}
+
+function vmGeneration(input: {
+  runtime: Runtime;
+  target: LocalVmTarget;
+  password: string | null;
+  viewerPort: number | null;
+  containerIdentity?: string | null;
+  startedAt?: string | null;
+  imageIdentity?: string | null;
+  networkIdentity?: string | null;
+}): string | null {
+  if (!input.password || !input.viewerPort) return null;
+  const containerIdentity = input.containerIdentity?.trim() ?? "";
+  const startedAt = input.startedAt?.trim() ?? "";
+  const imageIdentity = input.imageIdentity?.trim() ?? "";
+  const networkIdentity = input.networkIdentity?.trim() ?? "";
+  // VNC_PW is generated afresh by the trusted lifecycle path for every
+  // container creation. Container id/start time strengthen that epoch when
+  // the selected runtime exposes them, while the digest keeps the password
+  // out of capability metadata and public status payloads.
+  return createHash("sha256")
+    .update(JSON.stringify([
+      input.runtime,
+      input.target.key,
+      input.target.containerName,
+      input.viewerPort,
+      input.password,
+      containerIdentity,
+      startedAt,
+      imageIdentity,
+      networkIdentity,
+    ]))
+    .digest("hex");
+}
+
+/** Cheap exact-container identity check for an already-open MCP broker. It
+ * intentionally does not run Cua health/screenshot probes: every tool call
+ * can afford one bounded inspect, not a 30-second desktop capture. */
+export async function currentContainerComputerGeneration(
+  runtime: Runtime,
+  target: LocalVmTarget,
+  runner: CommandRunner = sh,
+): Promise<string | null> {
+  try {
+    const { stdout } = await runner(runtime, ["inspect", target.containerName], 8_000);
+    if (runtime === "container") {
+      const inspected = JSON.parse(stdout) as Array<{
+        id?: string;
+        identifier?: string;
+        createdAt?: string;
+        configuration?: {
+          image?: string | { reference?: string; descriptor?: { digest?: string } };
+          imageReference?: string;
+          publishedPorts?: Array<{ hostAddress?: string; hostPort?: number; containerPort?: number }>;
+          environment?: string[] | Record<string, string>;
+          labels?: Record<string, string>;
+        };
+        status?: { state?: string; startedAt?: string };
+      }>;
+      const detail = inspected[0];
+      if (detail?.status?.state !== "running" || !containerLabelsMatch(detail.configuration?.labels, target)) {
+        return null;
+      }
+      const image = typeof detail.configuration?.image === "string"
+        ? detail.configuration.image
+        : detail.configuration?.image?.descriptor?.digest ??
+          detail.configuration?.image?.reference ??
+          detail.configuration?.imageReference;
+      return vmGeneration({
+        runtime,
+        target,
+        password: viewerPassword(detail.configuration?.environment),
+        viewerPort: appleViewerPort(detail.configuration?.publishedPorts, target.viewerPort),
+        containerIdentity: detail.id ?? detail.identifier,
+        startedAt: detail.status?.startedAt ?? detail.createdAt,
+        imageIdentity: image,
+      });
+    }
+    const inspected = JSON.parse(stdout) as Array<{
+      Id?: string;
+      Created?: string;
+      Config?: { Image?: string; Labels?: Record<string, string>; Env?: string[] };
+      HostConfig?: {
+        NetworkMode?: string;
+        PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
+      };
+      NetworkSettings?: ContainerNetworkSettings;
+      State?: { Running?: boolean; StartedAt?: string };
+      Image?: string;
+    }>;
+    const detail = inspected[0];
+    if (!detail?.State?.Running || !containerLabelsMatch(detail.Config?.Labels, target)) return null;
+    const networkIdentity = attachedNetworkIdentity(detail.HostConfig, detail.NetworkSettings, target);
+    if (!networkIdentity) return null;
+    return vmGeneration({
+      runtime,
+      target,
+      password: viewerPassword(detail.Config?.Env),
+      viewerPort: dockerViewerPort(detail.NetworkSettings?.Ports, target.viewerPort),
+      containerIdentity: detail.Id,
+      startedAt: detail.State?.StartedAt ?? detail.Created,
+      imageIdentity: detail.Image ?? detail.Config?.Image,
+      networkIdentity,
+    });
+  } catch {
+    return null;
+  }
 }
 
 /** The one authoritative `exec … cua-driver` argv. Shared with the BYO-VPS
@@ -463,6 +713,9 @@ export async function containerComputerStatus(
     const { stdout } = await runner(status.runtime, ["inspect", target.containerName]);
     if (status.runtime === "container") {
       const inspected = JSON.parse(stdout) as Array<{
+        id?: string;
+        identifier?: string;
+        createdAt?: string;
         configuration?: {
           image?: string | { reference?: string; descriptor?: { digest?: string } };
           imageReference?: string;
@@ -472,7 +725,7 @@ export async function containerComputerStatus(
           labels?: Record<string, string>;
           mounts?: Array<{ source?: string; destination?: string; options?: string[] }>;
         };
-        status?: { state?: string };
+        status?: { state?: string; startedAt?: string };
       }>;
       const detail = inspected[0];
       status.container = detail?.status?.state === "running" ? "running" : "stopped";
@@ -495,16 +748,27 @@ export async function containerComputerStatus(
       const resources = detail?.configuration?.resources;
       status.security =
         (resources?.memoryInBytes ?? 0) >= MEMORY_BYTES && resources?.cpus === 2 ? "hardened" : "unsafe";
-      status.viewer_url = viewerUrl(viewerPassword(detail?.configuration?.environment), status.viewer_port);
+      const password = viewerPassword(detail?.configuration?.environment);
+      status.viewer_url = viewerUrl(password, status.viewer_port);
+      status.vm_generation = vmGeneration({
+        runtime: status.runtime,
+        target,
+        password,
+        viewerPort: status.viewer_port,
+        containerIdentity: detail?.id ?? detail?.identifier,
+        startedAt: detail?.status?.startedAt ?? detail?.createdAt,
+        imageIdentity: appleImageId ?? appleImage,
+      });
     } else {
       const inspected = JSON.parse(stdout) as Array<{
+        Id?: string;
+        Created?: string;
         Config?: { Image?: string; Labels?: Record<string, string>; Env?: string[] };
         HostConfig?: DockerHardeningConfig & {
+          NetworkMode?: string;
           PortBindings?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
         };
-        NetworkSettings?: {
-          Ports?: Record<string, Array<{ HostIp?: string; HostPort?: string }> | null>;
-        };
+        NetworkSettings?: ContainerNetworkSettings;
         Mounts?: Array<{
           Type?: string;
           Source?: string;
@@ -513,12 +777,18 @@ export async function containerComputerStatus(
         }>;
         EffectiveCaps?: string[];
         BoundingCaps?: string[];
-        State?: { Running?: boolean };
+        State?: { Running?: boolean; StartedAt?: string };
         Image?: string;
       }>;
       const detail = inspected[0];
       status.container = detail?.State?.Running ? "running" : "stopped";
-      status.network = dockerPortsAreLocal(detail?.HostConfig?.PortBindings) ? "loopback" : "unsafe";
+      status.network = dockerNetworkIsIsolated(
+        detail?.HostConfig,
+        detail?.NetworkSettings,
+        target,
+        platform,
+        status.runtime,
+      ) ? "loopback" : "unsafe";
       status.viewer_port = dockerViewerPort(detail?.NetworkSettings?.Ports, target.viewerPort);
       status.imageMatches =
         detail?.Config?.Image === IMAGE &&
@@ -537,7 +807,21 @@ export async function containerComputerStatus(
           ? podmanSecurityIsHardened(detail?.HostConfig, detail?.EffectiveCaps, detail?.BoundingCaps)
           : dockerSecurityIsHardened(detail?.HostConfig)
       ) ? "hardened" : "unsafe";
-      status.viewer_url = viewerUrl(viewerPassword(detail?.Config?.Env), status.viewer_port);
+      const password = viewerPassword(detail?.Config?.Env);
+      status.viewer_url = viewerUrl(password, status.viewer_port);
+      const networkIdentity = attachedNetworkIdentity(detail?.HostConfig, detail?.NetworkSettings, target);
+      status.vm_generation = networkIdentity
+        ? vmGeneration({
+            runtime: status.runtime,
+            target,
+            password,
+            viewerPort: status.viewer_port,
+            containerIdentity: detail?.Id,
+            startedAt: detail?.State?.StartedAt ?? detail?.Created,
+            imageIdentity: detail?.Image ?? detail?.Config?.Image,
+            networkIdentity,
+          })
+        : null;
     }
   } catch {
     // No container with this name.
@@ -809,6 +1093,161 @@ export function podmanSecurityIsHardened(
   });
 }
 
+type ManagedNetworkInspect = {
+  Name?: string;
+  name?: string;
+  Id?: string;
+  ID?: string;
+  id?: string;
+  Driver?: string;
+  driver?: string;
+  Internal?: boolean;
+  internal?: boolean;
+  Attachable?: boolean;
+  attachable?: boolean;
+  Ingress?: boolean;
+  ingress?: boolean;
+  EnableIPv6?: boolean;
+  ipv6_enabled?: boolean;
+  Labels?: Record<string, string>;
+  labels?: Record<string, string>;
+  Options?: Record<string, string>;
+  options?: Record<string, string>;
+  Containers?: Record<string, unknown>;
+  containers?: Record<string, unknown>;
+};
+
+function inspectedManagedNetwork(stdout: string): ManagedNetworkInspect | null {
+  const parsed = JSON.parse(stdout) as ManagedNetworkInspect[] | ManagedNetworkInspect;
+  return (Array.isArray(parsed) ? parsed[0] : parsed) ?? null;
+}
+
+export function managedLocalVmNetworkMatches(
+  detail: ManagedNetworkInspect | null | undefined,
+  runtime: Runtime,
+  target: LocalVmTarget,
+  options: { requireEmpty?: boolean } = {},
+): boolean {
+  if (!detail || runtime === "container") return false;
+  const expected = localVmNetworkIdentity(target);
+  const name = detail.Name ?? detail.name;
+  const id = (detail.Id ?? detail.ID ?? detail.id)?.trim() ?? "";
+  const driver = detail.Driver ?? detail.driver;
+  const labels = detail.Labels ?? detail.labels ?? {};
+  const networkOptions = detail.Options ?? detail.options ?? {};
+  const containers = detail.Containers ?? detail.containers ?? {};
+  const internal = detail.Internal ?? detail.internal ?? false;
+  const attachable = detail.Attachable ?? detail.attachable ?? false;
+  const ingress = detail.Ingress ?? detail.ingress ?? false;
+  const ipv6 = detail.EnableIPv6 ?? detail.ipv6_enabled ?? false;
+  if (
+    name !== expected.name ||
+    !/^[A-Za-z0-9._:-]{8,128}$/.test(id) ||
+    driver !== "bridge" ||
+    internal !== false ||
+    attachable !== false ||
+    ingress !== false ||
+    ipv6 !== false ||
+    labels[NETWORK_MANAGED_LABEL] !== "1" ||
+    labels[NETWORK_TARGET_LABEL] !== target.label ||
+    labels[NETWORK_LAYER_LABEL] !== NETWORK_LAYER_VERSION
+  ) return false;
+  if (options.requireEmpty && Object.keys(containers).length !== 0) return false;
+  if (runtime === "docker") {
+    return (
+      networkOptions["com.docker.network.bridge.name"] === expected.bridge &&
+      networkOptions["com.docker.network.bridge.enable_icc"] === "false" &&
+      networkOptions["com.docker.network.bridge.enable_ip_masquerade"] === "true"
+    );
+  }
+  // Podman runs in a separate machine on the supported macOS/Windows lanes.
+  // Its inspect schema does not expose Docker bridge options, but the exact
+  // target-labelled network is still one-per-VM and never shared.
+  return true;
+}
+
+export function localVmNetworkCreateArgs(runtime: Runtime, target: LocalVmTarget): string[] {
+  if (runtime === "container") throw new Error("Apple container owns its VM network boundary");
+  const identity = localVmNetworkIdentity(target);
+  const args = [
+    "network",
+    "create",
+    "--driver",
+    "bridge",
+    "--label",
+    `${NETWORK_MANAGED_LABEL}=1`,
+    "--label",
+    `${NETWORK_TARGET_LABEL}=${target.label}`,
+    "--label",
+    `${NETWORK_LAYER_LABEL}=${NETWORK_LAYER_VERSION}`,
+    "--ipv6=false",
+  ];
+  if (runtime === "docker") {
+    args.push(
+      "--opt",
+      `com.docker.network.bridge.name=${identity.bridge}`,
+      "--opt",
+      "com.docker.network.bridge.enable_icc=false",
+      "--opt",
+      "com.docker.network.bridge.enable_ip_masquerade=true",
+    );
+  }
+  args.push(identity.name);
+  return args;
+}
+
+/** Create or reuse only the exact managed network. A same-name, differently
+ * configured bridge is not adopted: doing so could silently attach a bot to
+ * the default Docker LAN. */
+export async function ensureLocalVmNetwork(
+  runtime: Runtime,
+  target: LocalVmTarget,
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  if (runtime === "container") return;
+  if (!localVmNetworkPolicyIsValid(platform, runtime, environment)) {
+    throw new Error(`Local VM network policy must be ${LOCAL_VM_NETWORK_POLICY}`);
+  }
+  const identity = localVmNetworkIdentity(target);
+  let stdout: string | null = null;
+  try {
+    stdout = (await runner(runtime, ["network", "inspect", identity.name], 8_000)).stdout;
+  } catch {
+    try {
+      await runner(runtime, localVmNetworkCreateArgs(runtime, target), 30_000);
+    } catch {
+      // A concurrent exact-target creator may have won. The authoritative
+      // inspect below decides whether that race is safe.
+    }
+    stdout = (await runner(runtime, ["network", "inspect", identity.name], 8_000)).stdout;
+  }
+  const detail = inspectedManagedNetwork(stdout);
+  if (!managedLocalVmNetworkMatches(detail, runtime, target, { requireEmpty: true })) {
+    throw new Error("Local VM network is not the exact empty managed bridge");
+  }
+}
+
+export async function removeLocalVmNetwork(
+  runtime: Runtime,
+  target: LocalVmTarget,
+  runner: CommandRunner = sh,
+): Promise<void> {
+  if (runtime === "container") return;
+  const identity = localVmNetworkIdentity(target);
+  let stdout: string;
+  try {
+    stdout = (await runner(runtime, ["network", "inspect", identity.name], 8_000)).stdout;
+  } catch {
+    return;
+  }
+  if (!managedLocalVmNetworkMatches(inspectedManagedNetwork(stdout), runtime, target, { requireEmpty: true })) {
+    throw new Error("Refusing to remove a non-empty or unverified Local VM network");
+  }
+  await runner(runtime, ["network", "rm", identity.name], 30_000);
+}
+
 export function containerRunArgs(
   runtime: Runtime,
   password = "CHANGE_ME",
@@ -818,6 +1257,7 @@ export function containerRunArgs(
     throw new Error("Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port");
   }
   const common = ["run", "-d", "--name", target.containerName];
+  const network = localVmNetworkIdentity(target);
   common.push(
     "--label",
     `${MANAGED_LABEL}=1`,
@@ -831,6 +1271,10 @@ export function containerRunArgs(
     `${WORKSPACE_LABEL}=1`,
     "--label",
     `${TARGET_LABEL}=${target.label}`,
+    "--label",
+    `${CONTAINER_NETWORK_LABEL}=${network.name}`,
+    "--label",
+    `${NETWORK_LAYER_LABEL}=${NETWORK_LAYER_VERSION}`,
   );
   if (runtime === "container") {
     // Apple container already places each Linux container in a lightweight VM.
@@ -850,6 +1294,8 @@ export function containerRunArgs(
     );
   } else {
     common.push(
+      "--network",
+      network.name,
       "--hostname",
       target.containerName,
       "--memory",
@@ -894,9 +1340,263 @@ export function containerRunArgs(
   return common;
 }
 
-async function ensureVmWorkspace(platform: NodeJS.Platform, target: LocalVmTarget): Promise<void> {
-  await mkdir(target.workspaceDir, { recursive: true, mode: 0o700 });
-  if (platform !== "win32") await chmod(target.workspaceDir, 0o700);
+function managedVmWorkspacePath(path: string): boolean {
+  if (!isAbsolute(path)) return false;
+  if (CONFIGURED_VM_WORKSPACE_ROOT) {
+    const rel = relative(VM_WORKSPACE_ROOT, resolve(path));
+    return rel === "shared" || /^[a-f0-9]{16}$/.test(rel);
+  }
+  const rel = relative(resolve(DATA_DIR), resolve(path));
+  return rel === "vm-home" || /^vm-homes[\\/][a-f0-9]{16}$/.test(rel);
+}
+
+function workspaceRootForTarget(target: LocalVmTarget): string {
+  if (CONFIGURED_VM_WORKSPACE_ROOT) return VM_WORKSPACE_ROOT;
+  return target.key === SHARED_LOCAL_VM_TARGET.key ? resolve(DATA_DIR) : VM_WORKSPACE_ROOT;
+}
+
+function storageLeafKeyForTarget(target: LocalVmTarget): string {
+  if (target.key === SHARED_LOCAL_VM_TARGET.key) return "shared";
+  const leaf = relative(workspaceRootForTarget(target), resolve(target.workspaceDir));
+  if (!/^[a-f0-9]{16}$/.test(leaf)) throw new Error("invalid Local VM storage leaf identity");
+  return leaf;
+}
+
+export function linuxDockerWorkspaceAcl(serverUid: number): string {
+  if (!Number.isSafeInteger(serverUid) || serverUid < 1) throw new Error("Local VM workspace needs a real server UID");
+  if (serverUid === VM_WORKSPACE_GUEST_UID) throw new Error("Local VM server and guest UIDs must be distinct");
+  const named = [...new Set([serverUid, VM_WORKSPACE_GUEST_UID])]
+    .map((uid) => `u:${uid}:rwx`)
+    .join(",");
+  const defaults = [...new Set([serverUid, VM_WORKSPACE_GUEST_UID])]
+    .map((uid) => `d:u:${uid}:rwx`)
+    .join(",");
+  return `u::rwx,${named},g::---,m::rwx,o::---,d:u::rwx,${defaults},d:g::---,d:m::rwx,d:o::---`;
+}
+
+export function linuxDockerWorkspaceFileAcl(serverUid: number, executable: boolean): string {
+  if (!Number.isSafeInteger(serverUid) || serverUid < 1) throw new Error("Local VM workspace needs a real server UID");
+  if (serverUid === VM_WORKSPACE_GUEST_UID) throw new Error("Local VM server and guest UIDs must be distinct");
+  const permission = executable ? "rwx" : "rw-";
+  const named = [...new Set([serverUid, VM_WORKSPACE_GUEST_UID])]
+    .map((uid) => `u:${uid}:${permission}`)
+    .join(",");
+  return `u::${permission},${named},g::---,m::${permission},o::---`;
+}
+
+/** Docker bind mounts retain host numeric ownership. Keep the directory
+ * server-owned, then grant only the deployment-reserved Cua uid 61000 and the
+ * exact server uid access/default ACLs. The ordinary Razer login uid 1000 has
+ * no alias to the guest and receives no ACL entry. */
+export async function applyLinuxDockerWorkspaceAcl(
+  path: string,
+  serverUid: number,
+  runner: CommandRunner = sh,
+): Promise<void> {
+  const root = await lstat(path);
+  const pending = [path];
+  let visited = 0;
+  while (pending.length) {
+    const current = pending.pop()!;
+    const info = await lstat(current);
+    visited += 1;
+    if (visited > 100_000) throw new Error("Local VM workspace has too many entries to secure");
+    if (info.isSymbolicLink() || info.dev !== root.dev) {
+      throw new Error("Local VM workspace contains a link or nested mount");
+    }
+    if (info.isDirectory()) {
+      await chmod(current, 0o700);
+      // --set replaces, rather than merges, the complete access/default ACL.
+      // This removes every stale named principal left by an earlier mapping.
+      await runner("/usr/bin/setfacl", ["--set", linuxDockerWorkspaceAcl(serverUid), "--", current], 8_000);
+      for (const child of await readdir(current)) pending.push(join(current, child));
+      continue;
+    }
+    if (!info.isFile()) throw new Error("Local VM workspace contains an unsupported inode");
+    const executable = Boolean(info.mode & 0o111);
+    await chmod(current, executable ? 0o700 : 0o600);
+    await runner(
+      "/usr/bin/setfacl",
+      ["--set", linuxDockerWorkspaceFileAcl(serverUid, executable), "--", current],
+      8_000,
+    );
+  }
+}
+
+function safeDedicatedGuestIdentity(record: string, kind: "passwd" | "group"): boolean {
+  const fields = record.trim().split(":");
+  if (kind === "group") {
+    return fields[0] === LOCAL_VM_GUEST_ACCOUNT && Number(fields[2]) === VM_WORKSPACE_GUEST_GID;
+  }
+  return (
+    fields[0] === LOCAL_VM_GUEST_ACCOUNT &&
+    Number(fields[2]) === VM_WORKSPACE_GUEST_UID &&
+    Number(fields[3]) === VM_WORKSPACE_GUEST_GID &&
+    (fields[6] === "/usr/sbin/nologin" || fields[6] === "/sbin/nologin" || fields[6] === "/bin/false")
+  );
+}
+
+/** An unmapped high uid is safe for development. If the deployment reserves
+ * it in NSS, it must be the exact locked account from the Razer contract. */
+async function verifyDedicatedGuestIdentity(runner: CommandRunner): Promise<void> {
+  for (const [database, id, kind] of [
+    ["passwd", VM_WORKSPACE_GUEST_UID, "passwd"],
+    ["group", VM_WORKSPACE_GUEST_GID, "group"],
+  ] as const) {
+    try {
+      const { stdout } = await runner("/usr/bin/getent", [database, String(id)], 4_000);
+      if (stdout.trim() && !safeDedicatedGuestIdentity(stdout, kind)) {
+        throw new Error(`Local VM guest ${kind} ${id} belongs to another host identity`);
+      }
+    } catch (error) {
+      // getent exits non-zero when an otherwise-safe high id is unmapped. A
+      // mismatched mapped record is our own error and must remain fatal.
+      if (error instanceof Error && error.message.includes("belongs to another host identity")) throw error;
+    }
+  }
+}
+
+async function validateWorkspaceLocation(target: LocalVmTarget, create: boolean): Promise<string> {
+  if (!managedVmWorkspacePath(target.workspaceDir)) throw new Error("Local VM workspace escaped its managed data root");
+  const workspaceRoot = workspaceRootForTarget(target);
+  if (!CONFIGURED_VM_WORKSPACE_ROOT && create) {
+    await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
+  }
+  const rootInfo = await lstat(workspaceRoot);
+  const canonicalRoot = await realpath(workspaceRoot);
+  if (
+    !rootInfo.isDirectory() ||
+    rootInfo.isSymbolicLink() ||
+    (CONFIGURED_VM_WORKSPACE_ROOT !== null && canonicalRoot !== resolve(workspaceRoot))
+  ) {
+    throw new Error("Local VM workspace root must be one canonical directory");
+  }
+  if (dirname(resolve(target.workspaceDir)) !== resolve(workspaceRoot)) {
+    throw new Error("Local VM workspace must be a direct child of its managed root");
+  }
+  if (create) {
+    try {
+      await mkdir(target.workspaceDir, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  const info = await lstat(target.workspaceDir);
+  const canonical = await realpath(target.workspaceDir);
+  if (
+    !info.isDirectory() ||
+    info.isSymbolicLink() ||
+    dirname(canonical) !== canonicalRoot ||
+    (CONFIGURED_VM_WORKSPACE_ROOT !== null && canonical !== resolve(target.workspaceDir)) ||
+    info.dev !== rootInfo.dev
+  ) {
+    throw new Error("Local VM workspace must be one canonical directory on its bounded filesystem");
+  }
+  return canonical;
+}
+
+/** Production preparation entrypoint used by lifecycle code and deployment
+ * acceptance. It validates the configured bounded root before invoking the
+ * one authoritative ACL implementation. */
+export async function ensureVmWorkspace(
+  platform: NodeJS.Platform,
+  runtime: Runtime,
+  target: LocalVmTarget,
+  runner: CommandRunner,
+  storage: { ensure: (kind: "vm", key: string) => void } = { ensure: ensureStorageLeafSync },
+): Promise<void> {
+  // The privileged helper owns subvolume creation/quota assignment in the
+  // hardened Razer deployment. It runs before even a best-effort mkdir.
+  storage.ensure("vm", storageLeafKeyForTarget(target));
+  const canonical = await validateWorkspaceLocation(target, true);
+  if (platform === "linux" && runtime === "docker") {
+    const serverUid = process.getuid?.();
+    if (serverUid === undefined) throw new Error("Linux Docker workspace ACL needs the service UID");
+    await verifyDedicatedGuestIdentity(runner);
+    await applyLinuxDockerWorkspaceAcl(canonical, serverUid, runner);
+  } else if (platform !== "win32") {
+    await chmod(canonical, 0o700);
+  }
+}
+
+/** A server-owned, networkless root helper container removes content even if
+ * a hostile guest owns it and stripped every inherited ACL. The source path
+ * is validated and hash-derived before this argv can be built. */
+export function linuxDockerWorkspaceCleanupArgs(target: LocalVmTarget, cleanupName: string): string[] {
+  if (!managedVmWorkspacePath(target.workspaceDir)) throw new Error("Local VM cleanup escaped its managed data root");
+  if (!/^openmausbot-vm-cleanup-[a-f0-9]{16}$/.test(cleanupName)) throw new Error("invalid Local VM cleanup identity");
+  return [
+    "run",
+    "--rm",
+    "--name",
+    cleanupName,
+    "--network",
+    "none",
+    "--read-only",
+    "--user",
+    "0:0",
+    "--cap-drop",
+    "ALL",
+    "--cap-add",
+    "DAC_OVERRIDE",
+    "--cap-add",
+    "FOWNER",
+    "--security-opt",
+    "no-new-privileges",
+    "--pids-limit",
+    "64",
+    "--memory",
+    "64m",
+    "--memory-swap",
+    "64m",
+    "--cpus",
+    "0.25",
+    "--ipc",
+    "private",
+    "--cgroupns",
+    "private",
+    "--mount",
+    `type=bind,source=${target.workspaceDir},target=/workspace`,
+    "--entrypoint",
+    "/usr/bin/find",
+    IMAGE,
+    "/workspace",
+    "-xdev",
+    "-mindepth",
+    "1",
+    "-delete",
+  ];
+}
+
+export async function deleteLocalVmWorkspace(
+  target: LocalVmTarget,
+  runtime: Runtime | null,
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+  storage: { retire: (kind: "vm", key: string) => Promise<void> } = { retire: retireStorageLeaf },
+): Promise<void> {
+  try {
+    await validateWorkspaceLocation(target, false);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (platform === "linux" && runtime === "docker") {
+    const cleanupName = `openmausbot-vm-cleanup-${randomBytes(8).toString("hex")}`;
+    try {
+      await runner("docker", linuxDockerWorkspaceCleanupArgs(target, cleanupName), 120_000);
+    } finally {
+      // `docker run --rm` normally removed itself. If the client timed out or
+      // disconnected, force-removing the exact random name reaps the helper
+      // before the durable path can be reused.
+      await runner("docker", ["rm", "-f", cleanupName], 15_000).catch(() => {});
+    }
+  }
+  // A hardened leaf is a Btrfs subvolume, so ordinary rm cannot retire it.
+  // This happens only after the root-capable cleanup container proved the
+  // hostile guest tree empty. In compatibility/dev mode retire is a no-op.
+  await storage.retire("vm", storageLeafKeyForTarget(target));
+  await rm(target.workspaceDir, { recursive: true, force: true });
 }
 
 async function prepareManagedImage(runtime: Runtime, runner: CommandRunner): Promise<void> {
@@ -939,12 +1639,18 @@ export async function containerComputerAction(
   if (action === "stop" && before.container !== "running") {
     throw Object.assign(new Error("The Local VM is not running"), { status: 409 });
   }
-  if (action === "remove" && before.container === "missing") return before;
+  if (action === "remove" && before.container === "missing") {
+    await removeLocalVmNetwork(runtime, target, runner);
+    return before;
+  }
 
   if (action === "pull") {
     await prepareManagedImage(runtime, runner);
   } else {
-    if (action === "run") await ensureVmWorkspace(platform, target);
+    if (action === "run") {
+      await ensureVmWorkspace(platform, runtime, target, runner);
+      await ensureLocalVmNetwork(runtime, target, runner, platform);
+    }
     const args =
       action === "run"
         ? containerRunArgs(runtime, randomBytes(6).toString("base64url"), target)
@@ -952,6 +1658,7 @@ export async function containerComputerAction(
           ? ["rm", runtime === "container" ? "--force" : "-f", target.containerName]
           : [action, target.containerName];
     await runner(runtime, args, 2 * 60_000);
+    if (action === "remove") await removeLocalVmNetwork(runtime, target, runner);
   }
   return containerComputerStatus(runner, platform, target);
 }
@@ -991,10 +1698,35 @@ export function wholeScreenshot(bytes: Buffer): ScreenshotCheck {
   };
 }
 
+const screenshotQueues = new Map<string, Promise<void>>();
+
+async function serializeScreenshot<T>(targetKey: string, capture: () => Promise<T>): Promise<T> {
+  const previous = screenshotQueues.get(targetKey) ?? Promise.resolve();
+  let release!: () => void;
+  const turn = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => {}).then(() => turn);
+  screenshotQueues.set(targetKey, tail);
+  await previous.catch(() => {});
+  try {
+    return await capture();
+  } finally {
+    release();
+    if (screenshotQueues.get(targetKey) === tail) screenshotQueues.delete(targetKey);
+  }
+}
+
 export async function containerComputerScreenshot(
   runner: CommandRunner = sh,
   platform: NodeJS.Platform = process.platform,
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+): Promise<string> {
+  return serializeScreenshot(target.key, () => captureContainerComputerScreenshot(runner, platform, target));
+}
+
+async function captureContainerComputerScreenshot(
+  runner: CommandRunner,
+  platform: NodeJS.Platform,
+  target: LocalVmTarget,
 ): Promise<string> {
   const cacheable = runner === sh && platform === process.platform;
   const now = Date.now();
@@ -1047,9 +1779,9 @@ const screenshotStatusCache = new Map<
 
 const containerMcpPath = SPAWNED_PROXIES.containerMcp;
 
-/** Spawn contract handed directly to agent runtimes. The tiny host wrapper
- * only preserves stdio through the container CLI; Cua Driver owns the MCP
- * protocol and every computer tool. */
+/** Spawn contract handed directly to agent runtimes. The provider receives
+ * only an opaque, exact-turn bearer for the trusted server broker. Runtime,
+ * container name, socket path, and Docker authority never cross this seam. */
 type ContainerMcpLaunch = {
   command: string;
   args: string[];
@@ -1057,18 +1789,17 @@ type ContainerMcpLaunch = {
 };
 
 export function containerComputerMcp(
-  runtime: Runtime,
-  control?: { url: string; token: string },
-  target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+  broker: { url: string; token: string },
 ): ContainerMcpLaunch {
   return {
     command: process.execPath,
-    args: [containerMcpPath, runtime, target.containerName, CUA_SOCKET],
-    // The control pair rides in env, not argv — argv is world-readable
-    // through `ps` for the life of the bridge.
+    args: [containerMcpPath],
+    // The bearer rides in env, not argv — argv is world-readable through
+    // `ps`. The child deletes both values before opening the socket.
     env: {
       ELECTRON_RUN_AS_NODE: "1",
-      ...(control ? { OMB_CONTROL_URL: control.url, OMB_CONTROL_TOKEN: control.token } : {}),
+      OMB_LOCAL_VM_MCP_URL: broker.url,
+      OMB_LOCAL_VM_MCP_CAPABILITY: broker.token,
     },
   };
 }
@@ -1131,11 +1862,16 @@ export function setupCommands(
  * bypass it and mount Cua Driver's official MCP server through
  * containerComputerMcp(). */
 export function computerProxyEnv(
-  computer: { boxId?: string; token?: string; control?: { url: string; token: string } },
+  computer: {
+    boxId?: string;
+    broker?: { url: string; token: string };
+    control?: { url: string; token: string };
+  },
 ): NodeJS.ProcessEnv {
   return {
     OGB_BOX_ID: computer.boxId ?? "",
-    OGB_BOX_TOKEN: computer.token ?? "",
+    OMB_BOX_BROKER_URL: computer.broker?.url ?? "",
+    OMB_BOX_CAPABILITY_TOKEN: computer.broker?.token ?? "",
     ...(computer.control
       ? { OMB_CONTROL_URL: computer.control.url, OMB_CONTROL_TOKEN: computer.control.token }
       : {}),

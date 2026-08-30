@@ -1,0 +1,228 @@
+#!/usr/bin/python3
+"""Provision one deterministic, isolated provider-instance seed home."""
+
+import grp
+import fcntl
+import hashlib
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+PROVIDER_ROOT = "/var/lib/openmaus-provider"
+INSTANCES_ROOT = f"{PROVIDER_ROOT}/instances"
+STATE_ROOT = f"{PROVIDER_ROOT}/state"
+PROVIDER_USER = "openmaus-provider"
+RUNTIME_GROUP = "openmaus-runtime"
+BTRFS = "/usr/bin/btrfs"
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+
+
+def component(prefix: str, value: str, length: int) -> str:
+    return hashlib.sha256(f"{prefix}\0{value}".encode("utf-8")).hexdigest()[:length]
+
+
+def mapped_home(driver_kind: str, instance_id: str) -> tuple[str, str, str]:
+    if not driver_kind or len(driver_kind) > 256 or not instance_id or len(instance_id) > 1024:
+        raise ValueError("provider instance identity is invalid")
+    driver = component("driver", driver_kind, 24)
+    instance = component("instance", f"{driver_kind}\0{instance_id}", 32)
+    return driver, instance, f"{INSTANCES_ROOT}/{driver}/{instance}"
+
+
+def checked_directory(path: str, uid: int, gid: int, mode: int) -> int:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    info = os.fstat(descriptor)
+    if info.st_uid != uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) != mode:
+        os.close(descriptor)
+        raise RuntimeError(f"unsafe deployment directory: {path}")
+    return descriptor
+
+
+def checked_child(parent_fd: int, name: str, uid: int, gid: int, mode: int) -> int:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    info = os.fstat(descriptor)
+    if info.st_uid != uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) != mode:
+        os.close(descriptor)
+        raise RuntimeError("provider instance home has unsafe ownership or mode")
+    return descriptor
+
+
+def create_child(parent_fd: int, name: str, uid: int, gid: int, mode: int) -> int:
+    try:
+        os.mkdir(name, mode, dir_fd=parent_fd)
+        os.chown(name, uid, gid, dir_fd=parent_fd, follow_symlinks=False)
+        os.chmod(name, mode, dir_fd=parent_fd, follow_symlinks=False)
+    except FileExistsError:
+        pass
+    return checked_child(parent_fd, name, uid, gid, mode)
+
+
+def btrfs_checked(args: list[str]) -> None:
+    result = subprocess.run(
+        [BTRFS, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=SAFE_ENV,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("provider persistent state requires enforced btrfs qgroups")
+
+
+def purge_directory(parent_fd: int, name: str, device: int, subvolume: bool = False) -> None:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        if os.fstat(descriptor).st_dev != device:
+            raise RuntimeError("provider state contains a nested mount")
+        for child in os.listdir(descriptor):
+            info = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            if info.st_dev != device:
+                raise RuntimeError("provider state contains a nested mount")
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                purge_directory(descriptor, child, device)
+            else:
+                os.unlink(child, dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+    if subvolume:
+        btrfs_checked(["subvolume", "delete", f"/proc/self/fd/{parent_fd}/{name}"])
+    else:
+        os.rmdir(name, dir_fd=parent_fd)
+
+
+def purge_instance_state(driver: str, instance: str, provider_uid: int, runtime_gid: int) -> str:
+    state_fd = checked_directory(STATE_ROOT, 0, runtime_gid, 0o750)
+    held_locks: list[int] = []
+    try:
+        driver_fd = checked_child(state_fd, driver, 0, runtime_gid, 0o750)
+        try:
+            instance_fd = checked_child(driver_fd, instance, 0, runtime_gid, 0o750)
+            try:
+                instance_lock = os.open(
+                    ".instance.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=instance_fd,
+                )
+                held_locks.append(instance_lock)
+                os.fchown(instance_lock, 0, runtime_gid)
+                os.fchmod(instance_lock, 0o600)
+                try:
+                    fcntl.flock(instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise RuntimeError("provider instance state is active") from error
+                names = os.listdir(instance_fd)
+                for name in names:
+                    if not (
+                        name == ".instance.lock"
+                        or re.fullmatch(r"\.lock-[0-9a-f]{48}", name)
+                        or re.fullmatch(r"[0-9a-f]{48}", name)
+                        or re.fullmatch(r"\.init-[0-9a-f]{48}-[0-9]+", name)
+                    ):
+                        raise RuntimeError("provider state contains an unexpected entry")
+                for name in names:
+                    if not re.fullmatch(r"\.lock-[0-9a-f]{48}", name):
+                        continue
+                    descriptor = os.open(
+                        name,
+                        os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=instance_fd,
+                    )
+                    held_locks.append(descriptor)
+                    lock_info = os.fstat(descriptor)
+                    if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != 0 or lock_info.st_nlink != 1:
+                        raise RuntimeError("provider persistent-home lock is unsafe")
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as error:
+                        raise RuntimeError("a provider persistent home is active") from error
+                device = os.fstat(instance_fd).st_dev
+                for name in names:
+                    if re.fullmatch(r"[0-9a-f]{48}", name) or re.fullmatch(r"\.init-[0-9a-f]{48}-[0-9]+", name):
+                        purge_directory(instance_fd, name, device, subvolume=True)
+                    elif re.fullmatch(r"\.lock-[0-9a-f]{48}", name):
+                        os.unlink(name, dir_fd=instance_fd)
+            finally:
+                for descriptor in reversed(held_locks):
+                    os.close(descriptor)
+                os.close(instance_fd)
+        finally:
+            os.close(driver_fd)
+    finally:
+        os.close(state_fd)
+    return f"{STATE_ROOT}/{driver}/{instance}"
+
+
+def main() -> int:
+    print_only = len(sys.argv) == 4 and sys.argv[1] == "--print"
+    purge_state = len(sys.argv) == 4 and sys.argv[1] == "--purge-state"
+    if print_only or purge_state:
+        driver_kind, instance_id = sys.argv[2:]
+    elif len(sys.argv) == 3:
+        driver_kind, instance_id = sys.argv[1:]
+    else:
+        print(f"usage: {sys.argv[0]} [--print|--purge-state] DRIVER_KIND INSTANCE_ID", file=sys.stderr)
+        return 64
+    try:
+        driver, instance, path = mapped_home(driver_kind, instance_id)
+    except (UnicodeError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 64
+    if print_only:
+        print(path)
+        return 0
+    if os.geteuid() != 0:
+        print("provider home provisioning must run as root", file=sys.stderr)
+        return 77
+    try:
+        provider_uid = pwd.getpwnam(PROVIDER_USER).pw_uid
+        runtime_gid = grp.getgrnam(RUNTIME_GROUP).gr_gid
+        btrfs_checked(["qgroup", "show", "--raw", STATE_ROOT])
+        if purge_state:
+            print(purge_instance_state(driver, instance, provider_uid, runtime_gid))
+            return 0
+        root_fd = checked_directory(PROVIDER_ROOT, 0, runtime_gid, 0o750)
+        try:
+            instances_fd = checked_directory(INSTANCES_ROOT, 0, runtime_gid, 0o750)
+            try:
+                driver_fd = create_child(instances_fd, driver, 0, runtime_gid, 0o750)
+                try:
+                    instance_fd = create_child(driver_fd, instance, provider_uid, runtime_gid, 0o2750)
+                    os.close(instance_fd)
+                finally:
+                    os.close(driver_fd)
+            finally:
+                os.close(instances_fd)
+            state_fd = checked_directory(STATE_ROOT, 0, runtime_gid, 0o750)
+            try:
+                state_driver_fd = create_child(state_fd, driver, 0, runtime_gid, 0o750)
+                try:
+                    state_instance_fd = create_child(state_driver_fd, instance, 0, runtime_gid, 0o750)
+                    os.close(state_instance_fd)
+                finally:
+                    os.close(state_driver_fd)
+            finally:
+                os.close(state_fd)
+        finally:
+            os.close(root_fd)
+    except (KeyError, OSError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        return 69
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

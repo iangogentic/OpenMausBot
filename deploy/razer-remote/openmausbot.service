@@ -1,0 +1,107 @@
+[Unit]
+Description=OpenMausBot harness and local web interface
+Wants=network-online.target
+After=network-online.target
+Requires=openmaus-storage-prepare.service
+After=openmaus-storage-prepare.service
+Requires=openmaus-provider-network.service
+After=openmaus-provider-network.service
+Requires=openmaus-provider.slice
+After=openmaus-provider.slice
+RequiresMountsFor=/var/lib/openmaus-provider/state /var/lib/openmausbot-workspaces /var/lib/openmausbot-vm-homes
+
+[Service]
+Type=simple
+User=openmaus-server
+Group=openmaus-runtime
+# The trusted harness needs Docker to create isolated Local VMs. Membership in
+# docker is root-equivalent by design; it is never inherited by provider turns.
+SupplementaryGroups=openmaus-workspace docker
+UMask=0077
+WorkingDirectory=/var/lib/openmausbot
+StateDirectory=openmausbot
+StateDirectoryMode=0700
+RuntimeDirectory=openmausbot-private openmaus-provider
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/chgrp openmaus-runtime /run/openmaus-provider
+ExecStartPre=/usr/bin/chmod 2750 /run/openmaus-provider
+ExecStartPre=/usr/bin/test -x /usr/bin/bwrap
+ExecStartPre=/usr/bin/test -x /usr/bin/slirp4netns
+ExecStartPre=/usr/bin/test -x /usr/bin/systemd-run
+ExecStartPre=/usr/bin/test -x /usr/bin/systemctl
+ExecStartPre=/usr/bin/test -x /usr/bin/docker
+ExecStartPre=/usr/bin/test -S /run/docker.sock
+ExecStartPre=/usr/bin/test -x /usr/bin/setfacl
+ExecStartPre=/usr/bin/test -x /usr/bin/getfacl
+ExecStartPre=/usr/bin/test -x /usr/bin/btrfs
+ExecStartPre=/usr/bin/test -x /usr/local/libexec/openmaus-storage-leaf
+ExecStartPre=/usr/local/libexec/openmaus-provider-network --check
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/openmaus-provider/state
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/openmausbot-workspaces
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/openmausbot-vm-homes
+ExecStartPre=/usr/bin/btrfs qgroup show --raw /var/lib/openmaus-provider/state
+ExecStartPre=/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-workspaces
+ExecStartPre=/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-vm-homes
+ExecStartPre=/usr/local/libexec/openmaus-provider-slice-check --check
+ExecStartPre=/usr/bin/rm -f /run/openmausbot-private/harness.sock /run/openmausbot-private/webhook.sock
+Environment="PATH=/opt/openmaus-provider/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=/var/lib/openmausbot"
+Environment="USER=openmaus-server"
+Environment="OMB_DATA_DIR=/var/lib/openmausbot/data"
+Environment="OMB_WORKSPACES_DIR=/var/lib/openmausbot-workspaces"
+Environment="OMB_LOCAL_VM_HOME_DIR=/var/lib/openmausbot-vm-homes"
+Environment="OMB_LOCAL_VM_NETWORK_POLICY=openmaus-vm-private-v1"
+Environment="OMB_REQUIRE_LOCAL_VM_NETWORK_ISOLATION=1"
+Environment="OMB_STORAGE_LEAF_HELPER=/usr/local/libexec/openmaus-storage-leaf"
+Environment="OMB_REQUIRE_STORAGE_ISOLATION=1"
+Environment="OMB_PROVIDER_LAUNCHER=/usr/local/libexec/openmaus-provider-launch"
+Environment="OMB_REQUIRE_PROVIDER_ISOLATION=1"
+Environment="OMB_PROVIDER_HOME=/var/lib/openmaus-provider"
+Environment="OMB_PROVIDER_STATE_DIR=/var/lib/openmaus-provider/state"
+Environment="OMB_PROVIDER_RUNTIME_DIR=/run/openmaus-provider"
+Environment="OMB_PROVIDER_HARNESS_HOST=10.0.2.2"
+Environment="OMB_PROVIDER_PARENT_UNIT=openmausbot.service"
+Environment="OMB_PROVIDER_MEMORY_HIGH_BYTES=3221225472"
+Environment="OMB_PROVIDER_MEMORY_MAX_BYTES=4294967296"
+Environment="OMB_PROVIDER_MEMORY_SWAP_MAX_BYTES=0"
+Environment="OMB_PROVIDER_CPU_QUOTA_PERCENT=200"
+Environment="OMB_PROVIDER_TASKS_MAX=256"
+Environment="OMB_STATIC_DIR=/opt/openmausbot/current/dist"
+Environment="OMB_PORT=8799"
+Environment="OMB_WEBHOOK_PORT=8800"
+Environment="OMB_LISTEN_SOCKET=/run/openmausbot-private/harness.sock"
+Environment="OMB_WEBHOOK_LISTEN_SOCKET=/run/openmausbot-private/webhook.sock"
+ExecStart=/usr/bin/node /opt/openmausbot/current/dist-server/index.js
+ExecStopPost=-/usr/bin/rm -f /run/openmausbot-private/harness.sock /run/openmausbot-private/webhook.sock
+Restart=on-failure
+RestartSec=5
+# The harness proves provider shutdown for up to 60 seconds before it exits.
+TimeoutStopSec=75
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# The server UID cannot traverse the root-owned state tree; this writable
+# mount exists only so its narrowly sudoed root supervisor can initialize and
+# bind the exact hashed per-bot leaf.
+ReadWritePaths=/var/lib/openmausbot /var/lib/openmausbot-workspaces /var/lib/openmausbot-vm-homes /var/lib/openmaus-provider/state /run/openmausbot-private /run/openmaus-provider
+AmbientCapabilities=
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=no
+SystemCallArchitectures=native
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# bubblewrap must create user/mount/PID/IPC/UTS namespaces for each hostile
+# turn, including a private network namespace connected only by the bounded
+# slirp gateway. Nested user namespaces are disabled inside the sandbox.
+RestrictNamespaces=~cgroup
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

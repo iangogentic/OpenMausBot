@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenMaus hostile-provider egress boundary
+After=network-pre.target
+Before=network.target openmausbot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/openmaus-provider-network --apply
+ExecStartPost=/usr/local/libexec/openmaus-provider-network --check
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

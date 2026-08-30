@@ -6,17 +6,24 @@
 // URL and credentials never pass through its transcript.
 //
 // stdout is the MCP transport. Never log there.
-import readline from "node:readline";
 import { randomUUID } from "node:crypto";
+
+import { readBoundedResponseText } from "./bounded-response.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedJsonLineDecoder,
+  CATALOG_NDJSON_LIMITS,
+  PROVIDER_NDJSON_LIMITS,
+} from "./drivers/bounded-json-lines.ts";
 
 type Json = Record<string, unknown>;
 
 const UPSTREAM = process.env.OMB_CONNECTOR_UPSTREAM_URL ?? "";
 const HARNESS = process.env.OMB_HARNESS_URL ?? "http://127.0.0.1:8799";
-const BOT_ID = process.env.OMB_BOT_ID ?? "";
-const THREAD_ID = process.env.OMB_THREAD_ID ?? "";
-const TOKEN = process.env.OMB_COMMS_TOKEN ?? "";
-const MAX_RESPONSE_BYTES = 20 * 1024 * 1024;
+// Codex flattens stdio MCP env maps into one child environment, so this must
+// not share a variable name with the peer-agent capability.
+const TOKEN = process.env.OMB_CONNECTOR_CAPABILITY_TOKEN ?? "";
+const MAX_RESPONSE_BYTES = 1536 * 1024;
 const INITIALIZE_RELAY_TIMEOUT_MS = 1_000;
 const RELAY_TIMEOUT_MS = 10 * 60_000;
 
@@ -34,7 +41,31 @@ function parsedHeaders(): Record<string, string> {
 
 const upstreamHeaders = parsedHeaders();
 let upstreamSessionId = "";
-const send = (message: Json) => process.stdout.write(`${JSON.stringify(message)}\n`);
+const MAX_IN_FLIGHT = 4;
+const MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
+const activeRequests = new Set<AbortController>();
+let proxyFailed = false;
+const failProxy = (error: unknown) => {
+  if (proxyFailed) return;
+  proxyFailed = true;
+  for (const controller of activeRequests) controller.abort(error);
+  activeRequests.clear();
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.stdin.destroy();
+  process.exitCode = 1;
+  const failsafe = setTimeout(() => process.exit(1), 1_000);
+  failsafe.unref?.();
+};
+const send = (message: Json) => {
+  if (proxyFailed) return;
+  const line = `${JSON.stringify(message)}\n`;
+  const bytes = Buffer.byteLength(line);
+  if (
+    bytes > PROVIDER_NDJSON_LIMITS.maxLineBytes ||
+    process.stdout.writableLength + bytes > MAX_PENDING_OUTPUT_BYTES
+  ) return failProxy(new Error("connector proxy output exceeded its buffer limit"));
+  process.stdout.write(line);
+};
 
 function textResult(id: unknown, text: string, isError = false): Json {
   return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) } };
@@ -56,63 +87,76 @@ function initializeResult(id: unknown, protocolVersion: unknown): Json {
   };
 }
 
-async function readBounded(response: Response): Promise<string> {
-  const declared = Number(response.headers.get("content-length") ?? "0");
-  if (declared > MAX_RESPONSE_BYTES) throw new Error("connector response exceeded 20 MB");
-  if (!response.body) return "";
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let size = 0;
-  let text = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > MAX_RESPONSE_BYTES) {
-      await reader.cancel();
-      throw new Error("connector response exceeded 20 MB");
-    }
-    text += decoder.decode(value, { stream: true });
+async function parseUpstream(response: Response, id: unknown): Promise<Json | null> {
+  const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+  if (!contentType.includes("text/event-stream")) {
+    const text = await readBoundedResponseText(response, MAX_RESPONSE_BYTES, "connector response exceeded 1536 KB");
+    if (!text.trim()) return null;
+    const parsed: unknown = JSON.parse(text);
+    assertBoundedJsonShape(parsed, PROVIDER_NDJSON_LIMITS);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Json : null;
   }
-  return text + decoder.decode();
-}
 
-function parseUpstream(text: string, id: unknown): Json | null {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith("{")) return JSON.parse(trimmed) as Json;
-  const frames = trimmed
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).trim())
-    .filter((line) => line && line !== "[DONE]")
-    .flatMap((line) => {
-      try {
-        return [JSON.parse(line) as Json];
-      } catch {
-        return [];
+  if (!response.body) return null;
+  const reader = response.body.getReader();
+  const decoder = new BoundedJsonLineDecoder(
+    { ...PROVIDER_NDJSON_LIMITS, maxTotalBytes: MAX_RESPONSE_BYTES },
+    { jsonPrefix: "data:", ignoredJsonPayloads: ["[DONE]"] },
+  );
+  let last: Json | null = null;
+  let matching: Json | null = null;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const frame of decoder.push(value)) {
+        if (!frame.value || typeof frame.value !== "object" || Array.isArray(frame.value)) continue;
+        const parsed = frame.value as Json;
+        last = parsed;
+        if (parsed.id === id) matching = parsed;
       }
-    });
-  return frames.findLast((frame) => frame.id === id) ?? frames.at(-1) ?? null;
+    }
+    for (const frame of decoder.flush()) {
+      if (!frame.value || typeof frame.value !== "object" || Array.isArray(frame.value)) continue;
+      const parsed = frame.value as Json;
+      last = parsed;
+      if (parsed.id === id) matching = parsed;
+    }
+    return matching ?? last;
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function relay(message: Json, timeoutMs = RELAY_TIMEOUT_MS): Promise<Json | null> {
   if (!UPSTREAM) throw new Error("connected apps are unavailable");
-  const response = await fetch(UPSTREAM, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-      ...upstreamHeaders,
-      ...(upstreamSessionId ? { "mcp-session-id": upstreamSessionId } : {}),
-    },
-    body: JSON.stringify(message),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const nextSession = response.headers.get("mcp-session-id");
-  if (nextSession) upstreamSessionId = nextSession;
-  if (!response.ok) throw new Error(`connector service returned HTTP ${response.status}`);
-  return parseUpstream(await readBounded(response), message.id);
+  const controller = new AbortController();
+  activeRequests.add(controller);
+  try {
+    const response = await fetch(UPSTREAM, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...upstreamHeaders,
+        ...(upstreamSessionId ? { "mcp-session-id": upstreamSessionId } : {}),
+      },
+      body: JSON.stringify(message),
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]),
+    });
+    const nextSession = response.headers.get("mcp-session-id");
+    if (nextSession) upstreamSessionId = nextSession;
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`connector service returned HTTP ${response.status}`);
+    }
+    return await parseUpstream(response, message.id);
+  } finally {
+    activeRequests.delete(controller);
+  }
 }
 
 function connectorAdds(args: unknown): string[] {
@@ -130,15 +174,28 @@ function connectorAdds(args: unknown): string[] {
 }
 
 async function showConnectorCards(slugs: string[]): Promise<void> {
-  const response = await fetch(`${HARNESS}/api/internal/connectors/request`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
-    body: JSON.stringify({ botId: BOT_ID, threadId: THREAD_ID, slugs, resumeKey: randomUUID() }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { error?: unknown };
-    throw new Error(String(body.error ?? `could not show connection card (HTTP ${response.status})`));
+  const controller = new AbortController();
+  activeRequests.add(controller);
+  try {
+    const response = await fetch(`${HARNESS}/api/internal/connectors/request`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ slugs, resumeKey: randomUUID() }),
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]),
+    });
+    if (!response.ok) {
+      const text = await readBoundedResponseText(response, 1024 * 1024, "connector card response exceeded 1 MB");
+      let body: { error?: unknown } = {};
+      try {
+        const parsed: unknown = text.trim() ? JSON.parse(text) : {};
+        assertBoundedJsonShape(parsed, CATALOG_NDJSON_LIMITS);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as { error?: unknown };
+      } catch {}
+      throw new Error(String(body.error ?? `could not show connection card (HTTP ${response.status})`));
+    }
+    await response.body?.cancel().catch(() => {});
+  } finally {
+    activeRequests.delete(controller);
   }
 }
 
@@ -200,22 +257,42 @@ async function handle(message: Json): Promise<void> {
   }
 }
 
-const input = readline.createInterface({ input: process.stdin, terminal: false });
-input.on("line", (line) => {
-  const trimmed = line.trim();
-  if (!trimmed) return;
-  let message: Json;
-  try {
-    message = JSON.parse(trimmed) as Json;
-  } catch {
-    return;
-  }
-  void handle(message).catch((error) => {
+const input = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS);
+const inFlight = new Set<Promise<void>>();
+let inputEnded = false;
+const dispatch = (message: Json) => {
+  if (proxyFailed) return;
+  if (inFlight.size >= MAX_IN_FLIGHT) return failProxy(new Error("connector proxy exceeded 4 concurrent requests"));
+  const task = handle(message).catch((error) => {
     if (message.id === undefined) return;
     const method = String(message.method ?? "");
     const messageText = error instanceof Error ? error.message : String(error);
     if (method === "tools/call") send(textResult(message.id, messageText, true));
     else send(jsonRpcError(message.id, messageText));
   });
+  inFlight.add(task);
+  void task.finally(() => inFlight.delete(task));
+};
+process.stdin.on("data", (chunk: Buffer) => {
+  if (inputEnded || proxyFailed) return;
+  try {
+    for (const { value } of input.push(chunk)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      dispatch(value as Json);
+    }
+  } catch (error) {
+    failProxy(error);
+  }
 });
-input.on("close", () => process.exit(0));
+process.stdin.on("end", () => {
+  inputEnded = true;
+  try {
+    for (const { value } of input.flush()) {
+      if (value && typeof value === "object" && !Array.isArray(value)) dispatch(value as Json);
+    }
+  } catch (error) {
+    failProxy(error);
+    return;
+  }
+  void Promise.allSettled([...inFlight]).then(() => { if (!proxyFailed) process.exitCode = 0; });
+});

@@ -7,7 +7,8 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { createProxyHandler } from "../src/proxy.ts";
+import { createCompanionJsonBufferBudget, createProxyHandler } from "../src/proxy.ts";
+import { createConnectedDeviceTracker } from "../src/connected-devices.ts";
 import type { CompanionEndpoint } from "../src/endpoints.ts";
 import { scrub } from "../src/wire.ts";
 
@@ -25,8 +26,12 @@ let harness: Server;
 let sidecar: Server;
 let sidecarPort = 0;
 let cloudDesktopAccess = true;
+let deviceEnabled = true;
 let companionMarker = "";
+let companionDeviceMarker = "";
 let endpointCandidates: CompanionEndpoint[] = [];
+let localVmRegistration: { deviceId: string; botId: string; payload: unknown } | null = null;
+const inFlight = new Map<string, { abort: () => void; cloudDesktop: boolean }>();
 /** What the stub harness answers with next. Set per test. */
 let respond: (res: ServerResponse) => void = (res) => res.end();
 
@@ -51,6 +56,7 @@ const device = async (
 beforeAll(async () => {
   harness = createServer((req, res) => {
     companionMarker = String(req.headers["x-openmausbot-companion"] ?? "");
+    companionDeviceMarker = String(req.headers["x-openmausbot-companion-device"] ?? "");
     respond(res);
   });
   const harnessPort = await listen(harness);
@@ -58,10 +64,29 @@ beforeAll(async () => {
   sidecar = createServer(
     createProxyHandler({
       harnessPort,
-      authenticate: (t) => (t === TOKEN ? { cloudDesktopAccess } : null),
+      authenticate: (t) => (t === TOKEN && deviceEnabled ? { id: "phone-1", cloudDesktopAccess } : null),
       redeem: () => ({ error: "not used here" }),
       serverName: () => "Test computer",
       endpoints: () => endpointCandidates,
+      track: (id, abort, scope) => {
+        const current = { abort, cloudDesktop: scope.cloudDesktop };
+        inFlight.set(id, current);
+        return () => {
+          if (inFlight.get(id) === current) inFlight.delete(id);
+        };
+      },
+      localVmViewer: {
+        register: (deviceId, botId, payload) => {
+          localVmRegistration = { deviceId, botId, payload };
+          return {
+            ok: true as const,
+            payload: {
+              joinUrl: "/api/bots/b1/phone-local-computer/viewer/generationtag01/" + "p".repeat(43) + "/vnc.html#safe",
+              viewerKind: "local-vm",
+            },
+          };
+        },
+      },
     }),
   );
   sidecarPort = await listen(sidecar);
@@ -73,6 +98,137 @@ afterAll(async () => {
 });
 
 describe("preparing a harness response for a device", () => {
+  it("enforces aggregate and per-device buffered-response budgets", () => {
+    const budget = createCompanionJsonBufferBudget(10, 15);
+    expect(budget.reserve("phone-1", 8)).toBe(true);
+    expect(budget.reserve("phone-1", 3)).toBe(false);
+    expect(budget.reserve("phone-2", 7)).toBe(true);
+    expect(budget.reserve("phone-3", 1)).toBe(false);
+    budget.release("phone-1", 8);
+    expect(budget.reserve("phone-3", 8)).toBe(true);
+    budget.release("phone-2", 100);
+    expect(budget.reserve("phone-2", 7)).toBe(true);
+  });
+
+  it("returns 429 for an excess event stream while the admitted sibling stays live", async () => {
+    const upstream = createServer((_req, response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.flushHeaders();
+    });
+    const upstreamPort = await listen(upstream);
+    const tracker = createConnectedDeviceTracker({
+      maxStreamsPerDevice: 1,
+      maxStreamsGlobal: 2,
+      maxRequestsPerDevice: 3,
+      maxRequestsGlobal: 6,
+    });
+    const proxy = createServer(createProxyHandler({
+      harnessPort: upstreamPort,
+      authenticate: (token) => token === "omb-one"
+        ? { id: "phone-1", cloudDesktopAccess: false }
+        : token === "omb-two"
+          ? { id: "phone-2", cloudDesktopAccess: false }
+          : null,
+      redeem: () => ({ error: "not used" }),
+      serverName: () => "Test computer",
+      connected: tracker.open,
+      track: tracker.openRequest,
+    }));
+    const proxyPort = await listen(proxy);
+    const request = (token: string) => fetch(`http://127.0.0.1:${proxyPort}/api/events`, {
+      headers: { authorization: `Bearer ${token}`, accept: "text/event-stream" },
+    });
+    let admitted: Response | null = null;
+    try {
+      admitted = await request("omb-one");
+      expect(admitted.status).toBe(200);
+      expect(tracker.ids()).toEqual(["phone-1"]);
+
+      const rejected = await request("omb-one");
+      expect(rejected.status).toBe(429);
+      expect(await rejected.json()).toMatchObject({ error: expect.stringContaining("event streams") });
+      expect(tracker.ids()).toEqual(["phone-1"]);
+
+      const sibling = await request("omb-two");
+      expect(sibling.status).toBe(200);
+      expect(tracker.ids()).toEqual(["phone-1", "phone-2"]);
+      await sibling.body?.cancel();
+    } finally {
+      await admitted?.body?.cancel();
+      proxy.closeAllConnections?.();
+      upstream.closeAllConnections?.();
+      await close(proxy);
+      await close(upstream);
+    }
+  });
+
+  it("keeps the public health check live without a paired device", async () => {
+    respond = (res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ app: "openmausbot", pid: 12345 }));
+    };
+    const response = await fetch(`http://127.0.0.1:${sidecarPort}/api/health`, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ app: "openmausbot" });
+  });
+
+  it("drops a delayed ordinary response when the exact device is revoked", async () => {
+    let upstreamReached!: () => void;
+    let upstreamClosed!: () => void;
+    const reached = new Promise<void>((resolve) => (upstreamReached = resolve));
+    const closed = new Promise<void>((resolve) => (upstreamClosed = resolve));
+    respond = (res) => {
+      res.once("close", upstreamClosed);
+      upstreamReached();
+      // Deliberately never send headers. The response is the test's stand-in
+      // for a slow transcript/image/audio/Box request.
+    };
+
+    const pending = fetch(`http://127.0.0.1:${sidecarPort}/api/threads/t1/messages`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    await reached;
+    deviceEnabled = false;
+    try {
+      expect(inFlight.get("phone-1")?.cloudDesktop).toBe(false);
+      inFlight.get("phone-1")?.abort();
+      await expect(pending).rejects.toThrow();
+      await closed;
+    } finally {
+      deviceEnabled = true;
+      inFlight.clear();
+    }
+  });
+
+  it("drops a delayed Box join when cloud desktop access is removed", async () => {
+    let upstreamReached!: () => void;
+    let upstreamClosed!: () => void;
+    const reached = new Promise<void>((resolve) => (upstreamReached = resolve));
+    const closed = new Promise<void>((resolve) => (upstreamClosed = resolve));
+    respond = (res) => {
+      res.once("close", upstreamClosed);
+      upstreamReached();
+    };
+
+    const pending = fetch(`http://127.0.0.1:${sidecarPort}/api/bots/b1/computer/join`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    await reached;
+    cloudDesktopAccess = false;
+    try {
+      expect(inFlight.get("phone-1")?.cloudDesktop).toBe(true);
+      inFlight.get("phone-1")?.abort();
+      await expect(pending).rejects.toThrow();
+      await closed;
+    } finally {
+      cloudDesktopAccess = true;
+      inFlight.clear();
+    }
+  });
+
   it("drops an endpoint whose runtime URL is not a string", async () => {
     const malformed: CompanionEndpoint = { kind: "hosted", priority: 0, url: "https://ok.example" };
     Object.defineProperty(malformed, "url", { value: 42 });
@@ -89,12 +245,34 @@ describe("preparing a harness response for a device", () => {
   it("requires the Mac to enable cloud desktop for this phone", async () => {
     cloudDesktopAccess = false;
     try {
-      const { status, text } = await device("/api/bots/b1/computer/join", "POST");
-      expect(status).toBe(403);
-      expect(text).toContain("enable it in OpenMausBot");
-      expect(text).toContain("Settings → Phone");
+      for (const [path, method] of [
+        ["/api/bots/b1/computer/control", "GET"],
+        ["/api/bots/b1/computer/control", "POST"],
+        ["/api/bots/b1/computer/join", "POST"],
+        ["/api/bots/b1/local-computer/join", "POST"],
+      ] as const) {
+        const { status, text } = await device(path, method);
+        expect(status).toBe(403);
+        expect(text).toContain("enable it in OpenMausBot");
+        expect(text).toContain("Settings → Phone");
+      }
     } finally {
       cloudDesktopAccess = true;
+    }
+  });
+
+  it("binds every enabled desktop-control request to the authenticated device", async () => {
+    respond = (res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ held: false, helpReason: null }));
+    };
+    for (const [path, method] of [
+      ["/api/bots/b1/computer/control", "GET"],
+      ["/api/bots/b1/computer/control", "POST"],
+    ] as const) {
+      expect((await device(path, method)).status).toBe(200);
+      expect(companionMarker).toBe("1");
+      expect(companionDeviceMarker).toBe("phone-1");
     }
   });
 
@@ -107,6 +285,25 @@ describe("preparing a harness response for a device", () => {
     expect(status).toBe(200);
     expect(JSON.parse(text).joinUrl).toBe("https://desktop.example/session/fresh");
     expect(companionMarker).toBe("1");
+    expect(companionDeviceMarker).toBe("phone-1");
+  });
+
+  it("exchanges an enabled Local VM join for the exact device and bot", async () => {
+    localVmRegistration = null;
+    respond = (res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        joinUrl: `/api/bots/b1/local-computer/viewer/${"i".repeat(43)}/vnc.html#password=hidden`,
+        expiresAt: Date.now() + 60_000,
+        viewerGeneration: "generation-12345678",
+      }));
+    };
+    const { status, text } = await device("/api/bots/b1/local-computer/join", "POST");
+    expect(status).toBe(200);
+    expect(JSON.parse(text)).toMatchObject({ viewerKind: "local-vm" });
+    expect(text).not.toContain("generation-12345678");
+    expect(localVmRegistration).toMatchObject({ deviceId: "phone-1", botId: "b1" });
+    expect(companionDeviceMarker).toBe("phone-1");
   });
 
   it("never forwards a body it could not scrub", async () => {

@@ -32,16 +32,24 @@ export interface RouteRequest {
   authenticated: boolean;
 }
 
-/** The one companion route that crosses into full interactive desktop
- * control. Both the allowlist and capability gate consume this classifier so
- * their security decisions cannot drift apart. */
-export const CLOUD_DESKTOP_JOIN_ROUTE = {
-  method: "POST",
-  path: /^\/api\/bots\/[\w-]+\/computer\/join$/,
-} as const;
+/** The complete phone desktop-control surface. A viewer URL without the
+ * take/heartbeat/release routes is not a feature: the harness correctly
+ * refuses the join because the phone never proved it owns control. Keep the
+ * classifier and allowlist on this one exact table so the capability gate
+ * cannot protect only half of the sequence. */
+export const CLOUD_DESKTOP_ROUTES: ReadonlyArray<{ method: string; path: RegExp }> = [
+  { method: "GET", path: /^\/api\/bots\/[\w-]+\/computer\/control$/ },
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/computer\/control$/ },
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/computer\/join$/ },
+  // The server-hosted Local VM uses the same exclusive human-control lease,
+  // but mints an isolated noVNC token instead of a provider URL. The viewer
+  // assets themselves are sidecar-owned bearer routes and never enter this
+  // ordinary authenticated API allowlist.
+  { method: "POST", path: /^\/api\/bots\/[\w-]+\/local-computer\/join$/ },
+];
 
-export function isCloudDesktopJoin(method: string, path: string): boolean {
-  return method === CLOUD_DESKTOP_JOIN_ROUTE.method && CLOUD_DESKTOP_JOIN_ROUTE.path.test(path);
+export function isCloudDesktopRequest(method: string, path: string): boolean {
+  return CLOUD_DESKTOP_ROUTES.some((route) => method === route.method && route.path.test(path));
 }
 
 /** Every request the iOS app makes, and nothing else.
@@ -77,9 +85,9 @@ const ALLOWED: ReadonlyArray<{ method: string; path: RegExp }> = [
   // outside identity, avatar, notifications, and voice preferences.
   { method: "PATCH", path: /^\/api\/bots\/[\w-]+\/profile$/ },
   { method: "POST", path: /^\/api\/bots\/[\w-]+\/avatar\/generate$/ },
-  // Full cloud desktop access. The route is narrow and the proxy applies a
+  // Full cloud desktop access. Every route is narrow and the proxy applies a
   // second, per-device capability check before it reaches the harness.
-  CLOUD_DESKTOP_JOIN_ROUTE,
+  ...CLOUD_DESKTOP_ROUTES,
 
   // rooms — making one, and talking in one
   { method: "POST", path: /^\/api\/groups$/ },
@@ -135,7 +143,7 @@ const EXPLAINED: ReadonlyArray<{ path: RegExp; error: string }> = [
     error: "Phone settings are managed on your computer",
   },
   { path: /^\/api\/config$/, error: "API keys can only be changed on your computer" },
-  { path: /^\/api\/local-computer(\/|$)/, error: "the Local VM is set up on your computer" },
+  { path: /^\/api\/local-computer(\/|$)/, error: "Local VM setup is managed on your computer" },
   {
     // Creating one exposes an endpoint to the internet, and rotating a
     // secret breaks whatever was sending to it. Neither belongs on a device

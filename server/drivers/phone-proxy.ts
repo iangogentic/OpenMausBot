@@ -2,15 +2,29 @@
 // devices only: no emulators, wireless debugging, network ADB, or Tailscale.
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync } from "node:fs";
-import { createInterface } from "node:readline";
 import { delimiter, join } from "node:path";
 import { homedir } from "node:os";
+
+import { BoundedJsonLineDecoder, PROVIDER_NDJSON_LIMITS } from "./bounded-json-lines.ts";
 
 type Json = Record<string, unknown>;
 type Device = { serial: string; state: string; model: string; connection: "usb" | "network" | "emulator" };
 type UiNode = { text: string; description: string; id: string; className: string; bounds: [number, number, number, number] };
 
 const MAX_ADB_OUTPUT = 16 * 1024 * 1024;
+const activeAdbChildren = new Set<ReturnType<typeof spawn>>();
+const MAX_DEVICE_ROWS = 256;
+const MAX_PACKAGE_ROWS = 10_000;
+const MAX_UI_NODES = 250;
+const MAX_UI_NODE_SCANS = 1_000;
+const MAX_UI_ATTRIBUTES = 64;
+const MAX_UI_FIELD_CHARS = 2_048;
+const MAX_TEXT_ROW_CHARS = 4_096;
+const MAX_TEXT_ROW_SCANS = 20_000;
+// Base64 and the JSON-RPC envelope must remain below the shared 2 MiB frame
+// limit. A larger raw PNG becomes a bounded per-call error, not a proxy-wide
+// output violation.
+const MAX_PHONE_SCREENSHOT_BYTES = 1_500_000;
 const PACKAGE = /^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/;
 const COMPONENT = /^([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+)\/\S+$/;
 const SAFE_TEXT = /^[A-Za-z0-9 _.,@-]+$/;
@@ -64,35 +78,67 @@ async function runAdb(args: string[], options: { binary?: boolean; timeoutMs?: n
   if (!adb) throw new Error("Android platform tools are unavailable. Reopen OpenMausBot or install adb.");
   return new Promise((resolve, reject) => {
     const child = spawn(adb, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    activeAdbChildren.add(child);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let size = 0;
+    let outputTooLarge = false;
     const timer = setTimeout(() => {
-      child.kill();
+      child.kill("SIGKILL");
       reject(new Error("The Android device command timed out"));
     }, options.timeoutMs ?? 12_000);
-    child.stdout.on("data", (chunk: Buffer) => {
+    const retain = (target: Buffer[], chunk: Buffer) => {
+      if (outputTooLarge) return;
       size += chunk.length;
-      if (size > MAX_ADB_OUTPUT) child.kill();
-      else stdout.push(chunk);
-    });
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+      if (size > MAX_ADB_OUTPUT) {
+        outputTooLarge = true;
+        child.kill("SIGKILL");
+        return;
+      }
+      target.push(chunk);
+    };
+    child.stdout.on("data", (chunk: Buffer) => retain(stdout, chunk));
+    child.stderr.on("data", (chunk: Buffer) => retain(stderr, chunk));
     child.on("error", (error) => {
       clearTimeout(timer);
+      activeAdbChildren.delete(child);
       reject(error);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (size > MAX_ADB_OUTPUT) return reject(new Error("The Android device returned too much data"));
-      if (code !== 0) return reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `adb exited ${code}`));
+      activeAdbChildren.delete(child);
+      if (outputTooLarge) return reject(new Error("The Android device returned too much data"));
+      if (code !== 0) {
+        let detail = "";
+        try {
+          detail = decodeAdbText(Buffer.concat(stderr), "Android device error").trim();
+        } catch (error) {
+          return reject(error);
+        }
+        return reject(new Error(detail || `adb exited ${code}`));
+      }
       resolve(Buffer.concat(stdout));
     });
   });
 }
 
+function decodeAdbText(output: Buffer, label = "Android device output"): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(output);
+  } catch {
+    throw new Error(`${label} was not valid UTF-8`);
+  }
+}
+
 export function parseDevices(output: string): Device[] {
   const devices: Device[] = [];
-  for (const raw of output.split(/\r?\n/)) {
+  let scanned = 0;
+  for (const row of output.matchAll(/[^\r\n]+/g)) {
+    scanned += 1;
+    if (scanned > MAX_TEXT_ROW_SCANS) break;
+    if (devices.length >= MAX_DEVICE_ROWS) break;
+    const raw = row[0];
+    if (raw.length > MAX_TEXT_ROW_CHARS) continue;
     const line = raw.trim();
     if (!line || line.startsWith("List of devices attached") || line.startsWith("* daemon")) continue;
     const [serial, state, ...fields] = line.split(/\s+/);
@@ -118,7 +164,7 @@ export function parseDevices(output: string): Device[] {
 
 async function usbDevices() {
   if (!resolveAdbPath()) return [];
-  return parseDevices((await runAdb(["devices", "-l"])).toString("utf8")).filter((device) => device.connection === "usb");
+  return parseDevices(decodeAdbText(await runAdb(["devices", "-l"]))).filter((device) => device.connection === "usb");
 }
 
 async function readySerial(requested?: unknown): Promise<string> {
@@ -143,9 +189,19 @@ function normalize(value: string) {
 
 export function parseLaunchablePackages(output: string): string[] {
   const packages: string[] = [];
-  for (const raw of output.split(/\r?\n/)) {
+  const seen = new Set<string>();
+  let scanned = 0;
+  for (const row of output.matchAll(/[^\r\n]+/g)) {
+    scanned += 1;
+    if (scanned > MAX_TEXT_ROW_SCANS) break;
+    if (packages.length >= MAX_PACKAGE_ROWS) break;
+    const raw = row[0];
+    if (raw.length > MAX_TEXT_ROW_CHARS) continue;
     const match = COMPONENT.exec(raw.trim());
-    if (match && !packages.includes(match[1])) packages.push(match[1]);
+    if (match && !seen.has(match[1])) {
+      seen.add(match[1]);
+      packages.push(match[1]);
+    }
   }
   return packages;
 }
@@ -173,7 +229,7 @@ async function launchablePackages(serial: string) {
     "shell", "cmd", "package", "query-activities", "--brief",
     "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
   ]);
-  return parseLaunchablePackages(output.toString("utf8"));
+  return parseLaunchablePackages(decodeAdbText(output));
 }
 
 function decodeXml(value: string) {
@@ -187,10 +243,17 @@ function decodeXml(value: string) {
 
 export function parseUiNodes(xml: string): UiNode[] {
   const nodes: UiNode[] = [];
+  let scanned = 0;
   for (const match of xml.matchAll(/<node\s+([^>]+?)\/?\s*>/g)) {
+    scanned += 1;
+    if (scanned > MAX_UI_NODE_SCANS) break;
+    if (nodes.length >= MAX_UI_NODES) break;
     const attributes: Record<string, string> = {};
+    let attributeCount = 0;
     for (const attribute of match[1].matchAll(/([\w:-]+)="([^"]*)"/g)) {
-      attributes[attribute[1]] = decodeXml(attribute[2]);
+      attributeCount += 1;
+      if (attributeCount > MAX_UI_ATTRIBUTES) break;
+      attributes[attribute[1]] = decodeXml(attribute[2].slice(0, MAX_UI_FIELD_CHARS));
     }
     const bounds = /^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/.exec(attributes.bounds ?? "");
     if (!bounds) continue;
@@ -209,20 +272,23 @@ export function parseUiNodes(xml: string): UiNode[] {
 }
 
 async function readNodes(serial: string) {
-  const streamed = (await onDevice(serial, ["shell", "uiautomator", "dump", "/dev/tty"])).toString("utf8");
+  const streamed = decodeAdbText(await onDevice(serial, ["shell", "uiautomator", "dump", "/dev/tty"]));
   const streamedStart = streamed.indexOf("<?xml");
   if (streamedStart >= 0) return parseUiNodes(streamed.slice(streamedStart));
 
   const remotePath = "/data/local/tmp/openmaus-window.xml";
   await onDevice(serial, ["shell", "uiautomator", "dump", remotePath]);
-  const saved = (await onDevice(serial, ["shell", "cat", remotePath])).toString("utf8");
-  void onDevice(serial, ["shell", "rm", "-f", remotePath]).catch(() => undefined);
-  const savedStart = saved.indexOf("<?xml");
-  return parseUiNodes(savedStart >= 0 ? saved.slice(savedStart) : saved);
+  try {
+    const saved = decodeAdbText(await onDevice(serial, ["shell", "cat", remotePath]));
+    const savedStart = saved.indexOf("<?xml");
+    return parseUiNodes(savedStart >= 0 ? saved.slice(savedStart) : saved);
+  } finally {
+    await onDevice(serial, ["shell", "rm", "-f", remotePath]).catch(() => undefined);
+  }
 }
 
 function nodeLines(nodes: UiNode[]) {
-  return nodes.slice(0, 250).map((node, index) => {
+  return nodes.slice(0, MAX_UI_NODES).map((node, index) => {
     const label = [node.text, node.description].filter(Boolean).join(" · ");
     return `${index}: ${JSON.stringify(label || node.id)} bounds=${node.bounds.join(",")} class=${node.className}`;
   }).join("\n") || "No accessible Android UI text is visible.";
@@ -254,7 +320,14 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
   if (name === "read_screen") return textResult(nodeLines(await readNodes(serial)));
   if (name === "screenshot") {
     const png = await onDevice(serial, ["exec-out", "screencap", "-p"], true);
-    if (!png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) throw new Error("Android returned an invalid screenshot");
+    if (png.length > MAX_PHONE_SCREENSHOT_BYTES) {
+      throw new Error("Android screenshot exceeds the MCP transport limit; use read_screen instead");
+    }
+    if (
+      png.length < 20 ||
+      !png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")) ||
+      !png.subarray(png.length - 8, png.length - 4).equals(Buffer.from("IEND", "ascii"))
+    ) throw new Error("Android returned an invalid screenshot");
     return { content: [{ type: "text", text: `Android screenshot from ${serial}` }, { type: "image", data: png.toString("base64"), mimeType: "image/png" }] };
   }
   if (name === "list_apps") {
@@ -293,7 +366,7 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
   }
   if (name === "swipe") {
     const direction = String(args.direction ?? "");
-    const size = (await onDevice(serial, ["shell", "wm", "size"])).toString("utf8");
+    const size = decodeAdbText(await onDevice(serial, ["shell", "wm", "size"]));
     const match = /(\d+)x(\d+)/.exec(size);
     if (!match) throw new Error("Could not read Android screen size");
     const width = Number(match[1]); const height = Number(match[2]);
@@ -323,7 +396,30 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
   throw new Error(`Unknown phone tool: ${name}`);
 }
 
-const send = (message: Json) => process.stdout.write(`${JSON.stringify(message)}\n`);
+const MAX_IN_FLIGHT = 2;
+const MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
+let proxyFailed = false;
+const failProxy = (error: unknown) => {
+  if (proxyFailed) return;
+  proxyFailed = true;
+  for (const child of activeAdbChildren) child.kill("SIGKILL");
+  activeAdbChildren.clear();
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.stdin.destroy();
+  process.exitCode = 1;
+  const failsafe = setTimeout(() => process.exit(1), 1_000);
+  failsafe.unref?.();
+};
+const send = (message: Json) => {
+  if (proxyFailed) return;
+  const line = `${JSON.stringify(message)}\n`;
+  const bytes = Buffer.byteLength(line);
+  if (
+    bytes > PROVIDER_NDJSON_LIMITS.maxLineBytes ||
+    process.stdout.writableLength + bytes > MAX_PENDING_OUTPUT_BYTES
+  ) return failProxy(new Error("phone proxy output exceeded its buffer limit"));
+  process.stdout.write(line);
+};
 const ok = (id: unknown, result: unknown) => send({ jsonrpc: "2.0", id, result });
 const rpcError = (id: unknown, code: number, message: string) => send({ jsonrpc: "2.0", id, error: { code, message } });
 
@@ -348,11 +444,39 @@ async function handle(message: Json) {
 }
 
 if (process.argv[1] && existsSync(process.argv[1]) && /phone-proxy\.(?:ts|js)$/.test(process.argv[1])) {
-  const lines = createInterface({ input: process.stdin, terminal: false });
-  lines.on("line", (line) => {
+  const input = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS);
+  const inFlight = new Set<Promise<void>>();
+  let inputEnded = false;
+  const dispatch = (message: Json) => {
+    if (proxyFailed) return;
+    if (inFlight.size >= MAX_IN_FLIGHT) return failProxy(new Error("phone proxy exceeded 2 concurrent requests"));
+    const task = handle(message).catch((error) => {
+      rpcError(message.id, -32603, error instanceof Error ? error.message : String(error));
+    });
+    inFlight.add(task);
+    void task.finally(() => inFlight.delete(task));
+  };
+  process.stdin.on("data", (chunk: Buffer) => {
+    if (inputEnded || proxyFailed) return;
     try {
-      const message = JSON.parse(line) as Json;
-      void handle(message).catch((error) => rpcError(message.id, -32603, error instanceof Error ? error.message : String(error)));
-    } catch {}
+      for (const { value } of input.push(chunk)) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+        dispatch(value as Json);
+      }
+    } catch (error) {
+      failProxy(error);
+    }
+  });
+  process.stdin.on("end", () => {
+    inputEnded = true;
+    try {
+      for (const { value } of input.flush()) {
+        if (value && typeof value === "object" && !Array.isArray(value)) dispatch(value as Json);
+      }
+    } catch (error) {
+      failProxy(error);
+      return;
+    }
+    void Promise.allSettled([...inFlight]).then(() => { if (!proxyFailed) process.exitCode = 0; });
   });
 }

@@ -227,7 +227,7 @@ function Call({ bot }: { bot: Bot }) {
 
   // the approval we last asked about aloud, so a card that stays open
   // while the user thinks is not re-read every render
-  const askedApproval = useRef<string | null>(null);
+  const askedApproval = useRef<{ requestId: string; messageId: string } | null>(null);
   const askedQuestion = useRef<{ requestId: string; messageId: string } | null>(null);
   const phaseRef = useRef<Phase>(initialPhase);
   const alive = useRef(true);
@@ -321,7 +321,8 @@ function Call({ bot }: { bot: Bot }) {
           dispatch({
             type: "decideRequest",
             threadId: bot.threadId,
-            requestId: open,
+            requestId: open.requestId,
+            messageId: open.messageId,
             behavior: allow ? "allow" : "deny",
             message: allow ? undefined : "Denied by the user, on a call.",
           });
@@ -380,7 +381,11 @@ function Call({ bot }: { bot: Bot }) {
     // The request may be resolved from the normal approval UI or by another
     // client while this call is open. Do not keep treating future speech as
     // an answer to a card that no longer exists.
-    if (askedApproval.current && approval?.requestId !== askedApproval.current) {
+    if (
+      askedApproval.current &&
+      (approval?.requestId !== askedApproval.current.requestId ||
+        approval.message.id !== askedApproval.current.messageId)
+    ) {
       askedApproval.current = null;
     }
     if (askedQuestion.current && question?.card?.requestId !== askedQuestion.current.requestId) {
@@ -390,8 +395,13 @@ function Call({ bot }: { bot: Bot }) {
       move("working");
       hush();
     }
-    if (approval && askedApproval.current !== approval.requestId && phase !== "speaking") {
-      askedApproval.current = approval.requestId;
+    if (
+      approval &&
+      (askedApproval.current?.requestId !== approval.requestId ||
+        askedApproval.current.messageId !== approval.message.id) &&
+      phase !== "speaking"
+    ) {
+      askedApproval.current = { requestId: approval.requestId, messageId: approval.message.id };
       spokenIds.current.add(approval.message.id);
       void sayThenListen(`${bot.name} wants to ${approval.tool}. ${approval.detail}. Should I allow it?`);
       return;

@@ -34,4 +34,13 @@ emulator-5554 device product:sdk model:Emulator transport_id:6
       { text: "Where to?", description: "Destination", id: "com.ubercab:id/input", className: "android.widget.TextView", bounds: [12, 100, 400, 180] },
     ]);
   });
+
+  it("caps adversarial UI dumps before materializing every node", () => {
+    const xml = Array.from({ length: 300 }, (_, index) =>
+      `<node text="row-${index}" resource-id="id-${index}" class="android.widget.TextView" bounds="[0,0][1,1]" />`
+    ).join("");
+    const nodes = parseUiNodes(xml);
+    expect(nodes).toHaveLength(250);
+    expect(nodes.at(-1)?.text).toBe("row-249");
+  });
 });

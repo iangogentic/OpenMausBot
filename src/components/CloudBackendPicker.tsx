@@ -8,10 +8,12 @@ import { cn } from "@/lib/cn";
 export function CloudBackendPicker({
   value,
   vpsSupported,
+  disabled = false,
   onChange,
 }: {
   value: CloudBackend;
   vpsSupported: boolean;
+  disabled?: boolean;
   onChange: (backend: CloudBackend) => void;
 }) {
   return (
@@ -24,17 +26,17 @@ export function CloudBackendPicker({
       </div>
       <div className="mt-2 flex overflow-hidden rounded-lg border border-hairline/40">
         {(["box", "vps"] as const).map((backend, i) => {
-          const disabled = backend === "vps" && !vpsSupported;
+          const optionDisabled = disabled || (backend === "vps" && !vpsSupported);
           return (
             <button
               key={backend}
-              disabled={disabled}
-              title={disabled ? "Self-hosted VPS requires Claude or an ACP engine" : undefined}
+              disabled={optionDisabled}
+              title={backend === "vps" && !vpsSupported ? "Self-hosted VPS requires Claude or an ACP engine" : undefined}
               onClick={() => onChange(backend)}
               className={cn(
                 "flex-1 py-1.5 text-[12px]",
                 i > 0 && "border-l border-hairline/40",
-                disabled && "cursor-not-allowed opacity-40",
+                optionDisabled && "cursor-not-allowed opacity-40",
                 value === backend ? "bg-raised text-ink" : "text-ink-secondary hover:bg-raised/60 hover:text-ink",
               )}
             >

@@ -1,0 +1,6 @@
+# Only this immutable supervisor may run as root. No credential wildcard, shell,
+# interpreter, arbitrary command, or SETENV grant crosses this seam. Provider
+# environment lives in the validated server-owned manifest instead.
+Defaults!/usr/local/libexec/openmaus-provider-supervisor env_keep += "OMB_PROVIDER_LAUNCH_MANIFEST"
+openmaus-server ALL=(root) NOPASSWD: /usr/local/libexec/openmaus-provider-supervisor -- *
+openmaus-server ALL=(root) NOPASSWD: /usr/local/libexec/openmaus-provider-supervisor --retire-owner

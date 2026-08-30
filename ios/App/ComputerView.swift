@@ -1,10 +1,9 @@
 // A bot's computer, live.
 //
 // The harness already screenshots a working bot every few seconds and pushes
-// the frame to any client that asked for it. This is that, and nothing more:
-// no clicking, no typing, no control. Watching is the useful half on a phone
-// — you want to know what it is doing, not to do it yourself on a screen the
-// size of a playing card.
+// the frame to any client that asked for it. Preview stays cheap; an explicitly
+// enabled phone can also take the same short, exclusive control lease as the
+// desktop app and open the provider's interactive viewer.
 //
 // Frames are expensive (hundreds of kilobytes of base64 each), so they are
 // off unless this view is on screen. `watchScreen` reopens the stream asking
@@ -21,10 +20,15 @@ struct ComputerView: View {
     let bot: Bot
     @EnvironmentObject private var session: Session
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var confirmingDesktop = false
     @State private var openingDesktop = false
     @State private var desktopURL: URL?
+    @State private var desktopAccess: Session.CloudDesktopAccess?
     @State private var desktopError: String?
+    @State private var heartbeatTask: Task<Void, Never>?
+    @State private var viewActive = false
+    @State private var desktopOwnerId = "phone-\(UUID().uuidString)"
 
     private var frame: ScreenFrame? { session.state.screens[bot.id] }
 
@@ -64,7 +68,7 @@ struct ComputerView: View {
             // A VPS-backed bot is "cloud" too, but the server refuses to mint
             // an interactive desktop for it — no button beats a dead one. An
             // older harness never sends cloudBackend, so nil keeps the button.
-            if current.computer == "cloud" && current.cloudBackend != "vps" {
+            if current.computer == "vm" || (current.computer == "cloud" && current.cloudBackend != "vps") {
                 VStack(spacing: 8) {
                     if let desktopError {
                         Text(desktopError)
@@ -80,13 +84,16 @@ struct ComputerView: View {
                                 .tint(.white)
                                 .frame(maxWidth: .infinity)
                         } else {
-                            Label("Open live cloud desktop", systemImage: "display")
+                            Label(
+                                current.computer == "vm" ? "Open live Local VM" : "Open live cloud desktop",
+                                systemImage: "display"
+                            )
                                 .frame(maxWidth: .infinity)
                         }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(openingDesktop)
-                    Text("Interactive VNC session. Access must be enabled for this phone in the Mac's Phone settings.")
+                    Text("Interactive desktop session. Closing hands control back and closes this app-owned stream.")
                         .font(.caption)
                         .foregroundStyle(Color.white.opacity(0.6))
                         .multilineTextAlignment(.center)
@@ -96,28 +103,62 @@ struct ComputerView: View {
                 .background(.ultraThinMaterial)
             }
         }
-        .alert("Open live cloud desktop?", isPresented: $confirmingDesktop) {
+        .alert(current.computer == "vm" ? "Open live Local VM?" : "Open live cloud desktop?", isPresented: $confirmingDesktop) {
             Button("Cancel", role: .cancel) {}
             Button("Open desktop") { Task { await openDesktop() } }
         } message: {
-            Text("This gives this phone full control of the cloud computer, including anything signed in inside it.")
+            Text(
+                current.computer == "vm"
+                    ? "This gives this phone full control of this bot's Local VM on your OpenMaus server. The viewer is tied to this phone, bot, VM generation, and short control lease."
+                    : "This gives this phone full control of the cloud computer, including anything signed in inside it. A provider link intentionally copied elsewhere can remain valid until ascii.dev expires it, normally within 10 minutes."
+            )
         }
         .sheet(
             isPresented: Binding(
                 get: { desktopURL != nil },
                 set: { if !$0 { desktopURL = nil } }
-            )
+            ),
+            onDismiss: { Task { await closeDesktop() } }
         ) {
             if let desktopURL {
-                CloudDesktopBrowser(url: desktopURL)
-                    .ignoresSafeArea()
+                NavigationStack {
+                    CloudDesktopBrowser(url: desktopURL)
+                        .ignoresSafeArea(edges: .bottom)
+                        .navigationTitle(current.computer == "vm" ? "Live Local VM" : "Live cloud desktop")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button("Done") { self.desktopURL = nil }
+                            }
+                        }
+                }
             }
         }
         .onAppear {
+            viewActive = true
             session.watchScreen(of: bot.id)
         }
         .onDisappear {
+            viewActive = false
             session.stopWatchingScreen(of: bot.id)
+            Task { await closeDesktop() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // iOS may suspend networking immediately in the background. Close
+            // and release while there is still execution time instead of
+            // retaining an interactive browser with no heartbeat.
+            if phase != .active { Task { await closeDesktop() } }
+        }
+        .onChange(of: session.state.computerControl[current.id]?.held) { _, held in
+            guard held == false, let expectedAccess = desktopAccess else { return }
+            // Stream events carry no lease token and can cross a later L2 take
+            // response. Validate the exact current proof before closing it.
+            Task { await reconcileReportedLeaseLoss(expectedAccess) }
+        }
+        .onChange(of: session.status) { _, status in
+            guard status != .live, desktopAccess != nil else { return }
+            desktopError = "Phone control ended because the computer connection closed."
+            Task { await closeDesktop() }
         }
     }
 
@@ -145,9 +186,124 @@ struct ComputerView: View {
         desktopError = nil
         defer { openingDesktop = false }
         do {
-            desktopURL = try await session.cloudDesktop(for: current)
+            let access = try await session.cloudDesktop(for: current, ownerId: desktopOwnerId)
+            guard viewActive, scenePhase == .active else {
+                await session.releaseCloudDesktop(
+                    botId: current.id,
+                    ownerId: access.ownerId,
+                    leaseToken: access.leaseToken
+                )
+                return
+            }
+            desktopAccess = access
+            desktopURL = access.url
+            startHeartbeat(access)
         } catch {
             desktopError = error.localizedDescription
         }
+    }
+
+    @MainActor
+    private func startHeartbeat(_ access: Session.CloudDesktopAccess) {
+        heartbeatTask?.cancel()
+        heartbeatTask = Task {
+            func uptimeMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
+            var watchdog = CloudDesktopLeaseWatchdog(
+                proofUptimeMs: uptimeMs(),
+                serverLeaseTtlMs: access.leaseTtlMs
+            )
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if Task.isCancelled { return }
+                guard desktopAccess?.leaseToken == access.leaseToken else { return }
+                if watchdog.isExpired(nowUptimeMs: uptimeMs()) {
+                    await closeDesktop(
+                        expectedAccess: access,
+                        failureMessage: "Phone control ended because its safety heartbeat expired."
+                    )
+                    return
+                }
+                let probe = await session.probeCloudDesktopLease(
+                    botId: current.id,
+                    ownerId: access.ownerId,
+                    leaseToken: access.leaseToken
+                )
+                guard cloudDesktopLeaseIsCurrent(
+                    desktopAccess?.leaseIdentity,
+                    expected: access.leaseIdentity
+                ) else { return }
+                switch probe {
+                case let .held(leaseTtlMs):
+                    watchdog.renew(
+                        proofUptimeMs: uptimeMs(),
+                        serverLeaseTtlMs: leaseTtlMs ?? access.leaseTtlMs
+                    )
+                    continue
+                case .retry:
+                    if watchdog.isExpired(nowUptimeMs: uptimeMs()) {
+                        await closeDesktop(
+                            expectedAccess: access,
+                            failureMessage: "Phone control ended because the server could not renew it safely."
+                        )
+                        return
+                    }
+                    continue
+                case let .invalid(message):
+                    await closeDesktop(
+                        expectedAccess: access,
+                        failureMessage: "Phone control ended: \(message)"
+                    )
+                    return
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func reconcileReportedLeaseLoss(_ expectedAccess: Session.CloudDesktopAccess) async {
+        let probe = await session.probeCloudDesktopLease(
+            botId: current.id,
+            ownerId: expectedAccess.ownerId,
+            leaseToken: expectedAccess.leaseToken
+        )
+        guard cloudDesktopLeaseIsCurrent(
+            desktopAccess?.leaseIdentity,
+            expected: expectedAccess.leaseIdentity
+        ) else { return }
+        if case let .invalid(message) = probe {
+            await closeDesktop(
+                expectedAccess: expectedAccess,
+                failureMessage: "Phone control was handed back or revoked: \(message)"
+            )
+        }
+    }
+
+    @MainActor
+    private func closeDesktop(
+        expectedAccess: Session.CloudDesktopAccess? = nil,
+        failureMessage: String? = nil
+    ) async {
+        // A heartbeat for L1 can finish after this view has already released
+        // L1 and opened L2. Check before touching any current UI/task state;
+        // stale L1 must not cancel, close, or release its successor.
+        if let expectedAccess {
+            guard cloudDesktopLeaseIsCurrent(
+                desktopAccess?.leaseIdentity,
+                expected: expectedAccess.leaseIdentity
+            ) else { return }
+        }
+        if let failureMessage { desktopError = failureMessage }
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        desktopURL = nil
+        guard let access = desktopAccess else { return }
+        // Clear first: sheet dismissal, scene changes, and view teardown can
+        // arrive together. Only the first caller owns the release request.
+        desktopAccess = nil
+        await session.releaseCloudDesktop(
+            botId: current.id,
+            ownerId: access.ownerId,
+            leaseToken: access.leaseToken
+        )
     }
 }

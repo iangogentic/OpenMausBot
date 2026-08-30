@@ -1,0 +1,197 @@
+#!/usr/bin/python3
+"""Install the UID-scoped provider egress firewall as one nft transaction."""
+
+import os
+import pwd
+import copy
+import json
+import subprocess
+import sys
+
+
+NFT = "/usr/bin/nft"
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+
+
+def rules(uid: int) -> str:
+    return f"""
+destroy table inet openmaus_provider
+table inet openmaus_provider {{
+  chain output {{
+    type filter hook output priority -100; policy accept;
+    meta skuid {uid} limit rate over 50 mbytes/second burst 100 mbytes drop comment \"provider-bandwidth-v1\"
+    meta skuid {uid} ip daddr 127.0.0.1 tcp dport 8799 accept comment \"provider-harness-v4-v1\"
+    meta skuid {uid} ip6 daddr ::1 tcp dport 8799 accept comment \"provider-harness-v6-v1\"
+    meta skuid {uid} ip daddr 100.100.100.100 udp dport 53 accept comment \"provider-dns-v4-udp-v1\"
+    meta skuid {uid} ip daddr 100.100.100.100 tcp dport 53 accept comment \"provider-dns-v4-tcp-v1\"
+    meta skuid {uid} ip6 daddr fd7a:115c:a1e0::53 udp dport 53 accept comment \"provider-dns-v6-udp-v1\"
+    meta skuid {uid} ip6 daddr fd7a:115c:a1e0::53 tcp dport 53 accept comment \"provider-dns-v6-tcp-v1\"
+    meta skuid {uid} ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 224.0.0.0/4, 240.0.0.0/4 }} reject with icmpx type admin-prohibited comment \"provider-private-v4-v1\"
+    meta skuid {uid} ip6 daddr {{ ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8 }} reject with icmpx type admin-prohibited comment \"provider-private-v6-v1\"
+    oifname \"ombvm*\" ip saddr 127.0.0.0/8 tcp dport 6901 accept comment \"vm-host-viewer-output-v1\"
+    oifname \"ombvm*\" drop comment \"vm-host-output-deny-v1\"
+  }}
+  chain input {{
+    type filter hook input priority -150; policy accept;
+    iifname \"ombvm*\" drop comment \"vm-host-deny-v1\"
+  }}
+  chain forward {{
+    type filter hook forward priority -150; policy accept;
+    iifname \"ombvm*\" limit rate over 100 mbytes/second burst 200 mbytes drop comment \"vm-bandwidth-v1\"
+    iifname \"ombvm*\" oifname \"ombvm*\" drop comment \"vm-cross-deny-v1\"
+    iifname \"ombvm*\" ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 224.0.0.0/4, 240.0.0.0/4 }} reject with icmpx type admin-prohibited comment \"vm-private-v4-v1\"
+    iifname \"ombvm*\" ip6 daddr {{ ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8 }} reject with icmpx type admin-prohibited comment \"vm-private-v6-v1\"
+    iifname \"ombvm*\" accept comment \"vm-public-egress-v1\"
+    iifname \"lo\" oifname \"ombvm*\" ip saddr 127.0.0.0/8 tcp dport 6901 ct state new accept comment \"vm-loopback-viewer-v1\"
+    oifname \"ombvm*\" ct state established,related accept comment \"vm-return-v1\"
+    oifname \"ombvm*\" drop comment \"vm-unsolicited-inbound-deny-v1\"
+  }}
+}}
+"""
+
+
+def semantic_objects(document: object) -> list[dict]:
+    if not isinstance(document, dict) or not isinstance(document.get("nftables"), list):
+        raise RuntimeError("nft JSON output is invalid")
+    objects: list[dict] = []
+    for raw in document["nftables"]:
+        if not isinstance(raw, dict):
+            raise RuntimeError("nft JSON output contains a non-object command")
+        if set(raw) == {"metainfo"}:
+            continue
+        # `--check --echo` also reports the release's leading destroy command.
+        # It is intentionally absent from a live table listing and is the only
+        # non-add command the expected stream may contain.
+        if set(raw) in ({"destroy"}, {"delete"}):
+            command = next(iter(raw))
+            destroyed = raw[command]
+            if destroyed != {"table": {"family": "inet", "name": "openmaus_provider"}}:
+                raise RuntimeError("nft JSON output contains an unexpected destroy command")
+            continue
+        current = raw["add"] if set(raw) == {"add"} else raw
+        if not isinstance(current, dict) or len(current) != 1:
+            raise RuntimeError("nft JSON output contains an unexpected command")
+        kind, value = next(iter(current.items()))
+        if kind not in ("table", "chain", "rule") or not isinstance(value, dict):
+            # A named set/map/counter/flowtable or any future object is policy
+            # authority too. This release uses none, so fail closed instead of
+            # silently dropping it from comparison.
+            raise RuntimeError(f"nft JSON output contains an unexpected {kind} object")
+        normalized = copy.deepcopy(value)
+        # Kernel-assigned location metadata is the only non-policy material.
+        # Preserve every other present field so flags/comments/device binds and
+        # future semantic properties cannot be added without failing equality.
+        normalized.pop("handle", None)
+        normalized.pop("index", None)
+        objects.append({kind: normalized})
+    if not objects or list(objects[0]) != ["table"] or sum("table" in item for item in objects) != 1:
+        raise RuntimeError("nft JSON output omitted the policy table")
+    return objects
+
+
+def json_command(argv: list[str], *, input_text: str | None = None) -> object:
+    result = subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=SAFE_ENV,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or "nft JSON command failed").strip())
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("nft did not return valid JSON") from error
+
+
+def validate_loaded(uid: int) -> None:
+    # Ask the same installed nft parser to compile this release's native
+    # policy without applying it, then compare the complete normalized JSON
+    # object stream to the live kernel table. This attests chain hooks,
+    # priorities, policies, expression trees, verdicts, rule order, UID,
+    # CIDR sets, rates, and comments; handles/counters alone are volatile.
+    expected = json_command(
+        [NFT, "--json", "--numeric", "--check", "--echo", "--file", "-"],
+        input_text=rules(uid),
+    )
+    loaded = json_command(
+        [NFT, "--json", "--numeric", "--stateless", "list", "table", "inet", "openmaus_provider"],
+    )
+    if semantic_objects(expected) != semantic_objects(loaded):
+        raise RuntimeError("provider firewall semantic JSON does not match this release")
+
+
+def normalizer_self_test() -> None:
+    table = {"family": "inet", "name": "openmaus_provider"}
+    chain = {
+        "family": "inet", "table": "openmaus_provider", "name": "output",
+        "type": "filter", "hook": "output", "prio": -100, "policy": "accept",
+    }
+    rule = {
+        "family": "inet", "table": "openmaus_provider", "chain": "output",
+        "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 947}}, {"drop": None}],
+        "comment": "fixture-v1",
+    }
+    expected = {"nftables": [{"metainfo": {}}, {"add": {"table": table}}, {"add": {"chain": chain}}, {"add": {"rule": rule}}]}
+    loaded = {"nftables": [{"table": {**table, "handle": 1}}, {"chain": {**chain, "handle": 2}}, {"rule": {**rule, "handle": 3}}]}
+    baseline = semantic_objects(expected)
+    if baseline != semantic_objects(loaded):
+        raise RuntimeError("nft semantic normalizer rejected equivalent policies")
+    for mutation in (
+        lambda value: value["nftables"][1]["chain"].update({"prio": 0}),
+        lambda value: value["nftables"][2]["rule"]["expr"].append({"accept": None}),
+        lambda value: value["nftables"][0]["table"].update({"flags": ["dormant"]}),
+        lambda value: value["nftables"].append({"rule": {**rule, "comment": "extra"}}),
+    ):
+        drift = copy.deepcopy(loaded)
+        mutation(drift)
+        if baseline == semantic_objects(drift):
+            raise RuntimeError("nft semantic normalizer accepted policy drift")
+    unexpected = copy.deepcopy(loaded)
+    unexpected["nftables"].append({"set": {"family": "inet", "table": "openmaus_provider", "name": "shadow"}})
+    try:
+        semantic_objects(unexpected)
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("nft semantic normalizer accepted an extra policy object")
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--normalizer-self-test"]:
+        try:
+            normalizer_self_test()
+            return 0
+        except RuntimeError as error:
+            print(f"openmaus provider network self-test refused: {error}", file=sys.stderr)
+            return 69
+    if os.geteuid() != 0 or sys.argv[1:] not in (["--apply"], ["--check"]):
+        return 64
+    try:
+        account = pwd.getpwnam("openmaus-provider")
+        if account.pw_uid == 0:
+            raise RuntimeError("provider UID may not be root")
+        if sys.argv[1] == "--apply":
+            result = subprocess.run(
+                [NFT, "--file", "-"],
+                input=rules(account.pw_uid),
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=SAFE_ENV,
+            )
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or "nft transaction failed").strip())
+        validate_loaded(account.pw_uid)
+        return 0
+    except (KeyError, OSError, RuntimeError) as error:
+        print(f"openmaus provider network refused: {error}", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

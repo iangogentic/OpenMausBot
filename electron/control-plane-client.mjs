@@ -1,9 +1,12 @@
+import { readBoundedResponseJson } from "./bounded-response.mjs";
+
 const INSTALLATION_CREDENTIAL =
   /^omb_install_[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/;
 const INSTALLATION_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CLIENT_INSTANCE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REQUEST_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_CONTROL_PLANE_RESPONSE_BYTES = 1024 * 1024;
 
 const stringValue = (value) => (typeof value === "string" ? value : null);
 
@@ -205,7 +208,11 @@ export function createControlPlaneClient({
 
     let payload = null;
     if (response.status !== 204) {
-      payload = await response.json().catch(() => null);
+      payload = await readBoundedResponseJson(
+        response,
+        MAX_CONTROL_PLANE_RESPONSE_BYTES,
+        "control-plane response exceeded 1 MB",
+      ).catch(() => null);
     }
     if (!response.ok) {
       const rawCode = stringValue(plainObject(payload)?.error);

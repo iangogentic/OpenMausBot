@@ -8,9 +8,11 @@
 // MAX_FILES files or MAX_FILE_BYTES per file, and only markdown is ever
 // requested (v1 imports are markdown-only by policy).
 import { z } from "zod";
+import { readBoundedResponseText } from "./bounded-response.ts";
 
 const MAX_FILES = 30;
 const MAX_FILE_BYTES = 256 * 1024;
+const MAX_LISTING_BYTES = 1024 * 1024;
 const API = "https://api.github.com";
 
 export interface FetchedSkill {
@@ -30,12 +32,12 @@ interface Target {
 export function parseSkillSource(input: string): Target | { rawUrl: string } | { error: string } {
   const text = input.trim();
   if (!text) return { error: "paste a GitHub repository, folder, or SKILL.md URL" };
-  if (/^https?:\/\/raw\.githubusercontent\.com\/.+\/SKILL\.md$/i.test(text)) return { rawUrl: text };
-  const blob = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+SKILL\.md)$/i);
+  if (/^https:\/\/raw\.githubusercontent\.com\/.+\/SKILL\.md$/i.test(text)) return { rawUrl: text };
+  const blob = text.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+SKILL\.md)$/i);
   if (blob) {
     return { rawUrl: `https://raw.githubusercontent.com/${blob[1]}/${blob[2]}/${blob[3]}/${blob[4]}` };
   }
-  const tree = text.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/tree\/([^/]+)(?:\/(.*))?)?\/?$/i);
+  const tree = text.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/tree\/([^/]+)(?:\/(.*))?)?\/?$/i);
   if (tree) {
     return { owner: tree[1]!, repo: tree[2]!, ref: tree[3], path: tree[4] ?? "" };
   }
@@ -66,17 +68,28 @@ function asEntries(listing: z.infer<typeof CONTENT_LISTING>): ContentEntry[] {
 async function fetchListing(url: string, fetcher: typeof fetch): Promise<ContentEntry[]> {
   const response = await fetcher(url, {
     headers: { accept: "application/vnd.github+json", "user-agent": "OpenMausBot-skills" },
+    redirect: "error",
+    signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) throw new Error(`GitHub API ${response.status} for ${url}`);
-  return asEntries(CONTENT_LISTING.parse(await response.json()));
+  const raw = await readBoundedResponseText(response, MAX_LISTING_BYTES, "GitHub directory listing is too large");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("GitHub returned an invalid directory listing");
+  }
+  return asEntries(CONTENT_LISTING.parse(parsed));
 }
 
 async function fetchText(url: string, fetcher: typeof fetch): Promise<string> {
-  const response = await fetcher(url, { headers: { "user-agent": "OpenMausBot-skills" } });
+  const response = await fetcher(url, {
+    headers: { "user-agent": "OpenMausBot-skills" },
+    redirect: "error",
+    signal: AbortSignal.timeout(10_000),
+  });
   if (!response.ok) throw new Error(`download failed (${response.status})`);
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_FILE_BYTES) throw new Error("file is larger than the 256KB import cap");
-  return text;
+  return readBoundedResponseText(response, MAX_FILE_BYTES, "file is larger than the 256KB import cap");
 }
 
 async function listDir(target: Target, path: string, fetcher: typeof fetch): Promise<ContentEntry[]> {

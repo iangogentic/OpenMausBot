@@ -30,6 +30,11 @@ computer. For the paired phone, enable **Cloud desktop** under **Settings →
 Phone**, open a bot configured for **Cloud box**, choose its computer
 preview on iPhone, and confirm **Open live cloud desktop**. The app requests a
 fresh HTTPS viewer session and does not use or store the provider API key.
+The viewer is an ephemeral in-app WebKit surface with no address/share chrome,
+popup windows, external main-frame navigation, or web permission grants. Its
+Done button releases the phone's exact control lease; a raw provider URL copied
+outside the app can remain valid until ascii.dev's normal expiry (up to 10
+minutes), because ordinary hand-back does not stop the guest's running work.
 
 For the direct remote alternative, both devices may be signed into the same
 Tailscale network and the reviewer may enter the computer's `.ts.net` MagicDNS

@@ -176,7 +176,7 @@ describe("CodexDriver turns (fake app-server)", () => {
           args: ["/tmp/connector-proxy.js"],
           env: {
             OMB_CONNECTOR_UPSTREAM_URL: "http://127.0.0.1:8799/api/internal/connectors/mcp",
-            OMB_COMMS_TOKEN: "per-boot-token",
+            OMB_CONNECTOR_CAPABILITY_TOKEN: "connector-turn-token",
           },
         },
       },
@@ -184,9 +184,9 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((event) => event.type === "turn.completed");
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv.join(" ")).toContain("mcp_servers.openmausbot_connectors.command");
-    expect(seen.argv.join(" ")).toContain("OMB_COMMS_TOKEN");
-    expect(seen.argv.join(" ")).not.toContain("per-boot-token");
-    expect(seen.env.OMB_COMMS_TOKEN).toBe("per-boot-token");
+    expect(seen.argv.join(" ")).toContain("OMB_CONNECTOR_CAPABILITY_TOKEN");
+    expect(seen.argv.join(" ")).not.toContain("connector-turn-token");
+    expect(seen.env.OMB_CONNECTOR_CAPABILITY_TOKEN).toBe("connector-turn-token");
   });
 
   it("mounts peer-agent comms without placing the comms token in argv", async () => {
@@ -204,10 +204,7 @@ describe("CodexDriver turns (fake app-server)", () => {
           env: {
             ELECTRON_RUN_AS_NODE: "1",
             OMB_HARNESS_URL: "http://127.0.0.1:8799",
-            OMB_BOT_ID: "captain",
-            OMB_THREAD_ID: "t-agents",
-            OMB_COMMS_TOKEN: "peer-comms-secret",
-            OMB_TURN_DEPTH: "0",
+            OMB_AGENTS_CAPABILITY_TOKEN: "agents-turn-token",
           },
         },
       },
@@ -217,10 +214,66 @@ describe("CodexDriver turns (fake app-server)", () => {
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv.join(" ")).toContain("mcp_servers.agents.command");
     expect(seen.argv.join(" ")).toContain("/tmp/agents-proxy.js");
-    expect(seen.argv.join(" ")).toContain("OMB_COMMS_TOKEN");
-    expect(seen.argv.join(" ")).not.toContain("peer-comms-secret");
-    expect(seen.env.OMB_COMMS_TOKEN).toBe("peer-comms-secret");
+    expect(seen.argv.join(" ")).toContain("OMB_AGENTS_CAPABILITY_TOKEN");
+    expect(seen.argv.join(" ")).not.toContain("agents-turn-token");
+    expect(seen.env.OMB_AGENTS_CAPABILITY_TOKEN).toBe("agents-turn-token");
     expect(instance.adapter.capabilities.agentsMcp).toBe(true);
+  });
+
+  it("keeps peer-agent and connector turn capabilities distinct when both MCPs mount", async () => {
+    await create();
+    const dump = join(scratch, "combined-capabilities.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-combined-capabilities",
+      text: "coordinate and check mail",
+      integrations: {
+        composio: {
+          command: process.execPath,
+          args: ["/tmp/connector-proxy.js"],
+          env: {
+            OMB_CONNECTOR_CAPABILITY_TOKEN: "connector-token",
+          },
+        },
+        agents: {
+          command: process.execPath,
+          args: ["/tmp/agents-proxy.js"],
+          env: {
+            OMB_AGENTS_CAPABILITY_TOKEN: "agents-token",
+          },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.OMB_CONNECTOR_CAPABILITY_TOKEN).toBe("connector-token");
+    expect(seen.env.OMB_AGENTS_CAPABILITY_TOKEN).toBe("agents-token");
+    expect(seen.argv.join(" ")).not.toContain("connector-token");
+    expect(seen.argv.join(" ")).not.toContain("agents-token");
+  });
+
+  it("mounts Ian Brain without placing its exact-turn capability in argv", async () => {
+    await create();
+    const dump = join(scratch, "ian-brain-capability.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-ian-brain-capability",
+      text: "read my wiki",
+      integrations: {
+        ianBrain: {
+          url: "http://127.0.0.1:8799/api/internal/ian-brain/mcp",
+          token: "ian-brain-turn-token",
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv.join(" ")).toContain("mcp_servers.ian_brain.command");
+    expect(seen.argv.join(" ")).toContain("ian-brain-proxy");
+    expect(seen.argv.join(" ")).not.toContain("ian-brain-turn-token");
+    expect(seen.env.OMB_IAN_BRAIN_CAPABILITY_TOKEN).toBe("ian-brain-turn-token");
   });
 
   it("mounts the Local VM computer MCP server without placing credentials in argv", async () => {
@@ -259,7 +312,10 @@ describe("CodexDriver turns (fake app-server)", () => {
       threadId: "t-remote-computer",
       text: "take a screenshot",
       integrations: {
-        computer: { boxId: "box-123", token: "remote-secret" },
+        computer: {
+          boxId: "box-123",
+          broker: { url: "http://127.0.0.1:8799/api/internal/box", token: "turn-capability" },
+        },
       },
     });
     await recorder.until((event) => event.type === "turn.completed");
@@ -267,10 +323,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv.join(" ")).toContain("mcp_servers.computer.command");
     expect(seen.argv.join(" ")).toContain("computer-proxy");
-    expect(seen.argv.join(" ")).toContain("OGB_BOX_TOKEN");
-    expect(seen.argv.join(" ")).not.toContain("remote-secret");
+    expect(seen.argv.join(" ")).toContain("OMB_BOX_CAPABILITY_TOKEN");
+    expect(seen.argv.join(" ")).not.toContain("turn-capability");
     expect(seen.env.OGB_BOX_ID).toBe("box-123");
-    expect(seen.env.OGB_BOX_TOKEN).toBe("remote-secret");
+    expect(seen.env.OMB_BOX_CAPABILITY_TOKEN).toBe("turn-capability");
+    expect(seen.env.OGB_BOX_TOKEN).toBeUndefined();
   });
 
   it("sends the local provider when the picker id is custom-encoded", async () => {
@@ -291,7 +348,45 @@ describe("CodexDriver turns (fake app-server)", () => {
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv).toContain("model_providers.unsloth.base_url=\"http://127.0.0.1:8888/v1\"");
     expect(JSON.stringify(seen.argv)).not.toContain("unsloth-secret");
-    expect(seen.env.OPENMAUSBOT_LOCAL_UNSLOTH_API_KEY).toBe("unsloth-secret");
+    // Upstream host credentials are reserved from provider children. Direct
+    // adapter callers get the non-secret local fallback; production dispatch
+    // always supplies the exact-turn model relay below.
+    expect(seen.env.OPENMAUSBOT_LOCAL_UNSLOTH_API_KEY).toBe("local");
+  });
+
+  it("routes local models through an exact-turn relay without exposing the upstream source", async () => {
+    await create({
+      environment: {
+        UNSLOTH_STUDIO_AUTH_TOKEN: "real-upstream-secret",
+        OPENMAUSBOT_DESKTOP2_QWEN_URL: "http://127.0.0.1:18011/v1",
+      },
+    });
+    const dump = join(scratch, "relay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    const relay = {
+      openaiBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay/v1",
+      anthropicBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay",
+      token: "opaque-exact-turn-model-token-123456",
+      host: "desktop2_qwen",
+      model: "Qwen3.8-27B-Abliterated",
+    };
+    await instance.adapter.sendTurn({
+      threadId: "t-local-relay",
+      text: "hi",
+      model: "desktop2_qwen::Qwen3.8-27B-Abliterated",
+      integrations: { modelRelay: relay },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    const threadStart = seen.calls.find((call: { method: string }) => call.method === "thread/start");
+    expect(threadStart.params).toMatchObject({
+      model: relay.model,
+      modelProvider: "openmaus_desktop2_qwen",
+    });
+    expect(JSON.stringify(seen)).toContain(relay.openaiBaseUrl);
+    expect(JSON.stringify(seen)).toContain(relay.token);
+    expect(JSON.stringify(seen)).not.toContain("http://127.0.0.1:18011/v1");
+    expect(JSON.stringify(seen)).not.toContain("real-upstream-secret");
   });
 
   it("streams agentMessage deltas without re-emitting the settled text", async () => {
@@ -546,6 +641,49 @@ describe("CodexDriver turns (fake app-server)", () => {
       recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-codex-continue"),
     ).resolves.toMatchObject({ ok: true });
     await Promise.allSettled([first, second]);
+  }, 20_000);
+
+  it("drains a cancelled retry before admitting a successor on the same thread", async () => {
+    process.env.FAKE_CODEX_TRANSIENTS = "1";
+    process.env.FAKE_CODEX_STATE = join(scratch, "codex-launches-stop-drain");
+    process.env.FAKE_CODEX_RETRY_SCALE = "0.2";
+    await create();
+
+    const threadId = "t-codex-stop-drain";
+    await instance.adapter.sendTurn({ threadId, turnId: "retired-generation", text: "retry, then stop" });
+    const retry = await recorder.until(
+      (event) => event.type === "turn.retrying" && event.threadId === threadId,
+    );
+    const retiredBackoffMs = retry.type === "turn.retrying" ? retry.delayMs : 1_000;
+
+    // Stop must cancel the pending delay, settle the retired handle, and only
+    // then return. Otherwise this immediate successor is rejected as busy and
+    // the old timer can later erase its active-map entry.
+    await instance.adapter.interruptTurn(threadId);
+    expect(instance.adapter.hasSession(threadId)).toBe(false);
+    expect(recorder.events.filter(
+      (event) => event.type === "turn.completed" && event.turnId === "retired-generation",
+    )).toHaveLength(1);
+
+    process.env.FAKE_CODEX_MODE = "approval";
+    await instance.adapter.sendTurn({ threadId, turnId: "successor-generation", text: "stay active" });
+    const opened = await recorder.until(
+      (event) => event.type === "request.opened" && event.turnId === "successor-generation",
+    );
+
+    // Wait beyond the retired generation's original scaled backoff. Its late
+    // continuation must neither relaunch nor delete the successor handle.
+    await new Promise((resolve) => setTimeout(
+      resolve,
+      Math.ceil(retiredBackoffMs * 0.2) + 100,
+    ));
+    expect(instance.adapter.hasSession(threadId)).toBe(true);
+    await expect(
+      instance.adapter.respondToRequest(threadId, opened.requestId!, { behavior: "allow" }),
+    ).resolves.toBe("allowed-once");
+    await expect(recorder.until(
+      (event) => event.type === "turn.completed" && event.turnId === "successor-generation",
+    )).resolves.toMatchObject({ ok: true });
   }, 20_000);
 
   it("never retries after agent text already streamed (duplicate-text hazard)", async () => {

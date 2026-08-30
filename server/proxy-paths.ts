@@ -38,9 +38,12 @@ export const SPAWNED_PROXIES = {
   permission: resolveProxy("permission-proxy"),
   containerMcp: resolveProxy("container-mcp"),
   vpsContainerMcp: resolveProxy("vps-container-mcp"),
+  gatedMcp: resolveProxy("gated-mcp"),
+  physicalMcp: resolveProxy("physical-mcp-proxy"),
   agents: resolveProxy("drivers/agents-proxy"),
   dweb: resolveProxy("drivers/dweb-proxy"),
   connectors: resolveProxy("connector-proxy"),
+  ianBrain: resolveProxy("ian-brain-proxy"),
   phone: resolveProxy("drivers/phone-proxy"),
   // Loaded by the external `pi` process via `-e`, not by this server — but
   // resolved through the same single source of truth so the packaged layout

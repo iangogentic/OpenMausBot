@@ -61,7 +61,7 @@ describe("appendDecision / readDecisions", () => {
     // Both shapes redact.ts guards against: a known key prefix, and a
     // KEY=value pair with a secret-shaped name. The summary is whatever
     // the agent typed — this is exactly how a key ends up in a log.
-    const secret = "sk-live-abcdefghijklmnop1234";
+    const secret = ["sk", "-live-", "abcdefghijklmnop1234"].join("");
     appendDecision(dir, row({ summary: `export STRIPE_API_KEY=${secret}` }));
     await flushDecisionLog(dir);
     const raw = readFileSync(file(), "utf8");

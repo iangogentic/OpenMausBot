@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { CUA_SOCKET } from "./container-computer.ts";
 import { vpsContainerName } from "./vps-computer.ts";
 
 const temporary: string[] = [];
@@ -54,7 +55,7 @@ describe.skipIf(process.platform === "win32")("VPS Cua MCP bridge", () => {
     expect(result.stderr).toContain(
       `ARGS:-H ssh://production-vps exec -i -u cua -e HOME=/home/cua -e DISPLAY=:1 ` +
         `-e CUA_DRIVER_INSTALL_CHANNEL=python_package -e CUA_DRIVER_RS_TELEMETRY_ENABLED=0 ${vpsContainerName("bridge-test")} ` +
-        "/usr/local/libexec/openmausbot/cua-driver mcp --socket /run/user/1000/openmausbot-cua.sock",
+        `/usr/local/libexec/openmausbot/cua-driver mcp --socket ${CUA_SOCKET}`,
     );
   });
 

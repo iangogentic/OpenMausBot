@@ -91,23 +91,50 @@ export class RoomTurnDeadline {
   }
 }
 
-/** Completes the active room turn when its activity watchdog stalls. */
-export class RoomTurnStallRegistry {
-  private handlers = new Map<string, () => void>();
+export type RoomTurnForcedCompletion = "stalled" | "provider_reloaded";
 
-  register(threadId: string, handler: () => void): () => void {
-    this.handlers.set(threadId, handler);
+/** Completes the exact active room turn when an out-of-band owner stops it.
+ *
+ * The activity watchdog only knows the thread. Provider reload additionally
+ * supplies the dispatch generation, so a late reload cleanup can never settle
+ * a replacement turn that reused the room's stable thread id. */
+export class RoomTurnStallRegistry {
+  private handlers = new Map<string, {
+    generation?: string;
+    handler: (reason: RoomTurnForcedCompletion) => void;
+  }>();
+
+  register(
+    threadId: string,
+    handler: (reason: RoomTurnForcedCompletion) => void,
+    generation?: string,
+  ): () => void {
+    const registration = { generation, handler };
+    this.handlers.set(threadId, registration);
     return () => {
-      if (this.handlers.get(threadId) === handler) this.handlers.delete(threadId);
+      if (this.handlers.get(threadId) === registration) this.handlers.delete(threadId);
     };
   }
 
-  stall(threadId: string): boolean {
-    const handler = this.handlers.get(threadId);
-    if (!handler) return false;
+  private complete(
+    threadId: string,
+    reason: RoomTurnForcedCompletion,
+    generation?: string,
+  ): boolean {
+    const registration = this.handlers.get(threadId);
+    if (!registration) return false;
+    if (generation !== undefined && registration.generation !== generation) return false;
     this.handlers.delete(threadId);
-    handler();
+    registration.handler(reason);
     return true;
+  }
+
+  stall(threadId: string): boolean {
+    return this.complete(threadId, "stalled");
+  }
+
+  providerReloaded(threadId: string, generation: string): boolean {
+    return this.complete(threadId, "provider_reloaded", generation);
   }
 }
 

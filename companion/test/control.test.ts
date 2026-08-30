@@ -15,6 +15,8 @@ let port = 0;
 let devices: DeviceRegistry;
 let connectedDeviceIds: string[] = [];
 let disconnectedDeviceIds: string[] = [];
+let cloudDesktopDisconnectedDeviceIds: string[] = [];
+const CONTROL_SESSION_TOKEN = "s".repeat(48);
 
 const ask = async (
   method: string,
@@ -22,7 +24,11 @@ const ask = async (
   headers: Record<string, string> = {},
   body?: string,
 ): Promise<{ status: number; body: any }> => {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body });
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method,
+    headers: { "x-openmausbot-session": CONTROL_SESSION_TOKEN, ...headers },
+    body,
+  });
   const text = await res.text();
   try {
     return { status: res.status, body: JSON.parse(text) };
@@ -36,6 +42,7 @@ beforeAll(async () => {
   let hostedUrl: string | null = null;
   control = createControlServer({
     devices,
+    sessionToken: CONTROL_SESSION_TOKEN,
     companionPort: 8810,
     hostedUrl: () => hostedUrl,
     setHostedUrl: (next) => {
@@ -46,6 +53,9 @@ beforeAll(async () => {
     disconnectDevice: (deviceId) => {
       disconnectedDeviceIds.push(deviceId);
       connectedDeviceIds = connectedDeviceIds.filter((connectedId) => connectedId !== deviceId);
+    },
+    disconnectCloudDesktop: (deviceId) => {
+      cloudDesktopDisconnectedDeviceIds.push(deviceId);
     },
   });
   port = await new Promise<number>((resolve) =>
@@ -58,6 +68,19 @@ afterAll(async () => {
 });
 
 describe("origins the control server will change state for", () => {
+  it("requires the private app session even for originless loopback clients", async () => {
+    const base = `http://127.0.0.1:${port}`;
+    const before = devices.pairing();
+    expect((await fetch(`${base}/state`)).status).toBe(401);
+    expect((await fetch(`${base}/pairing`, { method: "POST" })).status).toBe(401);
+    expect((await fetch(`${base}/pairing`, {
+      method: "POST",
+      headers: { origin: base },
+    })).status).toBe(401);
+    expect(devices.pairing()).toEqual(before);
+    expect((await fetch(`${base}/`)).status).toBe(200);
+  });
+
   it("controls cloud desktop access per paired device", async () => {
     const { code } = devices.openPairing();
     const paired = devices.redeem(code, "iPhone");
@@ -68,6 +91,7 @@ describe("origins the control server will change state for", () => {
     expect(devices.authenticate(paired.token)?.cloudDesktopAccess).toBe(true);
     expect((await ask("DELETE", `/devices/${paired.device.id}/cloud-desktop`)).status).toBe(200);
     expect(devices.authenticate(paired.token)?.cloudDesktopAccess).toBe(false);
+    expect(cloudDesktopDisconnectedDeviceIds).toContain(paired.device.id);
     expect((await ask("POST", "/devices/missing/cloud-desktop")).status).toBe(404);
   });
 
@@ -110,12 +134,7 @@ describe("origins the control server will change state for", () => {
     expect((await ask("DELETE", "/pairing", { origin: "null" })).status).toBe(403);
   });
 
-  it("allows the page it serves, and no other loopback origin", async () => {
-    // Exactly this server's origin, not merely a loopback one. The page below
-    // is served from here and its writes carry this authority, so nothing is
-    // lost by narrowing — while a loopback origin on another port is another
-    // program's page, which has no more business opening a pairing window
-    // than a page on the internet does.
+  it("allows the authenticated app at the exact origin, and no other loopback origin", async () => {
     const { status } = await ask("POST", "/pairing", { origin: `http://127.0.0.1:${port}` });
     expect(status).toBe(201);
     expect((await ask("GET", "/state")).body.pairing).not.toBeNull();
@@ -130,9 +149,7 @@ describe("origins the control server will change state for", () => {
     expect((await ask("GET", "/state")).body.pairing).toBeNull();
   });
 
-  it("allows a client that sends no origin at all", async () => {
-    // The Electron main process, which is not a browser and is the normal
-    // desktop path. A CSRF check aimed at it would break the toggle.
+  it("allows the authenticated app when it sends no origin at all", async () => {
     expect((await ask("POST", "/pairing")).status).toBe(201);
     await ask("DELETE", "/pairing");
   });

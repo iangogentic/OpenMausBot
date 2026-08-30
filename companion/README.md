@@ -72,8 +72,26 @@ trusted-network-only rather than described as something it is not.
 With the harness already up (`pnpm dev:server`), from the repo root:
 
 ```sh
-pnpm companion
+sudo systemd-run --wait --collect --property=User=openmaus-companion \
+  --property='LoadCredential=openmausbot-ui-session:/etc/credstore/openmausbot-ui-session' \
+  --property='LoadCredential=openmausbot-companion-session:/etc/credstore/openmausbot-companion-session' \
+  pnpm companion
 ```
+
+The standalone sidecar deliberately refuses to start without both private,
+different systemd credentials (or Electron's private utility-process session
+channel). `openmausbot-ui-session` authorizes only upstream harness requests;
+`openmausbot-companion-session` authorizes only desktop pairing-control
+requests. It never accepts either raw bearer from argv or an ordinary process
+environment. The companion reads both once from systemd's private credential
+mount, closes the descriptors, and removes the directory path from its
+environment. Each credential must be a regular non-symlink file with no
+group/world permissions (`0600` or stricter).
+
+For the always-on Razer deployment use the dedicated **system** unit with
+`User=openmaus-companion`, not `systemd-run --user`. Both credential sources
+belong in root-owned `/etc/credstore` (`0700` directory, `0400` files). A user
+service under `/home/ian` does not protect either bearer from a provider shell.
 
 It prints where to point the phone, and where you pair:
 

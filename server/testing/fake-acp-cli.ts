@@ -6,6 +6,10 @@
 // turn. Failure modes mirror how real ACP agents misbehave:
 //
 //   FAKE_ACP_MODE   happy (default) | empty-reply | exit-early | fail-after-text | hang | no-auth | auth-required | permission
+//                   | output-no-newline (fragmented stdout exceeding the
+//                     trusted server's pre-newline byte budget)
+//                   | output-by-prompt (same, but only when prompt text
+//                     contains [hostile-output], for sibling-turn tests)
 //                   | interleave (message → tool → message → tool → message)
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
@@ -16,6 +20,8 @@
 //                     returns immediately, the peer runs after our turn)
 //                   | create-peer (a Chief creates a specialist, then delegates
 //                     work to it through the returned id)
+//                   | read-attachment (read the exact <attached-file> path
+//                     and reply with its bytes as base64)
 //                   | echo-gated (reply by echoing the full prompt, and when
 //                     FAKE_ACP_GATE_FILE is set hold the turn open until that
 //                     file exists — a deterministic busy window for the
@@ -35,7 +41,7 @@
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.FAKE_ACP_MODE ?? "happy";
 // opencode-shaped surface: the session carries its own model catalog and the
@@ -77,6 +83,11 @@ const dumpEnv = Object.fromEntries(
     "PATH",
     "HOME",
     "USERPROFILE",
+    "HERMES_HOME",
+    "PYTHONPATH",
+    "OPENMAUSBOT_HERMES_POLICY",
+    "OPENMAUSBOT_HERMES_RESTRICT_NATIVE",
+    "OPENMAUSBOT_HERMES_REQUIRED_MCP",
     "SystemRoot",
     "FAKE_ACP_MODE",
     "FAKE_ACP_RPC_DUMP",
@@ -97,12 +108,33 @@ const dumpEnv = Object.fromEntries(
     "KIMI_MODEL_BASE_URL",
     "KIMI_MODEL_PROVIDER_TYPE",
     "KIMI_MODEL_DISPLAY_NAME",
+    "OMB_MODEL_RELAY_OPENAI_BASE_URL",
+    "OMB_MODEL_RELAY_ANTHROPIC_BASE_URL",
+    "OMB_MODEL_RELAY_TOKEN",
+    "OMB_MODEL_RELAY_HOST",
+    "OMB_MODEL_RELAY_MODEL",
     "TEST_TURN_MODEL",
+    "TEST_PREPARED_ISOLATION",
   ].flatMap((key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]] as const)),
 );
 const dumpState: Record<string, unknown> = { argv, env: dumpEnv };
 if (process.env.FAKE_ACP_DUMP) {
   writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify({ argv, env: dumpEnv }, null, 2));
+}
+// The real Hermes Python sitecustomize policy writes this one-shot proof at
+// interpreter startup. Restricted Hermes driver tests use the protocol fake,
+// so mirror only that startup attestation; policy filtering itself is covered
+// by hermes-policy tests and a live Hermes smoke.
+if (
+  process.env.OPENMAUSBOT_HERMES_POLICY === "1" &&
+  process.env.OPENMAUSBOT_HERMES_POLICY_PROOF &&
+  process.env.OPENMAUSBOT_HERMES_POLICY_NONCE
+) {
+  writeFileSync(
+    process.env.OPENMAUSBOT_HERMES_POLICY_PROOF,
+    JSON.stringify({ version: 1, nonce: process.env.OPENMAUSBOT_HERMES_POLICY_NONCE }),
+    { mode: 0o600 },
+  );
 }
 if (argv.includes("--version")) {
   console.log("fake-acp 1.0.0");
@@ -372,6 +404,20 @@ function handle(msg: any) {
         out({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "fake acp: turn failed after streaming" } });
         return;
       }
+      const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+      if (mode === "output-no-newline" || (mode === "output-by-prompt" && promptText.includes("[hostile-output]"))) {
+        const fragment = "x".repeat(256 * 1024);
+        let remaining = 12;
+        const writeFragment = () => {
+          if (remaining-- <= 0) {
+            setInterval(() => {}, 1_000);
+            return;
+          }
+          process.stdout.write(fragment, () => setImmediate(writeFragment));
+        };
+        writeFragment();
+        return;
+      }
       const complete = () => {
         recordMethod("session/prompt.result");
         result(
@@ -438,7 +484,6 @@ function handle(msg: any) {
         // echoing the WHOLE prompt (system + turn text) lets a test assert
         // both what a drained turn was sent and what it was NOT sent (e.g.
         // the webhook untrusted-data paragraph a steered turn must not get)
-        const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
         const finish = () => {
           out({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { text: `echo: ${promptText}` } } } });
           complete();
@@ -453,6 +498,37 @@ function handle(msg: any) {
           return;
         }
         finish();
+        return;
+      }
+      if (mode === "read-attachment") {
+        const promptText = String(msg.params?.prompt?.[0]?.text ?? "");
+        const encodedPath = /<attached-file\s+path="([^"]+)"\s*\/?>/.exec(promptText)?.[1] ?? "";
+        const path = encodedPath
+          .replaceAll("&quot;", '"')
+          .replaceAll("&lt;", "<")
+          .replaceAll("&gt;", ">")
+          .replaceAll("&amp;", "&");
+        try {
+          const bytes = readFileSync(path);
+          out({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { text: `attachment-base64:${bytes.toString("base64")}` },
+              },
+            },
+          });
+          complete();
+        } catch (error) {
+          recordMethod("session/prompt.error");
+          out({
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: { code: -32000, message: `attachment read failed: ${error instanceof Error ? error.message : String(error)}` },
+          });
+        }
         return;
       }
       if (mode === "delegate-peer" && agentsMcp) {

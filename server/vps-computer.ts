@@ -32,6 +32,8 @@ export const VPS_MANAGED_LABEL = "com.openmausbot.vps";
 export const VPS_CONTAINER_LABEL = "com.openmausbot.container";
 export const VPS_VIEWER_LABEL = "com.openmausbot.vps-viewer";
 export const VPS_CONTAINER_PREFIX = "openmausbot-vps";
+export const VPS_CONFIG_CHANGE_ERROR =
+  "wait for the active VPS computer or viewer operation to finish before changing the SSH config alias";
 // SIGTERM must give ssh + docker time to tear down the remote exec before the
 // SIGKILL escalation; 1s was routinely too short over a WAN round-trip, and an
 // orphaned remote exec keeps the driver socket busy for the next command.
@@ -42,6 +44,59 @@ const CONTAINER_ID = /^[a-f0-9]{12,64}$/i;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/i;
 const PIDS_LIMIT = 512;
 const SCREENSHOT_PATH = "/tmp/openmausbot-vps-preview.png";
+
+let vpsConfigMutation = false;
+let activeVpsConfigUses = 0;
+
+export type VpsConfigUse = {
+  config: AppConfig;
+  release: () => void;
+};
+
+/** Hold one immutable SSH alias across a complete public lifecycle/viewer
+ * operation. AppConfig is mutated in place after saves, so a reference alone
+ * does not provide this guarantee. */
+export function acquireVpsConfigUse(cfg: AppConfig): VpsConfigUse {
+  if (vpsConfigMutation) {
+    throw Object.assign(new Error("VPS settings are being updated; retry the computer action"), { status: 409 });
+  }
+  activeVpsConfigUses += 1;
+  const config: AppConfig = {
+    ...cfg,
+    vps: cfg.vps ? { ...cfg.vps } : undefined,
+  };
+  let released = false;
+  return {
+    config,
+    release: () => {
+      if (released) return;
+      released = true;
+      activeVpsConfigUses = Math.max(0, activeVpsConfigUses - 1);
+    },
+  };
+}
+
+/** Exclude new alias-bound operations while a changed alias is committed. */
+export function beginVpsConfigMutation(
+  currentAlias: string | null,
+  nextAlias: string | null,
+): { allowed: true; changing: boolean; release: () => void } | { allowed: false; error: string } {
+  if (currentAlias === nextAlias) return { allowed: true, changing: false, release: () => {} };
+  if (vpsConfigMutation || activeVpsConfigUses > 0) {
+    return { allowed: false, error: VPS_CONFIG_CHANGE_ERROR };
+  }
+  vpsConfigMutation = true;
+  let released = false;
+  return {
+    allowed: true,
+    changing: true,
+    release: () => {
+      if (released) return;
+      released = true;
+      vpsConfigMutation = false;
+    },
+  };
+}
 const INTERNAL_VIEWER_PORT = 6901;
 const VIEWER_VERSION = "1";
 const lifecycleLocks = new Map<string, Promise<void>>();
@@ -57,8 +112,50 @@ const statusCache = new Map<string, { status: VpsComputerStatus; expiresAt: numb
 const viewerConnections = new Map<string, { privateIp: string; password: string }>();
 const desktopTunnels = new Map<
   string,
-  { child: ReturnType<typeof spawn>; joinUrl: string; expiry: ReturnType<typeof setTimeout> }
+  {
+    child: ReturnType<typeof spawn>;
+    viewerPort: number;
+    password: string;
+    generation: string;
+    targetKey: string;
+    containerId: string;
+    expiry: ReturnType<typeof setTimeout>;
+  }
 >();
+type VpsViewerChild = ReturnType<typeof spawn>;
+type VpsViewerOpening = {
+  targetKey: string;
+  authorizationId: string;
+  cancelled: boolean;
+  child: VpsViewerChild | null;
+  promise: Promise<VpsViewerTunnel>;
+};
+const desktopTunnelOpenings = new Map<string, VpsViewerOpening>();
+
+export interface VpsViewerTunnel {
+  /** Private loopback port on the harness host; never serialize directly. */
+  viewerPort: number;
+  /** Kept server-side until the same-origin proxy puts it in a URL fragment. */
+  password: string;
+  generation: string;
+  targetKey: string;
+  containerId: string;
+}
+
+export interface VpsViewerAuthorization {
+  /** Hash/opaque identity of the exact owner + lease; never a reusable API credential. */
+  id: string;
+  /** Rechecked after SSH is ready and immediately before the tunnel is published. */
+  stillAuthorized: () => boolean | Promise<boolean>;
+}
+
+async function viewerAuthorizationIsCurrent(authorization: VpsViewerAuthorization): Promise<boolean> {
+  try {
+    return (await authorization.stillAuthorized()) === true;
+  } catch {
+    return false;
+  }
+}
 
 export interface VpsCommandOptions {
   input?: string;
@@ -103,6 +200,17 @@ function containerNamePart(botId: string): string {
 export function vpsContainerName(botId: string): string {
   const hash = createHash("sha256").update(botId).digest("hex").slice(0, 12);
   return `${VPS_CONTAINER_PREFIX}-${containerNamePart(botId)}-${hash}`;
+}
+
+/** Canonical ownership scope shared by the public control lease, the MCP
+ * action gate, and the desktop viewer. Prefixing distinguishes it from the
+ * module's internal lifecycle-lock key while retaining the exact SSH target
+ * and managed container identity. */
+export function vpsControlTargetKey(cfg: AppConfig, botId: string): string {
+  const alias = vpsSshAlias(cfg);
+  return alias
+    ? `vps:${alias}:${vpsContainerName(botId)}`
+    : `vps:unconfigured:${vpsContainerName(botId)}`;
 }
 
 export function vpsDockerArgs(alias: string, args: string[]): string[] {
@@ -173,21 +281,44 @@ function loopbackAnswers(port: number): Promise<boolean> {
   });
 }
 
-function stopDesktopTunnel(botId: string): boolean {
+function cancelDesktopTunnelOpening(botId: string): boolean {
+  const opening = desktopTunnelOpenings.get(botId);
+  if (!opening) return false;
+  desktopTunnelOpenings.delete(botId);
+  opening.cancelled = true;
+  if (opening.child?.exitCode === null && !opening.child.killed) opening.child.kill("SIGTERM");
+  return true;
+}
+
+function stopPublishedDesktopTunnel(botId: string, expectedGeneration?: string): boolean {
   const tunnel = desktopTunnels.get(botId);
-  if (!tunnel) return false;
+  if (!tunnel || (expectedGeneration && tunnel.generation !== expectedGeneration)) return false;
   desktopTunnels.delete(botId);
   clearTimeout(tunnel.expiry);
   if (tunnel.child.exitCode === null && !tunnel.child.killed) tunnel.child.kill("SIGTERM");
   return true;
 }
 
-export function closeVpsDesktopTunnel(botId: string) {
-  return { closed: stopDesktopTunnel(botId) };
+function stopDesktopTunnel(botId: string): boolean {
+  const opening = cancelDesktopTunnelOpening(botId);
+  return stopPublishedDesktopTunnel(botId) || opening;
+}
+
+export function closeVpsDesktopTunnel(botId: string, expectedGeneration?: string) {
+  // An exact post-await authorization failure must not cancel a newer lease's
+  // opening. Lifecycle callers omit the generation and close both pending and
+  // published state for this bot.
+  return {
+    closed: expectedGeneration
+      ? stopPublishedDesktopTunnel(botId, expectedGeneration)
+      : stopDesktopTunnel(botId),
+  };
 }
 
 export function closeAllVpsDesktopTunnels(): void {
-  for (const botId of desktopTunnels.keys()) stopDesktopTunnel(botId);
+  for (const botId of new Set([...desktopTunnels.keys(), ...desktopTunnelOpenings.keys()])) {
+    stopDesktopTunnel(botId);
+  }
 }
 
 const STREAM_CAP_CHARS = 16 * 1024 * 1024;
@@ -842,82 +973,200 @@ export async function inspectVpsForAuto(
     : computeVpsComputerStatus(cfg, botId, runner);
 }
 
-/** Open a temporary noVNC connection through the configured SSH alias. The
- * returned URL is loopback-only and contains the per-container password in
- * its fragment (never sent in HTTP). Closing the app viewer calls the paired
- * close endpoint, and process shutdown closes every remaining child. */
-export async function vpsComputerJoin(
+/** Open a temporary noVNC connection through the configured SSH alias.
+ *
+ * This returns server-only binding material, never a 127.0.0.1 URL. The
+ * harness wraps it in a bot-scoped same-origin viewer session so a remote Mac
+ * connects through its existing harness tunnel rather than interpreting
+ * 127.0.0.1 as the Mac itself. */
+export async function openVpsViewerTunnel(
   cfg: AppConfig,
   botId: string,
+  authorization: VpsViewerAuthorization,
   runner: VpsCommandRunner = defaultRunner,
-): Promise<{ joinUrl: string; state: "running" }> {
+): Promise<VpsViewerTunnel> {
   const alias = vpsSshAlias(cfg);
   if (!alias) throw Object.assign(new Error("VPS is not configured"), { status: 409 });
+  if (!authorization.id || authorization.id.length > 256) {
+    throw Object.assign(new Error("VPS viewer authorization is invalid"), { status: 403 });
+  }
+
+  const targetKey = vpsControlTargetKey(cfg, botId);
 
   const existing = desktopTunnels.get(botId);
-  if (existing && existing.child.exitCode === null && !existing.child.killed) {
-    return { joinUrl: existing.joinUrl, state: "running" };
-  }
-  stopDesktopTunnel(botId);
-
-  // Always re-inspect here. A cached IP or password from before a container
-  // replacement is exactly the sort of secret-bearing stale state a viewer
-  // endpoint must not reuse.
-  const status = await computeVpsComputerStatus(cfg, botId, runner);
-  if (!status.ready) {
-    throw Object.assign(new Error(status.problem ?? "The VPS computer is not ready"), { status: 409 });
-  }
-  const connection = viewerConnections.get(`${alias}:${status.container_name}`);
-  if (!connection) {
-    throw Object.assign(
-      new Error("This VPS computer predates secure live desktop access — replace its managed container once"),
-      { status: 409 },
-    );
-  }
-
-  const localPort = await unusedLoopbackPort();
-  const child = spawn("ssh", vpsSshTunnelArgs(alias, localPort, connection.privateIp), {
-    shell: false,
-    env: { ...process.env, PATH: augmentedPath() },
-    stdio: ["ignore", "ignore", "pipe"],
-    windowsHide: true,
-  });
-  let failure: string | null = null;
-  let stderr = "";
-  child.stderr?.setEncoding("utf8");
-  child.stderr?.on("data", (chunk: string) => {
-    stderr = `${stderr}${chunk}`.slice(-1000);
-  });
-  child.once("error", (error) => {
-    failure = error.message;
-  });
-  child.once("close", (code) => {
-    const active = desktopTunnels.get(botId);
-    if (active?.child === child) {
-      clearTimeout(active.expiry);
-      desktopTunnels.delete(botId);
+  if (
+    existing &&
+    existing.targetKey === targetKey &&
+    existing.child.exitCode === null &&
+    !existing.child.killed
+  ) {
+    if (!(await viewerAuthorizationIsCurrent(authorization))) {
+      throw Object.assign(new Error("VPS viewer control lease expired"), { status: 403 });
     }
-    if (!failure) failure = stderr.trim() || `SSH viewer tunnel exited ${code ?? "without a status"}`;
+    return {
+      viewerPort: existing.viewerPort,
+      password: existing.password,
+      generation: existing.generation,
+      targetKey: existing.targetKey,
+      containerId: existing.containerId,
+    };
+  }
+  const opening = desktopTunnelOpenings.get(botId);
+  if (
+    opening &&
+    !opening.cancelled &&
+    opening.targetKey === targetKey &&
+    opening.authorizationId === authorization.id
+  ) return opening.promise;
+
+  // A different lease/target supersedes its own unfinished attempt. Mark it
+  // cancelled before starting the replacement, so its late SSH readiness can
+  // never publish over the newer generation.
+  cancelDesktopTunnelOpening(botId);
+  stopPublishedDesktopTunnel(botId);
+  const attempt: VpsViewerOpening = {
+    targetKey,
+    authorizationId: authorization.id,
+    cancelled: false,
+    child: null,
+    promise: null as unknown as Promise<VpsViewerTunnel>,
+  };
+  const assertCurrent = () => {
+    if (attempt.cancelled || desktopTunnelOpenings.get(botId) !== attempt) {
+      throw Object.assign(new Error("VPS viewer opening was superseded"), { status: 409 });
+    }
+  };
+  attempt.promise = (async () => {
+    // Always re-inspect here. A cached IP or password from before a container
+    // replacement is exactly the sort of secret-bearing stale state a viewer
+    // endpoint must not reuse.
+    const status = await computeVpsComputerStatus(cfg, botId, runner);
+    assertCurrent();
+    if (!status.ready) {
+      throw Object.assign(new Error(status.problem ?? "The VPS computer is not ready"), { status: 409 });
+    }
+    const connection = viewerConnections.get(`${alias}:${status.container_name}`);
+    if (!connection || !status.container_id) {
+      throw Object.assign(
+        new Error("This VPS computer predates secure live desktop access — replace its managed container once"),
+        { status: 409 },
+      );
+    }
+
+    const localPort = await unusedLoopbackPort();
+    assertCurrent();
+    const child = spawn("ssh", vpsSshTunnelArgs(alias, localPort, connection.privateIp), {
+      shell: false,
+      env: { ...process.env, PATH: augmentedPath() },
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true,
+    });
+    attempt.child = child;
+    assertCurrent();
+    let failure: string | null = null;
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr = `${stderr}${chunk}`.slice(-1000);
+    });
+    child.once("error", (error) => {
+      failure = error.message;
+    });
+    child.once("close", (code) => {
+      const active = desktopTunnels.get(botId);
+      if (active?.child === child) {
+        clearTimeout(active.expiry);
+        desktopTunnels.delete(botId);
+      }
+      if (!failure) failure = stderr.trim() || `SSH viewer tunnel exited ${code ?? "without a status"}`;
+    });
+
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && !failure && !attempt.cancelled) {
+      if (await loopbackAnswers(localPort)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assertCurrent();
+    if (failure || !(await loopbackAnswers(localPort))) {
+      if (child.exitCode === null && !child.killed) child.kill("SIGTERM");
+      const detail = failure || stderr.trim() || "the SSH port forward did not become ready";
+      throw Object.assign(new Error(`Could not open the VPS live desktop: ${detail}`), { status: 502 });
+    }
+    // The initial HTTP check happened before inspection + SSH startup. Its
+    // exact owner/token must still be live now; otherwise destroy this child
+    // before it is entered into the published tunnel registry.
+    if (!(await viewerAuthorizationIsCurrent(authorization))) {
+      if (child.exitCode === null && !child.killed) child.kill("SIGTERM");
+      throw Object.assign(new Error("VPS viewer control lease expired while the tunnel opened"), { status: 403 });
+    }
+    assertCurrent();
+
+    const containerId = status.container_id;
+    const generation = createHash("sha256")
+      // Random per-open ownership means an old expiry callback cannot match a
+      // replacement even if the OS reuses the same local port.
+      .update(`${targetKey}\0${containerId}\0${localPort}\0${connection.password}\0${randomBytes(16).toString("hex")}`)
+      .digest("hex");
+    // Viewer-close is the normal cleanup. This unref'd ceiling is a backstop
+    // for a renderer crash or an old browser client that cannot signal close.
+    // It closes only the child/generation it owns; a stale timer can never
+    // terminate a replacement tunnel.
+    const expiry = setTimeout(
+      () => stopPublishedDesktopTunnel(botId, generation),
+      8 * 60 * 60_000,
+    );
+    expiry.unref?.();
+    desktopTunnels.set(botId, {
+      child,
+      viewerPort: localPort,
+      password: connection.password,
+      generation,
+      targetKey,
+      containerId,
+      expiry,
+    });
+    return { viewerPort: localPort, password: connection.password, generation, targetKey, containerId };
+  })().finally(() => {
+    if (desktopTunnelOpenings.get(botId) === attempt) desktopTunnelOpenings.delete(botId);
   });
+  desktopTunnelOpenings.set(botId, attempt);
+  return attempt.promise;
+}
 
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline && !failure) {
-    if (await loopbackAnswers(localPort)) break;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+/** Cheap attachment-time generation fence. App-owned lifecycle paths close
+ * the tunnel before replacing a container; a dead SSH child also fails this
+ * check, so an old viewer token can never silently migrate to another VPS. */
+export async function vpsViewerTunnelIsCurrent(
+  cfg: AppConfig,
+  botId: string,
+  binding: Pick<VpsViewerTunnel, "viewerPort" | "generation" | "targetKey">,
+): Promise<boolean> {
+  const tunnel = desktopTunnels.get(botId);
+  if (
+    !tunnel ||
+    tunnel.child.exitCode !== null ||
+    tunnel.child.killed ||
+    tunnel.targetKey !== vpsControlTargetKey(cfg, botId) ||
+    tunnel.targetKey !== binding.targetKey ||
+    tunnel.viewerPort !== binding.viewerPort ||
+    tunnel.generation !== binding.generation
+  ) return false;
+  try {
+    // The SSH forward addresses a private container IP. Re-inspecting the
+    // managed container prevents an externally replaced container that later
+    // inherits that IP from receiving an old viewer connection.
+    const status = await inspectVpsForAuto(cfg, botId);
+    const after = desktopTunnels.get(botId);
+    return Boolean(
+      status.ready &&
+      status.container_id === tunnel.containerId &&
+      after === tunnel &&
+      after.child.exitCode === null &&
+      !after.child.killed,
+    );
+  } catch {
+    return false;
   }
-  if (failure || !(await loopbackAnswers(localPort))) {
-    if (child.exitCode === null && !child.killed) child.kill("SIGTERM");
-    const detail = failure || stderr.trim() || "the SSH port forward did not become ready";
-    throw Object.assign(new Error(`Could not open the VPS live desktop: ${detail}`), { status: 502 });
-  }
-
-  const joinUrl = `http://127.0.0.1:${localPort}/vnc.html#autoconnect=true&resize=scale&password=${encodeURIComponent(connection.password)}`;
-  // Viewer-close is the normal cleanup. This unref'd ceiling is a backstop
-  // for a renderer crash or an old browser client that cannot signal close.
-  const expiry = setTimeout(() => stopDesktopTunnel(botId), 8 * 60 * 60_000);
-  expiry.unref?.();
-  desktopTunnels.set(botId, { child, joinUrl, expiry });
-  return { joinUrl, state: "running" };
 }
 
 export function vpsContainerMcpArgs(alias: string, containerName: string): string[] {

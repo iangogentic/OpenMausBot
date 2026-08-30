@@ -18,19 +18,23 @@
 // computer-proxy / permission-proxy). All state comes from env, injected by
 // the harness when it builds the integration:
 //   OMB_HARNESS_URL  base URL of the harness (http://127.0.0.1:8799)
-//   OMB_BOT_ID       the calling bot's id (excluded from list_bots; sender)
-//   OMB_COMMS_TOKEN  shared secret for the localhost-only internal endpoints
-//   OMB_TURN_DEPTH   this turn's comms depth (the harness refuses recursion)
-import readline from "node:readline";
-
+//   OMB_AGENTS_CAPABILITY_TOKEN  turn-scoped authority for agents endpoints.
+//                                Bot, thread, depth, and generation are bound
+//                                server-side. The family-specific name avoids
+//                                collisions in CLIs that flatten MCP env maps.
 import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credential-request.ts";
+import { readBoundedResponseText } from "../bounded-response.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedJsonLineDecoder,
+  CATALOG_NDJSON_LIMITS,
+  PROVIDER_NDJSON_LIMITS,
+} from "./bounded-json-lines.ts";
 
 const HARNESS = process.env.OMB_HARNESS_URL ?? "http://127.0.0.1:8799";
-const BOT_ID = process.env.OMB_BOT_ID ?? "";
-const THREAD_ID = process.env.OMB_THREAD_ID ?? "";
-const TOKEN = process.env.OMB_COMMS_TOKEN ?? "";
-const DEPTH = Number(process.env.OMB_TURN_DEPTH ?? "0") || 0;
+const TOKEN = process.env.OMB_AGENTS_CAPABILITY_TOKEN ?? "";
 const MAX_CREATED_PER_TURN = 4;
+const MAX_API_RESPONSE_BYTES = 1024 * 1024;
 let createdThisTurn = 0;
 
 const TOOLS = [
@@ -104,25 +108,66 @@ const TOOLS = [
 ];
 
 type Json = Record<string, unknown>;
-const send = (msg: Json) => process.stdout.write(JSON.stringify(msg) + "\n");
+const MAX_IN_FLIGHT = 8;
+const MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
+const activeRequests = new Set<AbortController>();
+let proxyFailed = false;
+const failProxy = (error: unknown) => {
+  if (proxyFailed) return;
+  proxyFailed = true;
+  for (const controller of activeRequests) controller.abort(error);
+  activeRequests.clear();
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.stdin.destroy();
+  process.exitCode = 1;
+  const failsafe = setTimeout(() => process.exit(1), 1_000);
+  failsafe.unref?.();
+};
+const send = (msg: Json) => {
+  if (proxyFailed) return;
+  const line = JSON.stringify(msg) + "\n";
+  const bytes = Buffer.byteLength(line);
+  if (
+    bytes > PROVIDER_NDJSON_LIMITS.maxLineBytes ||
+    process.stdout.writableLength + bytes > MAX_PENDING_OUTPUT_BYTES
+  ) return failProxy(new Error("agents proxy output exceeded its buffer limit"));
+  process.stdout.write(line);
+};
 const ok = (id: unknown, result: unknown) => send({ jsonrpc: "2.0", id, result });
 const rpcErr = (id: unknown, code: number, message: string) => send({ jsonrpc: "2.0", id, error: { code, message } });
 const textResult = (id: unknown, text: string, isError = false) =>
   ok(id, { content: [{ type: "text", text }], isError });
 
 async function api(path: string, init?: RequestInit): Promise<Json> {
-  const res = await fetch(HARNESS + path, {
-    ...init,
-    headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, ...init?.headers },
-  });
-  const body = (await res.json().catch(() => ({}))) as Json;
-  if (!res.ok) throw new Error(String(body.error ?? `HTTP ${res.status}`));
-  return body;
+  const controller = new AbortController();
+  activeRequests.add(controller);
+  const timeout = AbortSignal.timeout(20 * 60_000);
+  try {
+    const signals = [controller.signal, timeout, ...(init?.signal ? [init.signal] : [])];
+    const res = await fetch(HARNESS + path, {
+      ...init,
+      signal: AbortSignal.any(signals),
+      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, ...init?.headers },
+    });
+    const text = await readBoundedResponseText(res, MAX_API_RESPONSE_BYTES, "agents response exceeded 1 MB");
+    let parsed: unknown = {};
+    try {
+      parsed = text.trim() ? JSON.parse(text) : {};
+    } catch {
+      parsed = {};
+    }
+    assertBoundedJsonShape(parsed, CATALOG_NDJSON_LIMITS);
+    const body = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Json : {};
+    if (!res.ok) throw new Error(String(body.error ?? `HTTP ${res.status}`));
+    return body;
+  } finally {
+    activeRequests.delete(controller);
+  }
 }
 
 async function callTool(name: string, args: Json): Promise<{ text: string; isError?: boolean }> {
   if (name === "list_bots") {
-    const r = await api(`/api/internal/agents?self=${encodeURIComponent(BOT_ID)}`);
+    const r = await api("/api/internal/agents");
     const bots = (r.bots as Array<Json>) ?? [];
     if (!bots.length) return { text: "No other bots in this section yet." };
     const lines = bots.map((b) => {
@@ -138,7 +183,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     if (!toBotId || !message) return { text: "ask_bot needs bot_id and message.", isError: true };
     const r = await api(`/api/internal/ask-bot`, {
       method: "POST",
-      body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID, toBotId, message, depth: DEPTH }),
+      body: JSON.stringify({ toBotId, message }),
     });
     if (r.busy) return { text: `That bot is busy right now — try again after it finishes.` };
     if (r.error) return { text: `Couldn't reach that bot: ${r.error}`, isError: true };
@@ -150,11 +195,8 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const reason = typeof args.reason === "string" ? args.reason.trim() : "";
     if (!toBotId || !message) return { text: "delegate_bot needs bot_id and message.", isError: true };
     const body: Record<string, unknown> = {
-      fromBotId: BOT_ID,
-      fromThreadId: THREAD_ID,
       toBotId,
       message,
-      depth: DEPTH,
     };
     if (reason) body.reason = reason;
     const r = await api(`/api/internal/delegate-bot`, { method: "POST", body: JSON.stringify(body) });
@@ -176,8 +218,6 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const r = await api(`/api/internal/create-bot`, {
       method: "POST",
       body: JSON.stringify({
-        fromBotId: BOT_ID,
-        fromThreadId: THREAD_ID,
         name: botName,
         role,
         instructions,
@@ -197,8 +237,6 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const r = await api("/api/internal/request-credential", {
       method: "POST",
       body: JSON.stringify({
-        fromBotId: BOT_ID,
-        fromThreadId: THREAD_ID,
         credentialId,
         ...(reason ? { reason } : {}),
       }),
@@ -251,18 +289,38 @@ async function handle(msg: Json) {
   }
 }
 
-const rl = readline.createInterface({ input: process.stdin, terminal: false });
-rl.on("line", (line) => {
-  const t = line.trim();
-  if (!t) return;
-  let msg: Json;
+const input = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS);
+const inFlight = new Set<Promise<void>>();
+let inputEnded = false;
+const dispatch = (msg: Json) => {
+  if (proxyFailed) return;
+  if (inFlight.size >= MAX_IN_FLIGHT) return failProxy(new Error("agents proxy exceeded 8 concurrent requests"));
+  const task = handle(msg).catch((e) => {
+    if (msg.id !== undefined) rpcErr(msg.id, -32603, e instanceof Error ? e.message : String(e));
+  });
+  inFlight.add(task);
+  void task.finally(() => inFlight.delete(task));
+};
+process.stdin.on("data", (chunk: Buffer) => {
+  if (inputEnded || proxyFailed) return;
   try {
-    msg = JSON.parse(t) as Json;
-  } catch {
+    for (const { value } of input.push(chunk)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      dispatch(value as Json);
+    }
+  } catch (error) {
+    failProxy(error);
+  }
+});
+process.stdin.on("end", () => {
+  inputEnded = true;
+  try {
+    for (const { value } of input.flush()) {
+      if (value && typeof value === "object" && !Array.isArray(value)) dispatch(value as Json);
+    }
+  } catch (error) {
+    failProxy(error);
     return;
   }
-  void handle(msg).catch((e) => {
-    if (msg.id !== undefined) rpcErr(msg.id, -32603, (e as Error).message);
-  });
+  void Promise.allSettled([...inFlight]).then(() => { if (!proxyFailed) process.exitCode = 0; });
 });
-rl.on("close", () => process.exit(0));

@@ -1,5 +1,7 @@
-// PostHog usage analytics + the email → person identity link.
-// The phc_ token is a write-only public key (safe to ship in the client).
+// Optional PostHog usage analytics + the email → person identity link.
+// This fork intentionally ships with no upstream project key or destination.
+// A distributor may provide its own VITE_POSTHOG_TOKEN/HOST at build time,
+// but collection still starts disabled until the person explicitly opts in.
 // Only the named events below are sent — autocapture is OFF on purpose:
 // it would ship the $el_text of clicked elements, and the sidebar/option
 // cards render model output and message previews, so it would leak fragments
@@ -7,14 +9,34 @@
 // identify(), so PostHog's Persons tab doubles as the collected-email list.
 import posthog from "posthog-js";
 
-const TOKEN = "phc_m2hP39w8y2gLPvHgDvSXAu6xcZ3agjf4ruL56rGcMZEe";
+const OPT_IN_KEY = "omb-analytics-opt-in";
 
-// Analytics are on by default; Settings → General turns them off. The choice
-// lives in localStorage because it has to be readable BEFORE init() runs: an
-// opted-out install must never call posthog.init(), so no request — not even
-// the library's own — leaves the machine. Once running, opting out routes
-// through opt_out_capturing(), which also drops anything already queued.
-const OPT_OUT_KEY = "omb-analytics-opt-out";
+function analyticsConfig(): { token: string; host: string } | null {
+  const token = String(import.meta.env.VITE_POSTHOG_TOKEN ?? "").trim();
+  const host = String(import.meta.env.VITE_POSTHOG_HOST ?? "").trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(host);
+  } catch {
+    return null;
+  }
+  if (
+    !/^phc_[A-Za-z0-9_-]{20,}$/.test(token) ||
+    parsed.protocol !== "https:" ||
+    parsed.username ||
+    parsed.password ||
+    (parsed.pathname !== "" && parsed.pathname !== "/") ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    return null;
+  }
+  return { token, host: parsed.origin };
+}
+
+export function analyticsAvailable(): boolean {
+  return analyticsConfig() !== null;
+}
 
 let ready = false;
 
@@ -27,11 +49,12 @@ let choice: boolean | undefined;
 
 /** False once the user has opted out on this machine. */
 export function analyticsEnabled(): boolean {
+  if (!analyticsAvailable()) return false;
   if (choice !== undefined) return choice;
   try {
-    return localStorage.getItem(OPT_OUT_KEY) !== "1";
+    return localStorage.getItem(OPT_IN_KEY) === "1";
   } catch {
-    return true; // storage unreadable → behave like a fresh install
+    return false; // storage unreadable can never manufacture consent
   }
 }
 
@@ -45,14 +68,15 @@ export function optAction(enabled: boolean, running: boolean): OptAction {
 }
 
 /** Flip the setting and act on it immediately, in both directions. */
-export function setAnalyticsEnabled(enabled: boolean) {
-  choice = enabled; // before persisting: the decision must not depend on it
+export function setAnalyticsEnabled(enabled: boolean): boolean {
+  const applied = enabled && analyticsAvailable();
+  choice = applied; // before persisting: the decision must not depend on it
   try {
-    localStorage.setItem(OPT_OUT_KEY, enabled ? "0" : "1");
+    localStorage.setItem(OPT_IN_KEY, applied ? "1" : "0");
   } catch {
     /* it will not survive a restart, but it holds for this session */
   }
-  switch (optAction(enabled, ready)) {
+  switch (optAction(applied, ready)) {
     case "opt-out":
       posthog.opt_out_capturing(); // also drops whatever is still queued
       break;
@@ -65,12 +89,14 @@ export function setAnalyticsEnabled(enabled: boolean) {
     case "none":
       break;
   }
+  return applied;
 }
 
 export function initAnalytics() {
-  if (ready || !analyticsEnabled()) return;
-  posthog.init(TOKEN, {
-    api_host: "https://us.i.posthog.com",
+  const config = analyticsConfig();
+  if (ready || !config || !analyticsEnabled()) return;
+  posthog.init(config.token, {
+    api_host: config.host,
     autocapture: false, // never capture clicked-element text (conversation leak)
     capture_pageview: false, // single-window desktop app — no page routes
     person_profiles: "identified_only",

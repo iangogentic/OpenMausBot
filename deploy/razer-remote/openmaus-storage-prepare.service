@@ -1,0 +1,27 @@
+[Unit]
+Description=Validate and prepare bounded OpenMaus storage
+Requires=var-lib-openmaus\x2dprovider-state.mount
+Requires=var-lib-openmausbot\x2dworkspaces.mount
+Requires=var-lib-openmausbot\x2dvm\x2dhomes.mount
+After=var-lib-openmaus\x2dprovider-state.mount
+After=var-lib-openmausbot\x2dworkspaces.mount
+After=var-lib-openmausbot\x2dvm\x2dhomes.mount
+Before=openmausbot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/openmaus-storage-setup --prepare-mounted
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/openmaus-provider/state /var/lib/openmausbot-workspaces /var/lib/openmausbot-vm-homes
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+AmbientCapabilities=
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

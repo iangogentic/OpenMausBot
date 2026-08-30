@@ -1,0 +1,36 @@
+#!/bin/sh
+# Root-installed, non-writable entry used only by openmaus-server. The narrow
+# sudoers rule starts a root lifecycle supervisor; that supervisor drops the
+# child to openmaus-provider and is the only process allowed to reap it.
+set -eu
+if [ -z "${OMB_PROVIDER_LAUNCH_MANIFEST-}" ]; then
+  exit 64
+fi
+
+if [ "${1-}" = "--retire-owner" ] && [ "$#" -eq 1 ]; then
+  exec /usr/bin/sudo -n -- /usr/local/libexec/openmaus-provider-supervisor --retire-owner
+fi
+if [ "${1-}" != "--" ]; then
+  exit 64
+fi
+shift
+if [ "$#" -lt 1 ]; then
+  exit 64
+fi
+
+# These belong only to the trusted control plane. Turn-scoped MCP capability
+# variables and the selected model provider's credentials intentionally stay;
+# they are the narrow authority that this exact provider turn needs.
+unset CREDENTIALS_DIRECTORY \
+  OMB_UI_SESSION_TOKEN OMB_UI_SESSION_TOKEN_SHA256 OMB_COMPANION_SESSION_TOKEN \
+  OMB_DATA_DIR OMB_USER_DATA OMB_STATIC_DIR \
+  OMB_PORT OMB_WEBHOOK_PORT OMB_LISTEN_SOCKET OMB_WEBHOOK_LISTEN_SOCKET \
+  OMB_COMPANION_PORT OMB_CONTROL_PORT \
+  OMB_COMPANION_LISTEN_SOCKET OMB_CONTROL_LISTEN_SOCKET \
+  OMB_PROVIDER_LAUNCHER OMB_REQUIRE_PROVIDER_ISOLATION \
+  OMB_PROVIDER_SANDBOX_PATHS OMB_PROVIDER_TURN_DIR
+
+# `--` terminates sudo's options. argv remains byte-for-byte argv; no shell
+# reparses prompts, paths, JSON, or MCP configuration. sudo keeps only the
+# sole exact allowlisted manifest pointer from openmaus-provider.sudoers.
+exec /usr/bin/sudo -n -- /usr/local/libexec/openmaus-provider-supervisor -- "$@"

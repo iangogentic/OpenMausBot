@@ -10,6 +10,16 @@ import {
 
 const BOT = { name: "Scout", title: "Research agent", description: "Finds evidence quickly." };
 
+const fakeWebp = (): Buffer => {
+  const bytes = Buffer.alloc(30);
+  bytes.write("RIFF", 0, "ascii");
+  bytes.writeUInt32LE(bytes.length - 8, 4);
+  bytes.write("WEBP", 8, "ascii");
+  bytes.write("VP8X", 12, "ascii");
+  bytes.writeUInt32LE(10, 16);
+  return bytes;
+};
+
 describe("avatar image generation", () => {
   it("bounds free-form direction and keeps the crop brief", () => {
     expect(avatarGenerationRequestSchema.safeParse({ prompt: "x".repeat(401) }).success).toBe(false);
@@ -30,7 +40,7 @@ describe("avatar image generation", () => {
   });
 
   it("uses one low-quality square GPT Image 2 request and decodes WebP bytes", async () => {
-    const bytes = Buffer.from("generated-webp");
+    const bytes = fakeWebp();
     const fetchMock = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
       data: [{ b64_json: bytes.toString("base64") }],
     }), { status: 200, headers: { "content-type": "application/json" } }));
@@ -53,6 +63,15 @@ describe("avatar image generation", () => {
     const malformed = vi.fn<typeof fetch>(async () => new Response('{"data":[]}', { status: 200 }));
     await expect(generateAvatarImage("sk-image", BOT, "", malformed))
       .rejects.toThrow("no generated image");
+  });
+
+  it("rejects base64 that is not a complete WebP container", async () => {
+    const invalid = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      data: [{ b64_json: Buffer.from("generated-webp").toString("base64") }],
+    }), { status: 200 }));
+
+    await expect(generateAvatarImage("sk-image", BOT, "", invalid))
+      .rejects.toThrow("invalid WebP image data");
   });
 
   it("cancels an upstream response as soon as it exceeds the byte cap", async () => {

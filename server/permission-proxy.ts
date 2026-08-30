@@ -14,10 +14,30 @@
 import { connect } from "node:net";
 import { randomUUID } from "node:crypto";
 
+import {
+  BoundedJsonLineDecoder,
+  PERMISSION_NDJSON_LIMITS,
+  PROVIDER_NDJSON_LIMITS,
+} from "./drivers/bounded-json-lines.ts";
+
 const socketPath = process.argv[2] ?? "";
+const MAX_WAITING = 64;
+const MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
+const ASK_TIMEOUT_MS = 16 * 60_000;
 
 const waiting = new Map<string, (msg: any) => void>();
 const conn = connect(socketPath);
+let proxyFailed = false;
+const failProxy = (error: unknown) => {
+  if (proxyFailed) return;
+  proxyFailed = true;
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  conn.destroy();
+  process.stdin.destroy();
+  process.exitCode = 1;
+  const failsafe = setTimeout(() => process.exit(1), 1_000);
+  failsafe.unref?.();
+};
 
 interface AllowPermissionResult {
   behavior: "allow";
@@ -33,27 +53,50 @@ const dead = () => {
 conn.on("error", dead);
 conn.on("close", dead);
 
-let connBuf = "";
+const brokerInput = new BoundedJsonLineDecoder(PERMISSION_NDJSON_LIMITS);
+let brokerInputFailed = false;
 conn.on("data", (chunk) => {
-  connBuf += chunk;
-  let nl;
-  while ((nl = connBuf.indexOf("\n")) !== -1) {
-    const line = connBuf.slice(0, nl);
-    connBuf = connBuf.slice(nl + 1);
-    let msg: any;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      continue;
+  if (brokerInputFailed) return;
+  try {
+    for (const { value } of brokerInput.push(chunk)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const msg = value as { t?: unknown; id?: unknown };
+      if (msg.t === "answer" && typeof msg.id === "string") {
+        waiting.get(msg.id)?.(msg);
+        waiting.delete(msg.id);
+      }
     }
-    if (msg.t === "answer") {
-      waiting.get(msg.id)?.(msg);
-      waiting.delete(msg.id);
-    }
+  } catch (error) {
+    brokerInputFailed = true;
+    failProxy(error);
   }
 });
 
-const send = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + "\n");
+const send = (obj: unknown) => {
+  if (proxyFailed) return;
+  const line = JSON.stringify(obj) + "\n";
+  const bytes = Buffer.byteLength(line);
+  if (
+    bytes > PROVIDER_NDJSON_LIMITS.maxLineBytes ||
+    process.stdout.writableLength + bytes > MAX_PENDING_OUTPUT_BYTES
+  ) return failProxy(new Error("permission proxy output exceeded its buffer limit"));
+  process.stdout.write(line);
+};
+
+const writeBroker = (obj: unknown) => {
+  if (proxyFailed || conn.destroyed) return false;
+  const line = JSON.stringify(obj) + "\n";
+  const bytes = Buffer.byteLength(line);
+  if (
+    bytes > PERMISSION_NDJSON_LIMITS.maxLineBytes ||
+    conn.writableLength + bytes > MAX_PENDING_OUTPUT_BYTES
+  ) {
+    failProxy(new Error("permission broker request exceeded its buffer limit"));
+    return false;
+  }
+  conn.write(line);
+  return true;
+};
 
 const TOOLS = [
   {
@@ -106,6 +149,20 @@ async function handle(msg: any) {
     const args = msg.params?.arguments ?? {};
     const askId = randomUUID();
     const isQuestion = name === "ask_user";
+    if (waiting.size >= MAX_WAITING) {
+      return send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          content: [{
+            type: "text",
+            text: isQuestion
+              ? "No answer was given — use your best judgment."
+              : JSON.stringify({ behavior: "deny", message: "OpenMausBot: too many pending permission requests" }),
+          }],
+        },
+      });
+    }
     // the CLI may include its own suggested permission rules; on allow we
     // hand them straight back as updatedPermissions so claude stops asking
     // at its own layer — no invented rule syntax (agentcal)
@@ -115,16 +172,20 @@ async function handle(msg: any) {
         ? args.suggestions
         : null;
     const answer: any = await new Promise((resolve) => {
-      waiting.set(askId, resolve);
+      const timer = setTimeout(() => {
+        waiting.delete(askId);
+        resolve({ behavior: "deny", message: "OpenMausBot: permission broker timed out — skip this action" });
+      }, ASK_TIMEOUT_MS);
+      timer.unref?.();
+      waiting.set(askId, (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      });
       if (conn.destroyed) return dead();
       const ask = isQuestion
         ? { t: "ask", id: askId, kind: "question", tool: "ask_user", input: { question: args.question, choices: args.choices } }
         : { t: "ask", id: askId, tool: args.tool_name, input: args.input };
-      try {
-        conn.write(JSON.stringify(ask) + "\n");
-      } catch {
-        dead();
-      }
+      if (!writeBroker(ask)) dead();
     });
     let text = answer.message || "No answer was given — use your best judgment.";
     if (!isQuestion) {
@@ -144,19 +205,40 @@ async function handle(msg: any) {
   }
 }
 
-let inBuf = "";
+const providerInput = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS);
+const inFlight = new Set<Promise<void>>();
+let inputEnded = false;
+const dispatch = (value: object) => {
+  if (proxyFailed) return;
+  if (inFlight.size >= MAX_WAITING) return failProxy(new Error("permission proxy exceeded 64 concurrent requests"));
+  const task = handle(value).catch((error) => {
+    process.stderr.write(`permission proxy request failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  });
+  inFlight.add(task);
+  void task.finally(() => inFlight.delete(task));
+};
 process.stdin.on("data", (chunk) => {
-  inBuf += chunk;
-  let nl;
-  while ((nl = inBuf.indexOf("\n")) !== -1) {
-    const line = inBuf.slice(0, nl);
-    inBuf = inBuf.slice(nl + 1);
-    if (!line.trim()) continue;
-    try {
-      void handle(JSON.parse(line));
-    } catch {
-      /* ignore malformed lines */
+  if (inputEnded || proxyFailed) return;
+  try {
+    for (const { value } of providerInput.push(chunk)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      dispatch(value);
     }
+  } catch (error) {
+    failProxy(error);
   }
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => {
+  inputEnded = true;
+  try {
+    for (const { value } of providerInput.flush()) {
+      if (value && typeof value === "object" && !Array.isArray(value)) dispatch(value);
+    }
+  } catch (error) {
+    failProxy(error);
+    return;
+  }
+  conn.destroy();
+  dead();
+  void Promise.allSettled([...inFlight]).then(() => { if (!proxyFailed) process.exitCode = 0; });
+});

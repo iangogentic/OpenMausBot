@@ -39,6 +39,25 @@ still turn off. A sleeping or powered-off computer cannot receive phone
 requests or run its local routines, including through the optional hosted
 transport.
 
+### Cloud desktop containment
+
+The harness accepts a minted Box viewer only when it is HTTPS, contains no URL
+userinfo, and is hosted on `ascii.dev` or one of its subdomains. The iOS app
+checks the same boundary again, then opens the viewer in an app-contained
+ephemeral WebKit data store. It exposes no address/share bar or popup browser,
+keeps the main frame on the exact minted origin, rejects unsafe schemes and
+web permissions, and discards its cookies and cache when the view closes.
+Closing the view also releases the phone's exact human-control lease.
+
+Lease release closes the app-owned stream and hands bot input back; it cannot
+invalidate a raw provider bearer URL that somebody intentionally copied by
+other means. [ascii.dev documents viewer URLs](https://docs.ascii.dev/box/desktop-streaming)
+as expiring within 10 minutes, so such a copy may remain usable until that
+provider expiry. Stopping/archiving
+the Box ends the computer session sooner, but also stops processes inside the
+guest, so OpenMausMobile never does that automatically during ordinary
+hand-back.
+
 ## Runtime architecture
 
 ```text

@@ -21,6 +21,7 @@ const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
+const UI_SESSION_TOKEN = `branching-ui-session-${"s".repeat(43)}`;
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 interface Msg {
@@ -31,6 +32,8 @@ interface Msg {
   parentId?: string | null;
   /** steer-queue: waiting to auto-send when the live turn settles */
   queued?: boolean;
+  /** Stable pending-chip identity copied onto the transcript message at drain/cancel. */
+  queueId?: string;
 }
 
 /** Client-side view of the active branch: walk parentId links from the leaf. */
@@ -53,7 +56,10 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
   const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: body ? { "content-type": "application/json" } : undefined,
+      headers: {
+        "x-openmausbot-session": UI_SESSION_TOKEN,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: res.status, body: await res.json() };
@@ -94,7 +100,9 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
     const env: NodeJS.ProcessEnv = {
       HOME: home,
       USERPROFILE: home,
+      VITEST: process.env.VITEST ?? "true",
       OMB_PORT: String(PORT),
+      OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
     };
     if (process.env.PATH) env.PATH = process.env.PATH;
     child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
@@ -196,7 +204,7 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
       const backendBefore = (await getBot(created.id)).cloudBackend;
       const backendChange = await api("PATCH", `/api/bots/${created.id}`, { cloudBackend: "vps" });
       expect(backendChange.status).toBe(409);
-      expect(backendChange.body.error).toContain("stop the active turn");
+      expect(backendChange.body.error).toMatch(/stop (?:the active|this bot's) turn/i);
       expect((await getBot(created.id)).cloudBackend).toBe(backendBefore);
 
       // a second send while busy queues (steer-queue) — never a parallel
@@ -218,16 +226,14 @@ posixOnly("conversation branching e2e (fake ACP fleet)", () => {
       expect(midTurn.status).toBe(409);
       expect((await getBot(created.id)).messages.filter((m: Msg) => m.text === "second try")).toHaveLength(0);
 
-      // stop the turn; the queued "sneaky second" auto-runs on settle
-      // (stop-then-steer), so that drained turn must be stopped too before
-      // the thread is truly quiet enough to edit
+      // Stop is a hard lifecycle boundary: queued work remains visibly
+      // queued instead of silently launching a successor after the person
+      // explicitly asked the bot to stop.
       expect((await api("POST", `/api/bots/${created.id}/interrupt`)).status).toBe(200);
       await waitFor(async () => {
         const b = await getBot(created.id);
-        return b.busy === true && b.messages.some((m: Msg) => m.text === "sneaky second" && !m.queued);
-      }, "the queued message to drain into its own turn", 20_000);
-      expect((await api("POST", `/api/bots/${created.id}/interrupt`)).status).toBe(200);
-      await waitFor(async () => (await getBot(created.id)).busy === false, "the drained turn to settle", 20_000);
+        return b.busy === false && b.messages.some((m: Msg) => m.text === "sneaky second" && m.queueId);
+      }, "the stopped turn to settle without auto-running queued work", 20_000);
       expect((await api("POST", `/api/bots/${created.id}/messages/${first.id}/edit`, { text: "second try" })).status).toBe(202);
 
       await waitFor(async () => {

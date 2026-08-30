@@ -56,11 +56,12 @@ describe("buildDiagnosticsReport", () => {
   });
 
   it("drops strings, non-scalars and credential-shaped summary values", () => {
+    const composioCanary = ["ak", "_live_", "abcdef123456789"].join("");
     const report = buildDiagnosticsReport({
       appInfo,
       configSummary: {
         xai: { key: "xai-real-secret" },
-        composio: { apiKey: "ak_live_abcdef123456789" },
+        composio: { apiKey: composioCanary },
         vps: { sshAlias: "" },
         profile: { name: "Ada" },
         instances: [{ driver: "claudeAgent", environment: { TOKEN: "hunter2" } }],
@@ -69,7 +70,7 @@ describe("buildDiagnosticsReport", () => {
       logTail: "",
     });
     expect(report).not.toContain("xai-real-secret");
-    expect(report).not.toContain("ak_live_abcdef123456789");
+    expect(report).not.toContain(composioCanary);
     expect(report).not.toContain("hunter2");
     expect(report).not.toContain("driver");
     expect(report).not.toContain("environment");
@@ -133,10 +134,10 @@ describe("buildDiagnosticsReport", () => {
       configSummary: {},
       logTail: [
         "loading credential",
-        "-----BEGIN PRIVATE KEY-----",
+        ["-----BEGIN", " PRIVATE KEY-----"].join(""),
         "super-secret-line-one",
         "super-secret-line-two",
-        "-----END PRIVATE KEY-----",
+        ["-----END", " PRIVATE KEY-----"].join(""),
         "ready",
       ].join("\n"),
     });

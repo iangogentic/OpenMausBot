@@ -92,6 +92,15 @@ describe("fetchBotDirectory", () => {
     );
     await expect(fetchBotDirectory(announced as unknown as typeof fetch)).rejects.toThrow("too large");
   });
+
+  it("rejects invalid UTF-8 and excessive JSON depth", async () => {
+    const invalid = vi.fn(async () => new Response(Uint8Array.from([0xff])));
+    await expect(fetchBotDirectory(invalid as unknown as typeof fetch)).rejects.toThrow("valid UTF-8");
+
+    const deep = `${'{"x":'.repeat(40)}null${"}".repeat(40)}`;
+    const nested = vi.fn(async () => new Response(deep));
+    await expect(fetchBotDirectory(nested as unknown as typeof fetch)).rejects.toThrow("json_depth");
+  });
 });
 
 describe("matchDirectoryBots", () => {

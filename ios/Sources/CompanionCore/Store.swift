@@ -36,6 +36,9 @@ public struct CompanionState: Sendable {
     /// `screens=on`, and only the newest frame is kept — these are hundreds
     /// of kilobytes each and a history of them is worth nothing.
     public var screens: [String: ScreenFrame] = [:]
+    /// Authoritative human-control state by bot. Unlike the secret lease
+    /// proof, this is safe to hydrate and lets a revoke close a phone viewer.
+    public var computerControl: [String: FleetComputerControl] = [:]
 
     public init() {}
 
@@ -102,6 +105,7 @@ public struct CompanionState: Sendable {
         rooms = fleet.groups
         messages.removeAll()
         hasMore.removeAll()
+        computerControl = fleet.computerControl
         for bot in fleet.bots {
             messages[bot.threadId] = bot.messages ?? []
             hasMore[bot.threadId] = bot.hasMore ?? false
@@ -227,6 +231,7 @@ public struct CompanionState: Sendable {
                 // was the last event that could ever mention this id.
                 clearStream(threadId)
                 clearScreen(botId)
+                computerControl.removeValue(forKey: botId)
                 bots.remove(at: index)
             }
 
@@ -264,6 +269,9 @@ public struct CompanionState: Sendable {
 
         case let .screen(botId, png, mime):
             screens[botId] = ScreenFrame(png: png, mime: mime)
+
+        case let .computerControl(botId, held, helpReason):
+            computerControl[botId] = FleetComputerControl(held: held, helpReason: helpReason)
 
         // Nothing to fold: config and provisioning state are not part of
         // this client's job yet.

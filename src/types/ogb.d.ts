@@ -174,9 +174,11 @@ type SkillRecordingPayload = {
         open(url: string, title: string, contextId: string): Promise<boolean>;
         /** Closes the live-desktop window, but only when it belongs to this bot. */
         close(contextId: string): Promise<boolean>;
-        /** The current viewer state, for a panel to initialize from on mount. */
-        currentState(): Promise<{ open: boolean; contextId: string | null }>;
-        onState(cb: (state: { open: boolean; contextId: string | null }) => void): () => void;
+        /** This exact bot's viewer state, for a panel to initialize on mount. */
+        currentState(contextId: string): Promise<{ open: boolean; contextId: string }>;
+        /** Every viewer owned by this renderer document (bounded in main). */
+        currentStates(): Promise<Array<{ open: true; contextId: string }>>;
+        onState(cb: (state: { open: boolean; contextId: string }) => void): () => void;
       };
       /** Native folder picker; resolves null when the user cancels. */
       pickFolder?(current?: string): Promise<string | null>;

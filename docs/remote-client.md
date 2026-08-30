@@ -2,161 +2,227 @@
 
 OpenMaus can run in two pieces:
 
-1. An always-on Linux host runs the harness server, provider CLIs, bot database, companion service, and virtual computers.
-2. A lightweight macOS or Windows app renders that server. It does not start a second harness or copy provider credentials to the client computer.
+1. An always-on Linux host runs the harness, provider CLIs, bot database,
+   phone companion, and virtual computers.
+2. A lightweight macOS or Windows app renders that server and, while running,
+   may attach its physical desktop through an attended outbound connection.
 
-Closing the client app does not stop work on the Linux host. The client checks server health and reloads itself after a service restart or temporary tunnel failure.
+On macOS, the red window button hides OpenMausBot and leaves a persistent
+menu-bar item: notifications and the attended Mac bridge remain active in the
+background. **OpenMausBot → Quit** (or the menu-bar **Quit and disconnect this
+computer** action) removes the physical Mac from the server. Either operation
+leaves server-side turns, routines, and virtual computers running. Windows
+currently quits and disconnects when its last window closes.
 
 ## Security boundary
 
-Keep the harness and companion control ports bound to loopback on the server. Carry them through an encrypted SSH tunnel or put an HTTPS reverse proxy with authentication in front of the harness. The client rejects cleartext HTTP origins unless they are loopback addresses.
+Bind the harness and companion ports to loopback. The desktop app owns its
+ephemeral loopback listeners and carries every accepted connection through
+the system OpenSSH client with strict host-key pinning. Two independent raw bearers exist only in the
+client's private `remote-client.json`: the harness receives only the SHA-256
+digest of the UI bearer, while the companion receives root-owned systemd
+credentials for upstream harness access and its separate pairing-control API.
 
-The bot runtime and the computer-control destination are separate. The harness, model CLI, shell, files, conversations, and routines stay on the Linux server. A bot can independently target a server-hosted Local VM, an external cloud computer, the attended physical Mac or Windows PC, or no graphical computer. For an always-on deployment, explicitly select the server-hosted Local VM instead of leaving the bot on Auto: Auto may fall back to the physical client computer when no cloud box exists.
+A hostile provider shell must not share the harness Unix identity. File
+permissions do not isolate two processes with the same UID: a provider could
+otherwise signal the harness, inspect `/proc`, or race to bind its control
+port. The production units therefore use three accounts:
 
-Physical-device control is optional and uses a separate loopback-only, authenticated, approval-gated bridge. The Linux server cannot reach it when the client app, client computer, or SSH tunnel is offline.
+- `openmaus-server`: harness and server-owned data;
+- `openmaus-provider`: model/provider CLIs and their MCP children;
+- `openmaus-companion`: phone companion.
+
+`OMB_REQUIRE_PROVIDER_ISOLATION=1` makes provider launch fail closed unless a
+root-owned identity-hop launcher is configured. Only the bot workspace root
+is shared through `openmaus-workspace`; the release, server data, session
+digest, credential store, and service definitions are not provider-readable
+or writable. Do not deploy the remote harness as the old shared `ian` user.
 
 ## Server
 
-Run the normal OpenMaus services on the Linux machine. A typical user service starts the harness on `127.0.0.1:8799`; the companion control plane listens on `127.0.0.1:8811`.
+Build and publish an immutable release under `/opt/openmausbot`; follow
+[`deploy/razer-remote/README.md`](../deploy/razer-remote/README.md) for the
+accounts, launcher, sudoers rule, system units, migration, and acceptance
+checks. The harness listens on `127.0.0.1:8799`; companion control listens on
+`127.0.0.1:8811`.
 
-Verify both before connecting a client:
-
-```sh
-curl -fsS http://127.0.0.1:8799/api/health
-curl -fsS http://127.0.0.1:8811/state
-```
-
-## Mac tunnel
-
-Forward local ports to the server over SSH:
+Generate two independent bearers on the client: one for the harness UI/API and
+one for companion pairing control. Run this command twice and do not reuse the
+first output as the second:
 
 ```sh
-ssh -NT \
-  -L 18799:127.0.0.1:8799 \
-  -L 8811:127.0.0.1:8811 \
-  -L 6080:127.0.0.1:6080 \
-  -R 127.0.0.1:18798:127.0.0.1:18798 \
-  user@server-tailnet-name
+node -e 'process.stdout.write(require("node:crypto").randomBytes(48).toString("base64url"))'
 ```
 
-Use a macOS LaunchAgent with `RunAtLoad` and `KeepAlive` to make this connection survive app closes and reconnect after network changes.
+Compute only the UI bearer's digest for the harness:
+
+```sh
+printf %s 'PASTE_THE_SAME_TOKEN' | shasum -a 256
+```
+
+Transfer each raw value separately through SSH stdin into the companion's
+root-only credential store; neither may land in a provider-readable home
+directory or unit `Environment=` line:
+
+```sh
+ssh user@server-tailnet-name 'sudo install -d -m 0700 -o root -g root /etc/credstore && \
+  sudo sh -c "umask 077; cat > /etc/credstore/openmausbot-ui-session" && \
+  sudo chown root:root /etc/credstore/openmausbot-ui-session && \
+  sudo chmod 0400 /etc/credstore/openmausbot-ui-session'
+# Paste the token, then press Ctrl-D.
+```
+
+Repeat that transfer for the companion-only token, changing the destination
+filename to `/etc/credstore/openmausbot-companion-session`.
+
+The harness drop-in contains only the 64-hex digest:
+
+```ini
+[Service]
+Environment="OMB_UI_SESSION_TOKEN_SHA256=<digest>"
+```
+
+The companion unit uses:
+
+```ini
+LoadCredential=openmausbot-ui-session:/etc/credstore/openmausbot-ui-session
+LoadCredential=openmausbot-companion-session:/etc/credstore/openmausbot-companion-session
+```
+
+The first credential is used only for the companion's upstream requests to
+the harness. The second is used only by the desktop app against companion
+control. Supplying the UI bearer to companion control is rejected.
+
+## App-owned pinned SSH
+
+Do not pre-bind `18799`/`8811` with an external `ssh -L` process. A fixed
+caller-managed loopback port is not server identity: if that tunnel is absent,
+another process could bind the port, receive a bearer, and serve privileged
+HTML. These legacy origins are rejected.
+
+Instead, copy the Razer host's public SSH host key through an already trusted
+console or an independently verified channel. On the Razer, the Ed25519 value
+is normally available with:
+
+```sh
+sudo cat /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+The public key is not a password, but its authenticity matters. Do not trust
+an unverified `ssh-keyscan` result from the same network path it is meant to
+authenticate.
+
+At launch, the app exclusively binds unpredictable loopback ports and writes a
+temporary known-hosts file containing only this pin. Every browser/API/
+WebSocket connection is sent through a fixed `ssh -W 127.0.0.1:<target>`
+process using `StrictHostKeyChecking=yes`, `BatchMode=yes`, and no user SSH
+config. If SSH or the Razer is unavailable, that app-owned connection closes;
+it never falls through to another loopback listener. There is no reverse CUA
+port.
 
 ## Client configuration
 
-Place `remote-client.json` in the app's Electron user-data directory:
+Place `remote-client.json` in the remote app's Electron user-data directory:
 
 ```json
 {
   "mode": "remote",
   "serverName": "Razer",
-  "serverUrl": "http://127.0.0.1:18799",
-  "companionUrl": "http://127.0.0.1:8811",
-  "deviceBridge": {
-    "enabled": true,
-    "port": 18798
-  }
+  "companion": true,
+  "ssh": {
+    "host": "razer.your-tailnet.ts.net",
+    "user": "ian",
+    "port": 22,
+    "hostPublicKey": "ssh-ed25519 AAAA..."
+  },
+  "sessionToken": "PASTE_THE_UI_TOKEN_GENERATED_ABOVE",
+  "companionSessionToken": "PASTE_THE_DIFFERENT_COMPANION_TOKEN_GENERATED_ABOVE"
 }
 ```
 
-For diagnostics, `--remote-server` or `OMB_REMOTE_URL` overrides `serverUrl`, and `OMB_REMOTE_COMPANION_URL` overrides `companionUrl`.
+The app uses the normal SSH agent/default identity. If necessary, add an
+absolute `identityFile` inside `ssh`; on POSIX it must be owner-only, regular,
+and not a symlink. Windows requires the OpenSSH agent/default identity and
+rejects `identityFile` until native handle-bound ACL validation is available.
 
-Build the remote-only Apple silicon bundle with:
+Older configs without `companionSessionToken` fail closed with a setup error;
+the app never derives it from `sessionToken`. Generate and provision a fresh
+independent value as described above.
+
+On macOS/Linux, make it owner-only before launch:
+
+```sh
+chmod 600 'remote-client.json'
+```
+
+The app opens and reads the same checked file handle, rejecting symlink-swap
+races, non-regular or oversized files, foreign ownership, and group/world-
+readable POSIX modes. On Windows it replaces the ACL with a SID-based rule for
+only the current process identity and verifies that exact ACL before opening;
+failure is fatal. Never copy this file to the Linux server.
+
+URL and environment overrides are deliberately unsupported in remote mode;
+they would bypass app ownership and host-key identity.
+
+Build the Apple-silicon remote app with:
 
 ```sh
 corepack pnpm package:remote:mac
 ```
 
-The result is `release-remote/mac-arm64/OpenMaus Razer.app`. The remote package omits the harness, server database, and companion server. It includes the pinned macOS CUA runtime because that runtime controls the Mac and must run inside the Mac app's local security boundary.
-
-Build the Windows x64 remote client on Windows with:
+The result is `release-remote/mac-arm64/OpenMaus Razer.app`. Build the Windows
+x64 installer on Windows with:
 
 ```powershell
 corepack pnpm package:remote:win
 ```
 
-The result is `release-remote/OpenMaus-Razer-<version>-setup.exe`. Put the same
-`remote-client.json` in `%APPDATA%\OpenMaus Razer`. The Windows build includes
-the hash-pinned Windows CUA runtime, keeps the device token under a user-only
-Windows ACL, and can expose the physical Windows desktop through the same
-attended bridge used on macOS.
+The remote package includes the pinned local CUA runtime but no harness,
+database, provider credentials, or companion listener.
 
-The remote UI uses `serverName` to keep the topology explicit: **Razer VM** means the isolated Linux desktop hosted on the Razer, while **This Mac** or **This Windows PC** means the user's physical client through the attended bridge. Neither option changes where the bot's model, shell, or files run.
+## Physical Mac/Windows bridge
 
-An explicitly selected server VM recovers on demand. Idle cleanup removes only its disposable container, and a host reboot may leave that managed container stopped; the next bot turn recreates it from the already prepared image while preserving the durable workspace. OpenMaus never removes an unowned stopped container or downloads/builds an image implicitly.
+There is no bridge token, descriptor, proxy command, or listening/reverse
+port. Electron main opens one authenticated outbound WebSocket through the
+app-owned pinned SSH origin using `x-openmausbot-session`. The bearer is never
+sent to an arbitrary pre-existing loopback listener. The server keeps only an
+in-memory registration bound to the exact platform and CUA executor generation.
 
-## Optional physical-device bridge
+For each provider turn, the provider receives one opaque, turn-scoped
+capability and a tiny stdio MCP broker. The server validates the live turn,
+target `physical:host`, registration ID, executor generation, and normal
+`ComputerControl` action ticket before relaying any `tools/call`. A human
+takeover therefore blocks actions even after **Always Allow While App Is
+Open** was selected.
 
-The current bridge uses `deviceBridge`, `device-bridge-token`,
-`scripts/remote-device-mcp-proxy.mjs`, and descriptor mode
-`remote-device-bridge`. Set `platform` to `darwin` or `win32`. Use a unique
-reverse-forwarded port for each attached client; for example IanPC can use
-18797 while a Mac retains 18798.
+Before spawning a local CUA MCP child, the client shows:
 
-The client creates a 32-byte token at `device-bridge-token` in its private
-Electron user-data directory. Copy that file to
-`~/.openmausbot/device-bridge-token` on the Linux server without printing it,
-and keep the server copy mode `0600`. Install
-`scripts/remote-device-mcp-proxy.mjs` at a private executable path and publish
-this hash-pinned descriptor, using the actual client platform:
+- **Deny**
+- **Allow Once**
+- **Always Allow While App Is Open**
 
-```json
-{
-  "schemaVersion": 1,
-  "mode": "remote-device-bridge",
-  "platform": "win32",
-  "scope": "local-computer",
-  "generation": "11234567-89ab-cdef-0123-456789abcdef",
-  "bridge": {
-    "host": "127.0.0.1",
-    "port": 18797,
-    "tokenFile": "/home/user/.openmausbot/device-bridge-token"
-  },
-  "proxy": {
-    "path": "/home/user/.local/lib/openmaus/remote-device-mcp-proxy.mjs",
-    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-  }
-}
-```
+The dialog identifies the server-authenticated bot and exact session; this
+identity is supplied by the turn capability, never by renderer JavaScript.
 
-The older `macBridge`, `mac-bridge-token`, `remote-mac-mcp-proxy.mjs`, and
-`remote-mac-bridge` descriptor remain supported for existing Mac installs.
+The decision window is bounded at two minutes and cancellable. After approval,
+the client obtains a fresh server `spawn` proof before creating the child, so
+a cancellation or replacement that raced the dialog spawns nothing. App
+disconnect, registration replacement, turn end, executor-generation change,
+transport failure, and shutdown close and force-reap the exact children.
 
-### Legacy Mac descriptor
+The old `macBridge`/`deviceBridge` config fields are ignored. The old
+`mac-bridge-token`, `device-bridge-token`, reverse-port listeners, stdio
+proxies, and Linux remote descriptors are retired and fail closed. The client
+removes its legacy token files during migration; delete matching legacy token,
+descriptor, and proxy files from the server before acceptance.
 
-The Mac app creates a 32-byte token at `mac-bridge-token` in its private Electron user-data directory. Copy that file to `~/.openmausbot/mac-bridge-token` on the Linux server without printing it, and keep both copies mode `0600`.
+## What survives a hidden or quit client
 
-Install `scripts/remote-mac-mcp-proxy.mjs` on the Linux server at a private, executable path such as `~/.local/lib/openmaus/remote-mac-mcp-proxy.mjs`. Publish `~/.openmausbot/cua-connection.json` with mode `0600`:
+- server-side bot turns and routines;
+- conversations and bot configuration;
+- provider CLI sessions and model endpoints;
+- companion and virtual-computer services.
 
-```json
-{
-  "schemaVersion": 1,
-  "mode": "remote-mac-bridge",
-  "platform": "darwin",
-  "scope": "local-computer",
-  "generation": "01234567-89ab-cdef-0123-456789abcdef",
-  "bridge": {
-    "host": "127.0.0.1",
-    "port": 18798,
-    "tokenFile": "/home/user/.openmausbot/mac-bridge-token"
-  },
-  "proxy": {
-    "path": "/home/user/.local/lib/openmaus/remote-mac-mcp-proxy.mjs",
-    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-  }
-}
-```
-
-Generate a fresh UUID and replace the all-zero hash with the real SHA-256 of the installed proxy.
-
-The server rejects unknown descriptor fields, non-loopback hosts, unsafe file ownership or modes, symlinks, invalid tokens, and proxy hash mismatches. The Mac rejects invalid tokens before showing a prompt and closes the CUA child when the tunneled connection closes.
-
-At connection time the client offers **Deny**, **Allow once**, and **Always allow while app is open**. OpenMaus separately gates individual computer tools in chat. **Always allow** on a chat approval remembers only that exact `local-computer:<tool>` key; it does not cover VM/cloud tools, unattended turns, or destructive/sensitive actions.
-
-## What survives a closed client
-
-- Server-side bot turns and routines
-- Conversations and bot configuration
-- Provider CLI sessions and API-key configuration
-- Companion and virtual-computer services
-
-Mac-only dictation remains local to the Mac client. Physical-device control becomes unavailable immediately when the client app quits or the reverse tunnel drops; this does not interrupt server-side work.
+Physical-device control survives a hidden macOS window while its menu-bar
+indicator is present. It does not survive an actual app quit. Mac-only
+dictation likewise requires the Mac app process.

@@ -67,4 +67,33 @@ describe("intakeFiles", () => {
     expect(out.attachments).toHaveLength(1);
     expect(out.notice).toMatch(/bad\.png: too large/);
   });
+
+  it("uploads remote binary files instead of leaking a controller-local path", async () => {
+    const selected = file("private.zip", "application/zip", 1234);
+    const uploaded: string[] = [];
+    const out = await intakeFiles([selected], {
+      allowImages: true,
+      getPath: () => "/Users/ian/private.zip",
+      uploadImage: upload,
+      uploadFile: async (f) => {
+        uploaded.push(f.name);
+        return { kind: "file", id: "razer-file", name: f.name, size: f.size, path: "/srv/openmaus/uploaded-files/id-private.zip" };
+      },
+    });
+    expect(uploaded).toEqual(["private.zip"]);
+    expect(out.attachments).toMatchObject([{ kind: "file", path: "/srv/openmaus/uploaded-files/id-private.zip" }]);
+    expect(JSON.stringify(out.attachments)).not.toContain("/Users/ian");
+  });
+
+  it("keeps a small remote text file inline instead of uploading it", async () => {
+    const out = await intakeFiles([file("notes.txt", "text/plain", 24)], {
+      allowImages: true,
+      getPath: () => "/Users/ian/notes.txt",
+      uploadImage: upload,
+      uploadFile: async () => {
+        throw new Error("small text should not upload");
+      },
+    });
+    expect(out.attachments).toMatchObject([{ kind: "paste", text: "contents" }]);
+  });
 });

@@ -1,0 +1,216 @@
+#!/usr/bin/python3
+"""Live Razer staging proof that never starts the production OpenMaus units."""
+
+from __future__ import annotations
+
+import grp
+import json
+import os
+import pwd
+import stat
+import subprocess
+import sys
+
+
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+
+HELPERS = {
+    "/usr/local/libexec/openmaus-provider-home": 0o755,
+    "/usr/local/libexec/openmaus-provider-launch": 0o755,
+    "/usr/local/libexec/openmaus-provider-network": 0o755,
+    "/usr/local/libexec/openmaus-provider-slice-check": 0o755,
+    "/usr/local/libexec/openmaus-provider-supervisor": 0o755,
+    "/usr/local/libexec/openmaus-provider-integration": 0o755,
+    "/usr/local/libexec/openmaus-storage-leaf": 0o755,
+    "/usr/local/libexec/openmaus-storage-setup": 0o755,
+    "/usr/local/libexec/openmaus-noncutover-preflight": 0o755,
+    "/etc/sudoers.d/openmaus-provider": 0o440,
+    "/etc/sudoers.d/openmaus-storage": 0o440,
+}
+
+UNIT_FILES = (
+    "openmaus-provider-network.service",
+    "openmaus-provider.slice",
+    "openmaus-storage-preflight.service",
+    "openmaus-storage-prepare.service",
+    r"var-lib-openmaus\x2dprovider-state.mount",
+    r"var-lib-openmausbot\x2dworkspaces.mount",
+    r"var-lib-openmausbot\x2dvm\x2dhomes.mount",
+    "openmausbot.service",
+    "openmausbot-companion.service",
+    "openmausbot-harness.socket",
+    "openmausbot-webhook.socket",
+    "openmausbot-companion.socket",
+    "openmausbot-control.socket",
+    "openmausbot-harness-proxy.service",
+    "openmausbot-webhook-proxy.service",
+    "openmausbot-companion-proxy.service",
+    "openmausbot-control-proxy.service",
+)
+
+STAGED_ACTIVE = (
+    "openmaus-provider-network.service",
+    "openmaus-provider.slice",
+    "openmaus-storage-prepare.service",
+    r"var-lib-openmaus\x2dprovider-state.mount",
+    r"var-lib-openmausbot\x2dworkspaces.mount",
+    r"var-lib-openmausbot\x2dvm\x2dhomes.mount",
+)
+
+PRODUCTION_INACTIVE = (
+    "openmausbot.service",
+    "openmausbot-companion.service",
+    "openmausbot-harness.socket",
+    "openmausbot-webhook.socket",
+    "openmausbot-companion.socket",
+    "openmausbot-control.socket",
+)
+
+TOOLS = (
+    "/usr/bin/btrfs",
+    "/usr/bin/bwrap",
+    "/usr/bin/docker",
+    "/usr/bin/getfacl",
+    "/usr/bin/mkfs.btrfs",
+    "/usr/bin/nft",
+    "/usr/bin/node",
+    "/usr/bin/setfacl",
+    "/usr/bin/slirp4netns",
+    "/usr/bin/systemctl",
+    "/usr/bin/systemd-analyze",
+    "/usr/bin/systemd-run",
+    "/usr/sbin/blkid",
+    "/usr/sbin/losetup",
+)
+
+
+def run(argv: list[str], *, capture: bool = False) -> str:
+    result = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        env=SAFE_ENV,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(f"preflight command failed: {argv[0]}{': ' + detail if detail else ''}")
+    return (result.stdout or "").strip()
+
+
+def checked_root_file(path: str, mode: int) -> None:
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or os.path.realpath(path) != path
+        or info.st_uid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != mode
+    ):
+        raise RuntimeError(f"installed deployment asset is unsafe: {path}")
+
+
+def group_ids(account: pwd.struct_passwd) -> set[int]:
+    return set(os.getgrouplist(account.pw_name, account.pw_gid))
+
+
+def is_active(unit: str) -> bool:
+    return subprocess.run(
+        ["/usr/bin/systemctl", "is-active", "--quiet", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=SAFE_ENV,
+    ).returncode == 0
+
+
+def require_identities() -> None:
+    server = pwd.getpwnam("openmaus-server")
+    provider = pwd.getpwnam("openmaus-provider")
+    guest = pwd.getpwnam("openmaus-vm-guest")
+    runtime_gid = grp.getgrnam("openmaus-runtime").gr_gid
+    workspace_gid = grp.getgrnam("openmaus-workspace").gr_gid
+    docker_gid = grp.getgrnam("docker").gr_gid
+    guest_gid = grp.getgrnam("openmaus-vm-guest").gr_gid
+    if server.pw_uid == 0 or provider.pw_uid == 0 or server.pw_gid != runtime_gid:
+        raise RuntimeError("trusted server/provider identities do not match the release")
+    if provider.pw_dir != "/var/lib/openmaus-provider":
+        raise RuntimeError("provider HOME does not match the protected deployment")
+    if guest.pw_uid != 61000 or guest.pw_gid != 61000 or guest_gid != 61000:
+        raise RuntimeError("Local VM guest identity is not the reserved uid/gid 61000")
+    server_groups = group_ids(server)
+    provider_groups = group_ids(provider)
+    if not {runtime_gid, workspace_gid, docker_gid}.issubset(server_groups):
+        raise RuntimeError("trusted server lacks an exact runtime/workspace/Docker grant")
+    if not {workspace_gid, runtime_gid}.issubset(provider_groups):
+        raise RuntimeError("provider lacks only the required shared runtime/workspace groups")
+    if {docker_gid, guest_gid} & provider_groups:
+        raise RuntimeError("provider inherited Docker or Local VM guest authority")
+    try:
+        human_groups = group_ids(pwd.getpwnam("ian"))
+    except KeyError:
+        human_groups = set()
+    if runtime_gid in human_groups or guest_gid in human_groups:
+        raise RuntimeError("human account inherited provider-runtime or VM-guest authority")
+
+
+def require_noncutover_state() -> None:
+    for unit in STAGED_ACTIVE:
+        if not is_active(unit):
+            raise RuntimeError(f"staging prerequisite is not active: {unit}")
+        fragment = run(["/usr/bin/systemctl", "show", unit, "--property=FragmentPath", "--value"], capture=True)
+        if fragment != f"/etc/systemd/system/{unit}":
+            raise RuntimeError(f"staging unit uses an unexpected fragment: {unit}")
+    for unit in PRODUCTION_INACTIVE:
+        if is_active(unit):
+            raise RuntimeError(f"non-cutover proof refuses an active production unit: {unit}")
+
+
+def main() -> int:
+    if os.geteuid() != 0 or sys.platform != "linux" or sys.argv[1:] != ["--check"]:
+        return 64
+    try:
+        if not os.path.isfile("/sys/fs/cgroup/cgroup.controllers"):
+            raise RuntimeError("unified cgroup v2 is unavailable")
+        for tool in TOOLS:
+            if not os.path.isfile(tool) or not os.access(tool, os.X_OK):
+                raise RuntimeError(f"required deployment tool is unavailable: {tool}")
+        for path, mode in HELPERS.items():
+            checked_root_file(path, mode)
+        for unit in UNIT_FILES:
+            checked_root_file(f"/etc/systemd/system/{unit}", 0o644)
+        require_identities()
+        require_noncutover_state()
+        run(["/usr/sbin/visudo", "-cf", "/etc/sudoers.d/openmaus-provider"])
+        run(["/usr/sbin/visudo", "-cf", "/etc/sudoers.d/openmaus-storage"])
+        run(["/usr/bin/systemd-analyze", "verify", *[f"/etc/systemd/system/{name}" for name in UNIT_FILES]])
+        run(["/usr/local/libexec/openmaus-storage-setup", "--check-mounted"])
+        run(["/usr/local/libexec/openmaus-provider-slice-check", "--check"])
+        run(["/usr/local/libexec/openmaus-provider-network", "--check"])
+        # These tests create only unique, bounded temporary images/subvolumes
+        # and transient units, then tear them down. Neither production backend
+        # nor any public socket is started.
+        run(["/usr/local/libexec/openmaus-storage-setup", "--integration-test"])
+        run(["/usr/local/libexec/openmaus-storage-leaf", "--integration-test"])
+        run(["/usr/bin/node", "/usr/local/libexec/openmaus-provider-integration"])
+        require_noncutover_state()
+        print(json.dumps({
+            "ok": True,
+            "cutover": False,
+            "productionUnitsStarted": False,
+            "storage": "bounded-btrfs-live",
+            "providerNetwork": "private-netns-slirp-and-exact-nft-live",
+            "providerCgroups": "per-turn-and-aggregate-exact",
+        }, sort_keys=True))
+        return 0
+    except (KeyError, OSError, RuntimeError) as error:
+        print(f"openmaus non-cutover preflight refused: {error}", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

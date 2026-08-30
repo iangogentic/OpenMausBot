@@ -1,6 +1,7 @@
 import { parseJson, type JsonValue } from "./schema.ts";
 import { isBotPackage, parseBotPackage, type ParsedBotPackage } from "./bot-package.ts";
 import { parseTeamManifest, type ParsedTeamManifest } from "./team-manifest.ts";
+import { readBoundedResponseText } from "./bounded-response.ts";
 
 export const TEAM_LIBRARY_REPOSITORY = "https://github.com/milind-soni/openmausbot-teams";
 export const TEAM_LIBRARY_RAW_ROOT = "https://raw.githubusercontent.com/milind-soni/openmausbot-teams/main";
@@ -129,8 +130,7 @@ async function fetchJson(url: string, maxBytes: number, fetcher: Fetcher): Promi
   }
   const announced = Number(response.headers.get("content-length") ?? 0);
   if (announced > maxBytes) throw new Error("The remote team file is too large");
-  const raw = await response.text();
-  if (Buffer.byteLength(raw) > maxBytes) throw new Error("The remote team file is too large");
+  const raw = await readBoundedResponseText(response, maxBytes, "The remote team file is too large");
   try {
     return parseJson(raw);
   } catch {
@@ -147,9 +147,7 @@ async function fetchText(url: string, maxBytes: number, fetcher: Fetcher): Promi
   if (!response.ok) throw Object.assign(new Error(`GitHub returned HTTP ${response.status}`), { status: response.status });
   const announced = Number(response.headers.get("content-length") ?? 0);
   if (announced > maxBytes) throw new Error("The remote team file is too large");
-  const raw = await response.text();
-  if (Buffer.byteLength(raw) > maxBytes) throw new Error("The remote team file is too large");
-  return raw;
+  return readBoundedResponseText(response, maxBytes, "The remote team file is too large");
 }
 
 export async function fetchTeamCatalog(fetcher: Fetcher = fetch): Promise<TeamCatalog> {

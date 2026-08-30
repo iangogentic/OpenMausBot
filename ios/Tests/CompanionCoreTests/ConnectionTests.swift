@@ -213,19 +213,95 @@ final class ConnectionTests: XCTestCase {
         XCTAssertNil(PairingInvite.parse(try XCTUnwrap(URL(string: "openmausbot://pair?address=one.local&address=two.local&code=123456"))))
     }
 
-    func testAcceptsOnlyAnHTTPSCloudDesktopSession() throws {
-        let valid = Data(#"{"joinUrl":"https://desktop.example/session/fresh","state":"ready"}"#.utf8)
+    func testAcceptsOnlyATrustedAsciiCloudDesktopSession() throws {
+        let valid = Data(#"{"joinUrl":"https://desktop.ascii.dev/session/fresh","state":"ready"}"#.utf8)
         let session = try JSONDecoder().decode(CloudDesktopSession.self, from: valid)
-        XCTAssertEqual(session.url.absoluteString, "https://desktop.example/session/fresh")
+        XCTAssertEqual(session.url.absoluteString, "https://desktop.ascii.dev/session/fresh")
 
         for value in [
-            "http://desktop.example/session",
+            "http://desktop.ascii.dev/session",
+            "https://desktop.example/session",
+            "https://ascii.dev.evil.example/session",
+            "https://user:secret@desktop.ascii.dev/session",
             "javascript:alert(1)",
-            "not a URL"
+            "not a URL",
+            "https://desktop.ascii.dev/" + String(repeating: "x", count: 4_096)
         ] {
             let data = try JSONSerialization.data(withJSONObject: ["joinUrl": value])
             XCTAssertThrowsError(try JSONDecoder().decode(CloudDesktopSession.self, from: data))
         }
+    }
+
+    func testAcceptsOnlyTheExactPairedLocalVMViewer() throws {
+        let base = try XCTUnwrap(URL(string: "https://razer.example"))
+        let generation = String(repeating: "g", count: 16)
+        let token = String(repeating: "t", count: 43)
+        let prefix = "/api/bots/bot-1/phone-local-computer/viewer/\(generation)/\(token)"
+        let raw = "\(prefix)/vnc.html#autoconnect=true&resize=scale&password=pw&path=\(prefix.dropFirst())/websockify"
+        let accepted = trustedPhoneLocalVmViewerURL(raw, companionBaseURL: base, botId: "bot-1")
+        XCTAssertEqual(accepted?.host, "razer.example")
+        XCTAssertEqual(accepted?.path, "\(prefix)/vnc.html")
+
+        for value in [
+            raw.replacingOccurrences(of: "/bot-1/", with: "/bot-2/"),
+            raw.replacingOccurrences(of: generation, with: "short"),
+            raw.replacingOccurrences(of: token, with: "short"),
+            raw.replacingOccurrences(of: "password=pw", with: "password="),
+            raw.replacingOccurrences(of: "/websockify", with: "/other"),
+            raw.replacingOccurrences(of: "/vnc.html", with: "/vnc.html?leak=1"),
+            "https://evil.example\(raw)",
+        ] {
+            XCTAssertNil(trustedPhoneLocalVmViewerURL(value, companionBaseURL: base, botId: "bot-1"), value)
+        }
+
+        let httpBase = try XCTUnwrap(URL(string: "http://razer.tailnet:8810"))
+        XCTAssertNotNil(trustedPhoneLocalVmViewerURL(raw, companionBaseURL: httpBase, botId: "bot-1"))
+    }
+
+    func testCloudDesktopNavigationKeepsTheMainFrameOnItsExactOrigin() throws {
+        let origin = try XCTUnwrap(URL(string: "https://desktop.ascii.dev/session/fresh"))
+        XCTAssertTrue(cloudDesktopNavigationIsAllowed(
+            destination: try XCTUnwrap(URL(string: "https://desktop.ascii.dev:443/vnc#screen")),
+            originalURL: origin,
+            isMainFrame: true
+        ))
+        XCTAssertFalse(cloudDesktopNavigationIsAllowed(
+            destination: try XCTUnwrap(URL(string: "https://auth.ascii.dev/continue")),
+            originalURL: origin,
+            isMainFrame: true
+        ))
+        XCTAssertFalse(cloudDesktopNavigationIsAllowed(
+            destination: try XCTUnwrap(URL(string: "https://evil.example/continue")),
+            originalURL: origin,
+            isMainFrame: true
+        ))
+        XCTAssertFalse(cloudDesktopNavigationIsAllowed(
+            destination: try XCTUnwrap(URL(string: "javascript:alert(1)")),
+            originalURL: origin,
+            isMainFrame: false
+        ))
+        XCTAssertTrue(cloudDesktopNavigationIsAllowed(
+            destination: try XCTUnwrap(URL(string: "https://static.example/provider-frame")),
+            originalURL: origin,
+            isMainFrame: false
+        ))
+    }
+
+    func testLocalVMNavigationKeepsEveryFrameOnTheCompanionOrigin() throws {
+        let origin = try XCTUnwrap(URL(string:
+            "https://razer.example/api/bots/bot-1/phone-local-computer/viewer/gggggggggggggggg/" +
+                String(repeating: "t", count: 43) + "/vnc.html"
+        ))
+        XCTAssertTrue(cloudDesktopNavigationIsAllowed(
+            destination: try XCTUnwrap(URL(string: "https://razer.example/app/ui.js")),
+            originalURL: origin,
+            isMainFrame: false
+        ))
+        XCTAssertFalse(cloudDesktopNavigationIsAllowed(
+            destination: try XCTUnwrap(URL(string: "https://evil.example/app/ui.js")),
+            originalURL: origin,
+            isMainFrame: false
+        ))
     }
 
     private static func base64URL(_ data: Data) throws -> String {

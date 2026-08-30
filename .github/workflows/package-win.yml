@@ -79,10 +79,12 @@ jobs:
           fi
           [ -f "$res/app-update.yml" ] || { echo "::error::missing $res/app-update.yml"; fail=1; }
           if [ -f "$res/app-update.yml" ]; then
-            grep -q "openmausbot-releases" "$res/app-update.yml" || {
-              echo "::error::app-update.yml does not point at openmausbot-releases"; fail=1; }
-            # while the build is unsigned, a publisherName makes
-            # electron-updater reject every update as untrusted
+            grep -q "owner: iangogentic" "$res/app-update.yml" &&
+              grep -q "repo: OpenMausBot" "$res/app-update.yml" || {
+              echo "::error::app-update.yml does not point at iangogentic/OpenMausBot"; fail=1; }
+            # Windows auto-update is disabled until these artifacts are
+            # signed. A publisherName on today's unsigned artifact would be
+            # false assurance and would also make every update fail closed.
             if grep -q "publisherName" "$res/app-update.yml"; then
               echo "::error::app-update.yml carries publisherName on an unsigned build"; fail=1
             fi

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  botDeletionConfirmation,
   configStatusFromFrame,
   initialState,
   openNotificationTarget,
@@ -8,6 +9,18 @@ import {
   type Bot,
   type Message,
 } from "./store";
+
+describe("bot deletion confirmation", () => {
+  it("explains the complete local deletion and fail-closed Box/VPS preflight", () => {
+    const copy = botDeletionConfirmation("Scout");
+
+    expect(copy).toContain("Permanently delete Scout?");
+    expect(copy).toMatch(/task, message, memory, imported skill, checkpoint/i);
+    expect(copy).toMatch(/checks both Box and VPS/i);
+    expect(copy).toMatch(/deletion stops.*select and remove/i);
+    expect(copy).not.toMatch(/if you do not want it to remain/i);
+  });
+});
 
 describe("notification routing", () => {
   const bots = [{ id: "bot-1", threadId: "main-thread", tasks: [{ threadId: "detached-thread" }] }] as never;
@@ -70,6 +83,75 @@ describe("config status frames", () => {
       profile: { name: "Ian", email: "ian@example.test" },
       features: { skillRecorder: true },
     });
+  });
+});
+
+describe("mutually exclusive right-side overlays", () => {
+  it("closes every competing overlay when Connected apps opens", () => {
+    const layered = {
+      ...initialState,
+      settingsOpen: true,
+      computerOpen: true,
+      inspectorOpen: true,
+      appSettingsOpen: true,
+      pluginsOpen: false,
+    };
+
+    const next = reducer(layered, { type: "togglePlugins", open: true });
+
+    expect(next).toMatchObject({
+      pluginsOpen: true,
+      settingsOpen: false,
+      computerOpen: false,
+      inspectorOpen: false,
+      appSettingsOpen: false,
+    });
+  });
+
+  it("closes Connected apps when another right-side overlay opens", () => {
+    for (const action of [
+      { type: "toggleSettings", open: true },
+      { type: "toggleComputer", open: true },
+      { type: "toggleInspector", open: true },
+      { type: "toggleAppSettings", open: true },
+    ] as const) {
+      expect(reducer({ ...initialState, pluginsOpen: true }, action).pluginsOpen).toBe(false);
+    }
+  });
+});
+
+describe("Auto computer selection", () => {
+  const bot = {
+    id: "computer-bot",
+    threadId: "computer-thread",
+    name: "Computer bot",
+    title: "",
+    description: "",
+    notifications: true,
+    color: "green",
+    unread: false,
+    modelSelection: { instanceId: "acp", model: "model" },
+    computer: "vm",
+    messages: [],
+  } satisfies Bot;
+
+  it("optimistically clears the explicit target without storing the wire-only auto sentinel", () => {
+    const next = reducer(
+      { ...initialState, bots: [bot], selectedId: bot.id },
+      { type: "setComputerAuto", botId: bot.id },
+    );
+
+    expect(next.bots[0]?.computer).toBeUndefined();
+  });
+
+  it("treats an omitted computer field in a complete bot frame as Auto", () => {
+    const { computer: _computer, messages: _messages, ...autoAnnouncement } = bot;
+    const next = reducer(
+      { ...initialState, bots: [bot], selectedId: bot.id },
+      { type: "botPatched", bot: autoAnnouncement },
+    );
+
+    expect(next.bots[0]?.computer).toBeUndefined();
   });
 });
 

@@ -54,7 +54,10 @@ describe("what the app may do", () => {
     ["DELETE", "/api/bots/bot_123/tasks/th_1"],
     ["PATCH", "/api/bots/bot_123/profile"],
     ["POST", "/api/bots/bot_123/avatar/generate"],
+    ["GET", "/api/bots/bot_123/computer/control"],
+    ["POST", "/api/bots/bot_123/computer/control"],
     ["POST", "/api/bots/bot_123/computer/join"],
+    ["POST", "/api/bots/bot_123/local-computer/join"],
     ["POST", "/api/groups/room-1/messages"],
     ["POST", "/api/groups/room-1/read"],
     ["GET", "/api/threads/th_1/messages"],
@@ -143,8 +146,16 @@ describe("what it may not", () => {
     expect(ask("GET", "/index.html")?.status).toBe(404);
   });
 
-  it("opens only a fresh cloud viewer, not the cloud computer control API", () => {
+  it("opens only lease-bound interactive viewers, not lifecycle or console APIs", () => {
+    expect(allowed("GET", "/api/bots/bot_123/computer/control")).toBe(true);
+    expect(allowed("POST", "/api/bots/bot_123/computer/control")).toBe(true);
     expect(allowed("POST", "/api/bots/bot_123/computer/join")).toBe(true);
+    expect(allowed("POST", "/api/bots/bot_123/local-computer/join")).toBe(true);
+    expect(allowed("GET", "/api/bots/bot_123/local-computer")).toBe(false);
+    expect(allowed("POST", "/api/bots/bot_123/local-computer/run")).toBe(false);
+    expect(allowed("POST", "/api/bots/bot_123/local-computer/stop")).toBe(false);
+    expect(allowed("POST", "/api/bots/bot_123/local-computer/remove")).toBe(false);
+    expect(allowed("POST", "/api/bots/bot_123/local-computer/screenshot")).toBe(false);
     expect(allowed("GET", "/api/bots/bot_123/computer")).toBe(false);
     expect(allowed("POST", "/api/bots/bot_123/computer/provision")).toBe(false);
     expect(allowed("POST", "/api/bots/bot_123/computer/sleep")).toBe(false);

@@ -4,6 +4,7 @@
 // suite is deterministic with or without agent CLIs installed — and pins
 // the shadow-instance behavior end to end while it's at it.
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer, request, type Server } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -14,6 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { vpsContainerName } from "./vps-computer.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SERVER_DIR, "..");
@@ -22,6 +24,9 @@ const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
 const WEBHOOK_BASE = `http://127.0.0.1:${WEBHOOK_PORT}`;
+const UI_SESSION_TOKEN = `test-ui-session-${"s".repeat(43)}`;
+const UI_SESSION_HEADER = { "x-openmausbot-session": UI_SESSION_TOKEN };
+const MODEL_RELAY_FIXTURE_MODEL = "relay-fixture-model";
 
 let child: ChildProcess;
 /** stands in for the box provider so config saving never touches the network */
@@ -30,21 +35,170 @@ let boxStubPort = 0;
 let home: string;
 let staticDir: string;
 let fakeClaudeDump: string;
+let fakeClaudeInterruptFailures: string;
+let fakeVpsState: string;
 let stderr = "";
+let deferredBoxList: {
+  boxes: unknown[];
+  started: () => void;
+  release: Promise<void>;
+} | null = null;
+let deferredBoxCommand: {
+  started: () => void;
+  release: Promise<void>;
+  fail: boolean;
+} | null = null;
+let boxPromptFixture: {
+  started: () => void;
+  status: "running" | "finished" | "failed";
+} | null = null;
+let deferredConnectorToolkits: {
+  remaining: number;
+  started: () => void;
+  release: Promise<void>;
+} | null = null;
+let deferredConnectorAuthorization: {
+  started: () => void;
+  release: Promise<void>;
+} | null = null;
+const connectedConnectorToolkits = new Set<string>();
+const boxResources = new Map<string, { id: string; name: string; state: string }>();
+let failBoxInventory = false;
+let lastModelRelayUpstream: {
+  authorization: string | undefined;
+  apiKey: string | undefined;
+  body: unknown;
+} | null = null;
+
+function deferNextBoxList(boxes: unknown[]): { started: Promise<void>; release: () => void } {
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  deferredBoxList = { boxes, started: markStarted, release: gate };
+  return { started, release };
+}
+
+function deferNextBoxCommand(fail = false): { started: Promise<void>; release: () => void } {
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  deferredBoxCommand = { started: markStarted, release: gate, fail };
+  return { started, release };
+}
+
+function trackNextBoxPrompt(): { started: Promise<void>; finish: () => void; fail: () => void } {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const fixture = { started: markStarted, status: "running" as const } as {
+    started: () => void;
+    status: "running" | "finished" | "failed";
+  };
+  boxPromptFixture = fixture;
+  return {
+    started,
+    finish: () => { fixture.status = "finished"; },
+    fail: () => { fixture.status = "failed"; },
+  };
+}
+
+function deferNextConnectorToolkitReads(count: number): { started: Promise<void>; release: () => void } {
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  deferredConnectorToolkits = { remaining: count, started: markStarted, release: gate };
+  return { started, release };
+}
+
+function deferNextConnectorAuthorizationFailure(): { started: Promise<void>; release: () => void } {
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  deferredConnectorAuthorization = { started: markStarted, release: gate };
+  return { started, release };
+}
+
+function stubBoxName(botId: string): string {
+  const hash = createHash("sha256").update(botId).digest("hex").slice(0, 6);
+  return `ogb-${botId.slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, "")}-${hash}`;
+}
 
 const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
+    headers: { ...UI_SESSION_HEADER, ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: await res.json() };
 };
 
+const companionApi = async (
+  method: string,
+  path: string,
+  body: unknown,
+  deviceId = "phone-1",
+): Promise<{ status: number; body: any }> => {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: {
+      ...UI_SESSION_HEADER,
+      "x-openmausbot-companion": "1",
+      "x-openmausbot-companion-device": deviceId,
+      ...(body ? { "content-type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return { status: res.status, body: await res.json() };
+};
+
+const internalApi = async (path: string, token: string, body: unknown): Promise<{ status: number; body: any }> => {
+  const response = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() };
+};
+
+const startConnectorTurn = async (botId: string, text: string): Promise<string> => {
+  expect((await api("PATCH", `/api/bots/${botId}`, {
+    modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+    composio: true,
+  })).status).toBe(200);
+  rmSync(fakeClaudeDump, { force: true });
+  expect((await api("POST", `/api/bots/${botId}/messages`, { text })).status).toBe(202);
+  await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+  const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+  const token = dump.mcpConfig?.mcpServers?.composio?.env?.OMB_CONNECTOR_CAPABILITY_TOKEN;
+  expect(token).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+  return token;
+};
+
 const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   const response = await fetch(`${BASE}/api/attachments`, {
     method: "POST",
-    headers: { "content-type": mime },
+    headers: { ...UI_SESSION_HEADER, "content-type": mime },
     body: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
   });
   expect(response.status).toBe(201);
@@ -54,12 +208,42 @@ const uploadAvatar = async (mime = "image/png"): Promise<string> => {
   return `/api/attachments/${name}`;
 };
 
-const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
+const pathStatusWithHeaders = (path: string, headers: Record<string, string>): Promise<number> =>
   new Promise((resolve, reject) => {
-    const req = request({ hostname: "127.0.0.1", port: PORT, path: "/api/health", headers }, (res) => {
+    const req = request({ hostname: "127.0.0.1", port: PORT, path, headers }, (res) => {
       res.resume();
       resolve(res.statusCode ?? 0);
     });
+    req.on("error", reject);
+    req.end();
+  });
+
+const statusWithHeaders = (headers: Record<string, string>): Promise<number> =>
+  pathStatusWithHeaders("/api/health", headers);
+
+const websocketUpgradeStatus = (path: string, headers: Record<string, string>): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const req = request({
+      hostname: "127.0.0.1",
+      port: PORT,
+      path,
+      method: "GET",
+      headers: {
+        connection: "Upgrade",
+        upgrade: "websocket",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": Buffer.alloc(16, 0x41).toString("base64"),
+        ...headers,
+      },
+    }, (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    });
+    req.on("upgrade", (res, socket) => {
+      socket.destroy();
+      resolve(res.statusCode ?? 101);
+    });
+    req.setTimeout(3_000, () => req.destroy(new Error("WebSocket upgrade timed out")));
     req.on("error", reject);
     req.end();
   });
@@ -68,9 +252,47 @@ beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), "omb-api-test-"));
   staticDir = join(home, "static");
   fakeClaudeDump = join(home, "fake-claude-dump.json");
+  fakeClaudeInterruptFailures = join(home, "fake-claude-interrupt-failures");
+  fakeVpsState = join(home, "fake-vps-containers.json");
   // a fleet of exactly one unknown driver: no CLI probes, no network
   mkdirSync(join(home, ".openmausbot"), { recursive: true });
   mkdirSync(join(staticDir, "assets"), { recursive: true });
+  const fakeBin = join(home, "fake-bin");
+  mkdirSync(fakeBin, { recursive: true });
+  writeFileSync(fakeVpsState, "[]");
+  writeFileSync(
+    join(fakeBin, "docker"),
+    [
+      `#!${process.execPath}`,
+      'const fs = require("node:fs");',
+      'const { spawnSync } = require("node:child_process");',
+      'const statePath = process.env.OMB_TEST_VPS_STATE;',
+      'const args = process.argv.slice(2);',
+      'if (args[0] !== "-H") {',
+      '  const result = spawnSync("docker", args, { env: { ...process.env, PATH: process.env.OMB_TEST_REAL_PATH || "" } });',
+      '  if (result.stdout) process.stdout.write(result.stdout);',
+      '  if (result.stderr) process.stderr.write(result.stderr);',
+      '  process.exit(result.status == null ? 1 : result.status);',
+      '}',
+      'const names = statePath ? JSON.parse(fs.readFileSync(statePath, "utf8")) : [];',
+      'const command = args[2];',
+      'if (command === "image") { console.error("Error: No such image"); process.exit(1); }',
+      'if (command === "inspect") {',
+      '  const name = args[3];',
+      '  if (!names.includes(name)) { console.error("Error: No such container"); process.exit(1); }',
+      '  process.stdout.write(JSON.stringify([{',
+      '    Id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",',
+      '    Image: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",',
+      '    Config: { Image: "fixture", Labels: { "com.openmausbot.vps": "1", "com.openmausbot.container": name }, Env: [] },',
+      '    HostConfig: {}, Mounts: [], State: { Running: true }, NetworkSettings: { Networks: {} }',
+      '  }]));',
+      '  process.exit(0);',
+      '}',
+      'if (command === "rm") { if (statePath) fs.writeFileSync(statePath, "[]"); process.exit(0); }',
+      'process.stdout.write("{}\\n");',
+    ].join("\n"),
+    { mode: 0o755 },
+  );
   writeFileSync(join(staticDir, "index.html"), "<!doctype html><title>Packaged OpenMausBot</title>");
   writeFileSync(join(staticDir, "assets", "smoke.css"), "body { color: white; }");
   writeFileSync(
@@ -78,7 +300,13 @@ beforeAll(async () => {
     JSON.stringify({
       instances: {
         ghost: { driver: "not-a-real-driver", displayName: "Ghost" },
-        claude: { driver: "claudeAgent", displayName: "Fixture Claude", config: { cli: FAKE_CLAUDE_CLI } },
+        claude: {
+          driver: "claudeAgent",
+          displayName: "Fixture Claude",
+          environment: { FAKE_CLAUDE_INTERRUPT_FAILURE_FILE: fakeClaudeInterruptFailures },
+          config: { cli: FAKE_CLAUDE_CLI },
+        },
+        computer: { driver: "boxAgent", config: { pollMs: 25 } },
       },
     }),
   );
@@ -185,7 +413,56 @@ beforeAll(async () => {
   );
 
   boxStub = createServer(async (req, res) => {
-    if (req.url?.startsWith("/api/v3.1/tool_router/session")) {
+    if (req.method === "POST" && req.url === "/v1/messages") {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      lastModelRelayUpstream = {
+        authorization: req.headers.authorization,
+        apiKey: typeof req.headers["x-api-key"] === "string" ? req.headers["x-api-key"] : undefined,
+        body: raw ? JSON.parse(raw) : null,
+      };
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ id: "relay-response", model: MODEL_RELAY_FIXTURE_MODEL, content: [] }));
+    }
+    if (req.method === "POST" && /^\/boxes\/[^/]+\/commands$/.test(req.url ?? "") && deferredBoxCommand) {
+      const deferred = deferredBoxCommand;
+      deferredBoxCommand = null;
+      deferred.started();
+      await deferred.release;
+      res.writeHead(deferred.fail ? 500 : 200, { "content-type": "application/json" });
+      return res.end(JSON.stringify(deferred.fail
+        ? { ok: false, error: { code: "fixture_command_failed" } }
+        : { ok: true, exitCode: 0, stdout: "done", stderr: "" }));
+    }
+    if (req.method === "POST" && /^\/boxes\/[^/]+\/prompt$/.test(req.url ?? "") && boxPromptFixture) {
+      boxPromptFixture.started();
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, promptRun: { id: "prompt-control-gate", status: "running" } }));
+    }
+    if (req.method === "GET" && /^\/boxes\/[^/]+\/prompts\/prompt-control-gate$/.test(req.url ?? "") && boxPromptFixture) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, promptRun: { id: "prompt-control-gate", status: boxPromptFixture.status } }));
+    }
+    if (req.method === "GET" && /^\/boxes\/[^/]+\/events$/.test(req.url ?? "") && boxPromptFixture) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, events: [] }));
+    }
+    if (
+      req.method === "POST" &&
+      req.url === "/api/v3.1/tool_router/session/trs_config_test/link"
+    ) {
+      const deferred = deferredConnectorAuthorization;
+      if (deferred) {
+        deferredConnectorAuthorization = null;
+        deferred.started();
+        await deferred.release;
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "delayed authorization failure" } }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ redirect_url: "https://connect.composio.dev/link/test" }));
+    }
+    if (req.method === "POST" && req.url?.startsWith("/api/v3.1/tool_router/session")) {
       if (req.headers["x-api-key"] !== "ak_good") {
         res.writeHead(401, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: { message: "invalid project key" } }));
@@ -197,13 +474,90 @@ beforeAll(async () => {
       return res.end(JSON.stringify({
         session_id: "trs_config_test",
         mcp: { type: "http", url: "https://app.composio.dev/tool_router/v3/trs_config_test/mcp" },
-        config: { user_id: body.user_id },
+        config: {
+          user_id: body.user_id,
+          multi_account: { enable: true, max_accounts_per_toolkit: 5, require_explicit_selection: true },
+        },
       }));
     }
+    if (req.method === "GET" && req.url === "/api/v3.1/tool_router/session/trs_config_test") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({
+        session_id: "trs_config_test",
+        mcp: { type: "http", url: "https://app.composio.dev/tool_router/v3/trs_config_test/mcp" },
+        config: {
+          user_id: "openmausbot_test",
+          multi_account: { enable: true, max_accounts_per_toolkit: 5, require_explicit_selection: true },
+        },
+      }));
+    }
+    if (req.url?.startsWith("/api/v3.1/tool_router/session/trs_config_test/toolkits")) {
+      const deferred = deferredConnectorToolkits;
+      if (deferred && deferred.remaining > 0) {
+        deferred.remaining -= 1;
+        if (deferred.remaining === 0) deferred.started();
+        await deferred.release;
+        if (deferredConnectorToolkits === deferred) deferredConnectorToolkits = null;
+      }
+      const requested = new URL(req.url, "http://127.0.0.1").searchParams.get("toolkits")?.split(",") ?? [];
+      const items = requested
+        .filter((slug) => connectedConnectorToolkits.has(slug))
+        .map((slug) => ({ slug, connected_account: { id: `account-${slug}`, status: "ACTIVE" } }));
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ items }));
+    }
+    if (req.url?.startsWith("/api/v3.1/connected_accounts")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ items: [] }));
+    }
+    if (req.url?.startsWith("/api/v3/toolkits")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ items: [] }));
+    }
+    if (
+      req.url === "/boxes" &&
+      req.headers.authorization === "Bearer box_good" &&
+      deferredBoxList
+    ) {
+      const deferred = deferredBoxList;
+      deferredBoxList = null;
+      deferred.started();
+      await deferred.release;
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, boxes: deferred.boxes }));
+    }
+    const boxCredentialOk =
+      req.headers.authorization === "Bearer box_good" || req.headers.authorization === "Bearer box_slow";
     if (req.headers.authorization === "Bearer box_slow") {
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
-    const ok = req.headers.authorization === "Bearer box_good" || req.headers.authorization === "Bearer box_slow";
+    if (boxCredentialOk && failBoxInventory && req.method === "GET" && req.url === "/boxes") {
+      res.writeHead(503, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: false, message: "fixture inventory unavailable" }));
+    }
+    if (boxCredentialOk && req.method === "GET" && req.url === "/boxes") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, boxes: [...boxResources.values()] }));
+    }
+    const resourceMatch = req.url?.match(/^\/boxes\/([^/]+)$/);
+    if (boxCredentialOk && resourceMatch) {
+      const resourceId = decodeURIComponent(resourceMatch[1]!);
+      const resource = boxResources.get(resourceId);
+      if (req.method === "GET") {
+        res.writeHead(resource ? 200 : 404, { "content-type": "application/json" });
+        return res.end(JSON.stringify(resource ? { ok: true, box: resource } : { ok: false, message: "not found" }));
+      }
+      if (req.method === "DELETE") {
+        if (!resource || req.headers["x-ascii-confirm-delete"] !== resourceId) {
+          res.writeHead(resource ? 400 : 404, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ ok: false, message: resource ? "confirmation required" : "not found" }));
+        }
+        boxResources.delete(resourceId);
+        res.writeHead(202, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, operationId: `delete-${resourceId}` }));
+      }
+    }
+    const ok = boxCredentialOk;
     res.writeHead(ok ? 200 : 401, { "content-type": "application/json" });
     res.end(JSON.stringify(ok ? { ok: true, boxes: [] } : { ok: false, code: "unauthorized" }));
   });
@@ -213,17 +567,29 @@ beforeAll(async () => {
   child = spawn(process.execPath, [join(SERVER_DIR, "index.ts")], {
     cwd: ROOT,
     env: {
-      ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+      PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       HOME: home,
       USERPROFILE: home,
+      NODE_ENV: "test",
+      // The real server is a separate process, so Vitest's marker is not
+      // present unless this fixture forwards it explicitly. Provider children
+      // deliberately expose FAKE_* controls only under that marker; without
+      // it the positive environment boundary correctly strips this suite's
+      // fake-Claude dump/hang controls and the lifecycle assertions time out.
+      VITEST: process.env.VITEST ?? "true",
       OMB_PORT: String(PORT),
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
       OMB_BOX_API: `http://127.0.0.1:${boxStubPort}`,
       OMB_COMPOSIO_API: `http://127.0.0.1:${boxStubPort}/api/v3.1`,
+      OMB_COMPOSIO_TOOLKITS_API: `http://127.0.0.1:${boxStubPort}/api/v3`,
+      OPENMAUSBOT_DESKTOP2_QWEN_URL: `http://127.0.0.1:${boxStubPort}/v1`,
       OMB_STATIC_DIR: staticDir,
+      OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
       FAKE_CLAUDE_MODE: "hang",
       FAKE_CLAUDE_DUMP: fakeClaudeDump,
+      OMB_TEST_VPS_STATE: fakeVpsState,
+      OMB_TEST_REAL_PATH: process.env.PATH ?? "",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -253,12 +619,68 @@ afterAll(async () => {
 });
 
 describe("harness HTTP API", () => {
+  it("requires the exact human app header on every ordinary API route", async () => {
+    const unauthenticated = await fetch(`${BASE}/api/bots`);
+    expect(unauthenticated.status).toBe(401);
+    const legacyCookie = await fetch(`${BASE}/api/bots`, {
+      headers: { cookie: `openmausbot_session=${UI_SESSION_TOKEN}` },
+    });
+    expect(legacyCookie.status).toBe(401);
+    const wrong = await fetch(`${BASE}/api/bots`, {
+      headers: { "x-openmausbot-session": "w".repeat(43) },
+    });
+    expect(wrong.status).toBe(401);
+    expect((await fetch(`${BASE}/api/bots`, { headers: UI_SESSION_HEADER })).status).toBe(200);
+    expect((await fetch(`${BASE}/api/health`)).status).toBe(200);
+  });
+
   it("rejects non-loopback authorities while accepting IPv4 and IPv6 loopback forms", async () => {
     expect(await statusWithHeaders({ host: "example.com" })).toBe(403);
     expect(await statusWithHeaders({ origin: "https://example.com" })).toBe(403);
     expect(await statusWithHeaders({ host: `127.0.0.2:${PORT}` })).toBe(200);
     expect(await statusWithHeaders({ host: `[::1]:${PORT}` })).toBe(200);
     expect(await statusWithHeaders({ origin: `http://[::1]:${PORT}` })).toBe(200);
+  });
+
+  it("rejects the wrong origin before either private physical WebSocket upgrades", async () => {
+    expect(await websocketUpgradeStatus("/api/internal/physical-bridge/register", {
+      origin: "https://attacker.invalid",
+      ...UI_SESSION_HEADER,
+    })).toBe(403);
+    expect(await websocketUpgradeStatus("/api/internal/physical-computer/mcp", {
+      origin: "openmausbot://desktop-main",
+      authorization: `Bearer ${"x".repeat(43)}`,
+    })).toBe(403);
+    expect(await websocketUpgradeStatus("/api/internal/local-vm-computer/mcp", {
+      origin: "https://attacker.invalid",
+      authorization: `Bearer ${"x".repeat(43)}`,
+    })).toBe(403);
+    expect(await websocketUpgradeStatus("/api/internal/local-vm-computer/mcp", {
+      origin: "openmausbot://local-vm-broker",
+      authorization: `Bearer ${"x".repeat(43)}`,
+    })).toBe(401);
+  });
+
+  it("isolates tokenized noVNC content on a viewer-only hostname", async () => {
+    const viewerHost = `openmaus-viewer.localhost:${PORT}`;
+    const fakeViewerPath = `/api/bots/b1/local-computer/viewer/${"a".repeat(43)}/vnc.html`;
+
+    // The viewer authority has no app UI and no API, even on the same port.
+    expect(await pathStatusWithHeaders("/api/health", { host: viewerHost })).toBe(404);
+    expect(await pathStatusWithHeaders("/", { host: viewerHost })).toBe(404);
+    // Conversely, the normal app authority never serves viewer assets.
+    expect(await pathStatusWithHeaders(fakeViewerPath, {
+      host: `127.0.0.1:${PORT}`,
+      ...UI_SESSION_HEADER,
+    })).toBe(404);
+    // A tokenized viewer path is routed only on the isolated host (the fake
+    // token has no session, so authorization correctly fails there).
+    expect(await pathStatusWithHeaders(fakeViewerPath, { host: viewerHost })).toBe(403);
+    // Compromised viewer JS cannot call the normal app API cross-origin.
+    expect(await pathStatusWithHeaders("/api/health", {
+      host: `127.0.0.1:${PORT}`,
+      origin: `http://${viewerHost}`,
+    })).toBe(403);
   });
 
   it("identifies itself on /api/health", async () => {
@@ -293,7 +715,7 @@ describe("harness HTTP API", () => {
   it("rejects malformed and oversized JSON bodies without hanging", async () => {
     const malformed = await fetch(`${BASE}/api/config`, {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
       body: "{",
     });
     expect(malformed.status).toBe(400);
@@ -301,11 +723,24 @@ describe("harness HTTP API", () => {
 
     const oversized = await fetch(`${BASE}/api/config`, {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
       body: JSON.stringify({ profile: { name: "x".repeat(1_000_001) } }),
     });
     expect(oversized.status).toBe(413);
     expect(await oversized.json()).toEqual({ error: "body too large" });
+
+    for (const body of [
+      `${"[".repeat(70)}0${"]".repeat(70)}`,
+      JSON.stringify({ values: Array.from({ length: 100_001 }, () => null) }),
+    ]) {
+      const tooComplex = await fetch(`${BASE}/api/config`, {
+        method: "PUT",
+        headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
+        body,
+      });
+      expect(tooComplex.status).toBe(413);
+      expect(await tooComplex.json()).toEqual({ error: "body too complex" });
+    }
 
     expect((await fetch(`${BASE}/api/health`)).status).toBe(200);
   });
@@ -528,7 +963,7 @@ describe("harness HTTP API", () => {
     expect(scoped.body.hits.every((candidate: { threadId: string }) => candidate.threadId === bot.threadId)).toBe(true);
     expect((await api("GET", "/api/search?q=hello&threadId=missing-thread")).status).toBe(404);
 
-    const markdown = await fetch(`${BASE}/api/threads/${bot.threadId}/export`);
+    const markdown = await fetch(`${BASE}/api/threads/${bot.threadId}/export`, { headers: UI_SESSION_HEADER });
     expect(markdown.status).toBe(200);
     expect(markdown.headers.get("content-type")).toContain("text/markdown");
     expect(markdown.headers.get("content-disposition")).toContain("attachment");
@@ -630,6 +1065,20 @@ describe("harness HTTP API", () => {
     const gated = await api("PATCH", `/api/bots/${bot.id}`, { composio: false });
     expect(gated.status).toBe(200);
 
+    // The broad settings endpoint can revoke grants, but it cannot forge a
+    // new persistent approval. New grants need the exact live approval card
+    // consumed by /always-allow; a guessed tool key is never enough.
+    const forgedGrant = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: ["Bash:git"] });
+    expect(forgedGrant.status).toBe(403);
+    expect(forgedGrant.body.error).toContain("live matching approval card");
+    const afterForgedGrant = (await api("GET", "/api/bots")).body.bots.find(
+      (candidate: { id: string }) => candidate.id === bot.id,
+    );
+    expect(afterForgedGrant.alwaysAllow).toBeUndefined();
+    const emptyRevocation = await api("PATCH", `/api/bots/${bot.id}`, { alwaysAllow: [] });
+    expect(emptyRevocation.status).toBe(200);
+    expect(emptyRevocation.body.bot.alwaysAllow).toEqual([]);
+
     // sidebar sections: assign, round-trip, trim, clear — and the field
     // drops off the record entirely once cleared rather than lingering
     // as an empty string through exports and wire frames
@@ -675,9 +1124,56 @@ describe("harness HTTP API", () => {
     expect((await api("PATCH", `/api/bots/${bot.id}`, { composio: true })).body.bot.composio).toBe(true);
 
     const deleted = await api("DELETE", `/api/bots/${bot.id}`);
-    expect(deleted.status).toBe(200);
+    expect(deleted.status, JSON.stringify(deleted.body)).toBe(200);
     const after = await api("GET", "/api/bots");
     expect(after.body.bots.find((b: { id: string }) => b.id === bot.id)).toBeUndefined();
+  });
+
+  it("blocks bot deletion on an inactive hosted Box until the explicit permanent-delete action succeeds", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    const resource = {
+      id: `box-resource-${bot.id}`,
+      name: stubBoxName(bot.id),
+      state: "archived",
+    };
+    try {
+      expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { computer: "off", cloudBackend: "vps" })).status).toBe(200);
+      boxResources.set(resource.id, resource);
+
+      const blocked = await api("DELETE", `/api/bots/${bot.id}`);
+      expect(blocked.status).toBe(409);
+      expect(blocked.body.error).toMatch(/hosted Box.*Select Box.*Permanently delete Box/i);
+      expect((await api("GET", "/api/bots")).body.bots.some((candidate: { id: string }) => candidate.id === bot.id)).toBe(true);
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "box" })).status).toBe(200);
+      const removed = await api("POST", `/api/bots/${bot.id}/computer/remove`, {});
+      expect(removed.status).toBe(200);
+      expect(removed.body).toMatchObject({ ok: true, deleted: true, pending: true });
+      expect(boxResources.has(resource.id)).toBe(false);
+      expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+    } finally {
+      boxResources.delete(resource.id);
+      failBoxInventory = false;
+      await api("PUT", "/api/config", { box: { token: "" } });
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("fails bot deletion closed when a configured Box account cannot be inventoried", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    try {
+      expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+      failBoxInventory = true;
+      const blocked = await api("DELETE", `/api/bots/${bot.id}`);
+      expect(blocked.status).toBe(409);
+      expect(blocked.body.error).toMatch(/Could not verify.*hosted Box.*Fix the Box connection/i);
+      expect((await api("GET", "/api/bots")).body.bots.some((candidate: { id: string }) => candidate.id === bot.id)).toBe(true);
+    } finally {
+      failBoxInventory = false;
+      await api("PUT", "/api/config", { box: { token: "" } });
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
   });
 
   it("elects one Chief of Staff per section and preserves other section Chiefs", async () => {
@@ -804,14 +1300,14 @@ describe("harness HTTP API", () => {
 
     const wrongType = await fetch(`${BASE}/api/attachments`, {
       method: "POST",
-      headers: { "content-type": "text/plain" },
+      headers: { ...UI_SESSION_HEADER, "content-type": "text/plain" },
       body: "not an image",
     });
     expect(wrongType.status).toBe(400);
 
     const saved = await fetch(`${BASE}/api/attachments`, {
       method: "POST",
-      headers: { "content-type": "image/png" },
+      headers: { ...UI_SESSION_HEADER, "content-type": "image/png" },
       body: new Uint8Array(png),
     });
     expect(saved.status).toBe(201);
@@ -821,23 +1317,122 @@ describe("harness HTTP API", () => {
     expect(savedPath).toContain("attachments");
 
     const name = savedPath.split(/[\\/]/).pop();
-    const served = await fetch(`${BASE}/api/attachments/${name}`);
+    const served = await fetch(`${BASE}/api/attachments/${name}`, { headers: UI_SESSION_HEADER });
     expect(served.status).toBe(200);
     expect(served.headers.get("content-type")).toBe("image/png");
     expect(Buffer.from(await served.arrayBuffer()).equals(png)).toBe(true);
 
     // the serving route is name-locked to the attachments dir
-    const traversal = await fetch(`${BASE}/api/attachments/..%2F..%2Fconfig.json`);
+    const traversal = await fetch(`${BASE}/api/attachments/..%2F..%2Fconfig.json`, { headers: UI_SESSION_HEADER });
     expect(traversal.status).toBe(404);
-    const unknown = await fetch(`${BASE}/api/attachments/00000000-0000-0000-0000-000000000000.png`);
+    const unknown = await fetch(`${BASE}/api/attachments/00000000-0000-0000-0000-000000000000.png`, { headers: UI_SESSION_HEADER });
     expect(unknown.status).toBe(404);
 
     const tooBig = await fetch(`${BASE}/api/attachments`, {
       method: "POST",
-      headers: { "content-type": "image/png" },
+      headers: { ...UI_SESSION_HEADER, "content-type": "image/png" },
       body: Buffer.alloc(IMAGE_MAX_BYTES + 1),
     });
     expect(tooBig.status).toBe(413);
+  });
+
+  it("moves remote binary uploads onto the server and saves exact Razer workspace bytes", async () => {
+    const macOnlyBytes = Buffer.from("this must not become a Mac path");
+    const finderName = "📄-报告.bin";
+    const uploaded = await fetch(`${BASE}/api/files/upload`, {
+      method: "POST",
+      headers: {
+        ...UI_SESSION_HEADER,
+        "content-type": "application/octet-stream",
+        "x-openmausbot-file-name-b64": Buffer.from(finderName, "utf8").toString("base64url"),
+      },
+      body: macOnlyBytes,
+    });
+    expect(uploaded.status).toBe(201);
+    const stored = await uploaded.json() as { path: string; name: string; bytes: number };
+    expect(stored.path).toContain("uploaded-files");
+    expect(stored.path).not.toContain("/Users/");
+    expect(stored.name).toBe(finderName);
+    expect(stored.bytes).toBe(macOnlyBytes.byteLength);
+
+    const razerWorkspace = join(home, ".openmausbot", "workspaces", "razer-bot");
+    mkdirSync(razerWorkspace, { recursive: true });
+    const razerName = "报告-📄.bin";
+    const razerPath = join(razerWorkspace, razerName);
+    const razerBytes = Buffer.from([0x52, 0x41, 0x5a, 0x45, 0x52, 0, 0xff]);
+    writeFileSync(razerPath, razerBytes);
+
+    const download = await fetch(`${BASE}/api/files/download`, {
+      method: "POST",
+      headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
+      body: JSON.stringify({ path: razerPath }),
+    });
+    expect(download.status).toBe(200);
+    expect(download.headers.get("x-openmausbot-file-name-b64")).toBe(
+      Buffer.from(razerName, "utf8").toString("base64url"),
+    );
+    expect(Buffer.from(await download.arrayBuffer()).equals(razerBytes)).toBe(true);
+
+    const outside = join(home, "mac-looking-private.txt");
+    writeFileSync(outside, "must not be downloadable");
+    const blocked = await fetch(`${BASE}/api/files/download`, {
+      method: "POST",
+      headers: { ...UI_SESSION_HEADER, "content-type": "application/json" },
+      body: JSON.stringify({ path: outside }),
+    });
+    expect(blocked.status).toBe(404);
+  });
+
+  it("hands a managed upload to the exact provider turn and removes it only after verified Stop", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    let stagedPath = "";
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      })).status).toBe(200);
+      const payload = Buffer.from([0, 0xff, 0x52, 0x41, 0x5a, 0x45, 0x52]);
+      const upload = await fetch(`${BASE}/api/files/upload`, {
+        method: "POST",
+        headers: {
+          ...UI_SESSION_HEADER,
+          "content-type": "application/octet-stream",
+          "x-openmausbot-file-name-b64": Buffer.from("provider-exact.bin").toString("base64url"),
+        },
+        body: payload,
+      });
+      expect(upload.status).toBe(201);
+      const saved = await upload.json() as { path: string };
+
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, {
+        text: `read this exact file\n\n<attached-file path="${saved.path}" />`,
+      })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const prompt = String(dump.prompt?.message?.content ?? "");
+      stagedPath = /<attached-file\s+path="([^"]+)"\s*\/?>/.exec(prompt)?.[1] ?? "";
+      expect(stagedPath).toContain("attachments-");
+      expect(stagedPath).not.toBe(saved.path);
+      expect(readFileSync(stagedPath)).toEqual(payload);
+
+      // A live sandbox cannot gain another mount. The same attachment sent
+      // mid-turn must queue for a fresh provider process, never be written as
+      // a raw DATA_DIR path into Claude's live stdin.
+      const queued = await api("POST", `/api/bots/${bot.id}/messages`, {
+        text: `also read this\n\n<attached-file path="${saved.path}" />`,
+      });
+      expect(queued).toMatchObject({ status: 202, body: { ok: true, queued: true } });
+      expect(queued.body.steered).toBeUndefined();
+
+      // fake Claude is still hung in this turn, so cleanup here would be a
+      // use-after-delete. Verified interrupt/reap is the lifecycle boundary.
+      expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
+      await expect.poll(() => existsSync(stagedPath)).toBe(false);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      if (stagedPath) rmSync(dirname(stagedPath), { recursive: true, force: true });
+    }
   });
 
   it("persists only app-owned bot avatars and supported crop shapes", async () => {
@@ -867,7 +1462,7 @@ describe("harness HTTP API", () => {
     const created = await api("POST", "/api/bots");
     const bot = created.body.bot;
     const avatarUrl = await uploadAvatar();
-    const stream = await openSse(`${BASE}/api/events`);
+    const stream = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
     try {
       await stream.until((frame) => frame.kind === "hello");
       const saved = await api("PATCH", `/api/bots/${bot.id}/profile`, {
@@ -939,7 +1534,7 @@ describe("harness HTTP API", () => {
       color: "purple",
       mascotExpression: "focused",
       autoApprove: true,
-      alwaysAllow: ["Bash:git"],
+      acknowledgeLocalAuto: true,
     });
     await api("PATCH", `/api/bots/${second.id}`, {
       name: "Scout",
@@ -973,7 +1568,7 @@ describe("harness HTTP API", () => {
     expect((await api("GET", "/api/bots")).body.groups).toHaveLength(roomsBefore);
     expect((await api("POST", "/api/teams/export", {})).body.team.name).toBe("My OpenMaus Team");
 
-    const stream = await openSse(`${BASE}/api/events`);
+    const stream = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
     try {
       await stream.until((frame) => frame.kind === "hello");
       const imported = await api("POST", "/api/teams/import", exported.body);
@@ -1062,7 +1657,7 @@ describe("harness HTTP API", () => {
     const roomsBefore = (await api("GET", "/api/bots")).body.groups.length;
     const folder = mkdtempSync(join(tmpdir(), "omb-project-"));
 
-    const stream = await openSse(`${BASE}/api/events`);
+    const stream = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
     try {
       await stream.until((frame) => frame.kind === "hello");
 
@@ -1252,7 +1847,6 @@ describe("harness HTTP API", () => {
       name: "Mira",
       title: "Project Lead",
       autoApprove: true,
-      alwaysAllow: ["Bash:git"],
       approvePeerComms: true,
       chiefOfStaff: true,
       composio: true,
@@ -1318,7 +1912,6 @@ describe("harness HTTP API", () => {
       title: "Project Lead",
       threadId: trusted.threadId,
       autoApprove: true,
-      alwaysAllow: ["Bash:git"],
       approvePeerComms: true,
       chiefOfStaff: true,
       composio: true,
@@ -1447,9 +2040,14 @@ describe("harness HTTP API", () => {
   it("grants Auto on this computer only through the warning acknowledgement", async () => {
     const created = await api("POST", "/api/bots");
     const bot = created.body.bot;
-    expect((await api("PATCH", `/api/bots/${bot.id}`, { autoApprove: true })).body.bot.autoApprove).toBe(
-      true,
-    );
+    const blindAuto = await api("PATCH", `/api/bots/${bot.id}`, { autoApprove: true });
+    expect(blindAuto.status).toBe(400);
+    const acknowledgedAuto = await api("PATCH", `/api/bots/${bot.id}`, {
+      autoApprove: true,
+      acknowledgeLocalAuto: true,
+    });
+    expect(acknowledgedAuto.status).toBe(200);
+    expect(acknowledgedAuto.body.bot.autoApprove).toBe(true);
 
     // The important half: a blind PATCH — exactly what a bot curling the
     // loopback API from a tool call would send — must be refused. The
@@ -1479,6 +2077,17 @@ describe("harness HTTP API", () => {
     const autoAcked = await api("PATCH", `/api/bots/${bot.id}`, { autoApprove: true, acknowledgeLocalAuto: true });
     expect(autoAcked.status).toBe(200);
 
+    // The explicit Auto value clears the persisted assignment. Because this
+    // is a complete bot frame, omission on the wire is authoritative Auto.
+    const backToAutoBlind = await api("PATCH", `/api/bots/${bot.id}`, { computer: "auto" });
+    expect(backToAutoBlind.status).toBe(400);
+    const backToAuto = await api("PATCH", `/api/bots/${bot.id}`, {
+      computer: "auto",
+      acknowledgeLocalAuto: true,
+    });
+    expect(backToAuto.status).toBe(200);
+    expect(backToAuto.body.bot.computer).toBeUndefined();
+
     // Leaving local ends the grant; coming back needs the warning again.
     await api("PATCH", `/api/bots/${bot.id}`, { computer: "off" });
     const back = await api("PATCH", `/api/bots/${bot.id}`, { computer: "local" });
@@ -1495,6 +2104,192 @@ describe("harness HTTP API", () => {
     const stopped = await api("POST", "/api/local-computer/interrupt", {});
     expect(stopped).toEqual({ status: 200, body: { ok: true } });
   });
+
+  it("gives a local-model child only an exact-turn relay and revokes replay on Stop", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: {
+          instanceId: "claude",
+          model: `desktop2_qwen::${MODEL_RELAY_FIXTURE_MODEL}`,
+        },
+      })).status).toBe(200);
+      lastModelRelayUpstream = null;
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "use the private model relay" })).status).toBe(202);
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+
+      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const relayBase = String(dump.env?.ANTHROPIC_BASE_URL ?? "");
+      const relayToken = String(dump.env?.ANTHROPIC_AUTH_TOKEN ?? "");
+      expect(relayBase).toBe(`${BASE}/api/internal/model-relay`);
+      expect(relayToken).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+      expect(JSON.stringify(dump)).not.toContain(`http://127.0.0.1:${boxStubPort}/v1`);
+      expect(dump.env?.OPENMAUSBOT_DESKTOP2_QWEN_URL).toBeUndefined();
+
+      const wrongModel = await fetch(`${relayBase}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": relayToken },
+        body: JSON.stringify({ model: "some-other-model", messages: [] }),
+      });
+      expect(wrongModel.status).toBe(403);
+      expect(lastModelRelayUpstream).toBeNull();
+
+      const relayed = await fetch(`${relayBase}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": relayToken },
+        body: JSON.stringify({ model: MODEL_RELAY_FIXTURE_MODEL, messages: [] }),
+      });
+      expect(relayed.status).toBe(200);
+      expect(await relayed.json()).toMatchObject({ id: "relay-response", model: MODEL_RELAY_FIXTURE_MODEL });
+      expect(lastModelRelayUpstream).toEqual({
+        authorization: "Bearer local",
+        apiKey: "local",
+        body: { model: MODEL_RELAY_FIXTURE_MODEL, messages: [] },
+      });
+
+      expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
+      const replay = await fetch(`${relayBase}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": relayToken },
+        body: JSON.stringify({ model: MODEL_RELAY_FIXTURE_MODEL, messages: [] }),
+      });
+      expect(replay.status).toBe(401);
+    } finally {
+      await api("POST", `/api/bots/${bot.id}/interrupt`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("retries the exact revoked bot generation after the first Stop cannot verify shutdown", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      })).status).toBe(200);
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "keep this exact turn alive" })).status).toBe(202);
+      await expect.poll(async () => {
+        const bots = (await api("GET", "/api/bots")).body.bots;
+        return bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy;
+      }).toBe(true);
+
+      writeFileSync(fakeClaudeInterruptFailures, "1");
+      const failed = await api("POST", `/api/bots/${bot.id}/interrupt`);
+      expect(failed.status).toBe(409);
+      expect(failed.body.error).toMatch(/could not be verified|did not stop/i);
+      expect(readFileSync(fakeClaudeInterruptFailures, "utf8")).toBe("0");
+      expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(409);
+
+      const retried = await api("POST", `/api/bots/${bot.id}/interrupt`);
+      expect(retried).toEqual({ status: 200, body: { ok: true } });
+      await expect.poll(async () => {
+        const bots = (await api("GET", "/api/bots")).body.bots;
+        return bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy;
+      }).toBe(false);
+      expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+    } finally {
+      writeFileSync(fakeClaudeInterruptFailures, "0");
+      await api("POST", `/api/bots/${bot.id}/interrupt`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("retries the exact room speaker after failed Stop already revoked its capabilities", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    const room = (await api("POST", "/api/groups", { name: "Stop retry room", memberIds: [bot.id] })).body.group;
+    try {
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      })).status).toBe(200);
+      expect((await api("PATCH", `/api/groups/${room.id}/setup`, { action: "skip" })).status).toBe(200);
+      expect((await api("POST", `/api/groups/${room.id}/messages`, { text: "keep the room turn alive" })).status).toBe(202);
+      await expect.poll(async () => {
+        const groups = (await api("GET", "/api/bots")).body.groups;
+        return groups.find((candidate: { id: string }) => candidate.id === room.id)?.busyBotId;
+      }).toBe(bot.id);
+
+      // Fail only after the provider emitted its terminal event. This clears
+      // the room's visible busyBotId and proves retry recovery comes from the
+      // retained exact generation, not from mutable room UI state.
+      writeFileSync(fakeClaudeInterruptFailures, "-1");
+      const failed = await api("POST", `/api/groups/${room.id}/interrupt`);
+      expect(failed.status).toBe(409);
+      expect(failed.body.error).toMatch(/terminal cleanup/i);
+      expect(readFileSync(fakeClaudeInterruptFailures, "utf8")).toBe("0");
+      await expect.poll(async () => {
+        const groups = (await api("GET", "/api/bots")).body.groups;
+        return groups.find((candidate: { id: string }) => candidate.id === room.id)?.busyBotId ?? null;
+      }).toBe(null);
+      expect((await api("DELETE", `/api/groups/${room.id}`)).status).toBe(409);
+
+      const retried = await api("POST", `/api/groups/${room.id}/interrupt`);
+      expect(retried).toEqual({ status: 200, body: { ok: true } });
+      await expect.poll(async () => {
+        const state = (await api("GET", "/api/bots")).body;
+        return {
+          busyBotId: state.groups.find((candidate: { id: string }) => candidate.id === room.id)?.busyBotId ?? null,
+          botBusy: state.bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy,
+        };
+      }).toEqual({ busyBotId: null, botBusy: false });
+      expect((await api("DELETE", `/api/groups/${room.id}`)).status).toBe(200);
+      expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+    } finally {
+      writeFileSync(fakeClaudeInterruptFailures, "0");
+      await api("POST", `/api/groups/${room.id}/interrupt`);
+      await api("POST", `/api/bots/${bot.id}/interrupt`);
+      await api("DELETE", `/api/groups/${room.id}`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it.runIf(process.platform === "darwin")(
+    "retries the exact failed generation through the global local-computer Stop",
+    async () => {
+      const bot = (await api("POST", "/api/bots", {})).body.bot;
+      const cuaDir = join(home, "Library", "Application Support", "OpenMausBot");
+      const cuaFile = join(cuaDir, "cua-connection.json");
+      try {
+        mkdirSync(cuaDir, { recursive: true });
+        writeFileSync(cuaFile, JSON.stringify({
+          mode: "available",
+          mcpCommand: process.execPath,
+          mcpArgs: ["mcp"],
+          mcpEnv: {},
+        }));
+        expect((await api("PATCH", `/api/bots/${bot.id}`, {
+          modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+          computer: "local",
+        })).status).toBe(200);
+        expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "keep the local turn alive" })).status).toBe(202);
+        await expect.poll(async () => {
+          const bots = (await api("GET", "/api/bots")).body.bots;
+          return bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy;
+        }).toBe(true);
+
+        writeFileSync(fakeClaudeInterruptFailures, "1");
+        const failed = await api("POST", "/api/local-computer/interrupt", {});
+        expect(failed.status).toBe(409);
+        expect(failed.body.error).toMatch(/could not be verified|did not stop/i);
+        expect(readFileSync(fakeClaudeInterruptFailures, "utf8")).toBe("0");
+        expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(409);
+
+        const retried = await api("POST", "/api/local-computer/interrupt", {});
+        expect(retried).toEqual({ status: 200, body: { ok: true } });
+        await expect.poll(async () => {
+          const bots = (await api("GET", "/api/bots")).body.bots;
+          return bots.find((candidate: { id: string }) => candidate.id === bot.id)?.busy;
+        }).toBe(false);
+        expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+      } finally {
+        writeFileSync(fakeClaudeInterruptFailures, "0");
+        await api("POST", "/api/local-computer/interrupt", {});
+        await api("POST", `/api/bots/${bot.id}/interrupt`);
+        await api("DELETE", `/api/bots/${bot.id}`);
+        rmSync(cuaFile, { force: true });
+      }
+    },
+  );
 
   it("persists an answered onboarding card", async () => {
     const { body } = await api("GET", "/api/bots");
@@ -1533,6 +2328,7 @@ describe("harness HTTP API", () => {
     // approval takes over the composer, so a dead end locks the room for good.
     const answered = await api("POST", "/api/threads/test-stranded-room-thread/respond", {
       requestId: "stranded-request",
+      messageId: "stranded-card",
       behavior: "allow",
     });
     expect(answered.status).toBe(200);
@@ -1648,6 +2444,29 @@ describe("harness HTTP API", () => {
     expect(nothing.status).toBe(400);
   });
 
+  it("refuses Box account rotation while a public computer operation is paused", async () => {
+    expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+    const created = await api("POST", "/api/bots", {});
+    const bot = created.body.bot;
+    const deferred = deferNextBoxList([]);
+    const statusRequest = api("GET", `/api/bots/${bot.id}/computer`);
+    try {
+      await deferred.started;
+      const rotated = await api("PUT", "/api/config", { box: { token: "box_slow" } });
+      expect(rotated.status).toBe(409);
+      expect(rotated.body.error).toMatch(/active Box computer operation/i);
+
+      deferred.release();
+      expect((await statusRequest).status).toBe(200);
+      expect((await api("PUT", "/api/config", { box: { token: "box_slow" } })).status).toBe(200);
+      expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+    } finally {
+      deferred.release();
+      await statusRequest.catch(() => null);
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
   it("validates and persists the global room turn timeout", async () => {
     const before = await api("GET", "/api/config");
     expect(before.status).toBe(200);
@@ -1689,15 +2508,19 @@ describe("harness HTTP API", () => {
     await api("PATCH", "/api/config", { features: { skillRecorder: false } });
   });
 
-  it("keeps shared Local VM mode by default and resolves isolated targets per bot when enabled", async () => {
+  it("isolates Local VMs per bot by default and retains an explicit shared option", async () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;
     const before = await api("GET", "/api/config");
-    expect(before.body.localVm).toEqual({ mode: "shared", maxInstances: 2 });
+    expect(before.body.localVm).toEqual({ mode: "per-bot", maxInstances: 2 });
 
-    const shared = await api("GET", `/api/bots/${first.id}/local-computer`);
-    expect(shared.status).toBe(200);
-    expect(shared.body).toMatchObject({ mode: "shared", target_key: "shared" });
+    const [defaultFirst, defaultSecond] = await Promise.all([
+      api("GET", `/api/bots/${first.id}/local-computer`),
+      api("GET", `/api/bots/${second.id}/local-computer`),
+    ]);
+    expect(defaultFirst.body).toMatchObject({ mode: "per-bot", max_instances: 2 });
+    expect(defaultSecond.body).toMatchObject({ mode: "per-bot", max_instances: 2 });
+    expect(defaultFirst.body.target_key).not.toBe(defaultSecond.body.target_key);
 
     const saved = await api("PATCH", "/api/config", {
       localVm: { mode: "per-bot", maxInstances: 3 },
@@ -1721,7 +2544,59 @@ describe("harness HTTP API", () => {
 
     const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
     expect(disk.localVm).toEqual({ mode: "per-bot", maxInstances: 3 });
-    await api("PATCH", "/api/config", { localVm: { mode: "shared", maxInstances: 2 } });
+
+    const sharedConfig = await api("PATCH", "/api/config", {
+      localVm: { mode: "shared", maxInstances: 2 },
+    });
+    expect(sharedConfig.status).toBe(200);
+    const [sharedFirst, sharedSecond] = await Promise.all([
+      api("GET", `/api/bots/${first.id}/local-computer`),
+      api("GET", `/api/bots/${second.id}/local-computer`),
+    ]);
+    expect(sharedFirst.body).toMatchObject({ mode: "shared", target_key: "shared" });
+    expect(sharedSecond.body).toMatchObject({ mode: "shared", target_key: "shared" });
+
+    await api("PATCH", "/api/config", { localVm: { mode: "per-bot", maxInstances: 2 } });
+  });
+
+  it("redacts Local VM viewer credentials and requires a control lease for same-origin join", async () => {
+    const bot = (await api("POST", "/api/bots")).body.bot;
+    expect((await api("PATCH", `/api/bots/${bot.id}`, { computer: "vm" })).status).toBe(200);
+
+    const globalStatus = await api("GET", "/api/local-computer");
+    expect(globalStatus.body).toMatchObject({
+      viewer_port: null,
+      viewer_url: "",
+      commands: { view: "" },
+    });
+    expect(JSON.stringify(globalStatus.body)).not.toContain("/vnc.html");
+    expect(JSON.stringify(globalStatus.body)).not.toContain("#password=");
+
+    const status = await api("GET", `/api/bots/${bot.id}/local-computer`);
+    expect(status.status).toBe(200);
+    expect(status.body).toMatchObject({
+      viewer_available: false,
+      viewer_port: null,
+      viewer_url: "",
+    });
+    expect(JSON.stringify(status.body)).not.toContain("password=");
+    expect(status.body.commands.view).toBe("");
+
+    const simplePost = await fetch(`${BASE}/api/bots/${bot.id}/local-computer/join`, {
+      method: "POST",
+      headers: UI_SESSION_HEADER,
+    });
+    expect(simplePost.status).toBe(415);
+
+    const missingLease = await api("POST", `/api/bots/${bot.id}/local-computer/join`, {});
+    expect(missingLease.status).toBe(400);
+    expect(missingLease.body.error).toContain("ownerId and leaseToken");
+
+    const unknown = await api("POST", "/api/bots/not-a-bot/local-computer/join", {
+      ownerId: "renderer",
+      leaseToken: "not-a-real-lease",
+    });
+    expect(unknown.status).toBe(404);
   });
 
   it("keeps an active turn alive when only the room timeout changes", async () => {
@@ -1777,24 +2652,67 @@ describe("harness HTTP API", () => {
     const before = await api("GET", "/api/bots");
     const bot = before.body.bots[0];
     expect(bot.cloudBackend).toBeUndefined();
+    try {
+      const bad = await api("PUT", "/api/config", { vps: { sshAlias: "prod; reboot" } });
+      expect(bad.status).toBe(400);
 
-    const bad = await api("PUT", "/api/config", { vps: { sshAlias: "prod; reboot" } });
-    expect(bad.status).toBe(400);
+      const saved = await api("PUT", "/api/config", { vps: { sshAlias: "production-vps" } });
+      expect(saved.status).toBe(200);
+      expect(saved.body.vps).toEqual({ configured: true, sshAlias: "production-vps" });
+      expect(JSON.stringify(saved.body)).not.toContain("privateKey");
 
-    const saved = await api("PUT", "/api/config", { vps: { sshAlias: "production-vps" } });
-    expect(saved.status).toBe(200);
-    expect(saved.body.vps).toEqual({ configured: true, sshAlias: "production-vps" });
-    expect(JSON.stringify(saved.body)).not.toContain("privateKey");
+      const patched = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "vps" });
+      expect(patched.status).toBe(200);
+      expect(patched.body.bot.cloudBackend).toBe("vps");
+      const autoStart = await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: true });
+      expect(autoStart.status).toBe(200);
+      expect(autoStart.body.bot.autoStartVps).toBe(true);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: "yes" })).status).toBe(400);
+      const invalid = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "daytona" });
+      expect(invalid.status).toBe(400);
+    } finally {
+      await api("PUT", "/api/config", { vps: { sshAlias: "" } });
+      await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "box", autoStartVps: false });
+    }
+  });
 
-    const patched = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "vps" });
-    expect(patched.status).toBe(200);
-    expect(patched.body.bot.cloudBackend).toBe("vps");
-    const autoStart = await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: true });
-    expect(autoStart.status).toBe(200);
-    expect(autoStart.body.bot.autoStartVps).toBe(true);
-    expect((await api("PATCH", `/api/bots/${bot.id}`, { autoStartVps: "yes" })).status).toBe(400);
-    const invalid = await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "daytona" });
-    expect(invalid.status).toBe(400);
+  it("blocks bot deletion on an inactive managed VPS container until the explicit remove action succeeds", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    const containerName = vpsContainerName(bot.id);
+    try {
+      writeFileSync(fakeVpsState, JSON.stringify([containerName]));
+      expect((await api("PUT", "/api/config", { vps: { sshAlias: "fixture-vps-delete" } })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { computer: "off", cloudBackend: "box" })).status).toBe(200);
+
+      const blocked = await api("DELETE", `/api/bots/${bot.id}`);
+      expect(blocked.status).toBe(409);
+      expect(blocked.body.error).toMatch(/managed VPS container.*Select VPS.*Remove managed VPS container/i);
+      expect((await api("GET", "/api/bots")).body.bots.some((candidate: { id: string }) => candidate.id === bot.id)).toBe(true);
+
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { cloudBackend: "vps" })).status).toBe(200);
+      const removed = await api("POST", `/api/bots/${bot.id}/computer/remove`, {});
+      expect(removed.status).toBe(200);
+      expect(removed.body).toMatchObject({ configured: true, daemonUp: true, container: "missing" });
+      expect(JSON.parse(readFileSync(fakeVpsState, "utf8"))).toEqual([]);
+
+      expect((await api("PUT", "/api/config", { vps: { sshAlias: "" } })).status).toBe(200);
+      expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+    } finally {
+      writeFileSync(fakeVpsState, "[]");
+      await api("PUT", "/api/config", { vps: { sshAlias: "" } });
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
+  });
+
+  it("never exposes the bot's cloud shell through the human app API", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    try {
+      const result = await api("POST", `/api/bots/${bot.id}/computer/exec`, { command: "id" });
+      expect(result.status).toBe(409);
+      expect(result.body.error).toMatch(/scoped computer tools/i);
+    } finally {
+      await api("DELETE", `/api/bots/${bot.id}`);
+    }
   });
 
   it("validates a Composio project key, creates a Session, and keeps externally stored secrets off disk", async () => {
@@ -1829,6 +2747,143 @@ describe("harness HTTP API", () => {
     expect((await api("PUT", "/api/config", { profile: { name: "Grace" } })).status).toBe(200);
     expect((await api("GET", "/api/config")).body.composio).toEqual({ configured: true, mode: "self-hosted" });
   });
+
+  it("does not let an older authorization failure roll a connected card back", async () => {
+    if (!(await api("GET", "/api/config")).body.composio?.configured) {
+      expect((await api("PUT", "/api/config", { composio: { apiKey: "ak_good" } })).status).toBe(200);
+    }
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    const token = await startConnectorTurn(bot.id, "wait while I connect GitHub");
+    const requested = await internalApi("/api/internal/connectors/request", token, {
+      resumeKey: "authorize-race",
+      slugs: ["github"],
+    });
+    expect(requested.status).toBe(200);
+    const messageId = requested.body.messageIds[0];
+    expect(messageId).toEqual(expect.any(String));
+
+    const deferred = deferNextConnectorAuthorizationFailure();
+    const authorization = api(
+      "POST",
+      `/api/bots/${bot.id}/connector-cards/${messageId}/authorize`,
+      { threadId: bot.threadId },
+    );
+    await Promise.race([
+      deferred.started,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("authorization request did not reach the provider")), 5_000)),
+    ]);
+
+    connectedConnectorToolkits.add("github");
+    const status = await api(
+      "GET",
+      `/api/bots/${bot.id}/connector-cards/${messageId}/status?threadId=${encodeURIComponent(bot.threadId)}`,
+    );
+    deferred.release();
+    const failedAuthorization = await authorization;
+    connectedConnectorToolkits.delete("github");
+
+    expect(status.status).toBe(200);
+    expect(status.body.connected).toBe(true);
+    expect(failedAuthorization.status).toBeGreaterThanOrEqual(400);
+    const current = (await api("GET", "/api/bots")).body.bots
+      .find((candidate: { id: string }) => candidate.id === bot.id)
+      .messages.find((candidate: { id: string }) => candidate.id === messageId);
+    expect(current.connector).toMatchObject({ status: "connected", resumed: true });
+    expect(current.connector.error).toBeUndefined();
+
+    expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
+    expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+  }, 30_000);
+
+  it("bounds parallel connector-card requests, revokes them with their exact turn, and caps transcript growth", async () => {
+    if (!(await api("GET", "/api/config")).body.composio?.configured) {
+      expect((await api("PUT", "/api/config", { composio: { apiKey: "ak_good" } })).status).toBe(200);
+    }
+    const firstBot = (await api("POST", "/api/bots", {})).body.bot;
+    const firstToken = await startConnectorTurn(firstBot.id, "wait while connector requests run");
+    const oversized = await fetch(`${BASE}/api/internal/connectors/request`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${firstToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ resumeKey: "oversized-body", slugs: ["github"], padding: "x".repeat(33_000) }),
+    });
+    expect(oversized.status).toBe(413);
+    expect(await oversized.json()).toEqual({ error: "body too large" });
+    const deferred = deferNextConnectorToolkitReads(2);
+    const firstRequest = internalApi("/api/internal/connectors/request", firstToken, {
+      resumeKey: "parallel-one",
+      slugs: ["github"],
+    });
+    const secondRequest = internalApi("/api/internal/connectors/request", firstToken, {
+      resumeKey: "parallel-two",
+      slugs: ["slack"],
+    });
+    await Promise.race([
+      deferred.started,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("connector requests did not overlap")), 5_000)),
+    ]);
+    const overConcurrency = await internalApi("/api/internal/connectors/request", firstToken, {
+      resumeKey: "parallel-three",
+      slugs: ["gmail"],
+    });
+    expect(overConcurrency.status).toBe(429);
+    expect(overConcurrency.body.error).toMatch(/already running/i);
+
+    const stopping = api("POST", `/api/bots/${firstBot.id}/interrupt`);
+    await expect.poll(async () => (
+      await internalApi("/api/internal/connectors/request", firstToken, {
+        resumeKey: "revoked-probe",
+        slugs: ["notion"],
+      })
+    ).status, { timeout: 5_000 }).toBe(401);
+    deferred.release();
+    expect((await firstRequest).status).toBe(409);
+    expect((await secondRequest).status).toBe(409);
+    expect((await stopping).status).toBe(200);
+    await api("DELETE", `/api/bots/${firstBot.id}`);
+
+    // A new exact turn receives fresh quotas, but can add no more than 24
+    // cards even when every request invents another resume key.
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    const token = await startConnectorTurn(bot.id, "exercise connector card ceilings");
+    const firstTwelve = Array.from({ length: 12 }, (_, index) => `first-${index}`);
+    const secondTwelve = Array.from({ length: 12 }, (_, index) => `second-${index}`);
+    expect((await internalApi("/api/internal/connectors/request", token, {
+      resumeKey: "batch-one",
+      slugs: firstTwelve,
+    })).status).toBe(200);
+    expect((await internalApi("/api/internal/connectors/request", token, {
+      resumeKey: "batch-two",
+      slugs: secondTwelve,
+    })).status).toBe(200);
+    const overCards = await internalApi("/api/internal/connectors/request", token, {
+      resumeKey: "batch-three",
+      slugs: ["twenty-fifth"],
+    });
+    expect(overCards.status).toBe(429);
+    expect(overCards.body.error).toMatch(/at most 24/i);
+
+    // Reusing an existing card does not grow the transcript, but each accepted
+    // route call still consumes the finite per-turn request allowance.
+    for (let index = 0; index < 5; index += 1) {
+      expect((await internalApi("/api/internal/connectors/request", token, {
+        resumeKey: "batch-one",
+        slugs: ["first-0"],
+      })).status).toBe(200);
+    }
+    const overRequests = await internalApi("/api/internal/connectors/request", token, {
+      resumeKey: "batch-one",
+      slugs: ["first-0"],
+    });
+    expect(overRequests.status).toBe(429);
+    expect(overRequests.body.error).toMatch(/request limit/i);
+
+    const state = (await api("GET", "/api/bots")).body.bots.find(
+      (candidate: { id: string }) => candidate.id === bot.id,
+    );
+    expect(state.messages.filter((message: { kind?: string }) => message.kind === "connector")).toHaveLength(24);
+    expect((await api("POST", `/api/bots/${bot.id}/interrupt`)).status).toBe(200);
+    await api("DELETE", `/api/bots/${bot.id}`);
+  }, 30_000);
 
   it.skipIf(process.platform === "win32")("stores the credentials file with owner-only permissions", () => {
     expect(statSync(join(home, ".openmausbot", "config.json")).mode & 0o777).toBe(0o600);
@@ -1959,7 +3014,7 @@ describe("harness HTTP API", () => {
       expect(renamed.body.task).not.toHaveProperty("resumeCursors");
 
       // and the same on the wire, not just in the HTTP responses
-      const stream = await openSse(`${BASE}/api/events`);
+      const stream = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
       try {
         await api("PATCH", `/api/bots/${botId}`, { unread: true });
         const frame = await stream.until((f) => f.kind === "bot");
@@ -1970,6 +3025,30 @@ describe("harness HTTP API", () => {
       }
     } finally {
       await api("DELETE", `/api/bots/${botId}`);
+    }
+  });
+
+  it("deletes private checkpoints and every task's diagnostic logs with the bot", async () => {
+    const created = await api("POST", "/api/bots");
+    const bot = created.body.bot;
+    const task = (await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Second private task" })).body.task;
+    const dataDir = join(home, ".openmausbot");
+    const checkpointDir = join(dataDir, "checkpoints", bot.id, "seeded-shadow");
+    mkdirSync(checkpointDir, { recursive: true });
+    writeFileSync(join(checkpointDir, "private.txt"), "snapshotted project contents");
+    for (const dirName of ["events", "native"]) {
+      const dir = join(dataDir, dirName);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${bot.threadId}.ndjson`), "primary private log");
+      writeFileSync(join(dir, `${task.threadId}.ndjson`), "secondary private log");
+    }
+
+    expect((await api("DELETE", `/api/bots/${bot.id}`)).status).toBe(200);
+
+    expect(existsSync(join(dataDir, "checkpoints", bot.id))).toBe(false);
+    for (const dirName of ["events", "native"]) {
+      expect(existsSync(join(dataDir, dirName, `${bot.threadId}.ndjson`))).toBe(false);
+      expect(existsSync(join(dataDir, dirName, `${task.threadId}.ndjson`))).toBe(false);
     }
   });
 
@@ -2039,7 +3118,12 @@ describe("bot memory API", () => {
    * the traversal tests need the wire to carry exactly the bytes shown */
   const rawGet = (rawPath: string): Promise<{ status: number; text: string }> =>
     new Promise((resolve, reject) => {
-      const req = request({ hostname: "127.0.0.1", port: PORT, path: rawPath }, (res) => {
+      const req = request({
+        hostname: "127.0.0.1",
+        port: PORT,
+        path: rawPath,
+        headers: UI_SESSION_HEADER,
+      }, (res) => {
         let text = "";
         res.on("data", (c) => (text += c));
         res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
@@ -2049,6 +3133,43 @@ describe("bot memory API", () => {
     });
 
   const workspaceOf = (botId: string) => join(home, ".openmausbot", "workspaces", botId);
+
+  const beginSlowJsonRequest = async (method: "POST" | "PUT", path: string, body: unknown) => {
+    const raw = Buffer.from(JSON.stringify(body));
+    let pendingRequest!: ReturnType<typeof request>;
+    const response = new Promise<{ status: number; body: any }>((resolve, reject) => {
+      pendingRequest = request({
+        hostname: "127.0.0.1",
+        port: PORT,
+        method,
+        path,
+        headers: {
+          ...UI_SESSION_HEADER,
+          "content-type": "application/json",
+          "content-length": String(raw.byteLength),
+        },
+      }, (res) => {
+        let text = "";
+        res.on("data", (chunk) => (text += chunk));
+        res.on("end", () => resolve({
+          status: res.statusCode ?? 0,
+          body: text ? JSON.parse(text) : {},
+        }));
+      });
+      pendingRequest.on("error", reject);
+      pendingRequest.flushHeaders();
+      pendingRequest.write(raw.subarray(0, raw.byteLength - 1));
+    });
+    // Headers plus an incomplete JSON body are enough for the route to pass
+    // its initial bot lookup and block inside readBody.
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    return {
+      finish: () => {
+        pendingRequest.end(raw.subarray(raw.byteLength - 1));
+        return response;
+      },
+    };
+  };
 
   it("reads empty memory for a fresh bot and 404s a bot that does not exist", async () => {
     const bot = (await api("POST", "/api/bots")).body.bot;
@@ -2084,6 +3205,22 @@ describe("bot memory API", () => {
     } finally {
       await api("DELETE", `/api/bots/${bot.id}`);
     }
+  });
+
+  it("does not recreate a deleted workspace when a memory or skill body finishes late", async () => {
+    const memoryBot = (await api("POST", "/api/bots")).body.bot;
+    expect((await api("PUT", `/api/bots/${memoryBot.id}/memory`, { text: "old" })).status).toBe(200);
+    expect(existsSync(workspaceOf(memoryBot.id))).toBe(true);
+    const staleMemory = await beginSlowJsonRequest("PUT", `/api/bots/${memoryBot.id}/memory`, { text: "stale" });
+    expect((await api("DELETE", `/api/bots/${memoryBot.id}`)).status).toBe(200);
+    expect((await staleMemory.finish()).status).toBe(404);
+    expect(existsSync(workspaceOf(memoryBot.id))).toBe(false);
+
+    const skillBot = (await api("POST", "/api/bots")).body.bot;
+    const staleSkill = await beginSlowJsonRequest("POST", `/api/bots/${skillBot.id}/skills`, { source: "owner/repo" });
+    expect((await api("DELETE", `/api/bots/${skillBot.id}`)).status).toBe(200);
+    expect((await staleSkill.finish()).status).toBe(404);
+    expect(existsSync(workspaceOf(skillBot.id))).toBe(false);
   });
 
   it("lists memory/ topic files and serves one by (possibly encoded) name", async () => {
@@ -2237,7 +3374,9 @@ describe("message pages", () => {
 
   it("404s an image on a message that has none", async () => {
     const full = await seedRoom(1);
-    const res = await fetch(`${BASE}/api/threads/${full.threadId}/messages/${full.messages[0].id}/image`);
+    const res = await fetch(`${BASE}/api/threads/${full.threadId}/messages/${full.messages[0].id}/image`, {
+      headers: UI_SESSION_HEADER,
+    });
     expect(res.status).toBe(404);
   });
 
@@ -2247,7 +3386,9 @@ describe("message pages", () => {
     // for threads that were never real. The 404 is the visible half; not
     // creating the thread is the half worth having.
     const before = (await api("GET", "/api/bots")).body.bots.length;
-    const res = await fetch(`${BASE}/api/threads/not-a-thread/messages/not-a-message/image`);
+    const res = await fetch(`${BASE}/api/threads/not-a-thread/messages/not-a-message/image`, {
+      headers: UI_SESSION_HEADER,
+    });
     expect(res.status).toBe(404);
     expect(((await res.json()) as { error: string }).error).toBe("no such conversation");
     // and the phantom thread is not now answerable as an empty conversation
@@ -2269,7 +3410,7 @@ describe("resumable event stream", () => {
     const { body } = await api("GET", "/api/bots");
     const botId = body.bots[0].id;
 
-    const stream = await openSse(`${BASE}/api/events`);
+    const stream = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
     try {
       const hello = await stream.until((f) => f.kind === "hello");
       expect(hello.cursor).toMatch(/^[0-9a-f]{8}:\d+$/);
@@ -2292,7 +3433,7 @@ describe("resumable event stream", () => {
     const { body } = await api("GET", "/api/bots");
     const botId = body.bots[0].id;
 
-    const first = await openSse(`${BASE}/api/events`);
+    const first = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
     const hello = await first.until((f) => f.kind === "hello");
     await nudge(botId);
     const seen = await first.until((f) => f.kind === "bot");
@@ -2306,7 +3447,7 @@ describe("resumable event stream", () => {
     await nudge(botId);
     await nudge(botId);
 
-    const resumed = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
+    const resumed = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`, UI_SESSION_HEADER);
     try {
       // ...and an old cursor still replays them, in order, without a hydrate
       const back = await resumed.until((f) => f.kind === "hello");
@@ -2323,13 +3464,13 @@ describe("resumable event stream", () => {
     const { body } = await api("GET", "/api/bots");
     const botId = body.bots[0].id;
 
-    const first = await openSse(`${BASE}/api/events`);
+    const first = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
     const hello = await first.until((f) => f.kind === "hello");
     first.close();
     await nudge(botId);
 
     // the id: field is what a browser echoes back on its own reconnect
-    const resumed = await openSse(`${BASE}/api/events`, { "last-event-id": hello.cursor });
+    const resumed = await openSse(`${BASE}/api/events`, { ...UI_SESSION_HEADER, "last-event-id": hello.cursor });
     try {
       expect((await resumed.until((f) => f.kind === "hello")).resumed).toBe(true);
       await resumed.until((f) => f.kind === "bot");
@@ -2344,7 +3485,7 @@ describe("resumable event stream", () => {
 
     // a phone on cellular opts out of the live desktop captures; nothing
     // else about its stream changes
-    const stream = await openSse(`${BASE}/api/events?screens=off`);
+    const stream = await openSse(`${BASE}/api/events?screens=off`, UI_SESSION_HEADER);
     try {
       expect((await stream.until((f) => f.kind === "hello")).resumed).toBe(false);
       await nudge(botId);
@@ -2357,7 +3498,7 @@ describe("resumable event stream", () => {
 
   it("refuses a cursor it cannot honour instead of replaying the wrong run", async () => {
     for (const cursor of ["deadbeef:1", "not-a-cursor", "12345678:999999"]) {
-      const stream = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`);
+      const stream = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`, UI_SESSION_HEADER);
       try {
         const hello = await stream.until((f) => f.kind === "hello");
         // false is the signal to hydrate — a partial replay would leave a
@@ -2366,6 +3507,21 @@ describe("resumable event stream", () => {
       } finally {
         stream.close();
       }
+    }
+  });
+
+  it("bounds simultaneous event streams so a paired slow client cannot exhaust descriptors", async () => {
+    const streams = [];
+    try {
+      for (let index = 0; index < 32; index += 1) {
+        streams.push(await openSse(`${BASE}/api/events?screens=off`, UI_SESSION_HEADER));
+      }
+      const rejected = await fetch(`${BASE}/api/events?screens=on`, { headers: UI_SESSION_HEADER });
+      expect(rejected.status).toBe(429);
+      expect(rejected.headers.get("retry-after")).toBe("5");
+      expect(await rejected.json()).toEqual({ error: "too many live event streams" });
+    } finally {
+      for (const stream of streams) stream.close();
     }
   });
 });
@@ -2427,6 +3583,77 @@ describe("instance CLI override API", () => {
     expect(res.body.install).toBeUndefined();
   });
 
+  it("retires a surviving computer bridge before a failed provider reload releases its fence", async () => {
+    const bot = (await api("POST", "/api/bots", {})).body.bot;
+    let reloadRecovered = false;
+    try {
+      writeFileSync(fakeClaudeInterruptFailures, "0");
+      expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+        computer: "cloud",
+        cloudBackend: "box",
+      })).status).toBe(200);
+
+      const boxList = deferNextBoxList([
+        { id: `box-${bot.id}`, name: stubBoxName(bot.id), state: "ready" },
+      ]);
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "keep this cloud bridge alive" })).status).toBe(202);
+      await boxList.started;
+      boxList.release();
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+
+      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const control = dump.mcpConfig?.mcpServers?.computer?.env;
+      const controlUrl = control?.OMB_CONTROL_URL;
+      const controlToken = control?.OMB_CONTROL_TOKEN;
+      expect(controlUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/api\/internal\/computer-control\?/);
+      expect(controlToken).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+
+      const began = await fetch(controlUrl, {
+        method: "POST",
+        headers: { authorization: `Bearer ${controlToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ op: "begin-action" }),
+      });
+      expect(began.status).toBe(200);
+      const actionId = ((await began.json()) as { actionId?: unknown }).actionId;
+      expect(actionId).toEqual(expect.any(String));
+      const ended = await fetch(controlUrl, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${controlToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ op: "end-action", actionId }),
+      });
+      expect(ended.status).toBe(200);
+
+      writeFileSync(fakeClaudeInterruptFailures, "1");
+      const failedReload = await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI });
+      expect(failedReload.status).toBe(409);
+      expect(failedReload.body.error).toMatch(/provider shutdown could not be verified/i);
+      expect(readFileSync(fakeClaudeInterruptFailures, "utf8")).toBe("0");
+      expect(() => process.kill(dump.pid, 0)).not.toThrow();
+
+      const stale = await fetch(controlUrl, {
+        method: "POST",
+        headers: { authorization: `Bearer ${controlToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ op: "begin-action" }),
+      });
+      expect(stale.status).toBe(409);
+      const staleBody = (await stale.json()) as { error?: string };
+      expect(staleBody.error).toMatch(/bridge turn has ended/i);
+
+      const recovered = await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI });
+      expect(recovered.status).toBe(200);
+      reloadRecovered = true;
+    } finally {
+      writeFileSync(fakeClaudeInterruptFailures, "0");
+      if (!reloadRecovered) await api("PATCH", "/api/instances/claude", { cli: FAKE_CLAUDE_CLI });
+      await api("POST", `/api/bots/${bot.id}/interrupt`);
+      await api("DELETE", `/api/bots/${bot.id}`);
+      await api("PUT", "/api/config", { box: { token: "" } });
+    }
+  });
+
   it("rejects overlapping provider configuration writes", async () => {
     const slowConfigWrite = api("PUT", "/api/config", { box: { token: "box_slow" } });
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -2442,27 +3669,283 @@ describe("computer control API (who is driving)", () => {
   beforeAll(async () => {
     const created = await api("POST", "/api/bots", {});
     botId = created.body.bot.id;
+    expect((await api("PATCH", `/api/bots/${botId}`, { computer: "local" })).status).toBe(200);
   });
 
   it("starts disengaged", async () => {
     const res = await api("GET", `/api/bots/${botId}/computer/control`);
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ held: false, helpReason: null, heldSinceMs: null });
+    expect(res.body).toEqual({
+      held: false,
+      helpReason: null,
+      heldSinceMs: null,
+      leaseExpiresAtMs: null,
+      targetSurface: "physical",
+      targetKey: "physical:host",
+      targetGeneration: null,
+    });
   });
 
-  it("take → held, broadcast on the wire, release → disengaged", async () => {
-    const sse = await openSse(`${BASE}/api/events`);
+  it("gates direct Box broker commands with the exact human-control action fence", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const cloudBot = created.body.bot;
+    const ownerId = "renderer-box-broker-gate";
+    let heldToken = "";
+    let releaseDeferred: (() => void) | null = null;
     try {
-      const took = await api("POST", `/api/bots/${botId}/computer/control`, { action: "take" });
+      expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${cloudBot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+        computer: "cloud",
+        cloudBackend: "box",
+      })).status).toBe(200);
+
+      const boxList = deferNextBoxList([
+        { id: `box-${cloudBot.id}`, name: stubBoxName(cloudBot.id), state: "ready" },
+      ]);
+      rmSync(fakeClaudeDump, { force: true });
+      expect((await api("POST", `/api/bots/${cloudBot.id}/messages`, { text: "keep the Box bridge alive" })).status).toBe(202);
+      await boxList.started;
+      boxList.release();
+      await expect.poll(() => existsSync(fakeClaudeDump), { timeout: 5_000 }).toBe(true);
+      const dump = JSON.parse(readFileSync(fakeClaudeDump, "utf8"));
+      const computerEnv = dump.mcpConfig?.mcpServers?.computer?.env;
+      const brokerToken = computerEnv?.OMB_BOX_CAPABILITY_TOKEN;
+      const controlUrl = computerEnv?.OMB_CONTROL_URL;
+      const controlToken = computerEnv?.OMB_CONTROL_TOKEN;
+      expect(brokerToken).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+      expect(controlUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/api\/internal\/computer-control\?/);
+      expect(controlToken).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+      const forgedRemotePrompt = await internalApi("/api/internal/box", brokerToken, {
+        op: "prompt",
+        provider: "codex",
+        model: "gpt-test",
+        prompt: "run outside this Claude turn",
+      });
+      expect(forgedRemotePrompt.status).toBe(403);
+      expect(forgedRemotePrompt.body.error).toMatch(/Computer engine/i);
+
+      // The official proxy already owns an exact bridge ticket. Its proof
+      // is accepted as nested work instead of deadlocking on a second ticket.
+      const began = await fetch(controlUrl, {
+        method: "POST",
+        headers: { authorization: `Bearer ${controlToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ op: "begin-action" }),
+      });
+      expect(began.status).toBe(200);
+      const actionId = ((await began.json()) as { actionId: string }).actionId;
+      const nested = await fetch(`${BASE}/api/internal/box`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${brokerToken}`,
+          "content-type": "application/json",
+          "x-openmausbot-control-action": actionId,
+        },
+        body: JSON.stringify({ op: "command", command: "true" }),
+      });
+      expect(nested.status).toBe(200);
+      const ended = await fetch(controlUrl, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${controlToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ op: "end-action", actionId }),
+      });
+      expect(ended.status).toBe(200);
+      expect(await ended.json()).toMatchObject({ ended: true });
+
+      // With no bot action in flight, the person can take the exact Box.
+      const initialTake = await api("POST", `/api/bots/${cloudBot.id}/computer/control`, { action: "take", ownerId });
+      expect(initialTake.status).toBe(200);
+      heldToken = initialTake.body.leaseToken;
+
+      // A raw broker caller has the turn bearer but not the proxy's exact
+      // action ticket, so human ownership still wins.
+      const refused = await internalApi("/api/internal/box", brokerToken, {
+        op: "command",
+        command: "true",
+      });
+      expect(refused.status).toBe(409);
+      expect(refused.body.error).toMatch(/person is controlling/i);
+      expect((await api("POST", `/api/bots/${cloudBot.id}/computer/control`, {
+        action: "release",
+        ownerId,
+        leaseToken: heldToken,
+      })).status).toBe(200);
+      heldToken = "";
+
+      // Once a direct broker command enters, Take fences new actions and
+      // waits for that exact ticket's terminal response before succeeding.
+      const deferred = deferNextBoxCommand();
+      releaseDeferred = deferred.release;
+      const command = internalApi("/api/internal/box", brokerToken, {
+        op: "command",
+        command: "sleep 1",
+      });
+      await deferred.started;
+      let takeSettled = false;
+      const takeover = api("POST", `/api/bots/${cloudBot.id}/computer/control`, {
+        action: "take",
+        ownerId,
+      }).then((value) => {
+        takeSettled = true;
+        return value;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(takeSettled).toBe(false);
+      deferred.release();
+      releaseDeferred = null;
+      expect((await command).status).toBe(200);
+      const tookAfterDrain = await takeover;
+      expect(tookAfterDrain.status).toBe(200);
+      heldToken = tookAfterDrain.body.leaseToken;
+      expect((await api("POST", `/api/bots/${cloudBot.id}/computer/control`, {
+        action: "release",
+        ownerId,
+        leaseToken: heldToken,
+      })).status).toBe(200);
+      heldToken = "";
+
+      // An upstream terminal error also releases only its own ticket.
+      const failed = deferNextBoxCommand(true);
+      releaseDeferred = failed.release;
+      const failedCommand = internalApi("/api/internal/box", brokerToken, {
+        op: "command",
+        command: "false",
+      });
+      await failed.started;
+      failed.release();
+      releaseDeferred = null;
+      expect((await failedCommand).body).toMatchObject({ ok: false, status: 500 });
+      const takeAfterError = await api("POST", `/api/bots/${cloudBot.id}/computer/control`, {
+        action: "take",
+        ownerId,
+      });
+      expect(takeAfterError.status).toBe(200);
+      heldToken = takeAfterError.body.leaseToken;
+    } finally {
+      releaseDeferred?.();
+      if (heldToken) {
+        await api("POST", `/api/bots/${cloudBot.id}/computer/control`, {
+          action: "release",
+          ownerId,
+          leaseToken: heldToken,
+        });
+      }
+      await api("POST", `/api/bots/${cloudBot.id}/interrupt`);
+      await api("DELETE", `/api/bots/${cloudBot.id}`);
+      await api("PUT", "/api/config", { box: { token: "" } });
+    }
+  });
+
+  it("keeps a Computer-engine Box prompt fenced until its verified remote terminal", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const computerBot = created.body.bot;
+    const ownerId = "renderer-box-prompt-gate";
+    let heldToken = "";
+    const prompt = trackNextBoxPrompt();
+    try {
+      expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+      expect((await api("PATCH", `/api/bots/${computerBot.id}`, {
+        modelSelection: { instanceId: "computer", model: "gpt-5.4" },
+        computer: "cloud",
+        cloudBackend: "box",
+      })).status).toBe(200);
+      const boxList = deferNextBoxList([
+        { id: `box-${computerBot.id}`, name: stubBoxName(computerBot.id), state: "ready" },
+      ]);
+      const sent = await api("POST", `/api/bots/${computerBot.id}/messages`, { text: "work on the hosted desktop" });
+      expect(sent.status, JSON.stringify(sent.body)).toBe(202);
+      await boxList.started;
+      boxList.release();
+      await prompt.started;
+
+      let takeSettled = false;
+      const takeover = api("POST", `/api/bots/${computerBot.id}/computer/control`, {
+        action: "take",
+        ownerId,
+      }).then((value) => {
+        takeSettled = true;
+        return value;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(takeSettled).toBe(false);
+
+      prompt.finish();
+      const staleTake = await takeover;
+      expect(staleTake.status).toBe(409);
+      expect(staleTake.body.error).toMatch(/destination changed/i);
+      await expect.poll(async () => {
+        const bots = (await api("GET", "/api/bots")).body.bots;
+        return bots.find((candidate: { id: string }) => candidate.id === computerBot.id)?.busy;
+      }, { timeout: 8_000 }).toBe(false);
+      const took = await api("POST", `/api/bots/${computerBot.id}/computer/control`, {
+        action: "take",
+        ownerId,
+        surface: "cloud",
+      });
+      expect(took.status, JSON.stringify(took.body)).toBe(200);
+      heldToken = took.body.leaseToken;
+    } finally {
+      prompt.finish();
+      boxPromptFixture = null;
+      if (heldToken) {
+        await api("POST", `/api/bots/${computerBot.id}/computer/control`, {
+          action: "release",
+          ownerId,
+          leaseToken: heldToken,
+        });
+      }
+      await api("POST", `/api/bots/${computerBot.id}/interrupt`);
+      await api("DELETE", `/api/bots/${computerBot.id}`);
+      await api("PUT", "/api/config", { box: { token: "" } });
+    }
+  }, 20_000);
+
+  it("take → owner lease, heartbeat, broadcast, and owner-only release", async () => {
+    const sse = await openSse(`${BASE}/api/events`, UI_SESSION_HEADER);
+    try {
+      const ownerId = "renderer-session-a";
+      const took = await api("POST", `/api/bots/${botId}/computer/control`, { action: "take", ownerId });
       expect(took.status).toBe(200);
       expect(took.body.held).toBe(true);
+      expect(took.body.leaseToken).toMatch(/^lease_/);
+      expect(took.body.leaseExpiresAtMs).toBeGreaterThan(Date.now());
       const frame = await sse.until(
         (f) => f.kind === "computer-control" && f.botId === botId && f.held === true,
       );
       expect(frame.helpReason).toBeNull();
       const hydrated = await api("GET", "/api/bots");
       expect(hydrated.body.computerControl[botId]).toEqual({ held: true, helpReason: null });
-      const released = await api("POST", `/api/bots/${botId}/computer/control`, { action: "release" });
+      const hijack = await api("POST", `/api/bots/${botId}/computer/control`, {
+        action: "release",
+        ownerId: "renderer-session-b",
+        leaseToken: took.body.leaseToken,
+      });
+      expect(hijack.status).toBe(403);
+      const heartbeat = await api("POST", `/api/bots/${botId}/computer/control`, {
+        action: "heartbeat",
+        ownerId,
+        leaseToken: took.body.leaseToken,
+      });
+      expect(heartbeat.status).toBe(200);
+      expect(heartbeat.body.held).toBe(true);
+      const mismatchedSurface = await api(
+        "GET",
+        `/api/bots/${botId}/computer/control?surface=cloud`,
+      );
+      expect(mismatchedSurface.status).toBe(200);
+      expect(mismatchedSurface.body).toMatchObject({ held: true, targetSurface: "physical" });
+      const retarget = await api("PATCH", `/api/bots/${botId}`, { computer: "off" });
+      expect(retarget.status).toBe(409);
+      expect(retarget.body.error).toMatch(/hand computer control back/i);
+      const removeHeldBot = await api("DELETE", `/api/bots/${botId}`);
+      expect(removeHeldBot.status).toBe(409);
+      expect(removeHeldBot.body.error).toMatch(/hand computer control back/i);
+      const released = await api("POST", `/api/bots/${botId}/computer/control`, {
+        action: "release",
+        ownerId,
+        leaseToken: took.body.leaseToken,
+      });
+      expect(released.status).toBe(200);
       expect(released.body.held).toBe(false);
     } finally {
       sse.close();
@@ -2479,14 +3962,248 @@ describe("computer control API (who is driving)", () => {
   it("refuses a form-shaped POST — control mutations are JSON-only", async () => {
     const res = await fetch(`${BASE}/api/bots/${botId}/computer/control`, {
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
+      headers: { ...UI_SESSION_HEADER, "content-type": "application/x-www-form-urlencoded" },
       body: "action=take",
     });
     expect(res.status).toBe(415);
   });
 
+  it("binds phone take, heartbeat, and immediate device revoke to the authenticated device", async () => {
+    expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+    const created = await api("POST", "/api/bots", {});
+    const phoneBot = created.body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${phoneBot.id}`, { computer: "cloud", cloudBackend: "box" })).status).toBe(200);
+      const wrongSurface = await companionApi(
+        "GET",
+        `/api/bots/${phoneBot.id}/computer/control`,
+        undefined,
+      );
+      expect(wrongSurface.status).toBe(409);
+
+      const took = await companionApi(
+        "POST",
+        `/api/bots/${phoneBot.id}/computer/control`,
+        { action: "take", ownerId: "body-owner-is-not-authority", surface: "cloud" },
+      );
+      expect(took.status).toBe(200);
+      expect(took.body.leaseToken).toMatch(/^lease_/);
+
+      const heartbeat = await companionApi(
+        "POST",
+        `/api/bots/${phoneBot.id}/computer/control`,
+        { action: "heartbeat", ownerId: "still-not-authority", leaseToken: took.body.leaseToken },
+      );
+      expect(heartbeat.status).toBe(200);
+
+      const directHijack = await api("POST", `/api/bots/${phoneBot.id}/computer/control`, {
+        action: "heartbeat",
+        ownerId: "still-not-authority",
+        leaseToken: took.body.leaseToken,
+      });
+      expect(directHijack.status).toBe(403);
+
+      const revoked = await fetch(
+        `${BASE}/api/internal/companion-devices/phone-1/computer-control`,
+        { method: "DELETE", headers: UI_SESSION_HEADER },
+      );
+      expect(revoked.status).toBe(200);
+      expect(await revoked.json()).toEqual({ revoked: 1 });
+      const stale = await companionApi(
+        "POST",
+        `/api/bots/${phoneBot.id}/computer/control`,
+        { action: "heartbeat", ownerId: "ignored", leaseToken: took.body.leaseToken },
+      );
+      expect(stale.status).toBe(403);
+    } finally {
+      await api("DELETE", `/api/bots/${phoneBot.id}`);
+    }
+  });
+
+  it("binds phone Local VM control to the authenticated device without exposing lifecycle routes", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const phoneBot = created.body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${phoneBot.id}`, { computer: "vm" })).status).toBe(200);
+      const wrongSurface = await companionApi(
+        "POST",
+        `/api/bots/${phoneBot.id}/computer/control`,
+        { action: "take", ownerId: "ignored", surface: "cloud" },
+      );
+      expect(wrongSurface.status).toBe(409);
+
+      const took = await companionApi(
+        "POST",
+        `/api/bots/${phoneBot.id}/computer/control`,
+        { action: "take", ownerId: "body-owner-is-not-authority", surface: "vm" },
+      );
+      expect(took.status).toBe(200);
+      expect(took.body.leaseToken).toMatch(/^lease_/);
+
+      const directHijack = await api("POST", `/api/bots/${phoneBot.id}/computer/control`, {
+        action: "heartbeat",
+        ownerId: "body-owner-is-not-authority",
+        leaseToken: took.body.leaseToken,
+      });
+      expect(directHijack.status).toBe(403);
+
+      const join = await companionApi(
+        "POST",
+        `/api/bots/${phoneBot.id}/local-computer/join`,
+        { ownerId: "ignored", leaseToken: took.body.leaseToken },
+      );
+      // The hermetic test has no running desktop container, but reaching the
+      // readiness error proves the phone route passed identity + exact lease
+      // authorization instead of being stopped by the companion marker.
+      expect(join.status).toBe(409);
+      expect(join.body.error).toMatch(/viewer is not ready|container runtime|Local VM|start (?:docker|podman)/i);
+
+      const release = await companionApi(
+        "POST",
+        `/api/bots/${phoneBot.id}/computer/control`,
+        { action: "release", ownerId: "ignored", leaseToken: took.body.leaseToken },
+      );
+      expect(release.status).toBe(200);
+    } finally {
+      await api("DELETE", `/api/bots/${phoneBot.id}`);
+    }
+  });
+
+  it("refuses a phone VPS join before opening a host-local tunnel", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const vpsBot = created.body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${vpsBot.id}`, { computer: "cloud", cloudBackend: "vps" })).status).toBe(200);
+      const joined = await companionApi(
+        "POST",
+        `/api/bots/${vpsBot.id}/computer/join`,
+        { ownerId: "phone-owner", leaseToken: "not-used" },
+      );
+      expect(joined.status).toBe(409);
+      expect(joined.body.error).toMatch(/hosted Box desktop/i);
+    } finally {
+      await api("DELETE", `/api/bots/${vpsBot.id}`);
+    }
+  });
+
+  it("refuses a destination switch while a turn is busy even between tool actions", async () => {
+    const created = await api("POST", "/api/bots", {});
+    const busyBot = created.body.bot;
+    try {
+      expect((await api("PATCH", `/api/bots/${busyBot.id}`, {
+        modelSelection: { instanceId: "claude", model: "claude-sonnet-5" },
+      })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${busyBot.id}/messages`, { text: "keep working" })).status).toBe(202);
+      await expect.poll(async () => {
+        const bots = (await api("GET", "/api/bots")).body.bots;
+        return bots.find((candidate: { id: string }) => candidate.id === busyBot.id)?.busy;
+      }).toBe(true);
+
+      const prematureTake = await api("POST", `/api/bots/${busyBot.id}/computer/control`, {
+        action: "take",
+        ownerId: "renderer-before-target",
+        surface: "physical",
+      });
+      expect(prematureTake.status).toBe(409);
+      expect(prematureTake.body.error).toMatch(/still being selected/i);
+
+      const switched = await api("PATCH", `/api/bots/${busyBot.id}`, { computer: "off" });
+      expect(switched.status).toBe(409);
+      expect(switched.body.error).toMatch(/stop.*turn/i);
+    } finally {
+      await api("POST", `/api/bots/${busyBot.id}/interrupt`);
+      expect((await api("DELETE", `/api/bots/${busyBot.id}`)).status).toBe(200);
+    }
+  });
+
+  it.runIf(process.platform === "darwin")(
+    "never grants a stale cloud take after its deferred probe races a physical selection",
+    async () => {
+      expect((await api("PUT", "/api/config", { box: { token: "box_good" } })).status).toBe(200);
+      const created = await api("POST", "/api/bots", {});
+      const raceBot = created.body.bot;
+      const cuaDir = join(home, "Library", "Application Support", "OpenMausBot");
+      const cuaFile = join(cuaDir, "cua-connection.json");
+      const deferred = deferNextBoxList([
+        { id: `box-${raceBot.id}`, name: stubBoxName(raceBot.id), state: "ready" },
+      ]);
+      const staleTake = api("POST", `/api/bots/${raceBot.id}/computer/control`, {
+        action: "take",
+        ownerId: "renderer-stale-cloud",
+        surface: "cloud",
+      });
+      try {
+        await deferred.started;
+        mkdirSync(cuaDir, { recursive: true });
+        writeFileSync(cuaFile, JSON.stringify({
+          mode: "available",
+          mcpCommand: process.execPath,
+          mcpArgs: ["mcp"],
+          mcpEnv: {},
+        }));
+        expect((await api("PATCH", `/api/bots/${raceBot.id}`, { computer: "local" })).status).toBe(200);
+        expect((await api("POST", `/api/bots/${raceBot.id}/messages`, { text: "hold physical target" })).status).toBe(202);
+        await expect.poll(async () => {
+          const control = await api("GET", `/api/bots/${raceBot.id}/computer/control`);
+          return control.body.targetKey === "physical:host" && Boolean(control.body.targetGeneration);
+        }).toBe(true);
+
+        deferred.release();
+        const rejected = await staleTake;
+        expect(rejected.status).toBe(409);
+        expect(rejected.body.error).toMatch(/destination changed/i);
+        expect(rejected.body.leaseToken).toBeUndefined();
+        const current = await api("GET", `/api/bots/${raceBot.id}/computer/control`);
+        expect(current.body).toMatchObject({
+          held: false,
+          targetKey: "physical:host",
+          targetSurface: "physical",
+        });
+      } finally {
+        deferred.release();
+        rmSync(cuaFile, { force: true });
+        await api("POST", `/api/bots/${raceBot.id}/interrupt`);
+        await api("DELETE", `/api/bots/${raceBot.id}`);
+      }
+    },
+  );
+
+  it("allows only the active control owner to close a viewer", async () => {
+    const ownerId = "viewer-close-owner";
+    const took = await api("POST", `/api/bots/${botId}/computer/control`, { action: "take", ownerId });
+    expect(took.status).toBe(200);
+    const missing = await api("POST", `/api/bots/${botId}/computer/viewer-close`, {});
+    expect(missing.status).toBe(400);
+    const stale = await api("POST", `/api/bots/${botId}/computer/viewer-close`, {
+      ownerId,
+      leaseToken: "stale-control-token",
+    });
+    expect(stale.status).toBe(403);
+    const closed = await api("POST", `/api/bots/${botId}/computer/viewer-close`, {
+      ownerId,
+      leaseToken: took.body.leaseToken,
+    });
+    expect(closed.status).toBe(200);
+    await api("POST", `/api/bots/${botId}/computer/control`, {
+      action: "release",
+      ownerId,
+      leaseToken: took.body.leaseToken,
+    });
+  });
+
   it("keeps the internal who-is-driving endpoint behind the boot token", async () => {
     const res = await fetch(`${BASE}/api/internal/computer-control?botId=${botId}`);
     expect(res.status).toBe(401);
+
+    const missingBotId = await fetch(`${BASE}/api/internal/computer-control?bridgeId=forged`, {
+      headers: { authorization: "Bearer forged-bridge-token" },
+    });
+    expect(missingBotId.status).toBe(401);
+
+    const wrongBridgeToken = await fetch(
+      `${BASE}/api/internal/computer-control?botId=${botId}&bridgeId=forged`,
+      { headers: { authorization: "Bearer forged-bridge-token" } },
+    );
+    expect(wrongBridgeToken.status).toBe(401);
   });
 });

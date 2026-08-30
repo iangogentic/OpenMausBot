@@ -19,7 +19,9 @@
 // Running this process *is* the opt-in. There is no toggle, because a toggle
 // inside a process you chose to start would be ceremony: stopping it is the
 // off switch, and it is a more honest one than a flag in a file.
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
+import { chmodSync } from "node:fs";
+import { isAbsolute } from "node:path";
 
 import { createAddressWatcher } from "./advertise-watch.ts";
 import { createControlServer, hostCandidates } from "./control.ts";
@@ -37,6 +39,8 @@ import {
 } from "./mdns.ts";
 import { createProxyHandler } from "./proxy.ts";
 import { companionOriginSocket, listenCompanionOrigin } from "./origin.ts";
+import { takeHeadlessSessionTokens } from "./session-token.ts";
+import { CompanionLocalVmViewerGateway } from "./local-vm-viewer.ts";
 
 /** A port from the environment, or the default. Anything that is not a whole
  * number in range is the default — a typo'd port must not become port 0. */
@@ -52,6 +56,120 @@ const CONTROL_PORT = num(process.env.OMB_CONTROL_PORT, 8811);
 const SERVICE_TYPE = "_openmausbot._tcp";
 let hostedUrl = hostedCompanionUrl(process.env.OMB_COMPANION_HOSTED_URL);
 const PRIVATE_ORIGIN = companionOriginSocket(process.env.OMB_COMPANION_INTERNAL_ORIGIN);
+
+/** A deployment-only backend socket. The advertised TCP port remains the
+ * phone-facing endpoint held by systemd-socket-proxyd; this process binds
+ * only the protected UDS behind it. Invalid configuration never falls back
+ * to TCP, because that would silently discard the OS boundary. */
+function deploymentSocket(value: string | undefined, name: string): string | null {
+  if (!value) return null;
+  if (
+    process.platform === "win32" ||
+    !isAbsolute(value) ||
+    !value.endsWith(".sock") ||
+    /[\0\r\n]/.test(value) ||
+    Buffer.byteLength(value) > 96
+  ) {
+    throw new Error(`${name} must be an absolute Unix-socket path ending in .sock`);
+  }
+  return value;
+}
+
+const COMPANION_SOCKET = deploymentSocket(
+  process.env.OMB_COMPANION_LISTEN_SOCKET,
+  "OMB_COMPANION_LISTEN_SOCKET",
+);
+const CONTROL_SOCKET = deploymentSocket(
+  process.env.OMB_CONTROL_LISTEN_SOCKET,
+  "OMB_CONTROL_LISTEN_SOCKET",
+);
+// Never accept this bearer through argv/env: same-UID provider shells can
+// inspect another Linux process's initial environment even after JS deletes
+// its copy. Electron delivers it over the utility process's private channel.
+delete process.env.OMB_UI_SESSION_TOKEN;
+delete process.env.OMB_COMPANION_SESSION_TOKEN;
+const HEADLESS_SESSION_TOKENS = takeHeadlessSessionTokens();
+
+type UtilityParentPort = {
+  on(event: "message", listener: (event: { data?: unknown }) => void): void;
+};
+
+type SessionTokens = { harnessSessionToken: string; controlSessionToken: string };
+
+function validSessionToken(value: unknown): value is string {
+  return typeof value === "string" && value === value.trim() && value.length >= 32 && value.length <= 512 && !/[\r\n]/.test(value);
+}
+
+function validatedSessionTokens(
+  harnessSessionToken: unknown,
+  controlSessionToken: unknown,
+): SessionTokens | null {
+  if (
+    !validSessionToken(harnessSessionToken) ||
+    !validSessionToken(controlSessionToken) ||
+    harnessSessionToken === controlSessionToken
+  ) return null;
+  return { harnessSessionToken, controlSessionToken };
+}
+
+async function receiveSessionTokens(): Promise<SessionTokens | null> {
+  const parentPort = (process as NodeJS.Process & { parentPort?: UtilityParentPort }).parentPort;
+  // `pnpm companion` / systemd have no Electron parent port. Their token is
+  // read once from a systemd credential (or a strict private file) before
+  // any provider subprocess can inherit an environment carrying it.
+  if (!parentPort) {
+    return validatedSessionTokens(
+      HEADLESS_SESSION_TOKENS.harnessSessionToken,
+      HEADLESS_SESSION_TOKENS.controlSessionToken,
+    );
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: SessionTokens | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    parentPort.on("message", (event) => {
+      const message = event?.data as {
+        type?: unknown;
+        harnessSessionToken?: unknown;
+        controlSessionToken?: unknown;
+      } | undefined;
+      if (message?.type !== "openmausbot:companion-sessions") return;
+      finish(validatedSessionTokens(message.harnessSessionToken, message.controlSessionToken));
+    });
+    setTimeout(() => finish(null), 10_000).unref?.();
+  });
+}
+
+const SESSION_TOKENS = await receiveSessionTokens();
+if (!SESSION_TOKENS) {
+  throw new Error(
+    "companion needs distinct harness and control sessions from Electron or private systemd credentials",
+  );
+}
+const { harnessSessionToken: HARNESS_SESSION_TOKEN, controlSessionToken: CONTROL_SESSION_TOKEN } = SESSION_TOKENS;
+
+/** Withdraw a paired device's live human-control lease at the same moment as
+ * its sidecar grant. The ordinary 15-second lease expiry remains the crash
+ * backstop; this makes an explicit click on Revoke immediate. */
+function revokeHarnessDesktopLeases(deviceId: string): void {
+  if (!/^[\w-]{1,128}$/.test(deviceId)) return;
+  const req = httpRequest({
+    hostname: "127.0.0.1",
+    port: HARNESS_PORT,
+    path: `/api/internal/companion-devices/${encodeURIComponent(deviceId)}/computer-control`,
+    method: "DELETE",
+    headers: { "x-openmausbot-session": HARNESS_SESSION_TOKEN },
+    timeout: 2_000,
+  }, (res) => res.resume());
+  req.on("timeout", () => req.destroy());
+  // The grant has already been removed locally. Harness outage falls back to
+  // the bounded lease TTL instead of crashing the sidecar control plane.
+  req.on("error", () => {});
+  req.end();
+}
 
 /** Ports the harness takes for itself, and what it uses each for.
  *
@@ -92,6 +210,7 @@ async function refreshMachineName(): Promise<void> {
   if (cachedName) return; // an explicit override is not ours to second-guess
   try {
     const res = await fetch(`http://127.0.0.1:${HARNESS_PORT}/api/config`, {
+      headers: HARNESS_SESSION_TOKEN ? { "x-openmausbot-session": HARNESS_SESSION_TOKEN } : undefined,
       signal: AbortSignal.timeout(3000),
     });
     if (!res.ok) return;
@@ -133,8 +252,17 @@ const service = (): ServiceInfo => ({
 });
 
 const connectedDevices = createConnectedDeviceTracker();
+const localVmViewer = new CompanionLocalVmViewerGateway({
+  harnessPort: HARNESS_PORT,
+  track: (deviceId, terminate) => connectedDevices.openRequest(
+    deviceId,
+    terminate,
+    { cloudDesktop: true },
+  ),
+});
 const proxy = createProxyHandler({
     harnessPort: HARNESS_PORT,
+    harnessSessionToken: HARNESS_SESSION_TOKEN || undefined,
     // `authenticate` also stamps lastSeenAt, which is what makes the control
     // page able to say when a phone was last heard from.
     authenticate: (token) => devices.authenticate(token),
@@ -146,12 +274,36 @@ const proxy = createProxyHandler({
     hosts: () => hostCandidates(),
     endpoints: () => companionEndpointCandidates(COMPANION_PORT, undefined, undefined, hostedUrl),
     connected: connectedDevices.open,
+    track: connectedDevices.openRequest,
+    localVmViewer,
   });
-const companion = createServer(proxy);
-const managedOrigin = PRIVATE_ORIGIN ? createServer(proxy) : null;
+const deviceHandler = (req: Parameters<typeof proxy>[0], res: Parameters<typeof proxy>[1]) => {
+  let url: URL;
+  try {
+    url = new URL(req.url ?? "/", "http://companion.invalid");
+  } catch {
+    res.writeHead(400, { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" });
+    res.end("Bad Request\n");
+    return;
+  }
+  if (localVmViewer.handleHttp(req, res, url)) return;
+  proxy(req, res);
+};
+const companion = createServer(deviceHandler);
+const managedOrigin = PRIVATE_ORIGIN ? createServer(deviceHandler) : null;
+const attachViewerUpgrades = (server: ReturnType<typeof createServer>) => {
+  server.on("upgrade", (req, socket, head) => {
+    if (!localVmViewer.handleUpgrade(req, socket, head)) {
+      socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    }
+  });
+};
+attachViewerUpgrades(companion);
+if (managedOrigin) attachViewerUpgrades(managedOrigin);
 
 const control = createControlServer({
   devices,
+  sessionToken: CONTROL_SESSION_TOKEN,
   companionPort: COMPANION_PORT,
   hostedUrl: () => hostedUrl,
   setHostedUrl: (next) => {
@@ -159,29 +311,54 @@ const control = createControlServer({
   },
   discovery: () => ({ advertising: mdns.advertising, name: service().name }),
   connectedDeviceIds: connectedDevices.ids,
-  disconnectDevice: connectedDevices.disconnect,
+  disconnectDevice: (deviceId) => {
+    connectedDevices.disconnect(deviceId);
+    revokeHarnessDesktopLeases(deviceId);
+  },
+  disconnectCloudDesktop: (deviceId) => {
+    connectedDevices.disconnectCloudDesktop(deviceId);
+    revokeHarnessDesktopLeases(deviceId);
+  },
 });
 
 /** Bind a server, turning a bind failure into a sentence rather than a stack
  * trace, and leaving a handler behind for the errors that come after. */
-const listen = (server: ReturnType<typeof createServer>, port: number, host: string): Promise<void> =>
+type ListenTarget = { port: number; host: string } | { socketPath: string; advertisedPort: number };
+
+const listen = (server: ReturnType<typeof createServer>, target: ListenTarget): Promise<void> =>
   new Promise((resolve, reject) => {
+    const socketPath = "socketPath" in target ? target.socketPath : null;
+    const port = "port" in target ? target.port : target.advertisedPort;
+    const label = "socketPath" in target ? target.socketPath : `${target.host}:${target.port}`;
     const onError = (error: NodeJS.ErrnoException) => {
       server.removeListener("listening", onListening);
       // A second copy of the sidecar is the usual cause once the harness's
       // own ports are ruled out above, and "close whatever is using it"
       // sends someone hunting through `lsof` for a process they started.
-      const hint = ` — another copy of the companion may already be running; ${
-        port === COMPANION_PORT ? "OMB_COMPANION_PORT" : "OMB_CONTROL_PORT"
-      } chooses a different one`;
+      const hint = socketPath
+        ? ` — remove only this stale socket after proving no companion owns it: ${socketPath}`
+        : ` — another copy of the companion may already be running; ${
+            port === COMPANION_PORT ? "OMB_COMPANION_PORT" : "OMB_CONTROL_PORT"
+          } chooses a different one`;
       reject(
         error.code === "EADDRINUSE"
-          ? new Error(`port ${port} is already in use${hint}`)
+          ? new Error(`${socketPath ? "socket" : "port"} ${socketPath ?? port} is already in use${hint}`)
           : error,
       );
     };
     const onListening = () => {
       server.removeListener("error", onError);
+      if (socketPath) {
+        try {
+          chmodSync(socketPath, 0o600);
+        } catch (error) {
+          // A backend socket whose filesystem authority cannot be restricted
+          // must not stay reachable through a wider inherited umask.
+          server.close();
+          reject(error);
+          return;
+        }
+      }
       // Bound is not safe, and removing the startup handler while leaving
       // nothing in its place is how a running sidecar dies later. A listening
       // socket still emits `error` — EMFILE on accept, or an interface
@@ -191,13 +368,14 @@ const listen = (server: ReturnType<typeof createServer>, port: number, host: str
       // worth a line on stderr and nothing more: the other listener, and
       // every connection on this one, carry on.
       server.on("error", (error: NodeJS.ErrnoException) => {
-        console.warn(`companion: error on ${host}:${port} — ${error.message}`);
+        console.warn(`companion: error on ${label} — ${error.message}`);
       });
       resolve();
     };
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(port, host);
+    if ("socketPath" in target) server.listen(target.socketPath);
+    else server.listen(target.port, target.host);
   });
 
 /** Start the three-socket arrangement, in the order that makes a failure
@@ -222,8 +400,18 @@ async function main(): Promise<void> {
     );
   }
 
-  await listen(control, CONTROL_PORT, "127.0.0.1");
-  await listen(companion, COMPANION_PORT, "0.0.0.0");
+  await listen(
+    control,
+    CONTROL_SOCKET
+      ? { socketPath: CONTROL_SOCKET, advertisedPort: CONTROL_PORT }
+      : { port: CONTROL_PORT, host: "127.0.0.1" },
+  );
+  await listen(
+    companion,
+    COMPANION_SOCKET
+      ? { socketPath: COMPANION_SOCKET, advertisedPort: COMPANION_PORT }
+      : { port: COMPANION_PORT, host: "0.0.0.0" },
+  );
   if (managedOrigin && PRIVATE_ORIGIN) {
     await listenCompanionOrigin(managedOrigin, PRIVATE_ORIGIN);
   }
@@ -253,8 +441,11 @@ async function main(): Promise<void> {
   const addresses = lanAddresses();
   const tailscale = tailscaleAddress(addresses);
   const reach = tailnetName() ?? tailscale ?? addresses[0];
-  console.log(`companion  http://0.0.0.0:${COMPANION_PORT}  →  harness 127.0.0.1:${HARNESS_PORT}`);
-  console.log(`pair here  http://127.0.0.1:${CONTROL_PORT}`);
+  console.log(
+    `companion  public :${COMPANION_PORT}${COMPANION_SOCKET ? ` via ${COMPANION_SOCKET}` : ""}` +
+      `  →  harness 127.0.0.1:${HARNESS_PORT}`,
+  );
+  console.log(`pair here  public 127.0.0.1:${CONTROL_PORT}${CONTROL_SOCKET ? ` via ${CONTROL_SOCKET}` : ""}`);
   if (reach) console.log(`on your phone, enter  ${reach}:${COMPANION_PORT}`);
   if (tailscale && !tailnetName()) {
     // Do not tell someone to turn on MagicDNS when they may well have it on
@@ -272,6 +463,7 @@ const shutdown = async (signal: string): Promise<void> => {
   // the watcher first, or a tick could re-advertise the record the next
   // line just withdrew
   watcher.stop();
+  localVmViewer.revokeAll();
   await mdns.stop().catch(() => {});
   // close() waits for open connections, and an SSE stream never ends on its
   // own — drop the sockets so "stop" means stopped, now.

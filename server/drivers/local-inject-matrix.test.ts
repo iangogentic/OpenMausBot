@@ -17,6 +17,7 @@ import { ensureQwenInjectModel, QwenAgentDriver } from "./acp/qwen.ts";
 import { recordEvents } from "../testing/events.ts";
 import {
   applyClaudeInject,
+  applyModelRelayEnvironment,
   applyOpenAIInject,
   anthropicBaseUrl,
   codexLocalProviderArgs,
@@ -196,6 +197,78 @@ describe("Codex provider dialect", () => {
     const rendered = JSON.stringify(args);
     expect(rendered).toContain(`model_providers.${hostId}.base_url`);
     expect(rendered).not.toContain("unsloth-secret");
+  });
+});
+
+describe("exact-turn trusted model relay across every local writer", () => {
+  it("replaces stale direct upstream URLs/keys and emits only the relay token", () => {
+    const home = scratchHome("omb-relay-matrix-");
+    const host = localHost("unsloth")!;
+    const modelId = encodeInjectId(host.id, "Qwen3.8-27B-Abliterated");
+    const upstreamKey = "real-upstream-secret-never-child";
+    const directEnv: Record<string, string | undefined> = {
+      HOME: home,
+      UNSLOTH_STUDIO_AUTH_TOKEN: upstreamKey,
+    };
+    mkdirSync(join(home, ".grok"), { recursive: true });
+    mkdirSync(join(home, ".hermes"), { recursive: true });
+
+    // Simulate durable rows written by the pre-relay release.
+    ensureDroidInjectModel(modelId, directEnv);
+    ensureGrokInjectSlug(modelId, directEnv);
+    ensureHermesInjectProvider(modelId, directEnv);
+    ensureKimiInjectAlias(modelId, directEnv);
+    ensureOpenCodeInjectModel(modelId, directEnv);
+    ensureQwenInjectModel(modelId, directEnv);
+
+    const relay = {
+      openaiBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay/v1",
+      anthropicBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay",
+      token: "opaque-exact-turn-model-token-123456",
+      host: host.id,
+      model: "Qwen3.8-27B-Abliterated",
+    };
+    const env: Record<string, string | undefined> = { HOME: home };
+    applyModelRelayEnvironment(env, modelId, relay);
+
+    expect(applyOpenAIInject(env, modelId)).toEqual({ model: relay.model, injected: true });
+    expect(applyClaudeInject(env, modelId)).toEqual({ model: relay.model, injected: true });
+    const codexArgs = codexLocalProviderArgs(env, modelId);
+    ensureDroidInjectModel(modelId, env);
+    ensureGrokInjectSlug(modelId, env);
+    ensureHermesInjectProvider(modelId, env);
+    ensureKimiInjectAlias(modelId, env);
+    ensureOpenCodeInjectModel(modelId, env);
+    ensureQwenInjectModel(modelId, env);
+
+    const childVisible = [
+      JSON.stringify(env),
+      JSON.stringify(codexArgs),
+      readFileSync(join(home, ".factory", "settings.json"), "utf8"),
+      readFileSync(join(home, ".grok", "config.toml"), "utf8"),
+      readFileSync(join(home, ".hermes", "config.yaml"), "utf8"),
+      readFileSync(join(home, ".kimi-code", "config.toml"), "utf8"),
+      readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"),
+      readFileSync(join(home, ".qwen", "settings.json"), "utf8"),
+    ].join("\n");
+    expect(childVisible).toContain(relay.openaiBaseUrl);
+    expect(childVisible).toContain(relay.token);
+    expect(childVisible).not.toContain(host.baseUrl);
+    expect(childVisible).not.toContain(upstreamKey);
+  });
+
+  it("fails closed on a partial relay or a cross-host/model replay", () => {
+    const modelId = "omlx::Qwen3.8-27B-Abliterated";
+    expect(() => applyModelRelayEnvironment({}, modelId, {
+      openaiBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay/v1",
+      anthropicBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay",
+      token: "opaque-exact-turn-model-token-123456",
+      host: "spark_glm",
+      model: "Qwen3.8-27B-Abliterated",
+    })).toThrow(/does not match/);
+    expect(() => applyOpenAIInject({
+      OMB_MODEL_RELAY_TOKEN: "opaque-exact-turn-model-token-123456",
+    }, modelId)).toThrow(/incomplete/);
   });
 });
 
@@ -445,6 +518,51 @@ describe("Qwen / Hermes ACP turns", () => {
     }
   });
 
+  it("ACP core injects only the exact-turn relay into the spawned Qwen child", async () => {
+    const home = scratchHome("omb-qwen-relay-turn-");
+    const dump = join(home, "env.json");
+    const instance = await QwenAgentDriver.create({
+      instanceId: "qwen",
+      displayName: "Qwen",
+      environment: {
+        HOME: home,
+        FAKE_ACP_DUMP: dump,
+        OPENMAUSBOT_DESKTOP2_QWEN_URL: "http://127.0.0.1:18011/v1",
+        UNSLOTH_STUDIO_AUTH_TOKEN: "must-never-cross",
+      },
+      enabled: true,
+      config: { cli: FAKE_ACP, fullAuto: true },
+    });
+    const recorder = recordEvents(instance.adapter);
+    const model = "desktop2_qwen::Qwen3.8-27B-Abliterated";
+    const relay = {
+      openaiBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay/v1",
+      anthropicBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay",
+      token: "opaque-exact-turn-model-token-123456",
+      host: "desktop2_qwen",
+      model: "Qwen3.8-27B-Abliterated",
+    };
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-qwen-relay",
+        text: "hi",
+        model,
+        integrations: { modelRelay: relay },
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+      const seen = JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> };
+      expect(seen.env.OMB_MODEL_RELAY_TOKEN).toBe(relay.token);
+      expect(JSON.stringify(seen)).not.toContain("http://127.0.0.1:18011/v1");
+      expect(JSON.stringify(seen)).not.toContain("must-never-cross");
+      const settings = readFileSync(join(home, ".qwen", "settings.json"), "utf8");
+      expect(settings).toContain(relay.openaiBaseUrl);
+      expect(settings).toContain(relay.token);
+      expect(settings).not.toContain("http://127.0.0.1:18011/v1");
+    } finally {
+      await instance.dispose();
+    }
+  });
+
   it("Hermes ACP does not inherit OPENAI_API_KEY and set_model uses custom:omlx:…", async () => {
     const home = scratchHome("omb-hermes-turn-");
     mkdirSync(join(home, ".hermes"), { recursive: true });
@@ -452,6 +570,7 @@ describe("Qwen / Hermes ACP turns", () => {
       join(home, ".hermes", "config.yaml"),
       "model:\n  provider: auto\n  base_url: https://openrouter.ai/api/v1\n",
     );
+    writeFileSync(join(home, ".hermes", ".env"), "OPENROUTER_API_KEY=provider-secret-needed-by-hermes\n");
     const dump = join(home, "env.json");
     const instance = await HermesAgentDriver.create({
       instanceId: "hermes",
@@ -473,6 +592,8 @@ describe("Qwen / Hermes ACP turns", () => {
       expect(seen.argv).toEqual(["acp"]);
       expect(seen.env.OPENAI_API_KEY).toBeUndefined();
       expect(seen.env.OPENROUTER_API_KEY).toBeUndefined();
+      expect(seen.env.OPENMAUSBOT_HERMES_RESTRICT_NATIVE).toBe("1");
+      expect(seen.env.OPENMAUSBOT_HERMES_REQUIRED_MCP).toBe("");
       const configCalls = JSON.parse(readFileSync(`${dump}.config.json`, "utf8")) as Array<{
         method: string;
         params: { modelId?: string };
@@ -481,9 +602,122 @@ describe("Qwen / Hermes ACP turns", () => {
         method: "session/set_model",
         params: { sessionId: "fake-acp-session", modelId: "custom:omlx:gemma-4-31b-it-bf16" },
       });
-      const yaml = readFileSync(join(home, ".hermes", "config.yaml"), "utf8");
-      expect(yaml).toContain("provider: auto");
-      expect(yaml).toContain("  omlx:");
+      // OpenMaus never rewrites the user's shared Hermes profile. Provider
+      // injection lands in this bot/thread's isolated HERMES_HOME instead.
+      const sharedYaml = readFileSync(join(home, ".hermes", "config.yaml"), "utf8");
+      expect(sharedYaml).toContain("provider: auto");
+      expect(sharedYaml).not.toContain("  omlx:");
+      const isolatedYaml = readFileSync(join(seen.env.HERMES_HOME, "config.yaml"), "utf8");
+      expect(isolatedYaml).toContain("provider: auto");
+      expect(isolatedYaml).toContain("  omlx:");
+      // Hermes itself may read its provider credential, but the model has no
+      // terminal/file/browser/code-execution surface capable of opening it.
+      for (const toolset of ["terminal", "file", "browser", "code_execution"]) {
+        expect(isolatedYaml).toContain(`- ${toolset}`);
+      }
+      expect(readFileSync(join(seen.env.HERMES_HOME, ".env"), "utf8")).toContain(
+        "OPENROUTER_API_KEY=provider-secret-needed-by-hermes",
+      );
+    } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("Hermes computer turns use distinct bot-scoped homes and require the containment policy", async () => {
+    const home = scratchHome("omb-hermes-contained-");
+    mkdirSync(join(home, ".hermes"), { recursive: true });
+    writeFileSync(
+      join(home, ".hermes", "config.yaml"),
+      "model: qwen\nmcp_servers:\n  ian_brain:\n    url: http://127.0.0.1:15050/mcp\n",
+    );
+    const dump = join(home, "env.json");
+    const instance = await HermesAgentDriver.create({
+      instanceId: "hermes",
+      displayName: "Hermes",
+      environment: {
+        HOME: home,
+        FAKE_ACP_DUMP: dump,
+        MCP_IAN_BRAIN_API_KEY: "real-upstream-secret-must-not-enter-child",
+      },
+      enabled: true,
+      config: { cli: FAKE_ACP, fullAuto: true },
+    });
+    const recorder = recordEvents(instance.adapter);
+    const computer = { command: "fake-computer", args: [], env: {} };
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-hermes-contained-a",
+        isolationKey: "bot-a",
+        text: "use the computer",
+        model: "omlx::gemma-4-31b-it-bf16",
+        integrations: { localComputer: computer },
+      });
+      await recorder.until((e) => e.type === "turn.completed");
+      const first = JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> };
+      expect(first.env.OPENMAUSBOT_HERMES_POLICY).toBe("1");
+      const firstHome = first.env.HERMES_HOME;
+
+      await instance.adapter.sendTurn({
+        threadId: "t-hermes-contained-b",
+        isolationKey: "bot-b",
+        text: "use the other computer",
+        model: "omlx::gemma-4-31b-it-bf16",
+        integrations: { localComputer: computer },
+      });
+      await recorder.until((e) => e.type === "turn.completed" && e.threadId === "t-hermes-contained-b");
+      const second = JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> };
+      expect(second.env.OPENMAUSBOT_HERMES_POLICY).toBe("1");
+      expect(second.env.HERMES_HOME).not.toBe(firstHome);
+      expect(firstHome).toContain("hermes-bots");
+      expect(second.env.HERMES_HOME).toContain("hermes-bots");
+    } finally {
+      await instance.dispose();
+    }
+  });
+
+  it("Hermes Computer Off turns still load the Ian Brain credential deny policy", async () => {
+    const home = scratchHome("omb-hermes-ian-brain-only-");
+    mkdirSync(join(home, ".hermes"), { recursive: true });
+    writeFileSync(
+      join(home, ".hermes", "config.yaml"),
+      "agent:\n  disabled_toolsets: [tts]\nmcp_servers:\n  ian_brain:\n    url: http://127.0.0.1:15050/mcp\n",
+    );
+    const dump = join(home, "env.json");
+    const instance = await HermesAgentDriver.create({
+      instanceId: "hermes",
+      displayName: "Hermes",
+      environment: {
+        HOME: home,
+        FAKE_ACP_DUMP: dump,
+        MCP_IAN_BRAIN_API_KEY: "real-upstream-secret-must-not-enter-child",
+      },
+      enabled: true,
+      config: { cli: FAKE_ACP, fullAuto: true },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "t-hermes-ian-brain-only",
+        isolationKey: "bot-ian-brain-only",
+        text: "use Ian Brain without a computer",
+        integrations: {
+          ianBrain: {
+            url: "http://127.0.0.1:8799/api/internal/ian-brain/mcp",
+            token: "opaque-turn-capability",
+          },
+        },
+      });
+      await recorder.until((event) => event.type === "turn.completed");
+      const seen = JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> };
+      expect(seen.env.OPENMAUSBOT_HERMES_POLICY).toBe("1");
+      expect(seen.env.MCP_IAN_BRAIN_API_KEY).toBeUndefined();
+      expect(seen.env.OPENMAUSBOT_HERMES_RESTRICT_NATIVE).toBe("1");
+      expect(seen.env.OPENMAUSBOT_HERMES_REQUIRED_MCP).toBe("ian_brain");
+      expect(seen.env.PYTHONPATH).toContain("openmaus-policy");
+      const isolated = readFileSync(join(seen.env.HERMES_HOME, "config.yaml"), "utf8");
+      expect(isolated).toContain("- terminal");
+      expect(isolated).toContain("opaque-turn-capability");
+      expect(readFileSync(join(seen.env.HERMES_HOME, ".env"), "utf8")).not.toContain("MCP_IAN_BRAIN_API_KEY");
     } finally {
       await instance.dispose();
     }

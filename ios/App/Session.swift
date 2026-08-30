@@ -696,15 +696,120 @@ final class Session: ObservableObject {
         await perform { try await $0.interrupt(botId: bot.id) }
     }
 
-    /// Ask for one fresh cloud viewer URL. Unlike ordinary actions this
-    /// returns the value to a browser sheet and never writes it to app state.
-    func cloudDesktop(for bot: Bot) async throws -> URL {
+    struct CloudDesktopAccess {
+        let url: URL
+        let ownerId: String
+        let leaseToken: String
+        let leaseTtlMs: Double?
+
+        var leaseIdentity: CloudDesktopLeaseIdentity {
+            CloudDesktopLeaseIdentity(ownerId: ownerId, leaseToken: leaseToken)
+        }
+    }
+
+    enum CloudDesktopLeaseProbe {
+        case held(leaseTtlMs: Double?)
+        case invalid(String)
+        case retry
+    }
+
+    /// Take control first, then ask for one fresh viewer URL. If the second
+    /// hop fails, release the exact lease before returning the error so a
+    /// failed viewer never leaves the bot paused for the TTL.
+    func cloudDesktop(for bot: Bot, ownerId: String) async throws -> CloudDesktopAccess {
         guard let client else { throw APIError.transport("This computer is offline.") }
+        let surface = bot.computer == "vm" ? "vm" : "cloud"
         do {
-            return try await client.cloudDesktop(botId: bot.id).url
+            let control = try await client.takeCloudDesktopControl(
+                botId: bot.id,
+                ownerId: ownerId,
+                surface: surface
+            )
+            guard let leaseToken = control.leaseToken else {
+                throw APIError.transport("The computer did not return a control proof.")
+            }
+            do {
+                let desktop = try await client.cloudDesktop(
+                    botId: bot.id,
+                    ownerId: ownerId,
+                    leaseToken: leaseToken,
+                    surface: surface
+                )
+                return CloudDesktopAccess(
+                    url: desktop.url,
+                    ownerId: ownerId,
+                    leaseToken: leaseToken,
+                    leaseTtlMs: control.leaseTtlMs
+                )
+            } catch {
+                try? await client.releaseCloudDesktopControl(
+                    botId: bot.id,
+                    ownerId: ownerId,
+                    leaseToken: leaseToken
+                )
+                throw error
+            }
         } catch let error as APIError where error.isUnauthorized {
             status = .unauthorized
             throw error
+        }
+    }
+
+    func heartbeatCloudDesktop(botId: String, ownerId: String, leaseToken: String) async throws -> CloudDesktopControl {
+        guard let client else { throw APIError.transport("This computer is offline.") }
+        do {
+            return try await client.heartbeatCloudDesktopControl(
+                botId: botId,
+                ownerId: ownerId,
+                leaseToken: leaseToken
+            )
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+            throw error
+        }
+    }
+
+    /// Validate one exact lease after a generation-less `held=false` stream
+    /// event or during the periodic heartbeat. Transport failure is not proof
+    /// of revocation; a 4xx response is. A successful exact heartbeat repairs
+    /// local state in case an older false event crossed the take response.
+    func probeCloudDesktopLease(
+        botId: String,
+        ownerId: String,
+        leaseToken: String
+    ) async -> CloudDesktopLeaseProbe {
+        do {
+            let control = try await heartbeatCloudDesktop(
+                botId: botId,
+                ownerId: ownerId,
+                leaseToken: leaseToken
+            )
+            let helpReason = state.computerControl[botId]?.helpReason
+            state.computerControl[botId] = FleetComputerControl(held: true, helpReason: helpReason)
+            return .held(leaseTtlMs: control.leaseTtlMs)
+        } catch let error as APIError {
+            if case let .status(code, _) = error, (400...499).contains(code) {
+                return .invalid(error.localizedDescription)
+            }
+            return .retry
+        } catch {
+            return .retry
+        }
+    }
+
+    func releaseCloudDesktop(botId: String, ownerId: String, leaseToken: String) async {
+        guard let client else { return }
+        do {
+            try await client.releaseCloudDesktopControl(
+                botId: botId,
+                ownerId: ownerId,
+                leaseToken: leaseToken
+            )
+        } catch let error as APIError where error.isUnauthorized {
+            status = .unauthorized
+        } catch {
+            // Dropping the local proof stops heartbeat; the server's short TTL
+            // is the bounded fallback when the network vanished mid-close.
         }
     }
 

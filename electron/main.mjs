@@ -1,10 +1,10 @@
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, utilityProcess } from "electron";
+import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, powerSaveBlocker, safeStorage, screen, session, shell, systemPreferences, Tray, utilityProcess } from "electron";
 import { createRequire } from "node:module";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { startCua, stopCua, registerCuaIpc, setCuaStateListener } from "./cua.mjs";
 import { createAndroidDeviceController } from "./android-device.mjs";
 import { assemblyAICredential, mintAssemblyAIStreamingToken } from "./assemblyai.mjs";
@@ -17,6 +17,7 @@ import {
 } from "./skill-recorder.mjs";
 import { openBlankTerminal } from "./terminal-launch.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
+import { shouldStartUpdater } from "./updater-policy.mjs";
 import { buildDiagnosticsReport, decodeLogTail, diagnosticsFileName } from "./diagnostics.mjs";
 import { migrateWorkspaceCredentials, workspaceCredentialEnv } from "./workspace-credentials.mjs";
 import { activateExistingWindow } from "./single-instance.mjs";
@@ -24,13 +25,11 @@ import { pollServerIdentity } from "./server-boot-probe.mjs";
 import { packageUrlFromCommandLine, packageUrlFromDeepLink } from "./package-link.mjs";
 import { defaultSaveName, withSavableFile } from "./save-file.mjs";
 import {
-  readRemoteDeviceBridgeConfig,
-  readRemoteMacBridgeConfig,
-  readRemoteServerName,
-  resolveRemoteClientURL,
-  resolveRemoteCompanionURL,
+  readRemoteDeploymentConfig,
+  removeLegacyBridgeSecrets,
 } from "./remote-client.mjs";
-import { startRemoteDeviceBridge, startRemoteMacBridge } from "./remote-mac-bridge.mjs";
+import { startOwnedRemoteSshConnector } from "./remote-ssh-connector.mjs";
+import { startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -49,6 +48,10 @@ import { createSecureCredentialState } from "./secure-credential-state.mjs";
 import { readSecureCredentials } from "./secure-credentials.mjs";
 import { createControlPlaneClient } from "./control-plane-client.mjs";
 import {
+  readBoundedResponseBytes,
+  readBoundedResponseJson,
+} from "./bounded-response.mjs";
+import {
   companionAccountCleanupPending,
   createCompanionAccountService,
   resolveCompanionControlPlaneURL,
@@ -62,8 +65,36 @@ const { createDisplayMediaGuard, invokeDisplayMediaCallback, selectCaptureSource
   "./screen-preview.cjs",
 );
 const { STAGE_PREFIX: APPIMAGE_CUA_STAGE_PREFIX } = require("./cua-linux-bundle.cjs");
-const { desktopViewerUrl, sameDesktopViewerOrigin } = require("./desktop-viewer.cjs");
+const {
+  desktopViewerUrl,
+  desktopViewerNavigationAllowed,
+  desktopViewerLoadFailureLabel,
+  desktopViewerNeedsRfbProof,
+  desktopViewerRequestAllowed,
+  bindDesktopViewerNavigation,
+  bindDesktopViewerToOwner,
+} = require("./desktop-viewer.cjs");
+const { createDesktopViewerRegistry } = require("./desktop-viewer-registry.cjs");
 const { normalizeUnreadCount, parseWindowState, resolveWindowState } = require("./window-state.cjs");
+const { uiSessionRequestHeaders } = require("./ui-session.cjs");
+const {
+  DEFAULT_AUXILIARY_CLEANUP_TIMEOUT_MS,
+  DEFAULT_SERVER_SHUTDOWN_TIMEOUT_MS,
+  runQuitLifecycle,
+  trackUtilityProcessExit,
+} = require("./quit-lifecycle.cjs");
+const {
+  bindPrivilegedRendererNavigation,
+  createPrivilegedRendererController,
+  externalWebUrl,
+} = require("./privileged-renderer.cjs");
+const { physicalApprovalDialogOptions } = require("./physical-approval-dialog.cjs");
+const { remoteDownloadName } = require("./remote-file-name.cjs");
+const {
+  activateWindow,
+  backgroundMenuTemplate,
+  createWindowBackgroundPolicy,
+} = require("./window-background-policy.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // electron-builder changes the bundle/executable name for the remote shell,
@@ -71,38 +102,66 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Keep its cookies and remote-client.json separate from a normal OpenMausBot
 // installation on the same Mac.
 const packagedExecutableName = path.basename(process.execPath, path.extname(process.execPath));
-if (app.isPackaged && packagedExecutableName === "OpenMaus Razer") {
+const IS_REMOTE_PACKAGE = app.isPackaged && packagedExecutableName === "OpenMaus Razer";
+if (IS_REMOTE_PACKAGE) {
   app.setPath("userData", path.join(app.getPath("appData"), "OpenMaus Razer"));
 }
-const REMOTE_SERVER_URL = resolveRemoteClientURL({
-  argv: process.argv,
-  env: process.env,
-  userDataDir: app.getPath("userData"),
-});
-const REMOTE_COMPANION_URL = resolveRemoteCompanionURL({
-  env: process.env,
-  userDataDir: app.getPath("userData"),
-});
-const REMOTE_MAC_BRIDGE = readRemoteMacBridgeConfig(app.getPath("userData"));
-const REMOTE_DEVICE_BRIDGE = readRemoteDeviceBridgeConfig(app.getPath("userData"));
-const REMOTE_SERVER_NAME = readRemoteServerName(app.getPath("userData")) ?? "Remote server";
+const REMOTE_DEPLOYMENT = readRemoteDeploymentConfig(app.getPath("userData"));
+if (IS_REMOTE_PACKAGE && !REMOTE_DEPLOYMENT) {
+  throw new Error("OpenMaus Razer needs a private remote-client.json with pinned SSH settings");
+}
+const REMOTE_SSH_CONNECTOR = REMOTE_DEPLOYMENT
+  ? await startOwnedRemoteSshConnector(REMOTE_DEPLOYMENT)
+  : null;
+const REMOTE_SERVER_URL = REMOTE_SSH_CONNECTOR?.serverUrl ?? null;
+const REMOTE_COMPANION_URL = REMOTE_SSH_CONNECTOR?.companionUrl ?? null;
+const REMOTE_SERVER_NAME = REMOTE_DEPLOYMENT?.serverName ?? "Remote server";
+if (REMOTE_DEPLOYMENT) removeLegacyBridgeSecrets(app.getPath("userData"));
+const UI_SESSION_TOKEN = REMOTE_DEPLOYMENT?.sessionToken
+  ?? process.env.OMB_UI_SESSION_TOKEN?.trim()
+  ?? randomBytes(32).toString("base64url");
+const COMPANION_CONTROL_SESSION_TOKEN = REMOTE_DEPLOYMENT?.companionSessionToken
+  ?? randomBytes(32).toString("base64url");
+const UI_SESSION_TOKEN_SHA256 = createHash("sha256").update(UI_SESSION_TOKEN).digest("hex");
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
 // resolve to ::1 and paint a black window
 const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
 const DEFAULT_COMPOSIO_BROKER_URL = "https://openmausbot-composio.milindsoni201.workers.dev";
 let SERVER_PORT = 8799;
 const APP_ICON = path.join(__dirname, "resources/app-icon.png");
-let desktopViewerWindow = null;
-let desktopViewerOwner = null;
-let desktopViewerContextId = null;
+const desktopViewers = createDesktopViewerRegistry({
+  destroyViewer: (viewer) => viewer.destroy(),
+  isViewerDestroyed: (viewer) => viewer.isDestroyed(),
+  isOwnerDestroyed: (owner) => owner.isDestroyed(),
+  notifyOwner: (owner, state) => owner.send("desktop-viewer:state", state),
+});
 let pendingPackageInstallUrl = packageUrlFromCommandLine(process.argv);
 let mainWindow = null;
-let remoteMacBridge = null;
-let remoteMacAlwaysAllow = false;
-let remoteDeviceBridge = null;
-let remoteDeviceAlwaysAllow = false;
+let backgroundTray = null;
+let remotePhysicalBridge = null;
 let unreadCount = 0;
 let unreadOverlayIcon = null;
+let privilegedRendererController = null;
+const windowBackgroundPolicy = createWindowBackgroundPolicy(process.platform);
+
+function showMainWindow() {
+  if (activateWindow(mainWindow)) return mainWindow;
+  return createWindow();
+}
+
+function installBackgroundTray() {
+  if (process.platform !== "darwin" || backgroundTray) return;
+  const icon = nativeImage.createFromPath(APP_ICON).resize({ width: 18, height: 18 });
+  icon.setTemplateImage(true);
+  backgroundTray = new Tray(icon);
+  backgroundTray.setToolTip("OpenMausBot is running in the background");
+  backgroundTray.setContextMenu(Menu.buildFromTemplate(backgroundMenuTemplate({
+    serverName: REMOTE_SERVER_URL ? REMOTE_SERVER_NAME : "this Mac",
+    open: () => showMainWindow(),
+    quit: () => app.quit(),
+  })));
+  backgroundTray.on("click", () => showMainWindow());
+}
 
 function windowStateFile() {
   return path.join(app.getPath("userData"), "window-state.json");
@@ -223,6 +282,9 @@ app.on("second-instance", (_event, commandLine) => {
 // alternate ports until one binds AND identifies as ours (the probe checks
 // our API shape, not just a 200).
 let serverProc = null;
+let serverExit = null;
+let quitCleanupFinished = false;
+let quitCleanup = null;
 let serverReady = true;
 let secureCredentials = {};
 let secureCredentialState = null;
@@ -444,8 +506,17 @@ async function desktopCompanionState() {
 
 async function remoteCompanionRequest(method, endpoint) {
   try {
-    const response = await fetch(`${REMOTE_COMPANION_URL}${endpoint}`, { method });
-    const body = await response.json().catch(() => ({}));
+    const response = await fetch(`${REMOTE_COMPANION_URL}${endpoint}`, {
+      method,
+      headers: { "x-openmausbot-session": COMPANION_CONTROL_SESSION_TOKEN },
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await readBoundedResponseJson(
+      response,
+      1024 * 1024,
+      "Razer companion response exceeded 1 MB",
+    ).catch(() => ({}));
     if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`);
     return {
       enabled: true,
@@ -472,6 +543,8 @@ function companionLaunchOptions(hostedUrl = null) {
     resourcesPath: process.resourcesPath,
     harnessPort: SERVER_PORT,
     hostedUrl,
+    harnessSessionToken: UI_SESSION_TOKEN,
+    controlSessionToken: COMPANION_CONTROL_SESSION_TOKEN,
     log: slog,
   };
 }
@@ -688,9 +761,12 @@ function readLogTail(logPath) {
 // carried a secret.
 async function gatherDiagnostics() {
   const serverStatus = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/config`, {
+    headers: { "x-openmausbot-session": UI_SESSION_TOKEN },
     signal: AbortSignal.timeout(3_000),
   })
-    .then((res) => (res.ok ? res.json() : null))
+    .then((res) => res.ok
+      ? readBoundedResponseJson(res, 1024 * 1024, "diagnostics response exceeded 1 MB").catch(() => null)
+      : null)
     .catch(() => null);
   const logPath = path.join(LOG_DIR, "server.log");
   const log = readLogTail(logPath);
@@ -721,6 +797,7 @@ async function startServerOn(port) {
     OMB_RESOURCES_PATH: process.resourcesPath,
     OMB_SKILLS_DIR: path.join(process.resourcesPath, "skills"),
     OMB_PORT: String(port),
+    OMB_UI_SESSION_TOKEN_SHA256: UI_SESSION_TOKEN_SHA256,
     OMB_USER_DATA: app.getPath("userData"),
     ...(secureCredentials.composioApiKey
       ? { COMPOSIO_API_KEY: secureCredentials.composioApiKey }
@@ -740,6 +817,12 @@ async function startServerOn(port) {
   proc.stdout?.on("data", (d) => slog(`[out] ${String(d).trimEnd()}`));
   proc.stderr?.on("data", (d) => slog(`[err] ${String(d).trimEnd()}`));
   proc.once("spawn", () => slog(`spawned pid=${proc.pid}`));
+  const exitPromise = trackUtilityProcessExit(proc);
+  // Publish the child before the first boot-probe await. Closing the app on a
+  // cold-start/error screen must stop the server that is still trying to boot,
+  // not treat it as though no embedded child existed yet.
+  serverProc = proc;
+  serverExit = exitPromise;
   let exited = false;
   proc.once("exit", (code) => {
     exited = true;
@@ -765,7 +848,7 @@ async function startServerOn(port) {
     bootTimeoutMs: SERVER_BOOT_TIMEOUT_MS,
     isExited: () => exited,
   });
-  if (identity.outcome === "ready") return { proc };
+  if (identity.outcome === "ready") return { proc, exit: exitPromise };
   if (identity.outcome === "exited") {
     slog(`child on port ${port} exited before answering /api/health`);
   } else {
@@ -787,9 +870,12 @@ async function startServerPackaged() {
   let everyPortForeignOwned = true;
   for (let attempt = 0; attempt < 2; attempt++) {
     for (const port of [8799, 18799, 28799]) {
+      if (quitCleanup || quitCleanupFinished) return false;
       const started = await startServerOn(port);
+      if (quitCleanup || quitCleanupFinished) return false;
       if (started.proc) {
         serverProc = started.proc;
+        serverExit = started.exit;
         SERVER_PORT = port;
         return true;
       }
@@ -817,23 +903,21 @@ function syncManagedComposioCredentials() {
 
 // The page is built at failure time (not import time): the message depends on
 // how the boot failed, and the log path comes from LOG_DIR so Windows and
-// Linux users see their real location instead of a macOS guess. The link
-// opens the log through the window's setWindowOpenHandler, which routes to
-// the platform handler.
+// Linux users see their real location instead of a macOS guess. This fallback
+// window deliberately has no privileged preload.
 function escapeHtml(value) {
   return value.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
 }
 
 function buildErrorPage({ allPortsOccupied }) {
   const serverLogPath = path.join(LOG_DIR, "server.log");
-  const serverLogHref = pathToFileURL(serverLogPath).href;
   const reason = allPortsOccupied
     ? "Every OpenMausBot port answered health checks from another process — likely a second copy of the app, or another program on ports 8799–28799. Quit that program, then quit and reopen OpenMausBot."
     : "The background server didn't come up in time — this is usually slow startup, not a port conflict. Quit and reopen OpenMausBot.";
   return (
     "data:text/html;charset=utf-8," +
     encodeURIComponent(
-      `<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#070707;color:#fcfcfc;font:15px -apple-system,system-ui"><div style="text-align:center;max-width:360px"><div style="font-size:40px">🐭</div><h2 style="font-weight:600;margin:12px 0 6px">Couldn't start the bot server</h2><p style="color:#fcfcfc99;line-height:1.5">${escapeHtml(reason)} If it keeps happening, check <a target="_blank" rel="noopener" href="${serverLogHref}" style="color:#fcfcfc">${escapeHtml(serverLogPath)}</a>.</p></div></body>`,
+      `<body style="margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#070707;color:#fcfcfc;font:15px -apple-system,system-ui"><div style="text-align:center;max-width:440px"><div style="font-size:40px">🐭</div><h2 style="font-weight:600;margin:12px 0 6px">Couldn't start the bot server</h2><p style="color:#fcfcfc99;line-height:1.5">${escapeHtml(reason)} If it keeps happening, check the server log at <span style="color:#fcfcfc;overflow-wrap:anywhere">${escapeHtml(serverLogPath)}</span>.</p></div></body>`,
     )
   );
 }
@@ -854,6 +938,73 @@ function rendererOrigin() {
   return new URL(
     REMOTE_SERVER_URL ?? (app.isPackaged ? `http://127.0.0.1:${SERVER_PORT}` : DEV_URL),
   ).origin;
+}
+
+// Every method exposed by preload.cjs crosses one of these two registrars.
+// The proof is checked both before dispatch and after asynchronous handlers
+// settle, so a reload, process swap, destroyed window, or replacement window
+// cannot receive a result under authority minted for an earlier document.
+function registerPrivilegedIpcHandle(channel, handler) {
+  ipcMain.handle(channel, (event, documentToken, ...args) => {
+    const controller = privilegedRendererController;
+    if (!controller) throw new Error("Privileged renderer action rejected");
+    const proof = controller.authorize(event, documentToken);
+    return Promise.resolve(handler(event, ...args)).then(
+      (value) => {
+        controller.assertProof(proof);
+        return value;
+      },
+      (error) => {
+        controller.assertProof(proof);
+        throw error;
+      },
+    );
+  });
+}
+
+function registerPrivilegedIpcOn(channel, handler) {
+  ipcMain.on(channel, (event, documentToken, ...args) => {
+    try {
+      const controller = privilegedRendererController;
+      if (!controller) throw new Error("Privileged renderer action rejected");
+      const proof = controller.authorize(event, documentToken);
+      handler(event, ...args);
+      controller.assertProof(proof);
+    } catch {
+      // sendSync callers must always receive a reply. Fire-and-forget callers
+      // are deliberately dropped without revealing which boundary failed.
+      if (channel === "screen:preview-intent") event.returnValue = false;
+    }
+  });
+}
+
+// A sandboxed preload creates a new unguessable token every time Chromium
+// creates a document. Frame routing IDs can survive same-origin reloads, so
+// this one bootstrap claim is what distinguishes the new isolated world from
+// queued IPC sent by the document that just navigated away.
+ipcMain.on("desktop:claim-renderer-document", (event, documentToken) => {
+  event.returnValue = false;
+  try {
+    const controller = privilegedRendererController;
+    if (!controller) return;
+    controller.claim(event, documentToken);
+    event.returnValue = true;
+  } catch {
+    // The preload fails closed and does not expose window.ogb.
+  }
+});
+
+async function installUiSessionHeader() {
+  const origin = rendererOrigin();
+  // Remove any cookie left by an earlier build. Cookies are host-scoped, not
+  // port-scoped, and therefore cannot safely carry loopback authority.
+  await session.defaultSession.cookies.remove(origin, "openmausbot_session").catch(() => {});
+  session.defaultSession.webRequest.onBeforeSendHeaders(
+    { urls: ["<all_urls>"] },
+    (details, callback) => callback({
+      requestHeaders: uiSessionRequestHeaders(origin, UI_SESSION_TOKEN, details.url, details.requestHeaders),
+    }),
+  );
 }
 
 function watchRemoteServer(win) {
@@ -910,58 +1061,12 @@ function respondToDisplayMediaRequest(callback, response) {
   }
 }
 
-function notifyDesktopViewer(open) {
-  if (!desktopViewerOwner?.isDestroyed()) {
-    desktopViewerOwner.send("desktop-viewer:state", {
-      open,
-      contextId: desktopViewerContextId,
-    });
-  }
-}
-
-function desktopViewerErrorPage(message, retryUrl) {
-  const escape = (value) =>
-    String(value)
-      .replaceAll("&", "&amp;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;");
-  return (
-    "data:text/html;charset=utf-8," +
-    encodeURIComponent(`<!doctype html><meta name="color-scheme" content="dark"><title>Desktop unavailable</title>
-      <body style="margin:0;display:grid;place-items:center;height:100vh;background:#070707;color:#f5f5f5;font:14px -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">
-        <main style="max-width:420px;padding:32px;text-align:center"><h2 style="margin:0 0 10px;font-size:18px">Couldn't open the live desktop</h2>
-        <p style="margin:0 0 20px;color:#a1a1aa;line-height:1.5">${escape(message)}</p>
-        <a href="${escape(retryUrl)}" target="_blank" rel="noreferrer" style="display:inline-block;border-radius:9px;background:#fff;color:#111;padding:9px 14px;text-decoration:none;font-weight:600">Open in browser</a></main>
-      </body>`)
-  );
-}
-
 function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
   if (!owner || owner.isDestroyed()) throw new Error("The OpenMausBot window is unavailable");
   const url = desktopViewerUrl(rawUrl);
   const titleCandidate = Object.prototype.toString.call(rawTitle) === "[object String]" ? rawTitle.trim() : "";
   const title = titleCandidate ? titleCandidate.slice(0, 80) : "Live desktop";
-
-  const nextContextId =
-    Object.prototype.toString.call(contextId) === "[object String]" ? contextId.slice(0, 120) : null;
-
-  // Desktop URLs contain rotating access tokens. A newly minted URL replaces
-  // the old viewer instead of being retained anywhere after its window closes.
-  // Clear the ref first so the stale window's close handler no-ops; on a bot
-  // change, tell the previous bot to release (same-bot reopen stays quiet).
-  if (desktopViewerWindow && !desktopViewerWindow.isDestroyed()) {
-    const previous = desktopViewerWindow;
-    const previousOwner = desktopViewerOwner;
-    const previousContextId = desktopViewerContextId;
-    desktopViewerWindow = null;
-    previous.close();
-    if (previousContextId !== nextContextId && previousOwner && !previousOwner.isDestroyed()) {
-      previousOwner.send("desktop-viewer:state", { open: false, contextId: previousContextId });
-    }
-  }
-  desktopViewerOwner = owner.webContents;
-  desktopViewerContextId = nextContextId;
+  const nextContextId = desktopViewers.contextId(contextId);
 
   const viewer = new BrowserWindow({
     width: 1220,
@@ -982,68 +1087,144 @@ function openDesktopViewer(owner, rawUrl, rawTitle, contextId) {
       contextIsolation: true,
       sandbox: true,
       // Keep provider cookies away from the app renderer and discard them on
-      // app exit. The secret-bearing URL is sufficient to authenticate.
-      partition: "openmausbot-desktop-viewer",
+      // close. A fresh in-memory partition also prevents a closing viewer
+      // from sharing cookies or request-filter state with its replacement;
+      // the secret-bearing URL is sufficient to authenticate.
+      partition: `openmausbot-desktop-viewer-${randomUUID()}`,
     },
   });
-  desktopViewerWindow = viewer;
-  const viewerOrigin = url.origin;
-
+  const record = { contextId: nextContextId, owner: owner.webContents, viewer };
+  try {
+    // A rotating URL replaces only this bot's old authority window. Other
+    // bots retain their own windows, sessions, request filters and leases.
+    desktopViewers.install(nextContextId, record);
+  } catch (error) {
+    if (!viewer.isDestroyed()) viewer.destroy();
+    throw error;
+  }
+  const unbindViewerOwner = bindDesktopViewerToOwner(owner.webContents, () => {
+    desktopViewers.closeRecord(record);
+  });
+  viewer.once("closed", unbindViewerOwner);
   // VNC needs rendering, keyboard/mouse input and WebSockets — never host
   // camera, microphone, geolocation, notifications, USB, or other privileged
   // browser capabilities in this remote-content window.
   viewer.webContents.session.setPermissionCheckHandler(() => false);
   viewer.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  viewer.webContents.session.webRequest.onBeforeRequest(
+    { urls: ["<all_urls>"] },
+    (details, callback) => callback({ cancel: !desktopViewerRequestAllowed(url, details.url) }),
+  );
 
-  viewer.on("ready-to-show", () => viewer.show());
+  let settleOpen;
+  const opened = new Promise((resolve) => {
+    let settled = false;
+    let timeout;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      resolve(value);
+    };
+    settleOpen = finish;
+    timeout = setTimeout(() => {
+      finish(false);
+      if (!viewer.isDestroyed()) viewer.destroy();
+    }, 15_000);
+    viewer.webContents.once("did-finish-load", () => {
+      if (viewer.isDestroyed() || !desktopViewers.isCurrent(record)) return finish(false);
+      viewer.show();
+      if (!desktopViewerNeedsRfbProof(url)) {
+        desktopViewers.notifyOpen(record);
+        finish(true);
+        return;
+      }
+
+      // noVNC's main frame can load while websockify/RFB is dead. Only its
+      // connected class proves that the live window can actually send input.
+      // Keep the connecting window visible, but report success to the app only
+      // after that proof; an HTTP error page simply times out and closes.
+      const checkRfb = async () => {
+        if (settled || viewer.isDestroyed() || !desktopViewers.isCurrent(record)) return;
+        try {
+          const state = await viewer.webContents.executeJavaScript(
+            `(() => {
+              const root = document.documentElement;
+              const status = document.getElementById("noVNC_status");
+              return {
+                connected: root.classList.contains("noVNC_connected"),
+                failed: Boolean(status?.classList.contains("noVNC_status_error")),
+              };
+            })()`,
+            true,
+          );
+          if (state?.connected === true) {
+            desktopViewers.notifyOpen(record);
+            finish(true);
+            return;
+          }
+          if (state?.failed === true) {
+            finish(false);
+            if (!viewer.isDestroyed()) viewer.destroy();
+            return;
+          }
+        } catch {
+          // Navigation/teardown races settle through fail-load, close, or the
+          // bounded timeout. Never turn an evaluation error into success.
+        }
+        setTimeout(() => void checkRfb(), 150);
+      };
+      void checkRfb();
+    });
+    viewer.once("closed", () => {
+      finish(false);
+    });
+  });
   viewer.on("closed", () => {
-    if (desktopViewerWindow !== viewer) return;
-    desktopViewerWindow = null;
-    // The panel drops its "viewer open" state and releases control on this.
-    notifyDesktopViewer(false);
-    desktopViewerOwner = null;
-    desktopViewerContextId = null;
+    // Identity fencing makes a stale close from A1 a no-op after A2 replaced
+    // it, while a real close reports only this bot to its owning document.
+    desktopViewers.handleClosed(record);
   });
   viewer.on("page-title-updated", (event) => {
     event.preventDefault();
     viewer.setTitle(title);
   });
   viewer.webContents.setWindowOpenHandler(({ url: target }) => {
-    try {
-      const external = desktopViewerUrl(target);
-      void shell.openExternal(external.toString());
-    } catch {
-      // Ignore non-web and insecure URLs from the remote viewer.
-    }
-    return { action: "deny" };
+    // Hosted viewer content is untrusted. It cannot launch the user's normal
+    // browser, even for HTTPS: that would turn an automatic popup/navigation
+    // into phishing or a localhost-probing escape from this isolated session.
+    return { action: desktopViewerNavigationAllowed(url, target, true) ? "allow" : "deny" };
   });
-  viewer.webContents.on("will-navigate", (event, target) => {
-    if (sameDesktopViewerOrigin(target, viewerOrigin)) return;
-    event.preventDefault();
-    try {
-      void shell.openExternal(desktopViewerUrl(target).toString());
-    } catch {
-      // Keep privileged or malformed navigation out of the viewer.
-    }
+  const unbindViewerNavigation = bindDesktopViewerNavigation(viewer.webContents, url, () => {
+    settleOpen?.(false);
+    if (!viewer.isDestroyed()) viewer.destroy();
   });
-  viewer.webContents.on("did-fail-load", (_event, code, description, failedUrl, isMainFrame) => {
-    if (!isMainFrame || code === -3 || viewer.isDestroyed() || failedUrl.startsWith("data:")) return;
-    void viewer.loadURL(desktopViewerErrorPage(description || "The viewer did not respond.", url.toString()));
+  viewer.once("closed", unbindViewerNavigation);
+  viewer.webContents.on("did-fail-load", (_event, code, _description, failedUrl, isMainFrame) => {
+    if (
+      !isMainFrame ||
+      code === -3 ||
+      viewer.isDestroyed() ||
+      (typeof failedUrl === "string" && failedUrl.startsWith("data:"))
+    ) return;
+    settleOpen?.(false);
+    viewer.destroy();
   });
 
-  notifyDesktopViewer(true);
   void viewer.loadURL(url.toString()).catch((error) => {
     if (viewer.isDestroyed()) return;
-    void viewer.loadURL(desktopViewerErrorPage(error?.message ?? "The viewer did not respond.", url.toString()));
+    console.error(desktopViewerLoadFailureLabel(error));
+    settleOpen?.(false);
+    viewer.destroy();
   });
-  return true;
+  return opened;
 }
 
-ipcMain.on("screen:preview-intent", (event) => {
+registerPrivilegedIpcOn("screen:preview-intent", (event) => {
   event.returnValue = displayMediaGuard.begin(event.senderFrame);
 });
 
-ipcMain.on("desktop:unread-count", (event, value) => {
+registerPrivilegedIpcOn("desktop:unread-count", (event, value) => {
   const sender = BrowserWindow.fromWebContents(event.sender);
   if (!sender || sender !== mainWindow || sender.isDestroyed()) return;
   unreadCount = normalizeUnreadCount(value);
@@ -1052,9 +1233,21 @@ ipcMain.on("desktop:unread-count", (event, value) => {
 
 function createWindow() {
   const isMac = process.platform === "darwin";
+  const hostsPrivilegedRenderer = Boolean(REMOTE_SERVER_URL || !app.isPackaged || serverReady);
   const primary = screen.getPrimaryDisplay();
   const displays = [primary, ...screen.getAllDisplays().filter((display) => display.id !== primary.id)];
   const restored = resolveWindowState(readWindowState(), displays.map((display) => display.workArea));
+  const webPreferences = {
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: true,
+    // Control leases are intentionally short. Keep the renderer heartbeat
+    // timely when the user is driving the separate live-desktop window or
+    // has minimized the main app. The server-side viewer keepalive remains
+    // authoritative; this also keeps non-viewer physical takeover healthy.
+    backgroundThrottling: false,
+  };
+  if (hostsPrivilegedRenderer) webPreferences.preload = path.join(__dirname, "preload.cjs");
   const win = new BrowserWindow({
     ...restored.bounds,
     minWidth: 900,
@@ -1076,21 +1269,53 @@ function createWindow() {
             titleBarOverlay: { color: "#070707", symbolColor: "#b5b5b5", height: 60 },
           }
         : {}),
-    webPreferences: {
-      contextIsolation: true,
-      preload: path.join(__dirname, "preload.cjs"),
-    },
+    webPreferences,
   });
   mainWindow = win;
+  if (hostsPrivilegedRenderer) {
+    privilegedRendererController = createPrivilegedRendererController({
+      expectedOrigin: rendererOrigin(),
+      getMainWindow: () => mainWindow,
+    });
+    bindPrivilegedRendererNavigation({
+      controller: privilegedRendererController,
+      window: win,
+      onBlockedProgrammaticNavigation: () => {
+        try {
+          win.webContents.stop();
+        } finally {
+          // Programmatic loadURL/back/forward bypass the preventable
+          // will-navigate events. Destroying is the only fail-closed way to
+          // ensure Chromium cannot commit a foreign document with our preload.
+          if (!win.isDestroyed()) win.destroy();
+        }
+      },
+    });
+  } else {
+    privilegedRendererController = null;
+  }
   installWindowStatePersistence(win);
   applyUnreadBadge(win);
   if (restored.maximized) win.maximize();
+  win.on("close", (event) => {
+    if (!windowBackgroundPolicy.shouldHideOnClose()) return;
+    // Keep the renderer's event stream and native notifications alive, and
+    // keep the attended bridge visibly represented by the menu-bar item.
+    // OpenMausBot -> Quit remains the explicit disconnect operation.
+    event.preventDefault();
+    win.hide();
+  });
   win.on("closed", () => {
     if (mainWindow === win) mainWindow = null;
   });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    const external = externalWebUrl(url);
+    if (external) {
+      void shell.openExternal(external).catch((error) => {
+        console.error(`[desktop] external link failed: ${error?.message ?? error}`);
+      });
+    }
     return { action: "deny" };
   });
   win.webContents.on("did-finish-load", () => deliverPackageInstall(win));
@@ -1251,7 +1476,7 @@ function createWindow() {
 
 // Local-control screen preview — served from the main process so the Screen
 // Recording permission prompt attributes to the app, never the server
-ipcMain.handle("screen:frame", async () => {
+registerPrivilegedIpcHandle("screen:frame", async () => {
   if (process.platform !== "darwin") return null;
   const sources = await desktopCapturer.getSources({
     types: ["screen"],
@@ -1277,7 +1502,7 @@ ipcMain.handle("screen:frame", async () => {
 // Copy the engine command, then open a blank terminal. Renderer-controlled
 // text must never become a process argument: the user reviews and pastes it.
 // Returns false when the renderer should show the clipboard fallback.
-ipcMain.handle("engine:open-terminal", async (_event, command) => {
+registerPrivilegedIpcHandle("engine:open-terminal", async (_event, command) => {
   if (typeof command !== "string" || !command.trim()) return false;
   clipboard.writeText(command);
   return openBlankTerminal();
@@ -1289,7 +1514,10 @@ ipcMain.handle("engine:open-terminal", async (_event, command) => {
 // renderer sandboxed and let the main process open only ordinary web links.
 // A bot's working folder: the native picker, so the path is real and the
 // user never types one. Returns null when they cancel.
-ipcMain.handle("desktop:pick-folder", async (event, current) => {
+registerPrivilegedIpcHandle("desktop:pick-folder", async (event, current) => {
+  if (REMOTE_SERVER_URL) {
+    throw new Error("Choose a server working folder in OpenMaus; this native dialog can only see folders on this computer");
+  }
   const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
   const result = await dialog.showOpenDialog(win, {
     title: "Choose a working folder",
@@ -1302,7 +1530,7 @@ ipcMain.handle("desktop:pick-folder", async (event, current) => {
 // One-click bug-report bundle. Secrets are never read; the report is
 // redacted again on the way out (diagnostics.mjs). null means the user
 // cancelled the save dialog.
-ipcMain.handle("desktop:export-diagnostics", async (event) => {
+registerPrivilegedIpcHandle("desktop:export-diagnostics", async (event) => {
   const owner = BrowserWindow.fromWebContents(event.sender) ?? undefined;
   const report = await gatherDiagnostics();
   const result = await dialog.showSaveDialog(owner, {
@@ -1334,8 +1562,86 @@ ipcMain.handle("desktop:export-diagnostics", async (event) => {
 // there instead: a save dialog tells the user the file landed somewhere and
 // where, which a silent copy into ~/Downloads does not. The path is
 // renderer-controlled, so it must resolve inside ~/.openmausbot and be a
-// regular file — never a symlink escape or directory.
-ipcMain.handle("desktop:save-file", async (event, rawPath) => {
+// regular file — never a symlink escape or directory. In remote mode that
+// pathname lives on Razer, so it is fetched through the authenticated harness
+// endpoint; the Mac must never try to resolve it locally.
+const REMOTE_FILE_MAX_BYTES = 25 * 1024 * 1024;
+
+async function fetchRemoteSavableFile(rawPath) {
+  if (typeof rawPath !== "string" || !rawPath.trim() || rawPath.length > 4096) {
+    throw new Error("That server file path is invalid");
+  }
+  const response = await fetch(`${REMOTE_SERVER_URL}/api/files/download`, {
+    method: "POST",
+    redirect: "error",
+    headers: {
+      "content-type": "application/json",
+      "x-openmausbot-session": UI_SESSION_TOKEN,
+    },
+    body: JSON.stringify({ path: rawPath }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    const detail = await readBoundedResponseJson(
+      response,
+      64 * 1024,
+      "Razer file error response exceeded 64 KB",
+    ).catch(() => null);
+    throw new Error(typeof detail?.error === "string" ? detail.error : "That Razer file could not be downloaded");
+  }
+  const declared = Number(response.headers.get("content-length"));
+  if (!Number.isSafeInteger(declared) || declared < 0 || declared > REMOTE_FILE_MAX_BYTES) {
+    throw new Error("That Razer file is too large to save");
+  }
+  const bytes = Buffer.from(await readBoundedResponseBytes(
+    response,
+    REMOTE_FILE_MAX_BYTES,
+    "That Razer file is too large to save",
+  ));
+  if (bytes.byteLength !== declared || bytes.byteLength > REMOTE_FILE_MAX_BYTES) {
+    throw new Error("That Razer file changed while it was being downloaded");
+  }
+  return {
+    bytes,
+    defaultName: remoteDownloadName(
+      response.headers.get("x-openmausbot-file-name-b64"),
+      response.headers.get("x-openmausbot-file-name"),
+    ),
+  };
+}
+
+function writeRemoteSaveDestination(destination, bytes) {
+  if (process.platform === "win32") {
+    fs.writeFileSync(destination, bytes, { mode: 0o600 });
+    return;
+  }
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+  const handle = fs.openSync(destination, flags, 0o600);
+  try {
+    fs.fchmodSync(handle, 0o600);
+    fs.writeFileSync(handle, bytes);
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+registerPrivilegedIpcHandle("desktop:save-file", async (event, rawPath) => {
+  if (REMOTE_SERVER_URL) {
+    const file = await fetchRemoteSavableFile(rawPath);
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const defaultPath = await defaultSaveName(app.getPath("downloads"), file.defaultName);
+    const choice = await dialog.showSaveDialog(parent ?? undefined, {
+      title: "Where do you want to save it?",
+      message: "Save a copy from Razer",
+      defaultPath,
+      buttonLabel: "Save",
+      properties: ["createDirectory", "showOverwriteConfirmation"],
+    });
+    if (choice.canceled || !choice.filePath) return null;
+    writeRemoteSaveDestination(choice.filePath, file.bytes);
+    shell.showItemInFolder(choice.filePath);
+    return choice.filePath;
+  }
   return withSavableFile(rawPath, { home: os.homedir() }, async ({ defaultName, copyTo }) => {
     const parent = BrowserWindow.fromWebContents(event.sender);
     const defaultPath = await defaultSaveName(app.getPath("downloads"), defaultName);
@@ -1354,51 +1660,44 @@ ipcMain.handle("desktop:save-file", async (event, rawPath) => {
   });
 });
 
-ipcMain.handle("desktop:open-external", async (_event, rawUrl) => {
-  if (typeof rawUrl !== "string") throw new Error("A web address is required");
-  let url;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    throw new Error("That web address is invalid");
-  }
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    throw new Error("Only web links can be opened");
-  }
-  await shell.openExternal(url.toString());
+registerPrivilegedIpcHandle("desktop:open-external", async (_event, rawUrl) => {
+  const url = externalWebUrl(rawUrl);
+  if (!url) throw new Error("Only ordinary HTTP(S) web links can be opened");
+  await shell.openExternal(url);
   return true;
 });
 
 // The Box VNC viewer must be a top-level page for its token exchange. A
 // sandboxed modal BrowserWindow satisfies that requirement while keeping the
 // live desktop inside OpenMausBot instead of sending the person to a browser.
-ipcMain.handle("desktop-viewer:open", (event, rawUrl, title, contextId) => {
+registerPrivilegedIpcHandle("desktop-viewer:open", (event, rawUrl, title, contextId) => {
   const owner = BrowserWindow.fromWebContents(event.sender);
   return openDesktopViewer(owner, rawUrl, title, contextId);
 });
 
-// Close only when the caller owns the current viewer — otherwise one bot's
-// "Hand control back" would close (and release) another bot's viewer.
-ipcMain.handle("desktop-viewer:close", (_event, contextId) => {
-  const scoped = Object.prototype.toString.call(contextId) === "[object String]" ? contextId : null;
-  if (scoped !== desktopViewerContextId) return false;
-  if (desktopViewerWindow && !desktopViewerWindow.isDestroyed()) desktopViewerWindow.close();
-  return true;
+// Close only this exact bot's viewer and only from its owning renderer
+// document. A different bot's window and lease are never collateral damage.
+registerPrivilegedIpcHandle("desktop-viewer:close", (event, contextId) => {
+  return desktopViewers.close(contextId, event.sender);
 });
 
-// Lets a (re)mounted panel seed viewer-open state instead of defaulting to false.
-ipcMain.handle("desktop-viewer:state-now", () => ({
-  open: Boolean(desktopViewerWindow && !desktopViewerWindow.isDestroyed()),
-  contextId: desktopViewerContextId,
-}));
+// Panels query one exact bot. The global lease observer uses the bounded list
+// to recover all windows already owned by this renderer without choosing an
+// arbitrary "current" viewer from a concurrent set.
+registerPrivilegedIpcHandle("desktop-viewer:state-now", (event, contextId) => {
+  return desktopViewers.state(contextId, event.sender);
+});
+registerPrivilegedIpcHandle("desktop-viewer:states-now", (event) => {
+  return desktopViewers.states(event.sender);
+});
 
-ipcMain.handle("perm:status", () => ({
+registerPrivilegedIpcHandle("perm:status", () => ({
   mic:
     nativeActions.appleMediaPermissions
       ? systemPreferences.getMediaAccessStatus?.("microphone") ?? "unknown"
       : "unsupported",
 }));
-ipcMain.handle("perm:request-mic", async () => {
+registerPrivilegedIpcHandle("perm:request-mic", async () => {
   if (!nativeActions.appleMediaPermissions) return false;
   try {
     return await systemPreferences.askForMediaAccess("microphone");
@@ -1409,7 +1708,7 @@ ipcMain.handle("perm:request-mic", async () => {
 
 // macOS never re-prompts a denied permission — the only path is System
 // Settings; deep-link straight to the right privacy pane.
-ipcMain.handle("perm:open-settings", (_event, pane) => {
+registerPrivilegedIpcHandle("perm:open-settings", (_event, pane) => {
   if (!nativeActions.applePrivacySettings) return false;
   const panes = {
     mic: "Privacy_Microphone",
@@ -1423,7 +1722,7 @@ ipcMain.handle("perm:open-settings", (_event, pane) => {
   return shell.openExternal(`x-apple.systempreferences:com.apple.preference.security?${anchor}`);
 });
 
-ipcMain.handle("speech:start", (event, options) => {
+registerPrivilegedIpcHandle("speech:start", (event, options) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) return;
   if (!nativeActions.appleSpeech) {
@@ -1432,39 +1731,39 @@ ipcMain.handle("speech:start", (event, options) => {
   }
   startSpeech(win, options);
 });
-ipcMain.handle("speech:stop", () => {
+registerPrivilegedIpcHandle("speech:stop", () => {
   if (nativeActions.appleSpeech) stopSpeech();
 });
-ipcMain.handle("speech:finish", () => {
+registerPrivilegedIpcHandle("speech:finish", () => {
   if (nativeActions.appleSpeech) finishSpeech();
 });
 
-ipcMain.handle("skill-recorder:permissions", () => recorderPermissionStatus());
-ipcMain.handle("skill-recorder:start", (event) => {
+registerPrivilegedIpcHandle("skill-recorder:permissions", () => recorderPermissionStatus());
+registerPrivilegedIpcHandle("skill-recorder:start", (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (!win) throw new Error("The recorder window is unavailable");
   return startRecorder(win);
 });
-ipcMain.handle("skill-recorder:stop", () => stopRecorder());
-ipcMain.handle("skill-recorder:save", (_event, payload) => saveSkillRecording(payload));
+registerPrivilegedIpcHandle("skill-recorder:stop", () => stopRecorder());
+registerPrivilegedIpcHandle("skill-recorder:save", (_event, payload) => saveSkillRecording(payload));
 
 // ── companion sidecar ──────────────────────────────────────────────────
 // The renderer gets these five and nothing else: it can turn the companion
 // on and off, look at it, open or cancel a pairing window, and remove a
 // device. It cannot reach the sidecar's control port itself.
-ipcMain.handle("companion:state", () => desktopCompanionState());
-ipcMain.handle("companion:start", () =>
+registerPrivilegedIpcHandle("companion:state", () => desktopCompanionState());
+registerPrivilegedIpcHandle("companion:start", () =>
   REMOTE_COMPANION_URL ? desktopCompanionState() : startDesktopCompanion(),
 );
-ipcMain.handle("companion:stop", () =>
+registerPrivilegedIpcHandle("companion:stop", () =>
   REMOTE_COMPANION_URL ? desktopCompanionState() : stopDesktopCompanion(),
 );
-ipcMain.handle("companion:keep-awake", async (_event, enabled) => {
+registerPrivilegedIpcHandle("companion:keep-awake", async (_event, enabled) => {
   if (REMOTE_COMPANION_URL) return desktopCompanionState();
   rememberCompanionKeepAwake(Boolean(enabled));
   return desktopCompanionState();
 });
-ipcMain.handle("companion:pairing", (_event, open, expectedToken) =>
+registerPrivilegedIpcHandle("companion:pairing", (_event, open, expectedToken) =>
   REMOTE_COMPANION_URL
     ? remoteCompanionRequest(
         open ? "POST" : "DELETE",
@@ -1474,7 +1773,7 @@ ipcMain.handle("companion:pairing", (_event, open, expectedToken) =>
       )
     : companionPairing(Boolean(open), expectedToken).then(decorateDesktopCompanionState),
 );
-ipcMain.handle("companion:cloud-desktop", (_event, deviceId, allowed) =>
+registerPrivilegedIpcHandle("companion:cloud-desktop", (_event, deviceId, allowed) =>
   REMOTE_COMPANION_URL
     ? remoteCompanionRequest(
         allowed ? "POST" : "DELETE",
@@ -1482,7 +1781,7 @@ ipcMain.handle("companion:cloud-desktop", (_event, deviceId, allowed) =>
       )
     : companionCloudDesktopAccess(deviceId, Boolean(allowed)).then(() => desktopCompanionState()),
 );
-ipcMain.handle("companion:revoke", (_event, deviceId) =>
+registerPrivilegedIpcHandle("companion:revoke", (_event, deviceId) =>
   REMOTE_COMPANION_URL
     ? remoteCompanionRequest("DELETE", `/devices/${encodeURIComponent(String(deviceId))}`)
     : companionRevoke(deviceId).then(() => desktopCompanionState()),
@@ -1490,17 +1789,17 @@ ipcMain.handle("companion:revoke", (_event, deviceId) =>
 
 // Auth and connector credentials never cross this boundary. Every handler
 // returns the same deliberately tiny, secret-free public account state.
-ipcMain.handle("companion-account:state", () => ensureCompanionAccountService().state());
-ipcMain.handle("companion-account:request-code", (_event, email) =>
+registerPrivilegedIpcHandle("companion-account:state", () => ensureCompanionAccountService().state());
+registerPrivilegedIpcHandle("companion-account:request-code", (_event, email) =>
   ensureCompanionAccountService().requestCode(email),
 );
-ipcMain.handle("companion-account:verify-code", (_event, email, code) =>
+registerPrivilegedIpcHandle("companion-account:verify-code", (_event, email, code) =>
   ensureCompanionAccountService().verifyCode(email, code),
 );
-ipcMain.handle("companion-account:retry", () => ensureCompanionAccountService().retry());
-ipcMain.handle("companion-account:sign-out", () => ensureCompanionAccountService().signOut());
+registerPrivilegedIpcHandle("companion-account:retry", () => ensureCompanionAccountService().retry());
+registerPrivilegedIpcHandle("companion-account:sign-out", () => ensureCompanionAccountService().signOut());
 
-ipcMain.handle("desktop:connection", () => ({
+registerPrivilegedIpcHandle("desktop:connection", () => ({
   mode: REMOTE_SERVER_URL ? "remote" : "local",
   serverUrl: rendererOrigin(),
 }));
@@ -1519,15 +1818,15 @@ function desktopCapabilitiesForRenderer(localConnection) {
   };
 }
 
-ipcMain.handle("desktop:capabilities", async () =>
+registerPrivilegedIpcHandle("desktop:capabilities", async () =>
   desktopCapabilitiesForRenderer(await cuaReady),
 );
 
-ipcMain.handle("assemblyai:status", () => ({
+registerPrivilegedIpcHandle("assemblyai:status", () => ({
   configured: Boolean(assemblyAICredential(secureCredentials)),
 }));
 
-ipcMain.handle("assemblyai:set-key", async (_event, value) => {
+registerPrivilegedIpcHandle("assemblyai:set-key", async (_event, value) => {
   if (typeof value !== "string") throw new Error("Unsupported credential");
   if (!(await safeStorage.isAsyncEncryptionAvailable())) {
     throw new Error("The operating-system credential store is unavailable");
@@ -1541,7 +1840,7 @@ ipcMain.handle("assemblyai:set-key", async (_event, value) => {
   return { configured: Boolean(secret) };
 });
 
-ipcMain.handle("assemblyai:streaming-token", () =>
+registerPrivilegedIpcHandle("assemblyai:streaming-token", () =>
   mintAssemblyAIStreamingToken(assemblyAICredential(secureCredentials)),
 );
 
@@ -1554,7 +1853,7 @@ const CREDENTIAL_PATCH = {
   openaiImageApiKey: (value) => ({ imageGen: { key: value } }),
 };
 
-ipcMain.handle("credential:set", async (_event, name, value) => {
+registerPrivilegedIpcHandle("credential:set", async (_event, name, value) => {
   const patchFor = CREDENTIAL_PATCH[name];
   if (!patchFor || typeof value !== "string") {
     throw new Error("Unsupported credential");
@@ -1568,12 +1867,25 @@ ipcMain.handle("credential:set", async (_event, name, value) => {
     // cannot receive credentials from Electron at boot. Keep its established
     // local config path there; production always uses the encrypted store.
     const secretStorage = app.isPackaged && !REMOTE_SERVER_URL ? "?secretStorage=external" : "";
-    const response = await fetch(`${rendererOrigin()}/api/config${secretStorage}`, {
+    const requestUrl = `${rendererOrigin()}/api/config${secretStorage}`;
+    const response = await fetch(requestUrl, {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      redirect: "error",
+      // This is Node's main-process fetch, not a Chromium request, so the
+      // defaultSession webRequest hook cannot add the remote UI bearer. Use
+      // the same exact-origin helper explicitly; it also strips a caller-
+      // supplied copy if this target ever stops being the harness origin.
+      headers: uiSessionRequestHeaders(rendererOrigin(), UI_SESSION_TOKEN, requestUrl, {
+        "content-type": "application/json",
+      }),
       body: JSON.stringify(patchFor(secret)),
+      signal: AbortSignal.timeout(30_000),
     });
-    const body = await response.json().catch(() => null);
+    const body = await readBoundedResponseJson(
+      response,
+      1024 * 1024,
+      "credential update response exceeded 1 MB",
+    ).catch(() => null);
     if (!response.ok) throw new Error(body?.error || `Could not save credential (HTTP ${response.status})`);
     return body;
   };
@@ -1601,6 +1913,7 @@ async function broadcastDesktopCapabilities() {
 
 setCuaStateListener((connection) => {
   cuaReady = Promise.resolve(connection);
+  void remotePhysicalBridge?.refresh().catch(() => {});
   void broadcastDesktopCapabilities().catch((error) => {
     console.error("[desktop] capability broadcast failed:", error);
   });
@@ -1673,15 +1986,15 @@ app.whenReady().then(async () => {
       { useSystemPicker: false },
     );
   }
-  registerCuaIpc();
-  androidDevice.registerIpc(ipcMain);
-  registerUpdaterIpc();
+  registerCuaIpc(registerPrivilegedIpcHandle);
+  androidDevice.registerIpc({ handle: registerPrivilegedIpcHandle });
+  registerUpdaterIpc(registerPrivilegedIpcHandle);
   // Start the CUA daemon before the window so the harness can pick up the
   // connection descriptor on first render. Never blocks window creation on
   // failure — computer use degrades to "unavailable", the rest still works.
   cuaReady =
-    (process.platform === "darwin" && (!REMOTE_SERVER_URL || REMOTE_MAC_BRIDGE?.enabled)) ||
-    ((process.platform === "darwin" || process.platform === "win32") && REMOTE_DEVICE_BRIDGE?.enabled) ||
+    process.platform === "darwin" ||
+    process.platform === "win32" ||
     (process.platform === "linux" && !REMOTE_SERVER_URL)
       ? startCua().catch((e) => {
           console.error("[cua] start failed:", e);
@@ -1692,6 +2005,10 @@ app.whenReady().then(async () => {
           reason: REMOTE_SERVER_URL ? "remote-client" : "unsupported-platform",
         });
   if (app.isPackaged && !REMOTE_SERVER_URL) serverReady = await startServerPackaged();
+  // The raw human-app capability never enters renderer JavaScript. Electron
+  // injects it only on requests to the exact harness origin (port included),
+  // so bot-authored remote/loopback images cannot receive it.
+  await installUiSessionHeader();
   // The companion the user left on comes back without anyone finding the
   // toggle again — one attempt, after the harness port is settled, with the
   // exact options the IPC handler uses. A failure surfaces in companionState
@@ -1701,69 +2018,33 @@ app.whenReady().then(async () => {
     void startDesktopCompanion({ waitForHosted: false, remember: false });
   }
   const win = createWindow();
+  installBackgroundTray();
   if (
     REMOTE_SERVER_URL &&
-    REMOTE_DEVICE_BRIDGE?.enabled &&
     (process.platform === "darwin" || process.platform === "win32")
   ) {
     const deviceName = process.platform === "win32" ? "Windows PC" : "Mac";
-    remoteDeviceBridge = await startRemoteDeviceBridge({
-      userDataDir: app.getPath("userData"),
+    remotePhysicalBridge = await startOutboundPhysicalBridge({
+      serverUrl: REMOTE_SERVER_URL,
+      sessionToken: UI_SESSION_TOKEN,
+      platform: process.platform,
       getConnection: () => cuaReady,
-      port: REMOTE_DEVICE_BRIDGE.port,
-      approveConnection: async () => {
-        if (remoteDeviceAlwaysAllow) return true;
-        const options = {
-          type: "warning",
-          title: `Physical ${deviceName} access`,
-          message: `Allow the Razer OpenMaus server to control this ${deviceName}?`,
-          detail: "OpenMaus applies its separate per-action or remembered exact-tool approval in the chat. This connection lasts only for the current agent computer session.",
-          buttons: ["Deny", "Allow Once", "Always Allow While App Is Open"],
-          defaultId: 0,
-          cancelId: 0,
-          noLink: true,
-        };
+      approveConnection: async ({ signal, botId, botLabel, taskLabel, sessionId }) => {
+        const options = physicalApprovalDialogOptions({
+          deviceName,
+          botId,
+          botLabel,
+          taskLabel,
+          sessionId,
+          signal,
+        });
         const result = mainWindow && !mainWindow.isDestroyed()
           ? await dialog.showMessageBox(mainWindow, options)
           : await dialog.showMessageBox(options);
-        if (result.response === 2) remoteDeviceAlwaysAllow = true;
-        return result.response === 1 || result.response === 2;
+        return result.response === 2 ? "always" : result.response === 1 ? "once" : false;
       },
     }).catch((error) => {
-      console.error("[device-bridge] start failed:", error);
-      return null;
-    });
-  }
-  if (
-    REMOTE_SERVER_URL &&
-    !REMOTE_DEVICE_BRIDGE?.enabled &&
-    REMOTE_MAC_BRIDGE?.enabled &&
-    process.platform === "darwin"
-  ) {
-    remoteMacBridge = await startRemoteMacBridge({
-      userDataDir: app.getPath("userData"),
-      getConnection: () => cuaReady,
-      port: REMOTE_MAC_BRIDGE.port,
-      approveConnection: async () => {
-        if (remoteMacAlwaysAllow) return true;
-        const options = {
-          type: "warning",
-          title: "Physical Mac access",
-          message: "Allow the Razer OpenMaus server to control this Mac?",
-          detail: "OpenMaus applies its separate per-action or remembered exact-tool approval in the chat. This connection lasts only for the current agent computer session.",
-          buttons: ["Deny", "Allow Once", "Always Allow While App Is Open"],
-          defaultId: 0,
-          cancelId: 0,
-          noLink: true,
-        };
-        const result = mainWindow && !mainWindow.isDestroyed()
-          ? await dialog.showMessageBox(mainWindow, options)
-          : await dialog.showMessageBox(options);
-        if (result.response === 2) remoteMacAlwaysAllow = true;
-        return result.response === 1 || result.response === 2;
-      },
-    }).catch((error) => {
-      console.error("[mac-bridge] start failed:", error);
+      console.error("[physical-bridge] start failed:", error?.message ?? error);
       return null;
     });
   }
@@ -1795,9 +2076,11 @@ app.whenReady().then(async () => {
   }
   // in-app auto-update (packaged only) — checks GitHub releases, downloads on
   // the user's click, installs on "Restart to update"
-  startUpdater(win);
+  if (shouldStartUpdater({ packaged: app.isPackaged, remotePackage: IS_REMOTE_PACKAGE, platform: process.platform })) {
+    startUpdater(win);
+  }
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    showMainWindow();
   });
 });
 
@@ -1805,11 +2088,10 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-// EMBEDDING.md lifecycle rule: defer the first quit until the embedded
-// daemon's async cleanup completes — it can't run after the host exits.
-// Cap the defer so a wedged daemon cannot keep the app alive forever.
-const CUA_STOP_TIMEOUT_MS = 2500;
-let cuaCleanedUp = false;
+// EMBEDDING.md lifecycle rule: defer the first quit until embedded children
+// finish their own shutdown. CUA/bridge cleanup keeps its short bound, while
+// the harness server gets a separate budget long enough to run its verified
+// provider drain. The CUA timeout must never cut that server drain short.
 let signalQuitRequested = false;
 
 // Package managers, desktop watchdogs, and terminal launchers commonly stop
@@ -1827,31 +2109,71 @@ process.once("SIGINT", requestSignalQuit);
 process.once("SIGTERM", requestSignalQuit);
 
 app.on("before-quit", (e) => {
-  if (cuaCleanedUp) return;
+  windowBackgroundPolicy.requestQuit();
+  if (quitCleanupFinished) return;
   e.preventDefault();
-  try {
-    serverProc?.kill();
-  } catch {}
+  if (quitCleanup) return;
   // Release the sleep blocker synchronously; child shutdown is awaited below.
   syncCompanionKeepAwake(false, false);
   // a live dictation session runs its own helper child that holds the mic —
   // stop it here so quitting never orphans a recording process
   if (nativeActions.appleSpeech) stopSpeech();
   stopRecorder();
-  const cleanup = Promise.race([
-    Promise.all([
-      stopCua().catch(() => {}),
-      remoteDeviceBridge?.stop().catch(() => {}),
-      remoteMacBridge?.stop().catch(() => {}),
+  quitCleanup = runQuitLifecycle({
+    serverProcess: serverProc,
+    serverExit,
+    serverTimeoutMs: DEFAULT_SERVER_SHUTDOWN_TIMEOUT_MS,
+    auxiliaryTimeoutMs: DEFAULT_AUXILIARY_CLEANUP_TIMEOUT_MS,
+    stopAuxiliaries: () => Promise.allSettled([
+      Promise.resolve().then(async () => {
+        await remotePhysicalBridge?.stop();
+        await REMOTE_SSH_CONNECTOR?.stop();
+        await stopCua();
+      }),
       // Both listeners reachable from outside the app are owned children.
       // Shut the connector down first, then the sidecar, without changing the
       // remembered toggle the next launch will restore.
-      stopDesktopCompanion({ remember: false }).catch(() => {}),
+      Promise.resolve().then(() => stopDesktopCompanion({ remember: false })),
     ]),
-    new Promise((resolve) => setTimeout(resolve, CUA_STOP_TIMEOUT_MS).unref()),
-  ]);
-  cleanup.then(() => {
-    cuaCleanedUp = true;
-    app.quit();
+  });
+  void quitCleanup.then((result) => {
+    if (result.auxiliaries.status === "timeout") {
+      slog(`auxiliary cleanup exceeded ${DEFAULT_AUXILIARY_CLEANUP_TIMEOUT_MS}ms`);
+    } else if (result.auxiliaries.status === "rejected") {
+      slog(`auxiliary cleanup failed: ${result.auxiliaries.error?.message ?? result.auxiliaries.error}`);
+    } else {
+      const failures = (result.auxiliaries.value ?? [])
+        .filter((entry) => entry.status === "rejected")
+        .map((entry) => entry.reason?.message ?? String(entry.reason));
+      if (failures.length) slog(`auxiliary cleanup failures: ${failures.join("; ")}`);
+    }
+
+    quitCleanupFinished = true;
+    if (result.ok) {
+      app.quit();
+      return;
+    }
+
+    const detail = result.server.status === "timeout"
+      ? `embedded server did not exit within ${DEFAULT_SERVER_SHUTDOWN_TIMEOUT_MS}ms`
+      : result.server.status === "abnormal-exit"
+        ? `embedded server exited abnormally with code ${result.server.code ?? "unknown"}`
+        : `embedded server shutdown failed (${result.server.status})`;
+    slog(detail);
+    console.error(`[quit] ${detail}`);
+    // A non-zero desktop exit is observable to launchd/systemd/updaters and
+    // must not be confused with the server's clean, verified shutdown path.
+    process.exitCode = 1;
+    try {
+      serverProc?.kill();
+    } catch {}
+    app.exit(1);
+  }, (error) => {
+    quitCleanupFinished = true;
+    const detail = `embedded shutdown coordinator failed: ${error?.message ?? error}`;
+    slog(detail);
+    console.error(`[quit] ${detail}`);
+    process.exitCode = 1;
+    app.exit(1);
   });
 });

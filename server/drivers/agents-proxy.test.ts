@@ -5,17 +5,19 @@
 // shell — plain node child, so this runs on every OS like index.test.ts.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer, type Server } from "node:http";
+import { once } from "node:events";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const PROXY = join(dirname(fileURLToPath(import.meta.url)), "agents-proxy.ts");
-const TOKEN = "test-comms-token";
+const TOKEN = "test-capability-token";
 
 // scripted harness stub
 let stub: Server;
 let stubPort = 0;
 let lastAuth: string | undefined;
+let lastListUrl: string | undefined;
 let lastAskBody: any = null;
 let askResponse: unknown = { botName: "Helper", text: "hi from helper" };
 let lastDelegateBody: any = null;
@@ -47,6 +49,7 @@ beforeAll(async () => {
       return res.end(JSON.stringify({ error: "unauthorized" }));
     }
     if (req.method === "GET" && req.url?.startsWith("/api/internal/agents")) {
+      lastListUrl = req.url;
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(
         JSON.stringify({
@@ -104,10 +107,7 @@ beforeAll(async () => {
     env: {
       ...process.env,
       OMB_HARNESS_URL: `http://127.0.0.1:${stubPort}`,
-      OMB_BOT_ID: "bot-asker",
-      OMB_THREAD_ID: "thread-asker-routine",
-      OMB_COMMS_TOKEN: TOKEN,
-      OMB_TURN_DEPTH: "0",
+      OMB_AGENTS_CAPABILITY_TOKEN: TOKEN,
     },
     stdio: ["pipe", "pipe", "inherit"],
   });
@@ -145,25 +145,23 @@ describe("agents-proxy MCP surface", () => {
     ]);
   });
 
-  it("list_bots renders the roster and authenticates with the shared token", async () => {
+  it("list_bots renders the roster using only its scoped capability", async () => {
     const res = await callTool("list_bots", {});
     const text = res.result.content[0].text;
     expect(text).toContain("Helper");
     expect(text).toContain("bot-helper");
     expect(lastAuth).toBe(`Bearer ${TOKEN}`);
+    expect(lastListUrl).toBe("/api/internal/agents");
   });
 
-  it("ask_bot forwards sender + depth and returns the reply", async () => {
+  it("ask_bot leaves source identity bound to the capability", async () => {
     askResponse = { botName: "Helper", text: "hi from helper" };
     const res = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
     expect(res.result.content[0].text).toContain("Helper replied:");
     expect(res.result.content[0].text).toContain("hi from helper");
-    expect(lastAskBody).toMatchObject({
-      fromBotId: "bot-asker",
-      fromThreadId: "thread-asker-routine",
+    expect(lastAskBody).toEqual({
       toBotId: "bot-helper",
       message: "ping",
-      depth: 0,
     });
   });
 
@@ -181,7 +179,38 @@ describe("agents-proxy MCP surface", () => {
     expect(res.result.content[0].text).toContain("one hop");
   });
 
-  it("forwards the source thread when queueing a delegation", async () => {
+  it("cancels only an oversized harness response and remains usable", async () => {
+    askResponse = { botName: "Hostile", text: "x".repeat(1024 * 1024 + 1) };
+    const rejected = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping" });
+    expect(rejected.result.isError).toBe(true);
+    expect(rejected.result.content[0].text).toMatch(/exceeded 1 MB/);
+
+    askResponse = { botName: "Helper", text: "still healthy" };
+    const sibling = await callTool("ask_bot", { bot_id: "bot-helper", message: "ping again" });
+    expect(sibling.result.content[0].text).toContain("still healthy");
+  });
+
+  it("terminates only the proxy whose fragmented input exceeds the line cap", async () => {
+    const hostile = spawn(process.execPath, [PROXY], {
+      env: {
+        ...process.env,
+        OMB_HARNESS_URL: `http://127.0.0.1:${stubPort}`,
+        OMB_AGENTS_CAPABILITY_TOKEN: TOKEN,
+      },
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    hostile.stdin.on("error", () => {});
+    const exited = once(hostile, "exit");
+    const fragment = Buffer.alloc(64 * 1024, 0x78);
+    for (let i = 0; i < 33; i += 1) hostile.stdin.write(fragment);
+    const [code] = await exited;
+    expect(code).toBe(1);
+
+    const sibling = await rpc("tools/list");
+    expect(sibling.result.tools).toHaveLength(5);
+  });
+
+  it("queues a delegation without forwarding spoofable source identity", async () => {
     delegateResponse = { queued: true, message: "Delegation queued." };
     const res = await callTool("delegate_bot", {
       bot_id: "bot-helper",
@@ -189,13 +218,10 @@ describe("agents-proxy MCP surface", () => {
       reason: "follow-up",
     });
     expect(res.result.content[0].text).toContain("Delegation queued");
-    expect(lastDelegateBody).toMatchObject({
-      fromBotId: "bot-asker",
-      fromThreadId: "thread-asker-routine",
+    expect(lastDelegateBody).toEqual({
       toBotId: "bot-helper",
       message: "take this",
       reason: "follow-up",
-      depth: 0,
     });
   });
 
@@ -214,8 +240,6 @@ describe("agents-proxy MCP surface", () => {
     });
     expect(res.result.content[0].text).toContain("Created @Pixel in Work");
     expect(lastCreateBody).toEqual({
-      fromBotId: "bot-asker",
-      fromThreadId: "thread-asker-routine",
       name: "Pixel",
       role: "Product designer",
       instructions: "Design and review the user experience.",
@@ -230,8 +254,6 @@ describe("agents-proxy MCP surface", () => {
     expect(res.result.content[0].text).toContain("secure OpenCode API key card");
     expect(res.result.content[0].text).toContain("End this turn");
     expect(lastCredentialBody).toEqual({
-      fromBotId: "bot-asker",
-      fromThreadId: "thread-asker-routine",
       credentialId: "opencodeGoApiKey",
       reason: "The selected model needs it.",
     });

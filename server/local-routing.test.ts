@@ -39,6 +39,16 @@ describe("local computer routing", () => {
     ).toBe(true);
   });
 
+  it("lets an attended Windows bridge satisfy Auto even when the harness itself is remote", () => {
+    expect(
+      shouldMountLocalComputer({
+        requested: undefined,
+        hostPlatform: "win32",
+        providerSupportsLocal: true,
+      }),
+    ).toBe(true);
+  });
+
   it("never mounts the local desktop for explicit cloud/off or on an unsupported host", () => {
     for (const requested of ["cloud", "off"] as const) {
       expect(
@@ -52,7 +62,7 @@ describe("local computer routing", () => {
     expect(
       shouldMountLocalComputer({
         requested: "local",
-        hostPlatform: "win32",
+        hostPlatform: "freebsd",
         providerSupportsLocal: true,
       }),
     ).toBe(false);

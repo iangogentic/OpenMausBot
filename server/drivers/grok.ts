@@ -15,6 +15,12 @@ import type {
 import { newEventId, newId } from "../contracts.ts";
 import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { appendNative } from "./native.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedJsonLineDecoder,
+  PROVIDER_NDJSON_LIMITS,
+} from "./bounded-json-lines.ts";
+import { readBoundedResponseText } from "../bounded-response.ts";
 
 const DRIVER_KIND = "grok";
 const DEFAULT_URL = "https://api.x.ai/v1";
@@ -79,11 +85,13 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
         signal: opts.signal ?? AbortSignal.timeout(120_000),
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
+        const body = await readBoundedResponseText(res, 64 * 1024, "xAI error response is too large").catch(() => "");
         throw new Error(`xAI HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
       }
       if (!opts.stream) {
-        const json: any = await res.json();
+        const raw = await readBoundedResponseText(res, 8 * 1024 * 1024, "xAI response is too large");
+        const json: any = JSON.parse(raw);
+        assertBoundedJsonShape(json, PROVIDER_NDJSON_LIMITS);
         return {
           text: json.choices?.[0]?.message?.content ?? "",
           usage: json.usage
@@ -94,34 +102,28 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       let text = "";
       let usage: { input: number; output: number } | null = null;
       const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          let chunk: any;
-          try {
-            chunk = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            text += delta;
-            opts.onDelta?.(delta);
-          }
-          if (chunk.usage) {
-            usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
+      const frames = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS, {
+        jsonPrefix: "data:",
+        ignoredJsonPayloads: ["[DONE]"],
+      });
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          for (const { value: parsed } of frames.push(value)) {
+            const chunk: any = parsed;
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) {
+              text += delta;
+              opts.onDelta?.(delta);
+            }
+            if (chunk.usage) {
+              usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
+            }
           }
         }
+      } finally {
+        await reader.cancel().catch(() => {});
       }
       return { text, usage };
     };
@@ -130,7 +132,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
       const { threadId } = turn;
       if (!apiKey) throw new Error(`no xAI key — set ${config.apiKeyEnv} or config.json xai.key`);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
-      const turnId = newId();
+      const turnId = turn.turnId ?? newId();
       const abort = new AbortController();
       let streamedText = false;
       // the backoff is scaled down in tests so a fake's transient failures

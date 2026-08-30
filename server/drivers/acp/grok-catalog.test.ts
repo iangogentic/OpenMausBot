@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { GrokAgentDriver, readGrokModelCatalog, STATIC_GROK_MODELS } from "./grok.ts";
+import { GrokAgentDriver, grokIsAuthenticated, readGrokModelCatalog, STATIC_GROK_MODELS } from "./grok.ts";
 
 const scratchDirs: string[] = [];
 
@@ -93,6 +93,17 @@ name = "OK"
 });
 
 describe("GrokAgentDriver catalog", () => {
+  it("checks login in the exact instance GROK_HOME instead of the harness home", () => {
+    const harnessHome = scratchConfig("");
+    const providerParent = mkdtempSync(join(tmpdir(), "omb-grok-auth-"));
+    const providerHome = join(providerParent, "provider-grok");
+    scratchDirs.push(providerParent);
+    mkdirSync(providerHome, { recursive: true });
+    writeFileSync(join(providerHome, "auth.json"), "{}");
+    expect(grokIsAuthenticated({ HOME: harnessHome, GROK_HOME: providerHome })).toBe(true);
+    expect(grokIsAuthenticated({ HOME: harnessHome, GROK_HOME: join(providerParent, "missing") })).toBe(false);
+  });
+
   it("loads the config catalog when the instance is created", async () => {
     const home = scratchConfig(`[model.local-glm]\nname = "GLM local"\n`);
     const instance = await GrokAgentDriver.create({

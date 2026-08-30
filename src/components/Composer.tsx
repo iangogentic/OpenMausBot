@@ -10,6 +10,7 @@ import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import {
   appendPastedText,
   composeMessage,
+  fileAttachmentFromFile,
   imageAttachmentFromFile,
   intakeFiles,
   isImageFile,
@@ -296,6 +297,7 @@ export function Composer({
       allowImages: engineSupportsImages,
       getPath: pathForFile,
       uploadImage: imageAttachmentFromFile,
+      uploadFile: capabilities.connection?.mode === "remote" ? fileAttachmentFromFile : undefined,
     });
     if (added.length) addAttachments(added);
     // Keep file-specific failures beside the attachments. A successful
@@ -484,12 +486,13 @@ export function Composer({
             />
           </div>
         )}
-        <ComposerAttachments
+      <ComposerAttachments
           items={attachments}
           onAdd={addAttachments}
           onRemove={removeAttachment}
           onDisplayInChatBox={displayPasteInChatBox}
-          allowImages={engineSupportsImages}
+        allowImages={engineSupportsImages}
+        remote={capabilities.connection?.mode === "remote"}
           notice={attachmentNotice}
           onNotice={setAttachmentNotice}
         />

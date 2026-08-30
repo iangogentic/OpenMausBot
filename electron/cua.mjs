@@ -16,6 +16,7 @@
 
 import { app, ipcMain } from "electron";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import net from "node:net";
@@ -24,6 +25,7 @@ import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { createCuaConnectionStore } = require("./cua-connection.cjs");
+const { standaloneExecutorGeneration } = require("./cua-executor-generation.cjs");
 const {
   createLinuxCuaPreferenceStore,
   createLinuxCuaRuntime,
@@ -172,8 +174,10 @@ async function attachStandalone() {
     }
   }
   if (!(await socketAlive(STANDALONE_SOCKET))) return null;
+  const generation = standaloneExecutorGeneration(STANDALONE_SOCKET);
   return {
     mode: "standalone",
+    ...(generation ? { generation } : {}),
     socketPath: STANDALONE_SOCKET,
     mcpCommand: driver,
     mcpArgs: ["mcp"],
@@ -204,6 +208,9 @@ async function startEmbedded(binary) {
     embeddedHost = host;
     return {
       mode: "embedded",
+      // Epoch of the host-owned executor, not of an MCP stdio proxy. A new
+      // value is proof the old daemon was stopped and reinitialized.
+      generation: randomUUID(),
       socketPath: conn.socketPath,
       mcpCommand: binary,
       mcpArgs: ["mcp", "--embedded", "--socket", conn.socketPath],
@@ -251,8 +258,10 @@ export async function startCua() {
     }
   } else if (await socketAlive(STANDALONE_SOCKET)) {
     // Dev machine with CuaDriver.app's daemon already running.
+    const generation = standaloneExecutorGeneration(STANDALONE_SOCKET);
     nextConnection = {
       mode: "standalone",
+      ...(generation ? { generation } : {}),
       socketPath: STANDALONE_SOCKET,
       mcpCommand: binary,
       mcpArgs: ["mcp"],
@@ -307,15 +316,15 @@ export async function stopCua() {
   }
 }
 
-export function registerCuaIpc() {
-  ipcMain.handle("cua:connection", () => connectionStore.get());
-  ipcMain.handle("cua:permissions", () => cuaPermissionsStatus());
-  ipcMain.handle("cua:linux-status", () =>
+export function registerCuaIpc(registerHandle = ipcMain.handle.bind(ipcMain)) {
+  registerHandle("cua:connection", () => connectionStore.get());
+  registerHandle("cua:permissions", () => cuaPermissionsStatus());
+  registerHandle("cua:linux-status", () =>
     process.platform === "linux"
       ? ensureLinuxRuntime().getStatus()
       : { enabled: false, status: "unavailable", reasonCode: "unsupported-platform" },
   );
-  ipcMain.handle("cua:linux-enable", async () => {
+  registerHandle("cua:linux-enable", async () => {
     if (process.platform !== "linux") {
       return { enabled: false, status: "unavailable", reasonCode: "unsupported-platform" };
     }
@@ -326,7 +335,7 @@ export function registerCuaIpc() {
     }
     return ensureLinuxRuntime().getStatus();
   });
-  ipcMain.handle("cua:linux-disable", async () => {
+  registerHandle("cua:linux-disable", async () => {
     if (process.platform !== "linux") {
       return { enabled: false, status: "unavailable", reasonCode: "unsupported-platform" };
     }
@@ -337,7 +346,7 @@ export function registerCuaIpc() {
     }
     return ensureLinuxRuntime().getStatus();
   });
-  ipcMain.handle("cua:linux-retry", async () => {
+  registerHandle("cua:linux-retry", async () => {
     if (process.platform === "darwin") {
       try {
         await stopCua();

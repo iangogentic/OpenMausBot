@@ -19,6 +19,13 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedJsonLineDecoder,
+  CATALOG_NDJSON_LIMITS,
+  PROVIDER_NDJSON_LIMITS,
+} from "./bounded-json-lines.ts";
+import { readBoundedResponseText } from "../bounded-response.ts";
 
 const DRIVER_KIND = "openai-compat";
 
@@ -128,13 +135,15 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
         signal: opts.signal ?? AbortSignal.timeout(120_000),
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
+        const body = await readBoundedResponseText(res, 64 * 1024, "upstream error response is too large").catch(() => "");
         throw new Error(
           `upstream HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`,
         );
       }
       if (!opts.stream) {
-        const json: any = await res.json();
+        const raw = await readBoundedResponseText(res, 8 * 1024 * 1024, "upstream response is too large");
+        const json: any = JSON.parse(raw);
+        assertBoundedJsonShape(json, PROVIDER_NDJSON_LIMITS);
         const msg = json.choices?.[0]?.message;
         const mainContent = typeof msg?.content === "string" ? msg.content : "";
         const reasoningContent = typeof msg?.reasoning_content === "string" ? msg.reasoning_content : "";
@@ -153,43 +162,37 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       let reasoning = "";
       let usage: { input: number; output: number } | null = null;
       const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf("\n")) !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          let chunk: any;
-          try {
-            chunk = JSON.parse(data);
-          } catch {
-            continue;
-          }
-          const delta = chunk.choices?.[0]?.delta;
-          const contentDelta = typeof delta?.content === "string" ? delta.content : undefined;
-          const reasoningDelta = typeof delta?.reasoning_content === "string" ? delta.reasoning_content : undefined;
-          if (reasoningDelta) {
-            reasoning += reasoningDelta;
-            opts.onDelta?.(reasoningDelta, "reasoning_text");
-          }
-          if (contentDelta) {
-            text += contentDelta;
-            opts.onDelta?.(contentDelta, "assistant_text");
-          }
-          if (chunk.usage) {
-            usage = {
-              input: chunk.usage.prompt_tokens ?? 0,
-              output: chunk.usage.completion_tokens ?? 0,
-            };
+      const frames = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS, {
+        jsonPrefix: "data:",
+        ignoredJsonPayloads: ["[DONE]"],
+      });
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          for (const { value: parsed } of frames.push(value)) {
+            const chunk: any = parsed;
+            const delta = chunk.choices?.[0]?.delta;
+            const contentDelta = typeof delta?.content === "string" ? delta.content : undefined;
+            const reasoningDelta = typeof delta?.reasoning_content === "string" ? delta.reasoning_content : undefined;
+            if (reasoningDelta) {
+              reasoning += reasoningDelta;
+              opts.onDelta?.(reasoningDelta, "reasoning_text");
+            }
+            if (contentDelta) {
+              text += contentDelta;
+              opts.onDelta?.(contentDelta, "assistant_text");
+            }
+            if (chunk.usage) {
+              usage = {
+                input: chunk.usage.prompt_tokens ?? 0,
+                output: chunk.usage.completion_tokens ?? 0,
+              };
+            }
           }
         }
+      } finally {
+        await reader.cancel().catch(() => {});
       }
       return { text, reasoning, usage };
     };
@@ -202,7 +205,9 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
           signal: AbortSignal.timeout(8_000),
         });
         if (!res.ok) return;
-        const json: any = await res.json();
+        const raw = await readBoundedResponseText(res, 2 * 1024 * 1024, "model catalog response is too large");
+        const json: any = JSON.parse(raw);
+        assertBoundedJsonShape(json, CATALOG_NDJSON_LIMITS);
         const rows: Array<{ id?: unknown; name?: unknown }> = Array.isArray(json)
           ? json
           : Array.isArray(json?.data)
@@ -239,7 +244,7 @@ export const OpenAICompatDriver: ProviderDriver<OpenAICompatConfig> = {
       if (active.has(threadId)) {
         throw new Error("a turn is already running on this thread");
       }
-      const turnId = newId();
+      const turnId = turn.turnId ?? newId();
       const abort = new AbortController();
       active.set(threadId, { abort, turnId });
 

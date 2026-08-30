@@ -7,11 +7,12 @@ directories:
   output: release-remote
 
 # The remote shell carries no harness, provider keys, database, or companion
-# listener. Its CUA daemon stays local and is exposed only through the private,
-# approval-gated reverse-SSH bridge.
+# listener. Its CUA daemon stays local and is exposed only through an
+# authenticated, approval-gated outbound WebSocket over the harness tunnel.
 files:
   - electron/**
   - "!electron/**/*.test.*"
+  - "!electron/**/*.node-test.*"
   - "!electron/resources/speech-helper"
   - "!electron/resources/speech-helper.swift"
   - "!electron/resources/speech-helper-Info.plist"
@@ -25,10 +26,9 @@ files:
 
 asar: true
 
-publish:
-  - provider: github
-    owner: iangogentic
-    repo: OpenMausBot
+# This controller is a distinct product and intentionally has no update feed.
+# electron/updater-policy.mjs also prevents it from initializing the normal
+# OpenMausBot updater, so a controller can never ingest a server-app release.
 
 mac:
   target:

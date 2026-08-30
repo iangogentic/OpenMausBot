@@ -9,6 +9,12 @@ allowBuilds:
   electron: true # postinstall downloads the Electron dist
   esbuild: true # postinstall validates the platform binary
   electron-winstaller: false # unused — Windows builds ship NSIS
+  # core-js' postinstall is informational; do not grant dependency scripts
+  # authority merely to print a funding message. workerd's install selects
+  # and verifies the platform runtime used by Cloudflare integration tests.
+  core-js: false
+  workerd: true
 onlyBuiltDependencies:
   - electron
   - esbuild
+  - workerd

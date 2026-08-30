@@ -4,10 +4,8 @@
 // a per-thread canonical NDJSON log (the debugging trick both upstream and
 // agentcal lean on), and delivered to subscribers (the SSE endpoint and
 // the server-side message folder).
-import { appendFileSync } from "node:fs";
-import { join } from "node:path";
-
 import { EVENTS_DIR } from "../config.ts";
+import { appendBoundedNdjson } from "../bounded-log.ts";
 import { redactSecrets } from "../redact.ts";
 import type { ProviderInstance, RuntimeEvent, RuntimeEventListener } from "../contracts.ts";
 
@@ -35,11 +33,7 @@ export class EventBus {
       // the canonical log is a file people paste into bug reports; scrub
       // credential-shaped content (tool titles, request summaries, reply
       // text) the same way the native tee does
-      appendFileSync(
-        join(EVENTS_DIR, `${event.threadId}.ndjson`),
-        JSON.stringify(redactSecrets(event)) + "\n",
-        { mode: 0o600 },
-      );
+      appendBoundedNdjson(EVENTS_DIR, event.threadId, redactSecrets(event));
     } catch {
       /* logging must never take down the stream */
     }

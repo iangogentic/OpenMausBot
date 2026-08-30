@@ -120,9 +120,12 @@ So the harness just adds one entry to a bot's `--mcp-config`:
 } } }
 ```
 
-Electron main writes that descriptor to
-`<userData>/cua-connection.json` (see `electron/cua.mjs`); the harness reads
-it and injects the block. The driver's own non-idempotent-action safety and
+For a local embedded harness, Electron main writes that descriptor to
+`<userData>/cua-connection.json` (see `electron/cua.mjs`) and that same local
+harness reads it. A remote Linux harness never reads a Mac/Windows descriptor:
+the remote app registers CUA only in server memory over the authenticated
+outbound physical-device bridge, and providers receive only a turn-scoped
+stdio broker capability. The driver's own non-idempotent-action safety and
 the `ax → ax_fg → cgevent → cgevent_fg → cgevent_hid` delivery ladder
 (background pid-addressed input first — does not steal the user's cursor) are
 handled inside the binary; the host adds nothing.

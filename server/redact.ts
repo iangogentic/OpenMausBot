@@ -70,7 +70,7 @@ export function redactSecrets(input: unknown, depth = 0): unknown {
 
   if (Array.isArray(input)) {
     return input.map((item) => {
-      // ACP env entries: {name: "OMB_COMMS_TOKEN", value: "…"}
+      // ACP env entries: {name: "OMB_AGENTS_CAPABILITY_TOKEN", value: "…"}
       if (
         item !== null &&
         typeof item === "object" &&

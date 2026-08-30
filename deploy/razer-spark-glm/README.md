@@ -7,13 +7,13 @@ provider for every OpenMaus harness. The Hermes bot selection is:
 spark_glm::glm53-ablit-dflash2-k7-b4096-ms1-1m
 ```
 
-On Razer, install the included systemd drop-in:
+On Razer, install the included system-service drop-in:
 
 ```bash
-install -Dm644 spark-glm.conf \
-  /home/ian/.config/systemd/user/openmausbot.service.d/spark-glm.conf
-systemctl --user daemon-reload
-systemctl --user restart openmausbot.service
+sudo install -Dm644 spark-glm.conf \
+  /etc/systemd/system/openmausbot.service.d/spark-glm.conf
+sudo systemctl daemon-reload
+sudo systemctl restart openmausbot.service
 ```
 
 The Spark endpoint is private to the Tailscale network. The existing Hermes

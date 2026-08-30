@@ -18,13 +18,18 @@ import { ensureQwenInjectModel } from "./acp/qwen.ts";
 import {
   applyClaudeInject,
   applyOpenAIInject,
+  boundedLocalCatalogJson,
   codexLocalProviderArgs,
   decodeInjectId,
   encodeInjectId,
   contextWindowsFromPs,
   loadedIdsFromPayloads,
+  LOCAL_MODEL_CATALOG_MAX_RECORDS,
+  LOCAL_MODEL_CATALOG_MAX_RESPONSE_BYTES,
+  LOCAL_MODEL_ID_MAX_CHARS,
   LOCAL_HOSTS,
   mergeLocalInject,
+  probeLocalInjects,
   resolveInjectId,
 } from "./local-inject.ts";
 
@@ -45,6 +50,7 @@ describe("inject ids", () => {
   it("rejects official cloud slugs", () => {
     expect(decodeInjectId("claude-sonnet-5")).toBeNull();
     expect(decodeInjectId("gpt-5.6-sol")).toBeNull();
+    expect(decodeInjectId(`omlx::${"m".repeat(LOCAL_MODEL_ID_MAX_CHARS + 1)}`)).toBeNull();
   });
 
   it("exposes the desktop2 Qwen service as a named local harness target", () => {
@@ -207,6 +213,77 @@ describe("loadedIdsFromPayloads", () => {
 });
 
 describe("mergeLocalInject", () => {
+  it("rejects invalid UTF-8 and deeply nested catalog JSON", async () => {
+    expect(await boundedLocalCatalogJson(new Response(Uint8Array.from([0xff])))).toBeNull();
+    const deep = `${'{"x":'.repeat(40)}null${"}".repeat(40)}`;
+    expect(await boundedLocalCatalogJson(new Response(deep))).toBeNull();
+  });
+
+  it("does not follow credential-bearing redirects while probing", async () => {
+    let inspected = false;
+    await mergeLocalInject(
+      { default: "keep", options: [{ id: "keep", label: "Keep" }] },
+      { VITEST: "true", OPENMAUSBOT_PROBE_LOCAL_INJECT: "1" },
+      async (url, init) => {
+        if (String(url).includes(":8080")) {
+          inspected = true;
+          expect(init?.redirect).toBe("error");
+          expect(new Headers(init?.headers).get("authorization")).toBe("Bearer omlx");
+          return new Response(JSON.stringify({ data: [{ id: "safe-chat" }] }), { status: 200 });
+        }
+        return new Response("nope", { status: 500 });
+      },
+    );
+    expect(inspected).toBe(true);
+  });
+
+  it("bounds catalog bytes, record count, and model-id length", async () => {
+    const base = { default: "keep", options: [{ id: "keep", label: "Keep" }] };
+    const tooLarge = await mergeLocalInject(
+      base,
+      { VITEST: "true", OPENMAUSBOT_PROBE_LOCAL_INJECT: "1" },
+      async (url) => String(url).includes(":8080")
+        ? new Response("x".repeat(LOCAL_MODEL_CATALOG_MAX_RESPONSE_BYTES + 1), { status: 200 })
+        : new Response("nope", { status: 500 }),
+    );
+    expect(tooLarge).toEqual(base);
+
+    const records = Array.from(
+      { length: LOCAL_MODEL_CATALOG_MAX_RECORDS + 100 },
+      (_, index) => ({ id: `chat-${index}` }),
+    );
+    records.unshift({ id: "m".repeat(LOCAL_MODEL_ID_MAX_CHARS + 1) });
+    const capped = await mergeLocalInject(
+      base,
+      { VITEST: "true", OPENMAUSBOT_PROBE_LOCAL_INJECT: "1" },
+      async (url) => String(url).includes(":8080")
+        ? new Response(JSON.stringify({ data: records }), { status: 200 })
+        : new Response("nope", { status: 500 }),
+    );
+    const injected = capped.options.filter((option) => option.id.startsWith("omlx::"));
+    expect(injected).toHaveLength(LOCAL_MODEL_CATALOG_MAX_RECORDS - 1);
+    expect(capped.options.some((option) => option.id.includes("m".repeat(LOCAL_MODEL_ID_MAX_CHARS + 1)))).toBe(false);
+  });
+
+  it("never DNS-resolves a configured catalog source", async () => {
+    const host = LOCAL_HOSTS.find((candidate) => candidate.id === "omlx")!;
+    const original = host.baseUrl;
+    const seen: string[] = [];
+    host.baseUrl = "http://models.internal:8080/v1";
+    try {
+      await probeLocalInjects(
+        { VITEST: "true", OPENMAUSBOT_PROBE_LOCAL_INJECT: "1" },
+        async (url) => {
+          seen.push(String(url));
+          return new Response(JSON.stringify({ data: [] }), { status: 200 });
+        },
+      );
+    } finally {
+      host.baseUrl = original;
+    }
+    expect(seen.some((url) => url.includes("models.internal"))).toBe(false);
+  });
+
   it("marks oMLX /v1/models/status loaded rows, not the default_model", async () => {
     const catalog = await mergeLocalInject(
       { default: "keep", options: [{ id: "keep", label: "Keep" }] },
@@ -1014,8 +1091,8 @@ describe("ensureQwenInjectModel", () => {
   });
 });
 
-describe("live Custom lists on every local CLI harness", () => {
-  it("merges probed host models onto Kimi, Droid, and Antigravity", async () => {
+describe("live Custom lists on local CLI harnesses", () => {
+  it("advertises probed host models only on harnesses that can route them through the exact-turn relay", async () => {
     const previous = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL) => {
       if (String(url).includes(":8080")) {
@@ -1055,11 +1132,12 @@ describe("live Custom lists on every local CLI harness", () => {
           config: { cli: FAKE_AGY, fullAuto: true },
         }),
       );
-      for (const instance of instances) {
-        expect(instance.models.options.some((option) => option.id === "omlx::GLM-5.2-fp8" && option.custom)).toBe(
-          true,
-        );
+      for (const instance of instances.slice(0, 2)) {
+        expect(instance.models.options.some((option) => option.id === "omlx::GLM-5.2-fp8" && option.custom)).toBe(true);
       }
+      // Antigravity print mode has no supported per-turn custom endpoint. It
+      // must not advertise a model that would silently fall back to Google.
+      expect(instances[2]?.models.options.some((option) => option.id === "omlx::GLM-5.2-fp8")).toBe(false);
     } finally {
       globalThis.fetch = previous;
       for (const instance of instances) await instance.dispose();

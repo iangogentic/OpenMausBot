@@ -85,8 +85,8 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
     for (const message of messages) spokenIds.current.add(message.id);
   }
 
-  const askedApproval = useRef<{ requestId: string; member?: Bot } | null>(null);
-  const askedQuestion = useRef<{ requestId: string; member?: Bot } | null>(null);
+  const askedApproval = useRef<{ requestId: string; messageId: string; member?: Bot } | null>(null);
+  const askedQuestion = useRef<{ requestId: string; messageId: string; member?: Bot } | null>(null);
   const phaseRef = useRef<Phase>(initialPhase);
   const alive = useRef(true);
   const sayGeneration = useRef(0);
@@ -220,6 +220,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
             type: "decideRequest",
             threadId: group.threadId,
             requestId: openApproval.requestId,
+            messageId: openApproval.messageId,
             behavior: allow ? "allow" : "deny",
             message: allow ? undefined : "Denied by the user, on a group call.",
           });
@@ -238,6 +239,7 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
           type: "decideRequest",
           threadId: group.threadId,
           requestId: openQuestion.requestId,
+          messageId: openQuestion.messageId,
           behavior: "answer",
           message: said,
         });
@@ -286,16 +288,27 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
   }, [dispatch, enqueueSpeech, group.id, group.threadId, listen, move, scheduleListen]);
 
   useEffect(() => {
-    if (askedApproval.current && approval?.requestId !== askedApproval.current.requestId) {
+    if (
+      askedApproval.current &&
+      (approval?.requestId !== askedApproval.current.requestId ||
+        approval.message.id !== askedApproval.current.messageId)
+    ) {
       askedApproval.current = null;
     }
-    if (askedQuestion.current && question?.card?.requestId !== askedQuestion.current.requestId) {
+    if (
+      askedQuestion.current &&
+      (question?.card?.requestId !== askedQuestion.current.requestId || question.id !== askedQuestion.current.messageId)
+    ) {
       askedQuestion.current = null;
     }
 
-    if (approval && askedApproval.current?.requestId !== approval.requestId) {
+    if (
+      approval &&
+      (askedApproval.current?.requestId !== approval.requestId ||
+        askedApproval.current.messageId !== approval.message.id)
+    ) {
       const member = members.find((candidate) => candidate.id === approval.message.from?.botId);
-      askedApproval.current = { requestId: approval.requestId, member };
+      askedApproval.current = { requestId: approval.requestId, messageId: approval.message.id, member };
       spokenIds.current.add(approval.message.id);
       const name = member?.name ?? approval.message.from?.name ?? "A channel member";
       enqueueSpeech(
@@ -305,9 +318,12 @@ function GroupCall({ group, members }: { group: Group; members: Bot[] }) {
       );
     }
 
-    if (question?.card?.requestId && askedQuestion.current?.requestId !== question.card.requestId) {
+    if (
+      question?.card?.requestId &&
+      (askedQuestion.current?.requestId !== question.card.requestId || askedQuestion.current.messageId !== question.id)
+    ) {
       const member = members.find((candidate) => candidate.id === question.from?.botId);
-      askedQuestion.current = { requestId: question.card.requestId, member };
+      askedQuestion.current = { requestId: question.card.requestId, messageId: question.id, member };
       spokenIds.current.add(question.id);
       const name = member?.name ?? question.from?.name ?? "A channel member";
       const detail = question.card.subtitle.trim();

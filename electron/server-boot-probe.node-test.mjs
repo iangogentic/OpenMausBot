@@ -6,10 +6,9 @@ import { pollServerIdentity } from "./server-boot-probe.mjs";
 const OUR_BODY = () => ({ app: "openmausbot", pid: 4242, static: true });
 
 function okFetch({ body = OUR_BODY(), status = 200 } = {}) {
-  return async () => ({
-    ok: status >= 200 && status < 300,
+  return async () => new Response(JSON.stringify(body), {
     status,
-    json: async () => body,
+    headers: { "content-type": "application/json" },
   });
 }
 
@@ -45,7 +44,7 @@ test("a non-2xx health response is a foreign owner, reported without waiting out
   let attempts = 0;
   const fetchImpl = async () => {
     attempts += 1;
-    return { ok: false, status: 503, json: async () => null };
+    return new Response("", { status: 503 });
   };
   const startedAt = Date.now();
   const outcome = await pollServerIdentity({
@@ -64,7 +63,7 @@ test("a non-JSON body on an HTTP response counts as a foreign owner too", async 
     port: 28799,
     pid: () => 4242,
     bootTimeoutMs: 60_000,
-    fetchImpl: async () => ({ ok: true, status: 200, json: async () => "not json-shaped" }),
+    fetchImpl: async () => new Response("not json-shaped", { status: 200 }),
   });
   assert.equal(outcome.outcome, "foreign-owner");
 });
@@ -76,14 +75,12 @@ test("an incomplete response body that reaches the deadline is a timeout", async
     pid: () => 4242,
     bootTimeoutMs: 1_000,
     now: () => (atDeadline ? 1_000 : 0),
-    fetchImpl: async () => ({
-      ok: true,
-      status: 200,
-      json: async () => {
+    fetchImpl: async () => new Response(new ReadableStream({
+      pull(controller) {
         atDeadline = true;
-        throw new DOMException("body aborted", "AbortError");
+        controller.error(new DOMException("body aborted", "AbortError"));
       },
-    }),
+    }), { status: 200 }),
   });
   assert.equal(outcome.outcome, "timeout");
 });
@@ -159,7 +156,10 @@ test("regression: a pid read before the spawn event must not doom our own child"
   const fetchImpl = async () => {
     calls += 1;
     if (calls === 1) throw new Error("ECONNREFUSED");
-    return { ok: true, status: 200, json: async () => ({ app: "openmausbot", pid: 4242, static: true }) };
+    return new Response(JSON.stringify({ app: "openmausbot", pid: 4242, static: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   };
   const outcome = await pollServerIdentity({
     port: 8799,

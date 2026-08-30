@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenMausBot public listener to protected harness socket
+Requires=openmausbot.service
+After=openmausbot.service
+
+[Service]
+User=openmaus-server
+Group=openmaus-runtime
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd /run/openmausbot-private/harness.sock
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

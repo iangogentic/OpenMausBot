@@ -28,16 +28,11 @@ CUA supply-chain work is tracked in [issue #113](https://github.com/milind-soni/
 [issue #79](https://github.com/milind-soni/OpenMausBot/issues/79), and guarded GNOME/Wayland support in
 [issue #109](https://github.com/milind-soni/OpenMausBot/issues/109).
 
-## Download packages
+## Packages
 
-Choose one Ubuntu 24.04 x86_64 package from the latest release:
-
-- [Debian package (`OpenMausBot-amd64.deb`)](https://github.com/milind-soni/openmausbot-releases/releases/latest/download/OpenMausBot-amd64.deb) — recommended; APT installs its desktop dependencies.
-- [Portable AppImage (`OpenMausBot.AppImage`)](https://github.com/milind-soni/openmausbot-releases/releases/latest/download/OpenMausBot.AppImage) — does not install system files.
-- [SHA-256 checksums](https://github.com/milind-soni/openmausbot-releases/releases/latest/download/SHA256SUMS-ubuntu-x64.txt)
-
-Versioned packages and previous releases remain available on the
-[releases page](https://github.com/milind-soni/openmausbot-releases/releases).
+Build packages from this repository for the remote-host, per-bot VM, model
+relay, and physical-bridge features described here. The upstream v0.1.37
+packages predate those changes and are not interchangeable with this fork.
 
 ## Build packages
 
@@ -48,7 +43,7 @@ Requirements for building from source:
 - pnpm 10.33.0 (Corepack can install the version declared by the project)
 
 ```sh
-git clone https://github.com/milind-soni/OpenMausBot.git
+git clone https://github.com/iangogentic/OpenMausBot.git
 cd OpenMausBot
 corepack enable
 pnpm install --frozen-lockfile
@@ -90,13 +85,17 @@ configuration directory (`~/.config/openmausbot` unless the environment override
 
 ## Develop the desktop shell
 
-Development mode uses three processes. Keep each command running in its own terminal:
+Development mode starts one authenticated generation containing the harness,
+Vite, and Electron:
 
 ```sh
-pnpm dev:server
 pnpm dev
-pnpm dev:desktop
 ```
+
+Browser-only authenticated development is deliberately disabled. A provider
+CLI can reach the same loopback Vite proxy, so letting that proxy inject the UI
+bearer would grant the CLI control-plane authority. Use `pnpm dev`; Electron
+adds the ephemeral bearer at its app-owned request boundary.
 
 For a package-shaped build without creating `.deb` or AppImage artifacts:
 

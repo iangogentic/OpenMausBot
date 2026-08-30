@@ -24,6 +24,7 @@ const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
+const UI_SESSION_TOKEN = `decisions-ui-session-${"s".repeat(43)}`;
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 let child: ChildProcess;
@@ -33,7 +34,10 @@ let stderr = "";
 const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
+    headers: {
+      "x-openmausbot-session": UI_SESSION_TOKEN,
+      ...(body ? { "content-type": "application/json" } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: await res.json() };
@@ -100,15 +104,61 @@ async function waitForRunThread(runId: string, ms = 20_000) {
  * folds that to tool "shell", summary "echo hi" — so the always-allow key
  * is "shell:echo"). */
 async function makePermissionBot(patch: Record<string, unknown>) {
+  const requestedGrants = Array.isArray(patch.alwaysAllow)
+    ? patch.alwaysAllow.filter((value): value is string => typeof value === "string")
+    : [];
+  const wantsAuto = patch.autoApprove === true;
+  const safePatch = { ...patch };
+  delete safePatch.alwaysAllow;
+  delete safePatch.autoApprove;
   const created = await api("POST", "/api/bots");
   expect(created.status).toBe(201);
   const bot = created.body.bot;
   const patched = await api("PATCH", `/api/bots/${bot.id}`, {
-    ...patch,
+    ...safePatch,
     modelSelection: { instanceId: "grok", model: "fake-model" },
   });
   expect(patched.status).toBe(200);
-  return patched.body.bot ?? bot;
+  let current = patched.body.bot ?? bot;
+
+  // Remembered grants may only be minted from an exact live approval card.
+  // Prime the fixture through the same endpoint/order as the real "Always
+  // allow" button instead of forging privileged state through PATCH.
+  for (const allowKey of requestedGrants) {
+    expect((await api("POST", `/api/bots/${current.id}/messages`, { text: "prime remembered permission" })).status).toBe(202);
+    const card = await waitForBotCard(current.id);
+    expect(card, "the remembered-grant fixture never received its approval card").not.toBeNull();
+    expect(card.card.allowKey).toBe(allowKey);
+    expect((await api("POST", `/api/bots/${current.id}/always-allow`, {
+      allowKey,
+      messageId: card.id,
+    })).status).toBe(200);
+    expect((await api("POST", `/api/bots/${current.id}/respond`, {
+      requestId: card.card.requestId,
+      messageId: card.id,
+      behavior: "allow",
+    })).status).toBe(200);
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const { body } = await api("GET", "/api/bots");
+      const latest = (body.bots ?? []).find((candidate: { id: string }) => candidate.id === current.id);
+      if (latest && !latest.busy) {
+        current = latest;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(current.busy).not.toBe(true);
+  }
+  if (wantsAuto) {
+    const auto = await api("PATCH", `/api/bots/${current.id}`, {
+      autoApprove: true,
+      acknowledgeLocalAuto: true,
+    });
+    expect(auto.status).toBe(200);
+    current = auto.body.bot ?? current;
+  }
+  return current;
 }
 
 posixOnly("authorization decisions are logged", () => {
@@ -135,7 +185,9 @@ posixOnly("authorization decisions are logged", () => {
         ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
         HOME: home,
         USERPROFILE: home,
+        VITEST: process.env.VITEST ?? "true",
         OMB_PORT: String(PORT),
+        OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -192,7 +244,11 @@ posixOnly("authorization decisions are logged", () => {
       expect(shown!.botId).toBe(bot.id);
       expect(shown!.tool).toBe("shell");
 
-      const answered = await api("POST", `/api/bots/${bot.id}/respond`, { requestId, behavior: "allow" });
+      const answered = await api("POST", `/api/bots/${bot.id}/respond`, {
+        requestId,
+        messageId: card.id,
+        behavior: "allow",
+      });
       expect(answered.status).toBe(200);
       expect(answered.body.outcome).not.toBe("unavailable");
 
@@ -215,7 +271,11 @@ posixOnly("authorization decisions are logged", () => {
       const card = await waitForBotCard(bot.id);
       expect(card).not.toBeNull();
       const requestId = card.card.requestId as string;
-      expect((await api("POST", `/api/bots/${bot.id}/respond`, { requestId, behavior: "deny" })).status).toBe(200);
+      expect((await api("POST", `/api/bots/${bot.id}/respond`, {
+        requestId,
+        messageId: card.id,
+        behavior: "deny",
+      })).status).toBe(200);
 
       const user = await waitForDecision((r) => r.decision === "user-denied" && r.requestId === requestId);
       expect(user, "the denial never reached the decision log").not.toBeNull();

@@ -9,10 +9,9 @@ describe("AssemblyAI credential boundary", () => {
   });
 
   it("mints a bounded temporary token without putting the permanent key in the URL", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
+    const fetchImpl = vi.fn(async () => new Response('{"token":"temporary"}', {
       status: 200,
-      json: async () => ({ token: "temporary" }),
+      headers: { "content-type": "application/json" },
     }));
     await expect(mintAssemblyAIStreamingToken("permanent", { fetchImpl, expiresInSeconds: 900 }))
       .resolves.toEqual({ token: "temporary", expiresInSeconds: 600 });
@@ -20,16 +19,16 @@ describe("AssemblyAI credential boundary", () => {
       "https://streaming.assemblyai.com/v3/token?expires_in_seconds=600",
       {
         headers: { authorization: "permanent" },
+        redirect: "error",
         signal: expect.any(AbortSignal),
       },
     );
   });
 
   it("returns a useful error without exposing an upstream response body", async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: false,
+    const fetchImpl = vi.fn(async () => new Response('{"error":"upstream secret-shaped detail"}', {
       status: 401,
-      json: async () => ({ error: "upstream secret-shaped detail" }),
+      headers: { "content-type": "application/json" },
     }));
     await expect(mintAssemblyAIStreamingToken("wrong", { fetchImpl }))
       .rejects.toThrow("AssemblyAI rejected this API key");

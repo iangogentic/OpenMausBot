@@ -41,6 +41,9 @@ export default defineConfig({
     proxy: {
       "/api": {
         target: `http://127.0.0.1:${process.env.OMB_PORT || process.env.OGB_PORT || 8799}`,
+        // Never inject authority here. Any same-host provider can call Vite,
+        // so the only accepted dev client is Electron, which adds its
+        // per-generation bearer in the app-owned webRequest boundary.
       },
     },
   },

@@ -1,17 +1,17 @@
-// The one transparent stdio bridge behind both MCP entry points
-// (container-mcp.ts for the Local VM, vps-container-mcp.ts for the BYO VPS).
-// It defines no tools and parses no MCP messages: bytes in, bytes out.
+// The stdio bridge for the BYO-VPS entry point and trusted in-process MCP
+// transports. Local VM providers use container-mcp.ts's authority-free
+// WebSocket relay instead; the trusted server-owned broker gates that lane.
+// With no gate this module defines no tools and remains a byte-for-byte pipe.
 //
-// The single exception to that transparency is the who-is-driving gate
-// (opt-in via `gate`). While the person holds control of this computer in
-// the app, a `tools/call` from the agent is answered with a refusal HERE,
-// on the near side, and never forwarded — Cua Driver on the far side has
-// no concept of a person holding the wheel, so the refusal cannot come
-// from anywhere else. Everything that is not a tools/call still passes
-// through untouched, and with no gate configured the bridge remains the
-// byte-for-byte pipe described above.
+// The opt-in who-is-driving gate parses only enough JSON-RPC to enforce two
+// ownership behaviors Cua Driver cannot know about: every tools/call gets an
+// action ticket before forwarding, and tools/list gains one bridge-owned
+// computer_request_help tool for human handoff. While a person holds control,
+// calls are answered with a refusal HERE and never reach the driver. Batches
+// and duplicate request ids are rejected atomically; other singular frames
+// pass through unchanged.
 //
-// Two behaviors live here so neither entry point can drift:
+// Two transport behaviors live here for every caller that uses this bridge:
 //   1. Exit without truncation. `process.exit()` in a close/error handler
 //      discards whatever is still buffered on stdout — a final MCP result
 //      would be cut mid-frame. The bridge sets exitCode and unpipes instead,
@@ -21,10 +21,22 @@
 //      VPS dropping mid-turn leaves the exec silently wedged until the OS
 //      gives up — the harness sees a hung tool call, not an error.
 import { spawn } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
 
-import { CONTROL_REFUSAL_PLAIN, createControlClient } from "./control-client.ts";
+import {
+  CONTROL_ACTION_BUSY_PLAIN,
+  CONTROL_LIFECYCLE_PLAIN,
+  CONTROL_REFUSAL_PLAIN,
+  CONTROL_UNAVAILABLE_PLAIN,
+  createControlClient,
+  type ActionPermit,
+  type ControlClient,
+} from "./control-client.ts";
 import { augmentedPath } from "./env-path.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedUtf8LineDecoder,
+  PROVIDER_NDJSON_LIMITS,
+} from "./drivers/bounded-json-lines.ts";
 
 // 45s of TOTAL silence before the bridge even probes. An MCP session is
 // legitimately quiet between tool calls and a slow screenshot can take tens
@@ -125,6 +137,8 @@ export function createInactivityWatchdog(options: {
 export interface BridgeOptions {
   command: string;
   args: string[];
+  /** Optional sanitized environment for the far-end driver. */
+  env?: NodeJS.ProcessEnv;
   /** Names the far end in stderr messages, e.g. "Cua Driver". */
   label: string;
   /** Enables the dead-transport watchdog. Omitted for the Local VM, whose
@@ -135,29 +149,92 @@ export interface BridgeOptions {
   gate?: { url: string; token: string };
 }
 
+export const COMPUTER_REQUEST_HELP_TOOL = {
+  name: "computer_request_help",
+  description:
+    "Ask the person to take over this computer and wait until they hand it back. " +
+    "Use only when blocked by login, CAPTCHA, consent, or another step that truly needs a person. " +
+    "After it returns, take a fresh screenshot because the screen changed while they drove.",
+  inputSchema: {
+    type: "object",
+    properties: { reason: { type: "string", description: "Short explanation of what needs human help." } },
+    additionalProperties: false,
+  },
+} as const;
+
 /** Collect a byte stream into complete newline-terminated lines. MCP's
  * stdio transport is one JSON-RPC frame per line, so line boundaries are
  * the only safe place to inspect — or inject — anything. */
-export function createLineSplitter(onLine: (line: string) => void): {
-  push: (chunk: Buffer | string) => void;
-  flush: () => void;
+export const MCP_MAX_LINE_BYTES = 1024 * 1024;
+export const MCP_MAX_PENDING_FRAMES = 64;
+export const MCP_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+export const MCP_BATCH_UNSUPPORTED_PLAIN =
+  "JSON-RPC batches are not supported for computer control. Send one request at a time.";
+
+export function createLineSplitter(
+  onLine: (line: string) => void | boolean,
+  options: {
+    maxLineBytes?: number;
+    maxTotalBytes?: number;
+    maxFrames?: number;
+    maxFramesPerWindow?: number;
+    frameWindowMs?: number;
+    onOverflow?: () => void;
+  } = {},
+): {
+  push: (chunk: Buffer | string) => boolean;
+  flush: () => boolean;
 } {
-  let pending = "";
-  const decoder = new StringDecoder("utf8");
+  const maxLineBytes = options.maxLineBytes ?? MCP_MAX_LINE_BYTES;
+  if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) {
+    throw new TypeError("maxLineBytes must be a positive safe integer");
+  }
+  const decoder = new BoundedUtf8LineDecoder({
+    maxLineBytes,
+    maxBufferedBytes: maxLineBytes,
+    maxTotalBytes: options.maxTotalBytes ?? PROVIDER_NDJSON_LIMITS.maxTotalBytes,
+    maxFrames: options.maxFrames ?? PROVIDER_NDJSON_LIMITS.maxFrames,
+    maxFramesPerWindow: options.maxFramesPerWindow ?? PROVIDER_NDJSON_LIMITS.maxFramesPerWindow,
+    frameWindowMs: options.frameWindowMs ?? PROVIDER_NDJSON_LIMITS.frameWindowMs,
+  });
+  let failed = false;
+
+  const overflow = () => {
+    if (!failed) options.onOverflow?.();
+    failed = true;
+    return false;
+  };
+
+  const deliver = (lines: Array<{ line: string }>) => {
+    for (const { line } of lines) {
+      const accepted = onLine(line);
+      if (accepted === false) {
+        // The consumer owns the error report (for example its serialized
+        // queue overflowed). Do not fire the splitter callback twice.
+        failed = true;
+        return false;
+      }
+      if (failed) return false;
+    }
+    return true;
+  };
+
   return {
     push(chunk) {
-      pending += typeof chunk === "string" ? chunk : decoder.write(chunk);
-      let newline: number;
-      while ((newline = pending.indexOf("\n")) !== -1) {
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        onLine(line);
+      if (failed) return false;
+      try {
+        return deliver(decoder.push(chunk));
+      } catch {
+        return overflow();
       }
     },
     flush() {
-      pending += decoder.end();
-      if (pending) onLine(pending);
-      pending = "";
+      if (failed) return false;
+      try {
+        return deliver(decoder.flush());
+      } catch {
+        return overflow();
+      }
     },
   };
 }
@@ -168,16 +245,65 @@ export function createLineSplitter(onLine: (line: string) => void): {
  * reorder the agent's protocol stream. Only a `tools/call` is ever
  * refused; every other frame — handshakes, tools/list, notifications,
  * lines that are not JSON — passes through untouched. */
+export type GateInterceptor = ((line: string) => boolean) & { drain: () => Promise<void> };
+
 export function createGateInterceptor(options: {
-  isHeld: () => Promise<boolean>;
+  beginAction: () => Promise<ActionPermit>;
   forward: (line: string) => void;
   refuse: (line: string) => void;
+  actionForwarded?: (requestId: string, actionId: string) => void;
+  toolsListRequested?: (requestId: string) => void;
+  /** Track any other request forwarded to the driver (for example
+   * initialize), so its id cannot be reused by a tools/call before the first
+   * response and falsely settle that action. */
+  requestForwarded?: (requestId: string) => void;
+  requestHelp?: (reason: string) => Promise<{ text: string; isError?: boolean }>;
+  /** Reject a request id that is already live at the far-end driver. This is
+   * evaluated on the same serialized queue as beginAction, so a duplicate
+   * cannot race the first request's actionForwarded callback. */
+  requestIdAvailable?: (requestId: string) => boolean | Promise<boolean>;
+  /** Release a ticket acquired after this bounded queue was already closed. */
+  actionAbandoned?: (actionId: string) => void | Promise<void>;
+  onOverflow?: () => void;
+  maxPendingFrames?: number;
+  maxPendingBytes?: number;
   refusalText?: string;
-}): (line: string) => void {
+  unavailableText?: string;
+  lifecycleText?: string;
+  actionBusyText?: string;
+}): GateInterceptor {
   const refusalText = options.refusalText ?? CONTROL_REFUSAL_PLAIN;
+  const unavailableText = options.unavailableText ?? CONTROL_UNAVAILABLE_PLAIN;
+  const lifecycleText = options.lifecycleText ?? CONTROL_LIFECYCLE_PLAIN;
+  const actionBusyText = options.actionBusyText ?? CONTROL_ACTION_BUSY_PLAIN;
+  const maxPendingFrames = options.maxPendingFrames ?? MCP_MAX_PENDING_FRAMES;
+  const maxPendingBytes = options.maxPendingBytes ?? MCP_MAX_PENDING_BYTES;
+  if (!Number.isSafeInteger(maxPendingFrames) || maxPendingFrames < 1) {
+    throw new TypeError("maxPendingFrames must be a positive safe integer");
+  }
+  if (!Number.isSafeInteger(maxPendingBytes) || maxPendingBytes < 1) {
+    throw new TypeError("maxPendingBytes must be a positive safe integer");
+  }
   let queue: Promise<void> = Promise.resolve();
-  return (line: string) => {
-    queue = queue.then(async () => {
+  let pendingFrames = 0;
+  let pendingBytes = 0;
+  let failed = false;
+  const intercept = ((line: string) => {
+    if (failed) return false;
+    const lineBytes = Buffer.byteLength(line) + 1;
+    if (
+      lineBytes > maxPendingBytes ||
+      pendingFrames + 1 > maxPendingFrames ||
+      pendingBytes + lineBytes > maxPendingBytes
+    ) {
+      failed = true;
+      options.onOverflow?.();
+      return false;
+    }
+    pendingFrames += 1;
+    pendingBytes += lineBytes;
+    const task = queue.then(async () => {
+      if (failed) return;
       let frame: any = null;
       try {
         frame = JSON.parse(line);
@@ -185,30 +311,183 @@ export function createGateInterceptor(options: {
         // not a frame this gate understands — never stand between the
         // agent and its driver on anything but a recognized tool call
       }
-      if (!frame || frame.method !== "tools/call") {
+      if (!frame) {
         options.forward(line);
         return;
       }
-      const held = await options.isHeld().catch(() => false);
-      if (!held) {
+      assertBoundedJsonShape(frame, PROVIDER_NDJSON_LIMITS);
+      // A batch must be treated atomically. Passing an array through this
+      // object-shaped gate would let every embedded tools/call bypass its
+      // control ticket. Reject the whole batch before inspecting or
+      // forwarding any member; callers that need concurrency can send
+      // separately framed requests, which remain ordered by this queue.
+      if (Array.isArray(frame)) {
+        options.refuse(jsonRpcErrorFrame(null, -32600, MCP_BATCH_UNSUPPORTED_PLAIN));
+        return;
+      }
+      const requestFrame = typeof frame.method === "string";
+      const gatedRequestId = requestFrame ? requestKey(frame.id) : null;
+      if (
+        gatedRequestId !== null &&
+        options.requestIdAvailable &&
+        !(await Promise.resolve(options.requestIdAvailable(gatedRequestId)).catch(() => false))
+      ) {
+        options.refuse(jsonRpcErrorFrame(frame.id, -32600, "This JSON-RPC request id is already in flight"));
+        return;
+      }
+      if (frame.method === "tools/list") {
+        const id = gatedRequestId;
+        if (id) options.toolsListRequested?.(id);
         options.forward(line);
         return;
       }
-      options.refuse(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: frame.id ?? null,
-          result: { content: [{ type: "text", text: refusalText }], isError: true },
-        }),
+      if (frame.method !== "tools/call") {
+        if (gatedRequestId) options.requestForwarded?.(gatedRequestId);
+        options.forward(line);
+        return;
+      }
+      const requestId = requestKey(frame.id);
+      if (requestId === null) {
+        options.refuse(refusalFrame(frame.id, unavailableText));
+        return;
+      }
+      if (frame.params?.name === COMPUTER_REQUEST_HELP_TOOL.name && options.requestHelp) {
+        const reason = typeof frame.params?.arguments?.reason === "string" ? frame.params.arguments.reason : "";
+        const result = await options.requestHelp(reason).catch(() => ({
+          text: "Computer control authority became unavailable while asking for help. Pause and tell the person in chat.",
+          isError: true,
+        }));
+        if (failed) return;
+        options.refuse(toolResultFrame(frame.id, result.text, result.isError === true));
+        return;
+      }
+      const permit = await options.beginAction().catch(
+        (): ActionPermit => ({ allowed: false, reason: "unavailable" }),
       );
+      if (failed) {
+        if (permit.allowed) await options.actionAbandoned?.(permit.actionId);
+        return;
+      }
+      if (permit.allowed) {
+        options.actionForwarded?.(requestId, permit.actionId);
+        options.forward(line);
+        return;
+      }
+      options.refuse(refusalFrame(
+        frame.id,
+        permit.reason === "unavailable"
+          ? unavailableText
+          : permit.reason === "lifecycle-active"
+            ? lifecycleText
+            : permit.reason === "action-active"
+              ? actionBusyText
+            : refusalText,
+      ));
     });
-  };
+    queue = task.catch(() => {
+      if (!failed) {
+        failed = true;
+        options.onOverflow?.();
+      }
+    }).finally(() => {
+      pendingFrames -= 1;
+      pendingBytes -= lineBytes;
+    });
+    return true;
+  }) as GateInterceptor;
+  // stdin EOF is ordered after every preceding frame. Because the authority
+  // check is async, callers must await this queue before ending child stdin or
+  // a permitted action can be ticketed after the driver has already seen EOF.
+  intercept.drain = () => queue;
+  return intercept;
+}
+
+function requestKey(id: unknown): string | null {
+  return typeof id === "string" || (typeof id === "number" && Number.isFinite(id))
+    ? `${typeof id}:${String(id)}`
+    : null;
+}
+
+function refusalFrame(id: unknown, text: string): string {
+  return toolResultFrame(id, text, true);
+}
+
+function jsonRpcErrorFrame(id: unknown, code: number, message: string): string {
+  return JSON.stringify({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
+}
+
+function toolResultFrame(id: unknown, text: string, isError: boolean): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id: id ?? null,
+    result: { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) },
+  });
+}
+
+/** Add the bridge-owned handoff tool without hiding or rewriting any driver
+ * tools. Only the response to a tools/list request observed on this bridge is
+ * eligible, and an upstream tool of the same name wins to avoid duplication. */
+export function augmentToolsListResponse(line: string, pendingRequestIds: Set<string>): string {
+  let frame: any = null;
+  try {
+    frame = JSON.parse(line);
+  } catch {
+    return line;
+  }
+  assertBoundedJsonShape(frame, PROVIDER_NDJSON_LIMITS);
+  const id = requestKey(frame?.id);
+  if (!id || !pendingRequestIds.delete(id) || !Array.isArray(frame?.result?.tools)) return line;
+  if (frame.result.tools.some((tool: any) => tool?.name === COMPUTER_REQUEST_HELP_TOOL.name)) return line;
+  return JSON.stringify({
+    ...frame,
+    result: { ...frame.result, tools: [...frame.result.tools, COMPUTER_REQUEST_HELP_TOOL] },
+  });
+}
+
+export async function waitForHumanHelp(
+  client: ControlClient,
+  reason: string,
+  options: { pollMs?: number; waitMs?: number } = {},
+): Promise<{ text: string; isError?: boolean }> {
+  if (!client.configured) {
+    return { text: "Computer control authority is unavailable, so nobody can be paged safely right now.", isError: true };
+  }
+  const initial = await client.state(true);
+  if (!initial.available) {
+    return { text: "Computer control authority is unavailable, so nobody can be paged safely right now.", isError: true };
+  }
+  const requestId = initial.held ? null : await client.requestHelp(reason);
+  if (!initial.held && requestId === null) {
+    return { text: "The person could not be paged for this computer right now. Tell them in chat.", isError: true };
+  }
+  let sawHold = initial.held;
+  const pollMs = Math.max(25, options.pollMs ?? (Number(process.env.OMB_CONTROL_POLL_MS) || 1_500));
+  const waitMs = Math.max(100, options.waitMs ?? (Number(process.env.OMB_CONTROL_WAIT_MS) || 600_000));
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    const state = await client.state(true);
+    if (!state.available) {
+      if (requestId) await client.expireHelp(requestId);
+      return { text: "Computer control authority became unavailable while waiting. Pause and tell the person in chat.", isError: true };
+    }
+    if (state.held) sawHold = true;
+    if (!state.held && !state.helpOpen) {
+      return {
+        text: sawHold
+          ? "The person has finished driving and handed control back. Take a fresh screenshot before your next action."
+          : "The person saw your request and dismissed it without taking control. Carry on yourself.",
+      };
+    }
+  }
+  if (requestId) await client.expireHelp(requestId);
+  return { text: "Nobody took control within the wait window. Pause or ask again if you are still blocked.", isError: true };
 }
 
 export function runMcpBridge(options: BridgeOptions): void {
   const child = spawn(options.command, options.args, {
     shell: false,
-    env: { ...process.env, PATH: augmentedPath() },
+    env: { ...(options.env ?? process.env), PATH: augmentedPath() },
     stdio: ["pipe", "pipe", "pipe"],
   });
 
@@ -216,31 +495,159 @@ export function runMcpBridge(options: BridgeOptions): void {
   child.stdin.on("error", () => {});
   child.stderr.pipe(process.stderr);
 
-  let detach: () => void;
+  let detach: () => void = () => {};
+  let bridgeFailed = false;
+  let bridgeFailureFailsafe: ReturnType<typeof setTimeout> | null = null;
+  const failBridge = (reason: string) => {
+    if (bridgeFailed) return;
+    bridgeFailed = true;
+    process.stderr.write(`${reason}\n`);
+    process.exitCode = 1;
+    detach();
+    child.stdin.destroy();
+    child.kill("SIGKILL");
+    bridgeFailureFailsafe = setTimeout(() => process.exit(1), 2_000);
+    bridgeFailureFailsafe.unref?.();
+  };
   if (options.gate) {
     const client = createControlClient({ url: options.gate.url, token: options.gate.token });
-    const inbound = createLineSplitter(
-      createGateInterceptor({
-        isHeld: async () => (await client.state(true)).held,
-        forward: (line) => child.stdin.write(line + "\n"),
-        refuse: (line) => process.stdout.write(line + "\n"),
-      }),
-    );
+    const pendingActions = new Map<string, string>();
+    const pendingToolsList = new Set<string>();
+    let detached = false;
+    let childInputBackpressured = false;
+    let harnessOutputBackpressured = false;
+    const updateInputFlow = () => {
+      if (detached || childInputBackpressured || harnessOutputBackpressured) process.stdin.pause();
+      else process.stdin.resume();
+    };
+    const onChildInputDrain = () => {
+      childInputBackpressured = false;
+      updateInputFlow();
+    };
+    const onHarnessOutputDrain = () => {
+      harnessOutputBackpressured = false;
+      if (!detached && !bridgeFailed) child.stdout.resume();
+      updateInputFlow();
+    };
+    child.stdin.on("drain", onChildInputDrain);
+    process.stdout.on("drain", onHarnessOutputDrain);
+    const forwardToChild = (line: string) => {
+      if (detached || bridgeFailed) return;
+      if (!child.stdin.write(line + "\n")) {
+        childInputBackpressured = true;
+        updateInputFlow();
+      }
+    };
+    const emitHarness = (line: string) => {
+      if (bridgeFailed) return;
+      if (!process.stdout.write(line + "\n")) {
+        harnessOutputBackpressured = true;
+        child.stdout.pause();
+        updateInputFlow();
+      }
+    };
+    const interceptor = createGateInterceptor({
+      beginAction: () => client.beginAction(),
+      actionForwarded: (requestId, actionId) => pendingActions.set(requestId, actionId),
+      actionAbandoned: async (actionId) => {
+        if (!(await client.endAction(actionId))) await client.quarantineActions();
+      },
+      toolsListRequested: (requestId) => {
+        if (pendingToolsList.size >= MCP_MAX_PENDING_FRAMES) {
+          failBridge("too many unanswered computer MCP tool-list requests");
+          return;
+        }
+        pendingToolsList.add(requestId);
+      },
+      requestHelp: (reason) => waitForHumanHelp(client, reason),
+      forward: forwardToChild,
+      refuse: emitHarness,
+      onOverflow: () => failBridge("computer MCP request queue exceeded its limit"),
+    });
+    const inbound = createLineSplitter(interceptor, {
+      maxLineBytes: MCP_MAX_LINE_BYTES,
+      onOverflow: () => failBridge("computer MCP request frame exceeded its limit"),
+    });
     const onStdin = (chunk: Buffer) => inbound.push(chunk);
     process.stdin.on("data", onStdin);
     process.stdin.on("end", () => {
       inbound.flush();
-      child.stdin.end();
+      void interceptor.drain().finally(() => {
+        if (!bridgeFailed) child.stdin.end();
+      });
     });
     // Injected refusals must never land inside one of the child's
     // half-written frames, so the child's stdout is re-emitted at line
     // granularity as well.
-    const outbound = createLineSplitter((line) => process.stdout.write(line + "\n"));
+    let outboundQueue: Promise<void> = Promise.resolve();
+    let outboundPendingFrames = 0;
+    let outboundPendingBytes = 0;
+    let outboundFailed = false;
+    const outbound = createLineSplitter((line) => {
+      if (bridgeFailed || outboundFailed) return false;
+      const lineBytes = Buffer.byteLength(line) + 1;
+      if (
+        lineBytes > MCP_MAX_PENDING_BYTES ||
+        outboundPendingFrames + 1 > MCP_MAX_PENDING_FRAMES ||
+        outboundPendingBytes + lineBytes > MCP_MAX_PENDING_BYTES
+      ) {
+        outboundFailed = true;
+        failBridge("computer MCP response queue exceeded its limit");
+        return false;
+      }
+      outboundPendingFrames += 1;
+      outboundPendingBytes += lineBytes;
+      // Do not deliver a tool result to the provider until the harness has
+      // observed its action ticket ending. Otherwise the provider can emit
+      // turn.completed, clear the exact Auto target, and let a takeover race
+      // the still-registered action.
+      const task = outboundQueue.then(async () => {
+        if (bridgeFailed) return;
+        let frame: any = null;
+        try {
+          frame = JSON.parse(line);
+        } catch {}
+        if (frame !== null) assertBoundedJsonShape(frame, PROVIDER_NDJSON_LIMITS);
+        const id = requestKey(frame?.id);
+        if (id !== null && ("result" in (frame ?? {}) || "error" in (frame ?? {}))) {
+          const actionId = pendingActions.get(id);
+          if (actionId) {
+            const ended = await client.endAction(actionId);
+            if (!ended) {
+              failBridge("computer control authority did not acknowledge the completed action");
+              return;
+            }
+            pendingActions.delete(id);
+          }
+        }
+        emitHarness(augmentToolsListResponse(line, pendingToolsList));
+      });
+      outboundQueue = task.catch(() => {
+        failBridge("computer MCP response processing failed");
+      }).finally(() => {
+        outboundPendingFrames -= 1;
+        outboundPendingBytes -= lineBytes;
+      });
+      return true;
+    }, {
+      maxLineBytes: MCP_MAX_LINE_BYTES,
+      onOverflow: () => failBridge("computer MCP response frame exceeded its limit"),
+    });
     child.stdout.on("data", (chunk) => outbound.push(chunk));
     child.stdout.on("end", () => outbound.flush());
     detach = () => {
+      if (detached) return;
+      detached = true;
       process.stdin.off("data", onStdin);
       process.stdin.pause();
+      child.stdin.off("drain", onChildInputDrain);
+      process.stdout.off("drain", onHarnessOutputDrain);
+      child.stdout.pause();
+      // Never clear pending tickets merely because stdio disappeared. A
+      // remote click can keep running after SSH/docker/the child dies; the
+      // orphaned ticket is the conservative fence until a confirmed result
+      // ends it or a server-owned target reset proves the computer stopped.
+      void client.quarantineActions();
     };
   } else {
     process.stdin.pipe(child.stdin);
@@ -252,6 +659,8 @@ export function runMcpBridge(options: BridgeOptions): void {
   }
 
   let watchdog: WatchdogHandle | null = null;
+  let signalEscalation: ReturnType<typeof setTimeout> | null = null;
+  let signalExitFailsafe: ReturnType<typeof setTimeout> | null = null;
   if (options.liveness) {
     const liveness = options.liveness;
     watchdog = createInactivityWatchdog({
@@ -285,6 +694,9 @@ export function runMcpBridge(options: BridgeOptions): void {
     detach();
   });
   child.on("close", (code, signal) => {
+    if (bridgeFailureFailsafe) clearTimeout(bridgeFailureFailsafe);
+    if (signalEscalation) clearTimeout(signalEscalation);
+    if (signalExitFailsafe) clearTimeout(signalExitFailsafe);
     if (signal) process.stderr.write(`${options.label} connection ended with ${signal}\n`);
     // Let stdout and stderr drain before the bridge exits.
     process.exitCode = process.exitCode ?? code ?? 1;
@@ -293,6 +705,16 @@ export function runMcpBridge(options: BridgeOptions): void {
   });
 
   for (const signal of ["SIGTERM", "SIGINT"] as const) {
-    process.on(signal, () => child.kill(signal));
+    process.on(signal, () => {
+      if (signalEscalation) return;
+      process.exitCode = signal === "SIGTERM" ? 143 : 130;
+      child.kill(signal);
+      signalEscalation = setTimeout(() => {
+        child.kill("SIGKILL");
+        signalExitFailsafe = setTimeout(() => process.exit(process.exitCode ?? 1), 2_000);
+        signalExitFailsafe.unref?.();
+      }, 2_000);
+      signalEscalation.unref?.();
+    });
   }
 }

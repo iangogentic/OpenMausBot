@@ -22,6 +22,12 @@ import type {
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { appendNative } from "./native.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedJsonLineDecoder,
+  PROVIDER_NDJSON_LIMITS,
+} from "./bounded-json-lines.ts";
+import { readBoundedResponseText } from "../bounded-response.ts";
 
 const DRIVER_KIND = "minimax";
 const API_KEY_ENV = "MINIMAX_API_KEY";
@@ -164,12 +170,14 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       });
 
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
+        const body = await readBoundedResponseText(res, 64 * 1024, "MiniMax error response is too large").catch(() => "");
         throw new Error(`MiniMax HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
       }
 
       if (!opts.stream) {
-        const json: any = await res.json();
+        const raw = await readBoundedResponseText(res, 8 * 1024 * 1024, "MiniMax response is too large");
+        const json: any = JSON.parse(raw);
+        assertBoundedJsonShape(json, PROVIDER_NDJSON_LIMITS);
         return {
           text: json.choices?.[0]?.message?.content ?? "",
           usage: json.usage
@@ -183,22 +191,16 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       let usage: { input: number; output: number } | null = null;
       if (!res.body) throw new Error("MiniMax returned no response body");
       const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
+      const frames = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS, {
+        jsonPrefix: "data:",
+        ignoredJsonPayloads: ["[DONE]"],
+      });
       try {
-        readLoop: for (;;) {
+        for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          let nl;
-          while ((nl = buf.indexOf("\n")) !== -1) {
-            const line = buf.slice(0, nl).trim();
-            buf = buf.slice(nl + 1);
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
-            if (data === "[DONE]") break readLoop;
-            let chunk: any;
-            try { chunk = JSON.parse(data); } catch { continue; }
+          for (const { value: parsed } of frames.push(value)) {
+            const chunk: any = parsed;
             const delta = chunk.choices?.[0]?.delta?.content;
             if (delta) { text += delta; opts.onDelta?.(delta); }
             if (chunk.usage) {
@@ -217,7 +219,7 @@ export const MinimaxDriver: ProviderDriver<MinimaxConfig> = {
       if (!apiKey) throw new Error(`no MiniMax key — set ${API_KEY_ENV} or run mmx auth login --api-key …`);
       if (active.has(threadId)) throw new Error("a turn is already running on this thread");
 
-      const turnId = newId();
+      const turnId = turn.turnId ?? newId();
       const abort = new AbortController();
       active.set(threadId, { abort, turnId });
 

@@ -16,7 +16,12 @@ const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
-export const DEFAULT_LOCAL_VM_MODE = "shared" as const;
+// A shared VM makes two independent bots contend for one desktop and was the
+// source of the confusing "already being used by another turn" failure. New
+// installs therefore get one isolated desktop per bot by default. The explicit
+// `shared` setting remains available for operators who deliberately prefer the
+// smaller resource footprint.
+export const DEFAULT_LOCAL_VM_MODE = "per-bot" as const;
 export const DEFAULT_LOCAL_VM_MAX_INSTANCES = 2;
 export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
 export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
@@ -127,6 +132,23 @@ export function parseStoredConfig(value: JsonValue): AppConfig {
 }
 
 export function parseConfigPatch(value: JsonValue): ConfigPatch {
+  // Session/user identifiers are derived from a verified Composio project
+  // response.  They are valid in the stored schema, but never caller-owned
+  // API fields: accepting them would let a renderer redirect another user's
+  // connected-app session without proving the project key.
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const composio = (value as Record<string, JsonValue>).composio;
+    if (
+      composio &&
+      typeof composio === "object" &&
+      !Array.isArray(composio) &&
+      (Object.hasOwn(composio, "userId") || Object.hasOwn(composio, "sessionId"))
+    ) {
+      throw Object.assign(new Error("Invalid configuration at composio: session identifiers are server-derived"), {
+        status: 400,
+      });
+    }
+  }
   const parsed = appConfigPatchSchema.safeParse(value);
   if (!parsed.success) {
     throw Object.assign(new Error(schemaIssue(parsed.error, "Invalid configuration")), { status: 400 });
@@ -248,6 +270,7 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
+  "MCP_IAN_BRAIN_API_KEY",
 ] as const;
 
 /** Drop every workspace credential from a child-process env (in place). */
@@ -363,8 +386,9 @@ interface InstanceCliUpdate {
 /** The credential env instanceConfigs() injects for one driver — shared with
  * withInstanceCli() so the inject rule and the strip rule cannot drift apart.
  * Each secret goes only to the driver that actually reads it: the API-key
- * Grok driver reads XAI_API_KEY, the Computer driver reads BOX_TOKEN, and
- * OpenCode reads OPENCODE_API_KEY. Every other engine brings its own
+ * Grok reads XAI_API_KEY and OpenCode reads OPENCODE_API_KEY. The Computer
+ * engine receives only a non-secret configured flag; exact Box access is a
+ * per-turn capability minted by the harness. Every other engine brings its own
  * login, so handing it a key it never uses would only put that key in the
  * environment of an unrelated child process. */
 function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string> {
@@ -374,7 +398,7 @@ function injectedEnvironment(cfg: AppConfig, driver: string): Map<string, string
     environment.set("OPENAI_COMPAT_API_KEY", cfg.openaiCompat.key);
   if (driver === "openai-compat" && cfg.openaiCompat?.url)
     environment.set("OPENAI_COMPAT_URL", cfg.openaiCompat.url);
-  if (driver === "boxAgent" && cfg.box?.token) environment.set("BOX_TOKEN", cfg.box.token);
+  if (driver === "boxAgent" && cfg.box?.token) environment.set("OMB_BOX_CONFIGURED", "1");
   if (driver === "opencodeGo" && cfg.opencodeGo?.apiKey) environment.set("OPENCODE_API_KEY", cfg.opencodeGo.apiKey);
   return environment;
 }
@@ -445,6 +469,9 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
     const entry = { ...sourceEntry };
     map[id] = entry;
     const environment = { ...entry.environment };
+    // Never preserve the legacy provider-wide Box key in a runtime instance.
+    // The account secret belongs to the harness broker only.
+    if (entry.driver === "boxAgent") delete environment.BOX_TOKEN;
     for (const [key, value] of injectedEnvironment(cfg, entry.driver)) environment[key] = value;
     entry.environment = environment;
     // The driver URL is configuration, not a credential. Environment is

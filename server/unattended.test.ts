@@ -23,6 +23,7 @@ const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
+const UI_SESSION_TOKEN = `unattended-ui-session-${"s".repeat(43)}`;
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 let child: ChildProcess;
@@ -32,7 +33,10 @@ let stderr = "";
 const api = async (method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
+    headers: {
+      "x-openmausbot-session": UI_SESSION_TOKEN,
+      ...(body ? { "content-type": "application/json" } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: await res.json() };
@@ -105,7 +109,9 @@ posixOnly("unattended turns keep asking", () => {
         ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
         HOME: home,
         USERPROFILE: home,
+        VITEST: process.env.VITEST ?? "true",
         OMB_PORT: String(PORT),
+        OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -137,6 +143,7 @@ posixOnly("unattended turns keep asking", () => {
         (
           await api("PATCH", `/api/bots/${bot.id}`, {
             autoApprove: true,
+            acknowledgeLocalAuto: true,
             modelSelection: { instanceId: "grok", model: "fake-model" },
           })
         ).status,
@@ -179,12 +186,17 @@ posixOnly("unattended turns keep asking", () => {
       // payload and releases the bot that ACTS on it.
       const created = await api("POST", "/api/bots");
       const teammate = created.body.bot;
-      await api("PATCH", `/api/bots/${teammate.id}`, { name: "Teammate", autoApprove: true });
+      await api("PATCH", `/api/bots/${teammate.id}`, {
+        name: "Teammate",
+        autoApprove: true,
+        acknowledgeLocalAuto: true,
+      });
 
       const delegator = (await api("POST", "/api/bots")).body.bot;
       await api("PATCH", `/api/bots/${delegator.id}`, {
         name: "Delegator",
         autoApprove: true,
+        acknowledgeLocalAuto: true,
         modelSelection: { instanceId: "delegator", model: "fake-model" },
       });
 
@@ -235,6 +247,7 @@ posixOnly("unattended turns keep asking", () => {
       await api("PATCH", `/api/bots/${target.id}`, {
         name: "Answerer",
         autoApprove: true,
+        acknowledgeLocalAuto: true,
         modelSelection: { instanceId: "grok", model: "fake-model" },
       });
 
@@ -242,6 +255,7 @@ posixOnly("unattended turns keep asking", () => {
       await api("PATCH", `/api/bots/${asker.id}`, {
         name: "Asker",
         autoApprove: true,
+        acknowledgeLocalAuto: true,
         hidden: true, // keep it out of its own peer list's way
         modelSelection: { instanceId: "asker", model: "fake-model" },
       });

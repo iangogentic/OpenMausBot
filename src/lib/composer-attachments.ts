@@ -130,8 +130,52 @@ export function appendPastedText(text: string, pasted: string): string {
 }
 
 export const INLINE_DROP_LIMIT = 512 * 1024;
+/** Must stay in lock-step with server FILE_MAX_BYTES. Remote clients upload
+ * binary Finder files to the harness rather than handing its agents a path
+ * that only exists on the controller Mac. */
+export const REMOTE_FILE_MAX_BYTES = 25 * 1024 * 1024;
 
 export type DroppedFile = Pick<File, "name" | "size" | "type" | "text">;
+
+/** HTTP headers accept bytes, not arbitrary JavaScript strings. Carry the
+ * Finder name as canonical base64url UTF-8 so non-Latin filenames do not
+ * throw before fetch and round-trip without mojibake. */
+export function uploadFileNameHeader(name: string): string {
+  const bytes = new TextEncoder().encode(name);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+}
+
+/** Persist a non-image file in the harness-owned upload directory. This is
+ * only used for remote desktop sessions; local mode deliberately keeps the
+ * existing direct-file-path behavior. */
+export async function fileAttachmentFromFile(file: File): Promise<FileAttachment> {
+  if (file.size <= 0) throw Object.assign(new Error(`${file.name || "file"} is empty`), { status: 400 });
+  if (file.size > REMOTE_FILE_MAX_BYTES) {
+    throw Object.assign(new Error(`${file.name || "file"} exceeds 25 MB`), { status: 413 });
+  }
+  const response = await fetch("/api/files/upload", {
+    method: "POST",
+    headers: {
+      "content-type": "application/octet-stream",
+      "x-openmausbot-file-name-b64": uploadFileNameHeader(file.name || "attachment"),
+    },
+    body: await file.arrayBuffer(),
+  });
+  if (!response.ok) {
+    const detail = (await response.json().catch(() => ({ error: response.statusText }))) as { error?: string };
+    throw Object.assign(new Error(detail.error ?? "file upload failed"), { status: response.status });
+  }
+  const saved = (await response.json()) as { path: string; name?: string; bytes: number };
+  return {
+    kind: "file",
+    id: newId(),
+    path: saved.path,
+    name: saved.name || file.name || "attachment",
+    size: saved.bytes,
+  };
+}
 
 /** Turn a browser drop into composer attachments. Electron-backed files
  * keep their disk path; small pathless text drops keep their contents.
@@ -266,10 +310,13 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     allowImages: boolean;
     getPath: (file: T) => string;
     uploadImage: (file: T) => Promise<Attachment | null>;
+    /** Present only for a remote server: binary files are transferred to the
+     * harness, never represented by a controller-local Finder path. */
+    uploadFile?: (file: T) => Promise<FileAttachment>;
   },
 ): Promise<{ attachments: Attachment[]; notice: string | null }> {
   const files = [..._files];
-  const { allowImages, getPath, uploadImage } = _opts;
+  const { allowImages, getPath, uploadImage, uploadFile } = _opts;
   const attachments: Attachment[] = [];
   const rejectedNames: string[] = [];
   const imageErrors: string[] = [];
@@ -285,9 +332,28 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
       }
       continue;
     }
-    const result = await attachmentsFromDroppedFiles([file], getPath);
-    attachments.push(...result.attachments);
-    rejectedNames.push(...result.rejectedNames);
+    if (uploadFile) {
+      // Small text stays in the message, so it remains visible and editable
+      // without an otherwise needless server file. Binary and large text get
+      // a Razer-owned path the selected engine can actually open.
+      if (isInlineText(file) && file.size <= INLINE_DROP_LIMIT) {
+        try {
+          attachments.push(pasteAttachment(await file.text()));
+        } catch {
+          rejectedNames.push(file.name);
+        }
+      } else {
+        try {
+          attachments.push(await uploadFile(file));
+        } catch (err) {
+          imageErrors.push(`${file.name}: ${err instanceof Error ? err.message : "upload failed"}`);
+        }
+      }
+    } else {
+      const result = await attachmentsFromDroppedFiles([file], getPath);
+      attachments.push(...result.attachments);
+      rejectedNames.push(...result.rejectedNames);
+    }
   }
   const pathless = rejectedNames.length
     ? `${rejectedNames.join(", ")} — that file has no path on disk. Save it first, then attach it from Finder.`

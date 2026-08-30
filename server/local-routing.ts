@@ -8,8 +8,11 @@ export function shouldMountLocalComputer({
   providerSupportsLocal: boolean;
 }): boolean {
   if (!providerSupportsLocal) return false;
-  if (requested === "local") return hostPlatform === "darwin" || hostPlatform === "linux";
-  // Preserve the established macOS Auto behavior. Linux local control is a
-  // beta and can only be selected explicitly per bot.
-  return requested === undefined && hostPlatform === "darwin";
+  if (requested === "local") {
+    return hostPlatform === "darwin" || hostPlatform === "linux" || hostPlatform === "win32";
+  }
+  // Attended Mac and Windows bridges may be published by a remote Linux
+  // harness. Route from the actual connection descriptor's platform, not the
+  // harness process platform. Native Linux local control remains explicit-only.
+  return requested === undefined && (hostPlatform === "darwin" || hostPlatform === "win32");
 }

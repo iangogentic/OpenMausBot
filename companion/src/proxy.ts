@@ -11,7 +11,12 @@
 // the sidecar does NOT forward the device's Host or Origin. It speaks to the
 // harness as itself, from the machine the harness is already willing to
 // serve. Nothing upstream has to change, or even know this exists.
-import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  request as httpRequest,
+  type ClientRequest,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 
 import { bearerToken } from "./devices.ts";
 import {
@@ -19,13 +24,17 @@ import {
   MAX_COMPANION_ENDPOINTS,
   type CompanionEndpoint,
 } from "./endpoints.ts";
-import { denyReason, isCloudDesktopJoin } from "./routes.ts";
+import { denyReason, isCloudDesktopRequest } from "./routes.ts";
+import type { CompanionLocalVmViewerGateway } from "./local-vm-viewer.ts";
 import { createSseScrubber, isJson, scrub } from "./wire.ts";
 
 /** What the forwarding handler needs from the process around it. */
 export interface ProxyOptions {
   /** Where the harness is listening on loopback. */
   harnessPort: number;
+  /** Human-app bearer injected only on the loopback hop. Device credentials
+   * remain sidecar-scoped and never become harness control authority. */
+  harnessSessionToken?: string;
   /** Does this bearer token belong to a paired device? */
   authenticate: (token: string | undefined) => { id?: string; cloudDesktopAccess: boolean } | null;
   /** Redeem a pairing code. Handled here and never forwarded: the harness
@@ -49,7 +58,21 @@ export interface ProxyOptions {
   /** Register one authenticated, live event stream. The tracker can terminate
    * it synchronously when that device is revoked; the returned disposer is
    * called exactly once when either side closes it. */
-  connected?: (deviceId: string, disconnect: () => void) => () => void;
+  connected?: (deviceId: string, disconnect: () => void) => (() => void) | null;
+  /** Register a non-SSE request that is currently crossing the companion
+   * boundary. A device revocation terminates all such requests; removal of
+   * cloud desktop access terminates only requests in that narrower scope.
+   * The returned disposer must be safe to call after the registry already
+   * terminated the request. */
+  track?: (
+    deviceId: string,
+    disconnect: () => void,
+    scope: { cloudDesktop: boolean },
+  ) => (() => void) | null;
+  /** Exchanges the harness's loopback-only Local VM viewer token for a
+   * device-bound companion token before the JSON response crosses the
+   * network. The gateway owns the subsequent HTTP/WebSocket surface. */
+  localVmViewer?: Pick<CompanionLocalVmViewerGateway, "register">;
   /** How long the harness may take to produce response *headers*. Optional,
    * and only ever set by tests — the default is the one that ships. */
   headersTimeoutMs?: number;
@@ -72,6 +95,37 @@ const HEADERS_TIMEOUT_MS = 30_000;
  * buffer is the size of the response and nothing upstream promises that is
  * small. Far above any real payload — it exists to have a ceiling at all. */
 const MAX_JSON_BODY_BYTES = 32 * 1024 * 1024;
+export const MAX_BUFFERED_JSON_BYTES_PER_DEVICE = 48 * 1024 * 1024;
+export const MAX_BUFFERED_JSON_BYTES_GLOBAL = 96 * 1024 * 1024;
+
+/** Shared accounting for response bodies that must be retained for JSON
+ * scrubbing. Concurrency caps bound sockets; this independently bounds the
+ * aggregate bytes those accepted requests can retain. */
+export function createCompanionJsonBufferBudget(
+  maxPerDevice = MAX_BUFFERED_JSON_BYTES_PER_DEVICE,
+  maxGlobal = MAX_BUFFERED_JSON_BYTES_GLOBAL,
+) {
+  const perDevice = new Map<string, number>();
+  let total = 0;
+  const reserve = (deviceId: string, bytes: number): boolean => {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) return false;
+    const current = perDevice.get(deviceId) ?? 0;
+    if (bytes > maxPerDevice - current || bytes > maxGlobal - total) return false;
+    if (bytes) perDevice.set(deviceId, current + bytes);
+    total += bytes;
+    return true;
+  };
+  const release = (deviceId: string, bytes: number): void => {
+    if (!Number.isSafeInteger(bytes) || bytes <= 0) return;
+    const current = perDevice.get(deviceId) ?? 0;
+    const released = Math.min(current, bytes);
+    const next = current - released;
+    if (next) perDevice.set(deviceId, next);
+    else perDevice.delete(deviceId);
+    total = Math.max(0, total - released);
+  };
+  return Object.freeze({ reserve, release });
+}
 
 /** Read a JSON body, bounded. An unbounded read on an unauthenticated route
  * is a way to be memory-exhausted by anyone who can reach the port. */
@@ -197,7 +251,7 @@ const endpointSnapshot = (options: ProxyOptions): CompanionEndpointSnapshot => {
  * blocklist: `host` and `origin` must not travel (see above), `authorization`
  * is the sidecar's credential and means nothing to the harness, and hop-by-hop
  * headers are by definition not ours to relay. */
-const forwardHeaders = (req: IncomingMessage): Record<string, string> => {
+const forwardHeaders = (req: IncomingMessage, companionDeviceId?: string): Record<string, string> => {
   const out: Record<string, string> = {
     accept: String(req.headers.accept ?? "*/*"),
     // Lets a response whose URL is intentionally loopback-only (the VPS SSH
@@ -205,6 +259,12 @@ const forwardHeaders = (req: IncomingMessage): Record<string, string> => {
     // carries no authority; it only narrows behavior at the harness.
     "x-openmausbot-companion": "1",
   };
+  // The proxy overwrites this header after authenticating the bearer. The
+  // harness can therefore bind the human-control owner to the paired device
+  // rather than trusting an owner id invented by the phone request body.
+  if (companionDeviceId && /^[\w-]{1,128}$/.test(companionDeviceId)) {
+    out["x-openmausbot-companion-device"] = companionDeviceId;
+  }
   const contentType = req.headers["content-type"];
   if (contentType) out["content-type"] = String(contentType);
   // Last-Event-ID is how a reconnecting client asks for the gap. Dropping it
@@ -218,6 +278,7 @@ const forwardHeaders = (req: IncomingMessage): Record<string, string> => {
  * the token, then replay the request to the harness over loopback and scrub
  * what comes back. Pairing is the one route that stops here. */
 export function createProxyHandler(options: ProxyOptions) {
+  const jsonBufferBudget = createCompanionJsonBufferBudget();
   return function handle(req: IncomingMessage, res: ServerResponse): void {
     const path = (req.url ?? "/").split("?")[0];
     const method = req.method ?? "GET";
@@ -245,9 +306,9 @@ export function createProxyHandler(options: ProxyOptions) {
     // Pairing a phone grants the ordinary companion surface, not a browser
     // session with every credential that may exist inside the cloud desktop.
     // The computer owner enables this capability per device, off by default.
-    if (isCloudDesktopJoin(method, path) && !device?.cloudDesktopAccess) {
+    if (isCloudDesktopRequest(method, path) && !device?.cloudDesktopAccess) {
       return sendJson(res, 403, {
-        error: "cloud desktop access is off for this phone — enable it in OpenMausBot → Settings → Phone",
+        error: "interactive computer access is off for this phone — enable it in OpenMausBot → Settings → Phone",
       });
     }
 
@@ -295,16 +356,101 @@ export function createProxyHandler(options: ProxyOptions) {
       return sendJson(res, 200, endpointSnapshot(options));
     }
 
-    const upstream = httpRequest(
+    // Do not merely authenticate before starting the loopback request. The
+    // control page can revoke this exact device while the harness is still
+    // calculating a Box join URL, exporting a transcript, or rendering an
+    // image/audio response. Every in-flight request is therefore registered
+    // under its device id and the identity is checked again immediately
+    // before bytes leave this sidecar.
+    const cloudDesktopRequest = isCloudDesktopRequest(method, path);
+    const authenticatedDeviceId = device?.id;
+    // Health is deliberately the one public companion route: pairing needs a
+    // harmless liveness check before a device owns a token. It has no device
+    // identity to re-authorize, so it must remain outside the per-device
+    // revocation machinery rather than being mistaken for a revoked request
+    // and left hanging after its upstream socket is destroyed.
+    const publicHealth = method === "GET" && path === "/api/health" && !device;
+    let cancelled = false;
+    let upstream: ClientRequest | null = null;
+    let releaseRequest: (() => void) | null = null;
+    let revocationCanAbortSocket = false;
+    const releaseInFlight = () => {
+      releaseRequest?.();
+      releaseRequest = null;
+    };
+    const terminateRevokedRequest = () => {
+      cancelled = true;
+      releaseInFlight();
+      // `destroy()` is intentional rather than sending an error body. Once a
+      // device is revoked, a body that happened to be queued is not a safe
+      // response to complete, and callers already retry dropped requests.
+      upstream?.destroy();
+      // Compatibility for programmatic embedders that have not provided a
+      // request tracker yet: they still get a clean authorization failure at
+      // the final re-check. The shipped sidecar always supplies `track`, so
+      // real revoke/disable actions sever the socket immediately.
+      if ((revocationCanAbortSocket || res.headersSent) && !res.destroyed && !res.writableEnded) res.destroy();
+    };
+    const stillAuthorized = (): boolean => {
+      if (publicHealth) return true;
+      if (cancelled) return false;
+      const current = options.authenticate(token);
+      if (!current) return false;
+      // Production records always have an id. The fallback keeps isolated
+      // embedders that only model a boolean capability compatible, while the
+      // sidecar's real DeviceRegistry still gets exact-device revocation.
+      if (authenticatedDeviceId && current.id !== authenticatedDeviceId) return false;
+      return !cloudDesktopRequest || current.cloudDesktopAccess;
+    };
+    const requireCurrentAuthorization = (): boolean => {
+      if (stillAuthorized()) return true;
+      terminateRevokedRequest();
+      // Embedded users of the handler may not have installed the request
+      // tracker yet. They still must get a terminal denial rather than an
+      // indefinitely pending request when the final authorization check
+      // fails before headers. Once bytes are already out, the only safe
+      // terminal signal is the destroyed socket above.
+      if (!res.destroyed && !res.writableEnded && !res.headersSent) {
+        sendJson(res, 401, {
+          error: "pair this device from Phone settings in OpenMausBot on your computer",
+        });
+      }
+      return false;
+    };
+
+    // Acquire capacity before opening a loopback socket. A rejected request
+    // must not consume a harness connection while it waits for a slot.
+    if (authenticatedDeviceId && options.track) {
+      releaseRequest = options.track(
+        authenticatedDeviceId,
+        terminateRevokedRequest,
+        { cloudDesktop: cloudDesktopRequest },
+      );
+      if (!releaseRequest) {
+        return sendJson(res, 429, { error: "too many requests are already active for companion devices" });
+      }
+      revocationCanAbortSocket = true;
+    }
+
+    upstream = httpRequest(
       {
         hostname: "127.0.0.1",
         port: options.harnessPort,
         path: req.url,
         method,
-        headers: forwardHeaders(req),
+        headers: {
+          ...forwardHeaders(req, device?.id),
+          ...(options.harnessSessionToken
+            ? { "x-openmausbot-session": options.harnessSessionToken }
+            : {}),
+        },
       },
       (harness) => {
         clearTimeout(headersDeadline);
+        if (!requireCurrentAuthorization()) {
+          harness.destroy();
+          return;
+        }
         // Keep liveness tied to the actual harness. Answering from the
         // sidecar alone made a dead bot server look healthy and caused the
         // desktop to advertise a hosted route that could not serve chats.
@@ -317,6 +463,7 @@ export function createProxyHandler(options: ProxyOptions) {
           const fail = () => {
             if (finished) return;
             finished = true;
+            if (!requireCurrentAuthorization()) return;
             sendJson(res, 502, { error: "OpenMausBot is not ready on this computer" });
           };
           harness.on("data", (chunk: Buffer) => {
@@ -331,6 +478,7 @@ export function createProxyHandler(options: ProxyOptions) {
           harness.on("error", fail);
           harness.on("end", () => {
             if (finished) return;
+            if (!requireCurrentAuthorization()) return;
             let identity: unknown;
             try {
               identity = JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -350,6 +498,7 @@ export function createProxyHandler(options: ProxyOptions) {
               return;
             }
             finished = true;
+            if (!requireCurrentAuthorization()) return;
             sendJson(res, 200, { app: "openmausbot" });
           });
           return;
@@ -366,20 +515,34 @@ export function createProxyHandler(options: ProxyOptions) {
             && streamStatus < 300
             && Boolean(device?.id);
           const currentDevice = tracksDeviceConnection ? options.authenticate(token) : device;
-          if (tracksDeviceConnection && currentDevice?.id !== device?.id) {
+          if (
+            (tracksDeviceConnection && currentDevice?.id !== device?.id) ||
+            !requireCurrentAuthorization()
+          ) {
             harness.destroy();
-            return sendJson(res, 401, {
-              error: "pair this device from Phone settings in OpenMausBot on your computer",
-            });
+            // `requireCurrentAuthorization` has already dropped the socket
+            // if a tracked request was revoked. The 401 is only reachable
+            // for the older event-only path before any bytes were sent.
+            if (!res.destroyed && !res.writableEnded) {
+              return sendJson(res, 401, {
+                error: "pair this device from Phone settings in OpenMausBot on your computer",
+              });
+            }
+            return;
           }
           const disconnect = () => {
             if (!harness.destroyed) harness.destroy();
             if (!res.destroyed) res.destroy();
           };
-          let releaseConnection =
-            tracksDeviceConnection && currentDevice?.id
-              ? options.connected?.(currentDevice.id, disconnect) ?? null
-              : null;
+          let releaseConnection: (() => void) | null = null;
+          if (tracksDeviceConnection && currentDevice?.id && options.connected) {
+            releaseConnection = options.connected(currentDevice.id, disconnect);
+            if (!releaseConnection) {
+              releaseInFlight();
+              harness.destroy();
+              return sendJson(res, 429, { error: "too many event streams are already active for companion devices" });
+            }
+          }
           const release = () => {
             releaseConnection?.();
             releaseConnection = null;
@@ -408,6 +571,10 @@ export function createProxyHandler(options: ProxyOptions) {
           const scrubStream = createSseScrubber();
           harness.setEncoding("utf8");
           harness.on("data", (chunk: string) => {
+            if (!requireCurrentAuthorization()) {
+              harness.destroy();
+              return;
+            }
             let rewritten: string;
             try {
               rewritten = scrubStream(chunk);
@@ -430,16 +597,19 @@ export function createProxyHandler(options: ProxyOptions) {
           res.on("drain", () => harness.resume());
           harness.on("end", () => {
             release();
+            releaseInFlight();
             res.end();
           });
           harness.on("error", () => {
             release();
+            releaseInFlight();
             res.destroy();
           });
           // A device that hangs up must take the upstream connection with
           // it, or the harness accumulates readers nobody is listening to.
           res.on("close", () => {
             release();
+            releaseInFlight();
             harness.destroy();
           });
           return;
@@ -458,31 +628,71 @@ export function createProxyHandler(options: ProxyOptions) {
           // never sends accept-encoding, so this is a guard rather than a
           // path: if it ever fires, the body passes through unscrubbed and
           // intact rather than scrubbed and broken.
+          if (!requireCurrentAuthorization()) {
+            harness.destroy();
+            return;
+          }
           res.writeHead(harness.statusCode ?? 200, privateHeaders(harness.headers));
           // `pipe` does not carry a failure from source to destination. An
           // upstream that dies part-way through an image would otherwise
           // leave the phone holding an open connection and a content-length
           // that will never be satisfied — it waits for the rest forever,
           // which reads as a frozen app rather than as a failed request.
-          harness.on("error", () => res.destroy());
+          harness.on("data", () => {
+            if (!requireCurrentAuthorization()) harness.destroy();
+          });
+          harness.on("error", () => {
+            releaseInFlight();
+            res.destroy();
+          });
+          harness.on("end", releaseInFlight);
           harness.pipe(res);
           return;
         }
 
         const chunks: Buffer[] = [];
         let size = 0;
+        let retainedBytes = 0;
+        let bodyFailed = false;
+        const budgetDeviceId = authenticatedDeviceId ?? "public";
+        const releaseJsonBudget = () => {
+          if (!retainedBytes) return;
+          jsonBufferBudget.release(budgetDeviceId, retainedBytes);
+          retainedBytes = 0;
+        };
+        const failBufferedBody = (message: string) => {
+          if (bodyFailed) return;
+          bodyFailed = true;
+          releaseJsonBudget();
+          releaseInFlight();
+          harness.destroy();
+          if (res.headersSent) res.destroy();
+          else sendJson(res, 502, { error: message });
+        };
         harness.on("data", (chunk: Buffer) => {
+          if (bodyFailed) return;
           size += chunk.length;
           if (size > MAX_JSON_BODY_BYTES) {
-            harness.destroy();
-            if (res.headersSent) res.destroy();
-            else sendJson(res, 502, { error: "the response from OpenMausBot was too large" });
-            return;
+            return failBufferedBody("the response from OpenMausBot was too large");
           }
+          if (!jsonBufferBudget.reserve(budgetDeviceId, chunk.length)) {
+            return failBufferedBody("companion response buffering is at capacity");
+          }
+          retainedBytes += chunk.length;
           chunks.push(chunk);
         });
-        harness.on("error", () => res.destroy());
+        harness.on("error", () => {
+          releaseJsonBudget();
+          releaseInFlight();
+          res.destroy();
+        });
+        harness.on("aborted", releaseJsonBudget);
+        harness.on("close", releaseJsonBudget);
         harness.on("end", () => {
+          releaseJsonBudget();
+          releaseInFlight();
+          if (bodyFailed) return;
+          if (!requireCurrentAuthorization()) return;
           const body = Buffer.concat(chunks).toString("utf8");
 
           // Two failures live here and they are not the same failure.
@@ -507,9 +717,38 @@ export function createProxyHandler(options: ProxyOptions) {
           // scrubber exists to withhold. Not hypothetical: `scrub` recurses,
           // so a body nested a few thousand deep throws RangeError where
           // JSON.parse handles it fine.
+          let prepared: unknown;
+          try {
+            prepared = scrub(parsed);
+          } catch {
+            sendJson(res, 502, { error: "the response could not be prepared for this device" });
+            return;
+          }
+          const localVmJoin = path.match(/^\/api\/bots\/([\w-]+)\/local-computer\/join$/);
+          if (
+            method === "POST" &&
+            localVmJoin &&
+            (harness.statusCode ?? 500) >= 200 &&
+            (harness.statusCode ?? 500) < 300
+          ) {
+            if (!authenticatedDeviceId || !options.localVmViewer) {
+              sendJson(res, 503, { error: "phone Local VM viewing is not available on this server" });
+              return;
+            }
+            const registration = options.localVmViewer.register(
+              authenticatedDeviceId,
+              localVmJoin[1],
+              prepared,
+            );
+            if (!registration.ok) {
+              sendJson(res, registration.status, { error: registration.error });
+              return;
+            }
+            prepared = registration.payload;
+          }
           let text: string;
           try {
-            text = JSON.stringify(scrub(parsed));
+            text = JSON.stringify(prepared);
           } catch {
             sendJson(res, 502, { error: "the response could not be prepared for this device" });
             return;
@@ -523,6 +762,7 @@ export function createProxyHandler(options: ProxyOptions) {
          * a protocol violation, and Node's own parser rejects the response
          * outright rather than tolerating it. */
         function forward(text: string, upstreamHeaders: IncomingMessage["headers"], status: number): void {
+          if (!requireCurrentAuthorization()) return;
           const headers = { ...upstreamHeaders };
           delete headers["content-length"];
           delete headers["content-encoding"];
@@ -532,9 +772,15 @@ export function createProxyHandler(options: ProxyOptions) {
             "content-length": Buffer.byteLength(text),
           });
           res.end(text);
+          releaseInFlight();
         }
       },
     );
+
+    if (cancelled) {
+      upstream.destroy();
+      return;
+    }
 
     // A phone can go away at any point: before the harness has answered,
     // while its own request body is still going up, or partway through a
@@ -543,9 +789,13 @@ export function createProxyHandler(options: ProxyOptions) {
     // an ordinary finished response does not tear down a keep-alive socket
     // on its way out.
     res.on("close", () => {
+      releaseInFlight();
       if (!res.writableEnded) upstream.destroy();
     });
-    req.on("error", () => upstream.destroy());
+    req.on("error", () => {
+      releaseInFlight();
+      upstream.destroy();
+    });
 
     // `http.request` has no deadline of its own for the headers phase: a
     // harness that accepts the connection and then says nothing holds the
@@ -558,6 +808,7 @@ export function createProxyHandler(options: ProxyOptions) {
     headersDeadline.unref?.();
 
     upstream.on("error", () => {
+      releaseInFlight();
       clearTimeout(headersDeadline);
       // Headers already went out — a stream, or a piped body — or the
       // response is finished and this is a socket dying afterwards. There is

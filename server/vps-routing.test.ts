@@ -132,13 +132,17 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
   let gateFile: string;
   let acpDump: string;
   let dockerLog: string;
+  const UI_SESSION_TOKEN = `vps-routing-ui-session-${"s".repeat(43)}`;
 
   type ApiBody = Record<string, string | boolean | { instanceId: string; model: string } | { sshAlias: string }>;
 
   const api = async (method: string, path: string, body?: ApiBody): Promise<{ status: number; body: any }> => {
     const res = await fetch(`${BASE}${path}`, {
       method,
-      headers: body ? { "content-type": "application/json" } : undefined,
+      headers: {
+        "x-openmausbot-session": UI_SESSION_TOKEN,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
       body: body ? JSON.stringify(body) : undefined,
     });
     return { status: res.status, body: await res.json() };
@@ -194,8 +198,10 @@ posixOnly("VPS turn routing e2e (fake ACP fleet + fake docker over SSH)", () => 
     const env: NodeJS.ProcessEnv = {
       HOME: home,
       USERPROFILE: home,
+      VITEST: process.env.VITEST ?? "true",
       OMB_PORT: String(PORT),
       OMB_EXTRA_PATH: fakeBin,
+      OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
       FAKE_DOCKER_DIR: fakeBin,
       FAKE_DOCKER_LOG: dockerLog,
     };

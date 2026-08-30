@@ -1,0 +1,11 @@
+[Unit]
+Description=Persistent OpenMausBot public listener
+
+[Socket]
+ListenStream=127.0.0.1:8799
+Accept=no
+NoDelay=yes
+Service=openmausbot-harness-proxy.service
+
+[Install]
+WantedBy=sockets.target

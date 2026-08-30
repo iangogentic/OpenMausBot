@@ -84,6 +84,9 @@ export interface Message {
   /** screen messages: a frame of the bot's computer (base64) */
   png?: string;
   mime?: string;
+  /** Exact computer and per-turn generation that produced this frame. */
+  targetKey?: string;
+  targetGeneration?: string;
   at: number;
   /** the message this one follows; null = thread root. Edited messages
    * share a parentId with the version they replace — that's a fork. */
@@ -333,6 +336,9 @@ export interface InstanceInfo {
   cli?: string;
   /** Driver's default binary name (e.g. "claude"). */
   cliDefault?: string;
+  /** Platform reported by the harness that owns this engine. This is not the
+   * controller's Mac/Windows platform when using OpenMaus Razer. */
+  hostPlatform?: "darwin" | "win32" | "linux";
   /** Absolute paths of every default binary found on PATH, PATH order. */
   cliCandidates?: string[];
 }
@@ -365,8 +371,13 @@ export interface AppState {
   inspectorOpen: boolean;
   appSettingsOpen: boolean;
   appSettingsSection: AppSettingsSection;
-  /** latest live frame of a bot's computer, per botId */
-  screens: Record<string, { png: string; mime: string }>;
+  /** Latest live frame of a bot's computer. `at` lets the panel choose the
+   * newest exact capture instead of allowing an old SSE frame to outrank a
+   * later direct screenshot forever. */
+  screens: Record<
+    string,
+    { png: string; mime: string; at: number; targetKey: string; targetGeneration: string }
+  >;
   /** bots whose cloud computer is being provisioned */
   provisioning: Record<string, boolean>;
   /** who is driving each bot's computer: held = the person has the wheel
@@ -457,6 +468,7 @@ export type Action =
       type: "decideRequest";
       threadId: string;
       requestId: string;
+      messageId: string;
       behavior: "allow" | "deny" | "answer";
       message?: string;
       /** remember this exact grant (the server's allowKey) for the bot */
@@ -475,13 +487,22 @@ export type Action =
   | { type: "botPatched"; bot: BotAnnouncement }
   | { type: "messageAdded"; threadId: string; message: Message }
   | { type: "messagePatched"; threadId: string; message: Message }
-  | { type: "screenFrame"; botId: string; png: string; mime: string }
+  | {
+      type: "screenFrame";
+      botId: string;
+      png: string;
+      mime: string;
+      targetKey: string;
+      targetGeneration: string;
+      at?: number;
+    }
   | { type: "provisioning"; botId: string; on: boolean }
   | { type: "computerControl"; botId: string; held: boolean; helpReason: string | null }
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
   | { type: "error"; message: string | null }
+  | { type: "setComputerAuto"; botId: string; acknowledgeLocalAuto?: boolean }
   | { type: "toggleSettings"; open?: boolean }
   | { type: "togglePlugins"; open?: boolean }
   | { type: "toggleComputer"; open?: boolean }
@@ -516,6 +537,14 @@ export function openNotificationTarget(
     bot.threadId === target.threadId ||
     (bot.tasks ?? []).some((task) => task.threadId === target.threadId);
   if (known) dispatch({ type: "switchTask", botId: target.botId, threadId: target.threadId });
+}
+
+export function botDeletionConfirmation(botName: string): string {
+  return (
+    `Permanently delete ${botName}?\n\n` +
+    "This deletes every task, message, memory, imported skill, checkpoint, and private Local VM file owned by this bot. " +
+    "Before deletion, OpenMausBot checks both Box and VPS for a separately hosted computer. If either still exists, deletion stops and tells you which backend to select and remove in the Computer panel."
+  );
 }
 
 function updateBot(state: AppState, botId: string, fn: (b: Bot) => Bot): AppState {
@@ -756,6 +785,11 @@ export function reducer(state: AppState, action: Action): AppState {
       return updateBot(next, action.bot.id, (b) => ({
         ...b,
         ...action.bot,
+        // Bot frames are complete (apart from messages), so an omitted
+        // optional computer override means Auto. Assign it explicitly;
+        // spreading an object without the key would otherwise leave another
+        // window's old Cloud/VM/Local choice stuck in renderer state.
+        computer: action.bot.computer,
         // Ordinary bot patches omit messages and must preserve the current
         // transcript. A task switch is different: its full bot event carries
         // the new transcript, which must replace the previous task before the
@@ -845,7 +879,16 @@ export function reducer(state: AppState, action: Action): AppState {
     case "screenFrame":
       return {
         ...withMascotMotion(state, action.botId, "success"),
-        screens: { ...state.screens, [action.botId]: { png: action.png, mime: action.mime } },
+        screens: {
+          ...state.screens,
+          [action.botId]: {
+            png: action.png,
+            mime: action.mime,
+            at: action.at ?? Date.now(),
+            targetKey: action.targetKey,
+            targetGeneration: action.targetGeneration,
+          },
+        },
         provisioning: { ...state.provisioning, [action.botId]: false },
       };
     case "provisioning":
@@ -863,6 +906,11 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
+    case "setComputerAuto":
+      // The server accepts the explicit wire value `auto` and persists it as
+      // an absent override. Optimistically clear the override without ever
+      // putting that wire-only sentinel into Bot state.
+      return updateBot(state, action.botId, (b) => ({ ...b, computer: undefined }));
     case "connected":
       return { ...state, connected: action.value };
     case "error":
@@ -881,10 +929,20 @@ export function reducer(state: AppState, action: Action): AppState {
         computerOpen: open ? false : state.computerOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsOpen: open ? false : state.pluginsOpen,
       };
     }
-    case "togglePlugins":
-      return { ...state, pluginsOpen: action.open ?? !state.pluginsOpen };
+    case "togglePlugins": {
+      const open = action.open ?? !state.pluginsOpen;
+      return {
+        ...state,
+        pluginsOpen: open,
+        settingsOpen: open ? false : state.settingsOpen,
+        computerOpen: open ? false : state.computerOpen,
+        inspectorOpen: open ? false : state.inspectorOpen,
+        appSettingsOpen: open ? false : state.appSettingsOpen,
+      };
+    }
     case "focusMessage":
       return {
         ...state,
@@ -906,6 +964,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         inspectorOpen: open ? false : state.inspectorOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsOpen: open ? false : state.pluginsOpen,
       };
     }
     case "toggleInspector": {
@@ -916,6 +975,7 @@ export function reducer(state: AppState, action: Action): AppState {
         settingsOpen: open ? false : state.settingsOpen,
         computerOpen: open ? false : state.computerOpen,
         appSettingsOpen: open ? false : state.appSettingsOpen,
+        pluginsOpen: open ? false : state.pluginsOpen,
       };
     }
     case "toggleAppSettings": {
@@ -1223,12 +1283,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         action.type === "updateBot"
           ? stateRef.current.bots.find((candidate) => candidate.id === action.botId)
           : undefined;
+      const botBeforeComputerAuto =
+        action.type === "setComputerAuto"
+          ? stateRef.current.bots.find((candidate) => candidate.id === action.botId)
+          : undefined;
       const quizBeforeSend = (() => {
         if (action.type !== "send") return undefined;
         const bot = stateRef.current.bots.find((candidate) => candidate.id === action.botId);
         return bot ? openOnboardingCard(bot) : undefined;
       })();
-      if (action.type === "deleteBot") botPatchQueue.cancel(action.botId);
+      if (action.type === "deleteBot") {
+        const deleting = stateRef.current.bots.find((candidate) => candidate.id === action.botId);
+        if (!deleting) return;
+        const confirmed = window.confirm(botDeletionConfirmation(deleting.name));
+        if (!confirmed) return;
+        botPatchQueue.cancel(action.botId);
+        // The authoritative bot.deleted SSE removes it only after the server
+        // has stopped its provider and completed private-data cleanup. Keeping
+        // it visible on a 409/500 gives the person an actionable retry instead
+        // of an optimistic ghost deletion that reappears after refresh.
+        api(`/api/bots/${action.botId}`, { method: "DELETE" }).catch(showError);
+        return;
+      }
       rawDispatch(action);
       switch (action.type) {
         case "createRoutine":
@@ -1295,21 +1371,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               method: "POST",
               body: JSON.stringify({
                 requestId: action.requestId,
+                messageId: action.messageId,
                 behavior: action.behavior,
                 message: action.message,
               }),
             }).catch(showError);
           if (action.alwaysAllow) {
-            const bot = stateRef.current.bots.find((b) => b.id === action.alwaysAllow!.botId);
-            const next = [...new Set([...(bot?.alwaysAllow ?? []), action.alwaysAllow.key])];
             // save the grant BEFORE releasing the bot: it may ask again
             // within milliseconds, and a grant that hasn't landed yet
             // would make "always allow" ask a second time. A failed save
             // still lets this one through — losing a preference must not
             // strand the turn — but it says so.
-            void api(`/api/bots/${action.alwaysAllow.botId}`, {
-              method: "PATCH",
-              body: JSON.stringify({ alwaysAllow: next }),
+            void api(`/api/bots/${action.alwaysAllow.botId}/always-allow`, {
+              method: "POST",
+              body: JSON.stringify({ allowKey: action.alwaysAllow.key, messageId: action.messageId }),
             })
               .catch(showError)
               .finally(respond);
@@ -1328,6 +1403,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               method: "POST",
               body: JSON.stringify({
                 requestId: card.requestId,
+                messageId: action.messageId,
                 behavior,
                 message: behavior === "answer" ? action.answer : undefined,
               }),
@@ -1347,7 +1423,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (card?.requestId) {
             api(`/api/bots/${action.botId}/respond`, {
               method: "POST",
-              body: JSON.stringify({ requestId: card.requestId, behavior: "deny", message: "Dismissed by user." }),
+              body: JSON.stringify({ requestId: card.requestId, messageId: action.messageId, behavior: "deny", message: "Dismissed by user." }),
             }).catch(() => {});
           } else {
             persistCard(action.botId, action.messageId, { dismissed: true });
@@ -1388,9 +1464,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             .catch(showError);
           break;
         }
-        case "deleteBot":
-          api(`/api/bots/${action.botId}`, { method: "DELETE" }).catch(showError);
-          break;
         case "markUnread":
           api(`/api/bots/${action.botId}`, { method: "PATCH", body: JSON.stringify({ unread: true }) }).catch(
             () => {},
@@ -1477,6 +1550,49 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (botBeforeUpdate) {
             botPatchQueue.enqueue(action.botId, action.patch, botBeforeUpdate);
           }
+          break;
+        }
+        case "setComputerAuto": {
+          // `auto` is deliberately wire-only: the server removes the stored
+          // override and returns the ordinary absent `computer` field. Flush
+          // older profile edits first so an earlier explicit target cannot
+          // overtake this reset.
+          const payload: { computer: "auto"; acknowledgeLocalAuto?: true } = { computer: "auto" };
+          if (action.acknowledgeLocalAuto === true) payload.acknowledgeLocalAuto = true;
+          void botPatchQueue
+            .flush(action.botId)
+            .then(() =>
+              api(`/api/bots/${action.botId}`, {
+                method: "PATCH",
+                body: JSON.stringify(payload),
+              }),
+            )
+            .then(({ bot }: { bot: BotAnnouncement }) =>
+              rawDispatch({
+                type: "botPatched",
+                bot: { ...bot, ...botPatchQueue.overlayFor(action.botId) },
+              }),
+            )
+            .catch(async (caught) => {
+              // Roll the optimistic clear back to server truth on rejection.
+              // The captured bot is only the final fallback when even the
+              // reconciliation read is unavailable.
+              try {
+                const result: { bots: BotAnnouncement[] } = await api("/api/bots");
+                const authoritative = result.bots.find((candidate) => candidate.id === action.botId);
+                if (authoritative) {
+                  rawDispatch({
+                    type: "botPatched",
+                    bot: { ...authoritative, ...botPatchQueue.overlayFor(action.botId) },
+                  });
+                } else if (botBeforeComputerAuto) {
+                  rawDispatch({ type: "botPatched", bot: botBeforeComputerAuto });
+                }
+              } catch {
+                if (botBeforeComputerAuto) rawDispatch({ type: "botPatched", bot: botBeforeComputerAuto });
+              }
+              showError(caught);
+            });
           break;
         }
         default:
@@ -1685,7 +1801,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         }
         case "screen":
-          rawDispatch({ type: "screenFrame", botId: frame.botId, png: frame.png, mime: frame.mime ?? "image/png" });
+          // Frames without exact server-owned identity may belong to a
+          // previous destination/turn for this bot. Fail closed to direct
+          // polling when connected to an older server.
+          if (
+            typeof frame.targetKey !== "string" || !frame.targetKey ||
+            typeof frame.targetGeneration !== "string" || !frame.targetGeneration
+          ) break;
+          rawDispatch({
+            type: "screenFrame",
+            botId: frame.botId,
+            png: frame.png,
+            mime: frame.mime ?? "image/png",
+            targetKey: frame.targetKey,
+            targetGeneration: frame.targetGeneration,
+            // `frame.at` is stamped by the harness host. A remote Mac client
+            // may have a different wall clock, so comparing that value with
+            // client-side screenshot times can make an old SSE frame appear
+            // newer for minutes. Freshness is based on local receipt time.
+            at: Date.now(),
+          });
           break;
         case "computer":
           rawDispatch({ type: "provisioning", botId: frame.botId, on: frame.state === "provisioning" });

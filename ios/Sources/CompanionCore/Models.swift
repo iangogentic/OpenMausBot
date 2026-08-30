@@ -251,18 +251,31 @@ private struct Lossy<Element: Decodable>: Decodable {
 public struct Fleet: Decodable, Sendable {
     public var bots: [Bot]
     public var groups: [Room]
+    public var computerControl: [String: FleetComputerControl]
 
-    private enum CodingKeys: String, CodingKey { case bots, groups }
+    private enum CodingKeys: String, CodingKey { case bots, groups, computerControl }
 
-    public init(bots: [Bot], groups: [Room]) {
+    public init(bots: [Bot], groups: [Room], computerControl: [String: FleetComputerControl] = [:]) {
         self.bots = bots
         self.groups = groups
+        self.computerControl = computerControl
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         bots = try container.decodeIfPresent([Lossy<Bot>].self, forKey: .bots)?.compactMap(\.value) ?? []
         groups = try container.decodeIfPresent([Lossy<Room>].self, forKey: .groups)?.compactMap(\.value) ?? []
+        computerControl = try container.decodeIfPresent([String: FleetComputerControl].self, forKey: .computerControl) ?? [:]
+    }
+}
+
+public struct FleetComputerControl: Codable, Sendable {
+    public var held: Bool
+    public var helpReason: String?
+
+    public init(held: Bool, helpReason: String?) {
+        self.held = held
+        self.helpReason = helpReason
     }
 }
 
@@ -397,25 +410,200 @@ public struct CompanionConnectionMetadata: Decodable, Sendable {
 /// A freshly minted provider viewer. It is deliberately not Codable for
 /// persistence: the URL is a short-lived bearer credential and belongs only
 /// in memory for the browser session that requested it.
+private let cloudDesktopURLMaximumLength = 4_096
+
+/// Parse only viewer credentials issued on ascii.dev's HTTPS origin. This is
+/// public so the app's WebKit navigation delegate and the wire decoder share
+/// one policy instead of slowly drifting apart.
+public func trustedCloudDesktopURL(_ raw: String) -> URL? {
+    guard raw.utf8.count > 0,
+          raw.utf8.count <= cloudDesktopURLMaximumLength,
+          let parsed = URL(string: raw),
+          parsed.scheme?.lowercased() == "https",
+          parsed.user == nil,
+          parsed.password == nil,
+          let host = parsed.host?.lowercased(),
+          host == "ascii.dev" || host.hasSuffix(".ascii.dev")
+    else { return nil }
+    return parsed
+}
+
+/// Resolve only the device-bound Local VM viewer minted by the companion
+/// currently being dialed. Unlike the hosted Box URL, this may be HTTP on an
+/// explicitly approved LAN/Tailscale route; its origin must still match the
+/// paired connection exactly and its bot/generation/token/path components
+/// are all mandatory.
+public func trustedPhoneLocalVmViewerURL(
+    _ raw: String,
+    companionBaseURL: URL,
+    botId: String
+) -> URL? {
+    guard raw.utf8.count > 0,
+          raw.utf8.count <= cloudDesktopURLMaximumLength,
+          !botId.isEmpty,
+          botId.utf8.allSatisfy({
+              (48...57).contains($0) || (65...90).contains($0) ||
+                  (97...122).contains($0) || $0 == 95 || $0 == 45
+          }),
+          let parsed = URL(string: raw, relativeTo: companionBaseURL)?.absoluteURL,
+          parsed.user == nil,
+          parsed.password == nil,
+          parsed.query == nil,
+          parsed.scheme?.lowercased() == companionBaseURL.scheme?.lowercased(),
+          parsed.host?.lowercased() == companionBaseURL.host?.lowercased(),
+          (parsed.port ?? SelfDefaultPort.forScheme(parsed.scheme)) ==
+              (companionBaseURL.port ?? SelfDefaultPort.forScheme(companionBaseURL.scheme))
+    else { return nil }
+
+    let escapedBot = NSRegularExpression.escapedPattern(for: botId)
+    let pattern = "^/api/bots/\(escapedBot)/phone-local-computer/viewer/([A-Za-z0-9_-]{16})/([A-Za-z0-9_-]{32,128})/vnc\\.html$"
+    guard let expression = try? NSRegularExpression(pattern: pattern),
+          expression.firstMatch(
+              in: parsed.path,
+              range: NSRange(parsed.path.startIndex..., in: parsed.path)
+          ) != nil,
+          let components = URLComponents(url: parsed, resolvingAgainstBaseURL: false),
+          let fragment = components.fragment,
+          let fragmentItems = URLComponents(string: "?\(fragment)")?.queryItems
+    else { return nil }
+    let values = Dictionary(grouping: fragmentItems, by: \.name)
+    guard Set(values.keys) == Set(["autoconnect", "resize", "password", "path"]),
+          values.values.allSatisfy({ $0.count == 1 }),
+          values["autoconnect"]?.first?.value == "true",
+          values["resize"]?.first?.value == "scale",
+          let socketPath = values["path"]?.first?.value,
+          let password = values["password"]?.first?.value,
+          !password.isEmpty,
+          password.utf8.count <= 512,
+          !password.contains(where: { $0.isNewline || $0 == "\0" }),
+          socketPath == String(parsed.path.dropFirst().dropLast("vnc.html".count)) + "websockify"
+    else { return nil }
+    return parsed
+}
+
+private enum SelfDefaultPort {
+    static func forScheme(_ scheme: String?) -> Int? {
+        switch scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+}
+
+/// WebKit may follow same-origin paths and fragments needed by noVNC, but a
+/// main-frame redirect must never turn the bearer viewer into a general web
+/// browser. Explicit port 443 and the default HTTPS port are the same origin.
+public func cloudDesktopNavigationIsAllowed(
+    destination: URL,
+    originalURL: URL,
+    isMainFrame: Bool
+) -> Bool {
+    guard destination.absoluteString.utf8.count <= cloudDesktopURLMaximumLength,
+          destination.scheme?.lowercased() == "https",
+          destination.user == nil,
+          destination.password == nil,
+          let destinationHost = destination.host?.lowercased()
+    else { return false }
+    let localViewer = originalURL.path.range(
+        of: #"^/api/bots/[A-Za-z0-9_-]+/phone-local-computer/viewer/[A-Za-z0-9_-]{16}/[A-Za-z0-9_-]{32,128}/vnc\.html$"#,
+        options: .regularExpression
+    ) != nil
+    if !isMainFrame && !localViewer { return true }
+    guard let originHost = originalURL.host?.lowercased() else { return false }
+    if !localViewer && trustedCloudDesktopURL(originalURL.absoluteString) == nil { return false }
+    let destinationPort = destination.port ?? SelfDefaultPort.forScheme(destination.scheme)
+    let originPort = originalURL.port ?? SelfDefaultPort.forScheme(originalURL.scheme)
+    return destination.scheme?.lowercased() == originalURL.scheme?.lowercased() &&
+        destinationHost == originHost && destinationPort == originPort
+}
+
 public struct CloudDesktopSession: Decodable, Sendable {
     public let url: URL
+
+    public init(url: URL) {
+        self.url = url
+    }
 
     private enum CodingKeys: String, CodingKey { case joinUrl }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let raw = try container.decode(String.self, forKey: .joinUrl)
-        guard let parsed = URL(string: raw),
-              parsed.scheme?.lowercased() == "https",
-              parsed.host != nil
+        guard let parsed = trustedCloudDesktopURL(raw)
         else {
             throw DecodingError.dataCorruptedError(
                 forKey: .joinUrl,
                 in: container,
-                debugDescription: "Cloud desktop URL must be HTTPS"
+                debugDescription: "Cloud desktop URL must use a trusted ascii.dev HTTPS host"
             )
         }
         url = parsed
+    }
+}
+
+/// In-memory identity of one exact phone control lease. Owner id alone is
+/// deliberately insufficient: the same live view can release L1 and acquire
+/// L2, while a delayed heartbeat or viewer-close callback for L1 is still
+/// suspended on the network.
+public struct CloudDesktopLeaseIdentity: Hashable, Sendable {
+    public let ownerId: String
+    public let leaseToken: String
+
+    public init(ownerId: String, leaseToken: String) {
+        self.ownerId = ownerId
+        self.leaseToken = leaseToken
+    }
+}
+
+/// Generation fence shared by the app lifecycle and testable core. A delayed
+/// callback may mutate viewer state only while its exact owner/token pair is
+/// still current.
+public func cloudDesktopLeaseIsCurrent(
+    _ current: CloudDesktopLeaseIdentity?,
+    expected: CloudDesktopLeaseIdentity
+) -> Bool {
+    current == expected
+}
+
+/// The short server-owned lease that pauses bot input while this phone is
+/// driving. Only a successful take response carries `leaseToken`; heartbeat
+/// and release return the same public snapshot without reissuing authority.
+public struct CloudDesktopControl: Decodable, Sendable {
+    public let held: Bool
+    public let helpReason: String?
+    public let leaseExpiresAtMs: Double?
+    public let leaseToken: String?
+    public let leaseTtlMs: Double?
+}
+
+/// A phone must close its direct provider viewer *before* an unrenewed server
+/// lease can expire and let the bot resume. This monotonic watchdog never
+/// extends on a timeout/5xx; only a proven heartbeat renews it.
+public struct CloudDesktopLeaseWatchdog: Sendable {
+    public private(set) var proofUptimeMs: UInt64
+    public private(set) var safetyWindowMs: UInt64
+
+    public init(proofUptimeMs: UInt64, serverLeaseTtlMs: Double?) {
+        self.proofUptimeMs = proofUptimeMs
+        self.safetyWindowMs = Self.window(serverLeaseTtlMs)
+    }
+
+    public mutating func renew(proofUptimeMs: UInt64, serverLeaseTtlMs: Double?) {
+        self.proofUptimeMs = proofUptimeMs
+        self.safetyWindowMs = Self.window(serverLeaseTtlMs)
+    }
+
+    public func isExpired(nowUptimeMs: UInt64) -> Bool {
+        nowUptimeMs >= proofUptimeMs && nowUptimeMs - proofUptimeMs >= safetyWindowMs
+    }
+
+    private static func window(_ raw: Double?) -> UInt64 {
+        let fallback = 15_000.0
+        let supplied = raw.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? fallback
+        let bounded = min(15_000.0, max(250.0, supplied))
+        // Leave one third of the lease for scheduling and network jitter.
+        return max(100, UInt64(bounded * 2.0 / 3.0))
     }
 }
 

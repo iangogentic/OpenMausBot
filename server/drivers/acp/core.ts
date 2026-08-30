@@ -15,9 +15,16 @@
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
 import { homedir } from "node:os";
 
-import { PROVIDER_CREDENTIAL_ENV, WORKSPACE_CREDENTIAL_ENV } from "../../config.ts";
-import { decodeInjectId } from "../local-inject.ts";
-import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../../procs.ts";
+import { applyModelRelayEnvironment, decodeInjectId } from "../local-inject.ts";
+import {
+  describeSpawnFailure,
+  execCli,
+  spawnCli,
+  terminateCliTree,
+  type ProviderRuntimePath,
+  type ProviderHomeImport,
+} from "../../procs.ts";
+import { providerChildEnvironment } from "../../provider-child-env.ts";
 
 /**
  * A `host::model` pick talks to a loopback server with its own key.
@@ -50,6 +57,7 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+import { BoundedJsonLineDecoder } from "../bounded-json-lines.ts";
 
 export interface AcpConfig {
   cli: string;
@@ -91,6 +99,17 @@ export interface AcpSupport {
   install?: EngineInstall;
   /** CLI argv AFTER the binary name to enter ACP stdio mode. */
   spawnArgs(config: AcpConfig, turn: SendTurnInput): string[];
+  /** Optional per-turn executable override, resolved only after the turn env
+   * has been prepared. This is used by managed Python harnesses whose public
+   * launcher intentionally strips policy environment variables. No shell is
+   * involved; `cli` and every fixed arg stay distinct argv entries. */
+  resolveSpawnTarget?(ctx: {
+    cli: string;
+    args: string[];
+    env: Record<string, string | undefined>;
+    config: AcpConfig;
+    turn: SendTurnInput;
+  }): { cli: string; args: string[] };
   /** Provider credential variables this ACP child is allowed to inherit. */
   credentialEnv?: readonly string[];
   /** Select the model through a session config option instead of argv, for
@@ -101,12 +120,32 @@ export interface AcpSupport {
   /** Mutate the child env in place: strip a key, inject a policy. Receives the
    *  instance config so a support can vary with fullAuto. */
   transformEnv?(env: Record<string, string | undefined>, config: AcpConfig): void;
+  /** Prepare a turn-scoped environment before model resolution. Used when a
+   * harness needs isolated state in place before resolveTurnModel writes its
+   * provider configuration. */
+  prepareTurnEnv?(
+    env: Record<string, string | undefined>,
+    ctx: { turn: SendTurnInput; config: AcpConfig },
+  ): void;
   /** Mutate the child env after the turn model is known. Catalog refresh and
    *  snapshot share `transformEnv` and must not see a per-turn overlay. */
   applyTurnEnv?(
     env: Record<string, string | undefined>,
     ctx: { model?: string; requestedModel?: string },
   ): void;
+  /** Runtime artifacts that this exact provider turn may see through the
+   * production OS sandbox. Nothing under the shared runtime directory is
+   * mounted unless the driver names it here after preparing the turn. */
+  providerRuntimePaths?(
+    env: Record<string, string | undefined>,
+    ctx: { turn: SendTurnInput; config: AcpConfig },
+  ): ProviderRuntimePath[];
+  /** Server-staged files copied into this bot's durable provider HOME before
+   * the hostile process starts. Used for narrow policy/config refreshes. */
+  providerHomeImports?(
+    env: Record<string, string | undefined>,
+    ctx: { turn: SendTurnInput; config: AcpConfig },
+  ): ProviderHomeImport[];
   /** Pick the ACP authenticate methodId from initialize's advertised
    * authMethods; return null to skip the authenticate step. */
   pickAuthMethod(authMethods: Array<{ id?: string }>): string | null;
@@ -190,20 +229,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
     async create(input: DriverCreateInput<AcpConfig>): Promise<ProviderInstance> {
       const { instanceId, config } = input;
       const childEnv = () => {
-        const env: Record<string, string | undefined> = {
-          ...process.env,
-          ...input.environment,
-          PATH: augmentedPath(),
-        };
-        const allowedCredentials = new Set(support.credentialEnv ?? []);
-        // two lists, one rule: foreign PROVIDER keys must not flip a CLI's
-        // billing off its own login, and WORKSPACE credentials (box token,
-        // voice key, …) are the harness's secrets — riding along in
-        // `...process.env` is not a grant. A driver keeps only what its
-        // credentialEnv allowlist names.
-        for (const key of [...PROVIDER_CREDENTIAL_ENV, ...WORKSPACE_CREDENTIAL_ENV]) {
-          if (!allowedCredentials.has(key)) delete env[key];
-        }
+        const env = providerChildEnvironment(input.environment, {
+          credentialEnv: support.credentialEnv,
+          internal: { PATH: augmentedPath() },
+        });
         support.transformEnv?.(env, config);
         return env;
       };
@@ -220,8 +249,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
       await refreshModels();
       const listeners = new Set<RuntimeEventListener>();
       interface Turn {
-        stop: () => void;
-        interrupt: () => void;
+        stop: () => Promise<void>;
+        interrupt: () => Promise<void>;
         turnId: string;
         asks: Map<string, (behavior: string, source?: "user" | "timeout" | "system") => void>;
       }
@@ -259,6 +288,19 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             env: acpEnv(composio.env),
           });
         }
+        const ianBrain = turn.integrations?.ianBrain;
+        if (ianBrain) {
+          servers.push({
+            name: "ian_brain",
+            command: process.execPath,
+            args: [SPAWNED_PROXIES.ianBrain],
+            env: acpEnv({
+              ELECTRON_RUN_AS_NODE: "1",
+              OMB_IAN_BRAIN_URL: ianBrain.url,
+              OMB_IAN_BRAIN_CAPABILITY_TOKEN: ianBrain.token,
+            }),
+          });
+        }
         // The bot's computer, mounted exactly like the Claude driver does.
         // Cloud boxes use the REST adapter; host and sandbox Cua connections
         // expose Cua Driver's official MCP server directly.
@@ -289,9 +331,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         if (controlsHost && config.fullAuto) {
           throw new Error("local computer control requires interactive provider approvals");
         }
-        const turnId = newId();
+        const turnId = turn.turnId ?? newId();
         const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv();
+        applyModelRelayEnvironment(env, turn.model, turn.integrations?.modelRelay);
         if (
           support.requireAuthenticationBeforeSpawn
           && !skipSubscriptionAuthForLocalInject(turn.model)
@@ -302,6 +345,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           emit({ ...base(threadId, turnId), type: "turn.completed", ok: false, stopReason: "auth_required", cost: null });
           return { turnId };
         }
+        support.prepareTurnEnv?.(env, { turn, config });
         const resolvedModel = support.resolveTurnModel?.(turn.model, env);
         support.applyTurnEnv?.(env, { model: resolvedModel, requestedModel: turn.model });
         const cliTurn =
@@ -310,13 +354,33 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             : turn;
         const mcpServers = acpMcpServers(turn);
 
-        const child = spawnCli(config.cli, support.spawnArgs(config, cliTurn), {
+        const defaultSpawn = { cli: config.cli, args: support.spawnArgs(config, cliTurn) };
+        const spawnTarget = support.resolveSpawnTarget?.({
+          ...defaultSpawn,
+          env,
+          config,
+          turn: cliTurn,
+        }) ?? defaultSpawn;
+        const providerRuntimePaths = [
+          ...(turn.providerRuntimePaths ?? []),
+          ...(support.providerRuntimePaths?.(env, { turn: cliTurn, config }) ?? []),
+        ];
+        // This hook intentionally runs after model/config preparation: Hermes
+        // stages sanitized config first, then points the child at its durable
+        // logical HOME while the supervisor imports only those exact files.
+        const providerHomeImports = support.providerHomeImports?.(env, { turn: cliTurn, config }) ?? [];
+        const child = spawnCli(spawnTarget.cli, spawnTarget.args, {
           cwd,
           env,
           stdio: ["pipe", "pipe", "pipe"],
+          providerRuntimePaths,
+          providerHomeImports,
+          providerPersistentHome: {
+            ownerKey: turn.isolationKey ?? threadId,
+          },
         });
 
-        const state = { settled: false, promptSent: false, text: "" };
+        const state = { settled: false, settling: false, promptSent: false, text: "" };
         const asks = new Map<string, (behavior: string, source?: "user" | "timeout" | "system") => void>();
         let nextId = 1;
         let sessionId: string | null = null;
@@ -347,7 +411,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             send({ jsonrpc: "2.0", id, method, params });
           });
 
-        const stop = () => killCliTree(child);
+        const stop = () => terminateCliTree(child);
 
         /** Emit buffered assistant text as its own item, then clear it. */
         const flushAssistantText = () => {
@@ -358,8 +422,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         };
 
         const settle = (ok: boolean, stopReason: string | null) => {
-          if (state.settled) return;
-          state.settled = true;
+          if (state.settled || state.settling) return;
+          state.settling = true;
           if (interruptTimer) clearTimeout(interruptTimer);
           for (const finish of [...asks.values()]) finish("cancel", "system");
           for (const p of rpcPending.values()) {
@@ -367,10 +431,23 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             p.reject(new Error("turn settled"));
           }
           rpcPending.clear();
-          active.delete(threadId);
-          flushAssistantText();
-          emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null });
-          stop(); // the agent process does not exit on its own
+          void (async () => {
+            try {
+              await stop(); // the agent process does not exit on its own
+            } catch (error) {
+              state.settling = false;
+              emit({
+                ...base(threadId, turnId),
+                type: "runtime.error",
+                message: `could not prove ${DRIVER_KIND} exited: ${error instanceof Error ? error.message : String(error)}`,
+              });
+              return;
+            }
+            state.settled = true;
+            active.delete(threadId);
+            flushAssistantText();
+            emit({ ...base(threadId, turnId), type: "turn.completed", ok, stopReason, cost: null });
+          })();
         };
 
         // server→client permission request → canonical request.opened
@@ -492,42 +569,42 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
         };
 
-        let buf = "";
-        // decode as UTF-8 across chunk boundaries — a raw `buf += chunk` splits
-        // multibyte characters that straddle two reads and corrupts the text
-        child.stdout.setEncoding("utf8");
+        const stdout = new BoundedJsonLineDecoder();
+        let outputRejected = false;
         child.stdout.on("data", (chunk) => {
-          buf += chunk;
-          let nl;
-          while ((nl = buf.indexOf("\n")) !== -1) {
-            const line = buf.slice(0, nl);
-            buf = buf.slice(nl + 1);
-            if (!line.trim()) continue;
-            let msg: any;
-            try {
-              msg = JSON.parse(line);
-            } catch {
-              continue;
-            }
-            appendNative(threadId, { dir: "in", source: SOURCE, msg });
-            if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
-              const pend = rpcPending.get(msg.id);
-              if (pend) {
-                rpcPending.delete(msg.id);
-                if (pend.timer) clearTimeout(pend.timer);
-                if (msg.error) {
-                  const error = new Error(msg.error.message ?? JSON.stringify(msg.error));
-                  Object.assign(error, { code: msg.error.code, data: msg.error.data });
-                  pend.reject(error);
-                } else {
-                  pend.resolve(msg.result);
+          if (outputRejected) return;
+          try {
+            for (const { value } of stdout.push(chunk)) {
+              const msg: any = value;
+              appendNative(threadId, { dir: "in", source: SOURCE, msg });
+              if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+                const pend = rpcPending.get(msg.id);
+                if (pend) {
+                  rpcPending.delete(msg.id);
+                  if (pend.timer) clearTimeout(pend.timer);
+                  if (msg.error) {
+                    const detail = typeof msg.error?.data?.details === "string" ? msg.error.data.details.trim() : "";
+                    const error = new Error(detail || msg.error.message || JSON.stringify(msg.error));
+                    Object.assign(error, { code: msg.error.code, data: msg.error.data });
+                    pend.reject(error);
+                  } else {
+                    pend.resolve(msg.result);
+                  }
                 }
+              } else if (msg.id !== undefined && msg.method) {
+                handleServerRequest(msg);
+              } else if (msg.method) {
+                handleNotification(msg);
               }
-            } else if (msg.id !== undefined && msg.method) {
-              handleServerRequest(msg);
-            } else if (msg.method) {
-              handleNotification(msg);
             }
+          } catch (error) {
+            outputRejected = true;
+            emit({
+              ...base(threadId, turnId),
+              type: "runtime.error",
+              message: error instanceof Error ? error.message : String(error),
+            });
+            settle(false, "provider_output_limit");
           }
         });
 
@@ -541,7 +618,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           settle(false, "spawn_error");
         });
         child.on("close", (code) => {
-          if (!state.settled) {
+          if (!state.settled && !state.settling) {
             emit({
               ...base(threadId, turnId),
               type: "runtime.error",
@@ -551,12 +628,11 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           }
         });
 
-        const interrupt = () => {
+        const interrupt = async () => {
           if (sessionId) send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
-          else stop();
           if (interruptTimer) clearTimeout(interruptTimer);
-          interruptTimer = setTimeout(() => settle(true, "cancelled"), 5_000);
-          interruptTimer.unref?.();
+          await stop();
+          settle(true, "cancelled");
         };
         active.set(threadId, { stop, interrupt, turnId, asks });
         emit({ ...base(threadId, turnId), type: "turn.started" });
@@ -689,7 +765,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             else if (reason === "cancelled") settle(true, "cancelled");
             else settle(false, reason ?? "failed");
           } catch (e) {
-            if (!state.settled) {
+            if (!state.settled && !state.settling) {
               const message = e instanceof Error ? e.message : String(e);
               const code = support.classifyError?.(e);
               // Authentication setup is a user action, not a retry. The
@@ -744,7 +820,10 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             localComputerMcp: !config.fullAuto,
           },
           sendTurn,
-          interruptTurn: async (threadId) => active.get(threadId)?.interrupt(),
+          interruptTurn: async (threadId) => {
+            const turn = active.get(threadId);
+            if (turn) await turn.interrupt();
+          },
           respondToRequest: async (threadId, requestId, decision) => {
             const turn = active.get(threadId);
             const finish = turn?.asks.get(requestId);
@@ -754,7 +833,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           },
           hasSession: (threadId) => active.has(threadId),
           stopAll: async () => {
-            for (const { stop } of active.values()) stop();
+            await Promise.all([...active.values()].map(({ stop }) => stop()));
           },
           onEvent: (listener) => {
             listeners.add(listener);
@@ -762,7 +841,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           },
         },
         dispose: async () => {
-          for (const { stop } of active.values()) stop();
+          await Promise.all([...active.values()].map(({ stop }) => stop()));
           listeners.clear();
         },
       };

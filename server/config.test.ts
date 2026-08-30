@@ -40,6 +40,8 @@ describe("configuration boundaries", () => {
     expect(() => parseStoredConfig({ instances: { claude: { driver: 42 } } })).toThrow("instances.claude.driver");
     expect(() => parseConfigPatch({ opencodeGo: { apiKey: 42 } })).toThrow("opencodeGo.apiKey");
     expect(() => parseConfigPatch({ profile: [] })).toThrow("profile");
+    expect(() => parseConfigPatch({ composio: { sessionId: "attacker-session" } })).toThrow("server-derived");
+    expect(() => parseConfigPatch({ composio: { userId: "another-user" } })).toThrow("server-derived");
   });
 
   it("accepts only a simple VPS SSH config alias and exposes no credentials", () => {
@@ -70,13 +72,14 @@ describe("configuration boundaries", () => {
     },
   );
 
-  it("preserves shared Local VM behavior by default and accepts bounded per-bot mode", () => {
-    expect(localVmMode({})).toBe("shared");
+  it("isolates each bot by default and still accepts an explicit shared mode", () => {
+    expect(localVmMode({})).toBe("per-bot");
     expect(localVmMaxInstances({})).toBe(2);
     expect(parseConfigPatch({ localVm: { mode: "per-bot", maxInstances: 4 } })).toEqual({
       localVm: { mode: "per-bot", maxInstances: 4 },
     });
     expect(localVmMode({ localVm: { mode: "per-bot" } })).toBe("per-bot");
+    expect(localVmMode({ localVm: { mode: "shared" } })).toBe("shared");
     expect(localVmMaxInstances({ localVm: { maxInstances: 3 } })).toBe(3);
   });
 
@@ -263,30 +266,30 @@ describe("credential env narrowing", () => {
     };
     const instances = instanceConfigs(cfg);
     expect(instances.grokApi.environment).toEqual({ XAI_API_KEY: "SECRET-XAI" });
-    expect(instances.computer.environment).toEqual({ BOX_TOKEN: "SECRET-BOX" });
+    expect(instances.computer.environment).toEqual({ OMB_BOX_CONFIGURED: "1" });
     expect(instances.opencode.environment).toEqual({ OPENCODE_API_KEY: "SECRET-OCG" });
     // engines that bring their own login receive NO workspace credential
     expect(instances.claude.environment).toEqual({});
     expect(instances.codex.environment).toEqual({});
   });
 
-  it("hands no credential to any default-fleet CLI engine except the Computer", () => {
+  it("hands no provider credential to any default-fleet CLI engine", () => {
     // the default `grok` instance is the CLI-login grokAgent, not the
     // API-key driver, so a configured xai key reaches nobody by default
     const cfg: AppConfig = { xai: { key: "SECRET-XAI" }, box: { token: "SECRET-BOX" } };
     const instances = instanceConfigs(cfg);
     for (const [id, entry] of Object.entries(instances)) {
-      if (id === "computer") expect(entry.environment).toEqual({ BOX_TOKEN: "SECRET-BOX" });
+      if (id === "computer") expect(entry.environment).toEqual({ OMB_BOX_CONFIGURED: "1" });
       else expect(entry.environment).toEqual({});
     }
   });
 
-  it("keeps a per-instance environment while layering the credential on top", () => {
+  it("keeps a per-instance environment, strips legacy Box secrets, and adds only a configured flag", () => {
     const cfg: AppConfig = {
       box: { token: "SECRET-BOX" },
-      instances: { computer: { driver: "boxAgent", environment: { MY_FLAG: "1" } } },
+      instances: { computer: { driver: "boxAgent", environment: { MY_FLAG: "1", BOX_TOKEN: "legacy-secret" } } },
     };
-    expect(instanceConfigs(cfg).computer.environment).toEqual({ MY_FLAG: "1", BOX_TOKEN: "SECRET-BOX" });
+    expect(instanceConfigs(cfg).computer.environment).toEqual({ MY_FLAG: "1", OMB_BOX_CONFIGURED: "1" });
   });
 });
 

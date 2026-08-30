@@ -26,6 +26,8 @@
 //     type, Enter) in one round trip with one frame at the end.
 //
 // stdout is the MCP channel — never console.log here.
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import {
   normalizeBrowserUrl,
   normalizeCrop,
@@ -35,7 +37,13 @@ import {
   type BrowserTarget,
   type CropRegion,
 } from "./computer-observation.ts";
-import { CONTROL_REFUSAL, createControlClient } from "./control-client.ts";
+import {
+  CONTROL_ACTION_BUSY_PLAIN,
+  CONTROL_LIFECYCLE_PLAIN,
+  CONTROL_REFUSAL,
+  CONTROL_UNAVAILABLE_PLAIN,
+  createControlClient,
+} from "./control-client.ts";
 import {
   ensureRemoteCuaCommand,
   REMOTE_CUA_EXECUTABLE,
@@ -44,10 +52,20 @@ import {
   REMOTE_CUA_VERSION,
   semanticBrowserCommand,
 } from "./remote-computer.ts";
+import { callBoxBroker, type BoxBrokerConnection } from "./box-broker-client.ts";
+import {
+  BoundedJsonLineDecoder,
+  ProviderOutputLimitError,
+  PROVIDER_NDJSON_LIMITS,
+} from "./drivers/bounded-json-lines.ts";
 
-const BOX_API = process.env.OGB_BOX_API ?? "https://ascii.dev/api/box/v1";
-const boxId = process.env.OGB_BOX_ID ?? "";
-const token = process.env.OGB_BOX_TOKEN ?? "";
+const brokerActionContext = new AsyncLocalStorage<string>();
+const proxyAbortController = new AbortController();
+const broker: BoxBrokerConnection = {
+  url: process.env.OMB_BOX_BROKER_URL ?? "",
+  token: process.env.OMB_BOX_CAPABILITY_TOKEN ?? "",
+  controlActionId: () => brokerActionContext.getStore(),
+};
 
 // Who-is-driving: while the person holds control in the app, every tool
 // below is refused (not queued — a queued click lands after they've moved
@@ -108,14 +126,22 @@ interface RunOut {
  * 409 machine_not_running. Wake it and carry on rather than handing the
  * agent a cryptic failure it can only guess at. */
 async function resumeBox(): Promise<boolean> {
-  const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
-  await fetch(`${BOX_API}/boxes/${boxId}/resume`, { method: "POST", headers: auth }).catch(() => null);
+  await callBoxBroker(
+    broker,
+    "resume",
+    {},
+    { timeoutMs: 30_000, signal: proxyAbortController.signal },
+  ).catch(() => null);
   const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
-    const res = await fetch(`${BOX_API}/boxes/${boxId}`, { headers: auth }).catch(() => null);
-    const body: any = await res?.json().catch(() => null);
-    const state = body?.box?.state;
+    const response = await callBoxBroker(
+      broker,
+      "state",
+      {},
+      { timeoutMs: 10_000, signal: proxyAbortController.signal },
+    ).catch(() => null);
+    const state = (response?.body as any)?.box?.state;
     if (state && ["idle", "ready", "running"].includes(state)) return true;
     if (state === "error") return false;
   }
@@ -139,15 +165,14 @@ async function runOnBox(command: string, timeoutMs = 60_000, allowWake = true): 
     "/bin/bash -c",
     shellQuote(command),
   ].join(" ");
-  const res = await fetch(`${BOX_API}/boxes/${boxId}/commands`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-    body: JSON.stringify({ command: isolatedCommand }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const body: any = await res.json().catch(() => null);
-  if (res.status === 409 && allowWake) {
-    const code = body?.code ?? body?.error?.code ?? "";
+  const body: any = await callBoxBroker(
+    broker,
+    "command",
+    { command: isolatedCommand, timeoutMs },
+    { timeoutMs: Math.min(timeoutMs + 5_000, 180_000), signal: proxyAbortController.signal },
+  );
+  if (body?.status === 409 && allowWake) {
+    const code = body?.code ?? body?.body?.code ?? body?.body?.error?.code ?? "";
     if (/machine_not_running|box_starting|not_running|starting/i.test(String(code))) {
       const woke = await resumeBox();
       if (woke) return runOnBox(command, timeoutMs, false);
@@ -155,10 +180,10 @@ async function runOnBox(command: string, timeoutMs = 60_000, allowWake = true): 
     }
   }
   return {
-    ok: res.ok && body?.exitCode === 0,
+    ok: body?.ok === true && body?.exitCode === 0,
     exitCode: body?.exitCode ?? null,
     stdout: body?.stdout ?? "",
-    stderr: body?.stderr ?? String(body?.message ?? (res.ok ? "" : `HTTP ${res.status}`)),
+    stderr: body?.stderr ?? String(body?.message ?? (body?.ok ? "" : `HTTP ${body?.status ?? "error"}`)),
   };
 }
 
@@ -297,27 +322,29 @@ function wholeImage(bytes: Buffer, expectedBytes?: number): boolean {
  * envelope second. Both are validated — an error page served with a 200
  * must fall through, not reach the model as an "image". */
 async function fetchFrame(expectedBytes?: number): Promise<string | null> {
-  const auth = { authorization: `Bearer ${token}` };
   try {
-    const res = await fetch(
-      `${BOX_API}/boxes/${boxId}/artifacts?path=${encodeURIComponent(SHOT_PATH)}`,
-      { headers: auth, signal: AbortSignal.timeout(30_000) },
+    const result = await callBoxBroker(
+      broker,
+      "read-file",
+      { path: SHOT_PATH, transport: "artifacts" },
+      { timeoutMs: 30_000, signal: proxyAbortController.signal },
     );
-    if (res.ok) {
-      const bytes = Buffer.from(await res.arrayBuffer());
+    if (result.ok && typeof result.data === "string") {
+      const bytes = Buffer.from(result.data, "base64");
       if (wholeImage(bytes, expectedBytes)) return bytes.toString("base64");
     }
   } catch {
     /* fall through to the files API */
   }
   try {
-    const res = await fetch(
-      `${BOX_API}/boxes/${boxId}/files?path=${encodeURIComponent(SHOT_PATH)}&encoding=base64`,
-      { headers: auth, signal: AbortSignal.timeout(30_000) },
+    const result = await callBoxBroker(
+      broker,
+      "read-file",
+      { path: SHOT_PATH, transport: "files" },
+      { timeoutMs: 30_000, signal: proxyAbortController.signal },
     );
-    const body: any = await res.json().catch(() => null);
-    const content = body?.content;
-    if (!res.ok || typeof content !== "string" || !content) return null;
+    const content = result.data;
+    if (!result.ok || typeof content !== "string" || !content) return null;
     return wholeImage(Buffer.from(content, "base64"), expectedBytes) ? content : null;
   } catch {
     return null;
@@ -409,8 +436,77 @@ async function frameFrom(out: RunOut): Promise<Frame | null> {
   return { data: fetched, mime: "image/jpeg", hash, geometry };
 }
 
+const MAX_IN_FLIGHT_REQUESTS = 4;
+const MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
+let proxyFailed = false;
+
+const failExactProxy = (error: Error): void => {
+  if (proxyFailed) return;
+  proxyFailed = true;
+  proxyAbortController.abort(error);
+  process.stderr.write(`computer proxy rejected provider traffic: ${error.message}\n`);
+  process.stdin.destroy();
+  process.exitCode = 1;
+  const failsafe = setTimeout(() => process.exit(1), 1_000);
+  failsafe.unref?.();
+};
+
+const serializeOutput = (obj: unknown): { line: string; bytes: number } => {
+  const line = JSON.stringify(obj) + "\n";
+  const bytes = Buffer.byteLength(line);
+  if (bytes > PROVIDER_NDJSON_LIMITS.maxLineBytes) {
+    throw new ProviderOutputLimitError(
+      "line_bytes",
+      `computer proxy response exceeded ${PROVIDER_NDJSON_LIMITS.maxLineBytes} bytes`,
+    );
+  }
+  return { line, bytes };
+};
+
+const writeNow = (obj: unknown): void => {
+  if (proxyFailed) return;
+  try {
+    const { line, bytes } = serializeOutput(obj);
+    if (process.stdout.writableLength + bytes > MAX_PENDING_OUTPUT_BYTES) {
+      throw new ProviderOutputLimitError("buffered_bytes", "computer proxy stdout queue exceeded 4 MB");
+    }
+    process.stdout.write(line);
+  } catch (error) {
+    failExactProxy(error instanceof Error ? error : new Error(String(error)));
+  }
+};
+const withheldResponseIds = new Set<string>();
+const withheldResponses = new Map<string, { value: unknown; bytes: number }>();
+let withheldResponseBytes = 0;
+
+function responseKey(id: unknown): string | null {
+  return typeof id === "string" || (typeof id === "number" && Number.isFinite(id))
+    ? `${typeof id}:${String(id)}`
+    : null;
+}
+
+/** Tool implementations emit their result while the action ticket is still
+ * open. Hold that one frame until the harness acknowledges `end-action`; a
+ * provider that sees it earlier can settle the turn and race a takeover. */
 const send = (obj: unknown): void => {
-  process.stdout.write(JSON.stringify(obj) + "\n");
+  const frame = obj as { id?: unknown } | null;
+  const key = responseKey(frame?.id);
+  if (key && withheldResponseIds.has(key)) {
+    try {
+      const { bytes } = serializeOutput(obj);
+      const previous = withheldResponses.get(key);
+      const nextBytes = withheldResponseBytes - (previous?.bytes ?? 0) + bytes;
+      if (nextBytes > MAX_PENDING_OUTPUT_BYTES) {
+        throw new ProviderOutputLimitError("buffered_bytes", "computer proxy withheld responses exceeded 4 MB");
+      }
+      withheldResponseBytes = nextBytes;
+      withheldResponses.set(key, { value: obj, bytes });
+    } catch (error) {
+      failExactProxy(error instanceof Error ? error : new Error(String(error)));
+    }
+    return;
+  }
+  writeNow(obj);
 };
 const text = (id: unknown, t: string, isError = false): void =>
   send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: t }], isError: isError || undefined } });
@@ -803,14 +899,62 @@ async function semanticActAndObserve(
 const OPEN_WHILE_DRIVEN = new Set(["computer_request_help", "computer_status", "observation_metrics"]);
 
 async function call(id: unknown, name: string, args: any) {
-  if (!OPEN_WHILE_DRIVEN.has(name) && (await control.state(true)).held) {
-    return text(id, CONTROL_REFUSAL, true);
+  if (OPEN_WHILE_DRIVEN.has(name)) return callWithPermit(id, name, args);
+  const key = responseKey(id);
+  if (!key) return text(id, CONTROL_UNAVAILABLE_PLAIN, true);
+  const permit = await control.beginAction();
+  if (!permit.allowed) {
+    return text(
+      id,
+      permit.reason === "unavailable"
+        ? CONTROL_UNAVAILABLE_PLAIN
+        : permit.reason === "lifecycle-active"
+          ? CONTROL_LIFECYCLE_PLAIN
+          : permit.reason === "action-active"
+            ? CONTROL_ACTION_BUSY_PLAIN
+          : CONTROL_REFUSAL,
+      true,
+    );
   }
+  withheldResponseIds.add(key);
+  let failure: unknown = null;
+  try {
+    await brokerActionContext.run(permit.actionId, () => callWithPermit(id, name, args));
+  } catch (error) {
+    failure = error;
+  }
+  // Takeover does not report success until the harness observes this exact
+  // ticket ending. Await the acknowledgement rather than merely firing it.
+  const ended = await control.endAction(permit.actionId);
+  if (!ended) {
+    // Fail closed: do not let the provider settle this turn against a stale
+    // exact-target mapping while the harness still considers the action live.
+    process.stderr.write("computer control authority did not acknowledge the completed Box action\n");
+    withheldResponseIds.delete(key);
+    const discarded = withheldResponses.get(key);
+    withheldResponses.delete(key);
+    if (discarded) withheldResponseBytes -= discarded.bytes;
+    return;
+  }
+  withheldResponseIds.delete(key);
+  const response = withheldResponses.get(key);
+  withheldResponses.delete(key);
+  if (response !== undefined) {
+    withheldResponseBytes -= response.bytes;
+    writeNow(response.value);
+  }
+  if (failure) throw failure;
+}
+
+async function callWithPermit(id: unknown, name: string, args: any) {
   if (name === "computer_request_help") {
     if (!control.configured) {
-      return text(id, "nobody can be paged for this computer right now — carry on carefully", true);
+      return text(id, "computer control authority is unavailable, so nobody can be paged safely right now", true);
     }
     const initial = await control.state(true);
+    if (!initial.available) {
+      return text(id, "computer control authority is unavailable, so nobody can be paged safely right now", true);
+    }
     // If the person is already driving, don't clobber whatever plea they
     // are reading — just wait for the hand-back.
     const requestId = initial.held ? null : await control.requestHelp(String(args?.reason ?? ""));
@@ -822,6 +966,14 @@ async function call(id: unknown, name: string, args: any) {
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, CONTROL_POLL_MS));
       const state = await control.state(true);
+      if (!state.available) {
+        if (requestId) await control.expireHelp(requestId);
+        return text(
+          id,
+          "Computer control authority became unavailable while waiting. Pause and tell the person in chat.",
+          true,
+        );
+      }
       if (state.held) sawHold = true;
       if (!state.held && !state.helpOpen) {
         return text(
@@ -1055,19 +1207,52 @@ async function handle(msg: any) {
   }
 }
 
-let buf = "";
+const input = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS);
+const inFlight = new Set<Promise<void>>();
+let inputEnded = false;
+
+function dispatch(message: unknown): void {
+  if (proxyFailed) return;
+  if (inFlight.size >= MAX_IN_FLIGHT_REQUESTS) {
+    failExactProxy(new ProviderOutputLimitError("frame_rate", "computer proxy exceeded 4 concurrent requests"));
+    return;
+  }
+  const task = Promise.resolve()
+    .then(() => handle(message))
+    .then(() => undefined, (error) => {
+      process.stderr.write(`computer proxy request failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    });
+  inFlight.add(task);
+  void task.finally(() => inFlight.delete(task));
+}
+
 process.stdin.on("data", (chunk) => {
-  buf += chunk;
-  let nl;
-  while ((nl = buf.indexOf("\n")) !== -1) {
-    const line = buf.slice(0, nl);
-    buf = buf.slice(nl + 1);
-    if (!line.trim()) continue;
-    try {
-      void handle(JSON.parse(line));
-    } catch {
-      /* ignore malformed lines */
+  if (inputEnded || proxyFailed) return;
+  try {
+    for (const { value } of input.push(chunk)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      dispatch(value);
     }
+  } catch (error) {
+    failExactProxy(error instanceof Error ? error : new Error(String(error)));
   }
 });
-process.stdin.on("end", () => process.exit(0));
+process.stdin.on("end", () => {
+  inputEnded = true;
+  // A harness may close stdin while a remote Box command is still running.
+  // Wait for every normally completing request to end its exact action ticket
+  // before allowing this proxy to exit. Do not infer cancellation from EOF:
+  // if the process/transport dies, the ticket intentionally remains fenced.
+  try {
+    for (const { value } of input.flush()) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      dispatch(value);
+    }
+  } catch (error) {
+    failExactProxy(error instanceof Error ? error : new Error(String(error)));
+    return;
+  }
+  void Promise.allSettled([...inFlight]).then(() => {
+    if (!proxyFailed) process.exitCode = 0;
+  });
+});

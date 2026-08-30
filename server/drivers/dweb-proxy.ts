@@ -10,9 +10,16 @@
 // Speaks raw JSON-RPC 2.0 over stdio (no MCP SDK — house style, matches
 // agents-proxy / computer-proxy / permission-proxy). Config comes from env:
 //   DWEB_URL  base URL of the local dweb daemon (http://127.0.0.1:49737)
-import readline from "node:readline";
+import { readBoundedResponseText } from "../bounded-response.ts";
+import {
+  assertBoundedJsonShape,
+  BoundedJsonLineDecoder,
+  CATALOG_NDJSON_LIMITS,
+  PROVIDER_NDJSON_LIMITS,
+} from "./bounded-json-lines.ts";
 
 const DWEB = (process.env.DWEB_URL ?? "http://127.0.0.1:49737").replace(/\/+$/, "");
+const MAX_API_RESPONSE_BYTES = 1024 * 1024;
 const DWEB_DISPLAY = (() => {
   try {
     const url = new URL(DWEB);
@@ -59,21 +66,63 @@ const TOOLS = [
 ];
 
 type Json = Record<string, unknown>;
-const send = (msg: Json) => process.stdout.write(JSON.stringify(msg) + "\n");
+const MAX_IN_FLIGHT = 8;
+const MAX_PENDING_OUTPUT_BYTES = 4 * 1024 * 1024;
+const activeRequests = new Set<AbortController>();
+let proxyFailed = false;
+const failProxy = (error: unknown) => {
+  if (proxyFailed) return;
+  proxyFailed = true;
+  for (const controller of activeRequests) controller.abort(error);
+  activeRequests.clear();
+  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  process.stdin.destroy();
+  process.exitCode = 1;
+  const failsafe = setTimeout(() => process.exit(1), 1_000);
+  failsafe.unref?.();
+};
+const send = (msg: Json) => {
+  if (proxyFailed) return;
+  const line = JSON.stringify(msg) + "\n";
+  const bytes = Buffer.byteLength(line);
+  if (
+    bytes > PROVIDER_NDJSON_LIMITS.maxLineBytes ||
+    process.stdout.writableLength + bytes > MAX_PENDING_OUTPUT_BYTES
+  ) return failProxy(new Error("dweb proxy output exceeded its buffer limit"));
+  process.stdout.write(line);
+};
 const ok = (id: unknown, result: unknown) => send({ jsonrpc: "2.0", id, result });
 const rpcErr = (id: unknown, code: number, message: string) => send({ jsonrpc: "2.0", id, error: { code, message } });
 const textResult = (id: unknown, text: string, isError = false) =>
   ok(id, { content: [{ type: "text", text }], isError });
 
 async function api(path: string, init?: RequestInit): Promise<Json> {
-  const res = await fetch(DWEB + path, {
-    signal: AbortSignal.timeout(30_000),
-    ...init,
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  const body = (await res.json().catch(() => ({}))) as Json;
-  if (!res.ok) throw new Error(String(body.error ?? `HTTP ${res.status}`));
-  return body;
+  const controller = new AbortController();
+  activeRequests.add(controller);
+  try {
+    const signals = [
+      controller.signal,
+      ...(init?.signal ? [init.signal] : [AbortSignal.timeout(30_000)]),
+    ];
+    const res = await fetch(DWEB + path, {
+      ...init,
+      signal: AbortSignal.any(signals),
+      headers: { "content-type": "application/json", ...init?.headers },
+    });
+    const text = await readBoundedResponseText(res, MAX_API_RESPONSE_BYTES, "dweb response exceeded 1 MB");
+    let parsed: unknown = {};
+    try {
+      parsed = text.trim() ? JSON.parse(text) : {};
+    } catch {
+      parsed = {};
+    }
+    assertBoundedJsonShape(parsed, CATALOG_NDJSON_LIMITS);
+    const body = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Json : {};
+    if (!res.ok) throw new Error(String(body.error ?? `HTTP ${res.status}`));
+    return body;
+  } finally {
+    activeRequests.delete(controller);
+  }
 }
 
 async function callTool(name: string, args: Json): Promise<{ text: string; isError?: boolean }> {
@@ -179,18 +228,38 @@ async function handle(msg: Json) {
   }
 }
 
-const rl = readline.createInterface({ input: process.stdin, terminal: false });
-rl.on("line", (line) => {
-  const t = line.trim();
-  if (!t) return;
-  let msg: Json;
+const input = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS);
+const inFlight = new Set<Promise<void>>();
+let inputEnded = false;
+const dispatch = (msg: Json) => {
+  if (proxyFailed) return;
+  if (inFlight.size >= MAX_IN_FLIGHT) return failProxy(new Error("dweb proxy exceeded 8 concurrent requests"));
+  const task = handle(msg).catch((e) => {
+    if (msg.id !== undefined) rpcErr(msg.id, -32603, e instanceof Error ? e.message : String(e));
+  });
+  inFlight.add(task);
+  void task.finally(() => inFlight.delete(task));
+};
+process.stdin.on("data", (chunk: Buffer) => {
+  if (inputEnded || proxyFailed) return;
   try {
-    msg = JSON.parse(t) as Json;
-  } catch {
+    for (const { value } of input.push(chunk)) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      dispatch(value as Json);
+    }
+  } catch (error) {
+    failProxy(error);
+  }
+});
+process.stdin.on("end", () => {
+  inputEnded = true;
+  try {
+    for (const { value } of input.flush()) {
+      if (value && typeof value === "object" && !Array.isArray(value)) dispatch(value as Json);
+    }
+  } catch (error) {
+    failProxy(error);
     return;
   }
-  void handle(msg).catch((e) => {
-    if (msg.id !== undefined) rpcErr(msg.id, -32603, (e as Error).message);
-  });
+  void Promise.allSettled([...inFlight]).then(() => { if (!proxyFailed) process.exitCode = 0; });
 });
-rl.on("close", () => process.exit(0));

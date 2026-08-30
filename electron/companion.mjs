@@ -11,14 +11,19 @@
 // narrow list of things the renderer may ask for is written down in one
 // place rather than implied by whatever the control server happens to serve.
 import { app, utilityProcess } from "electron";
+import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveCompanionEntry } from "./companion-entry.mjs";
+import { readBoundedResponseJson } from "./bounded-response.mjs";
 import {
   cleanupCompanionOriginEndpoint,
   companionOriginHealth,
   createCompanionOriginEndpoint,
 } from "./companion-origin-gateway.mjs";
+
+const require = createRequire(import.meta.url);
+const { companionChildEnvironment, companionSessionMessage } = require("./companion-launch.cjs");
 
 // Passed to the fork rather than left to the sidecar's own defaults, so the
 // port this file fetches the control API on cannot drift from the port the
@@ -32,6 +37,10 @@ let proc = null;
 let lastError = null;
 let advertisedHostedUrl = null;
 let originTarget = null;
+// The control port is loopback, but provider shells may share this OS user.
+// Keep its bearer only in the Electron main process and this child generation;
+// never publish it through renderer state, argv, env, or a descriptor file.
+let controlSessionToken = null;
 let lifecycleListener = () => {};
 const expectedStops = new WeakSet();
 
@@ -114,18 +123,23 @@ export function rememberCompanionKeepAwake(keepAwake) {
 /** Ask the sidecar's own control server, which is the same API the standalone
  * page uses. Short timeout: this is loopback, and a spinner in Settings that
  * never resolves is worse than an error. */
-async function control(method, urlPath, body) {
+async function control(method, urlPath, body, sessionToken = controlSessionToken) {
+  const token = typeof sessionToken === "string" ? sessionToken.trim() : "";
+  if (token.length < 32 || token.length > 512 || /[\r\n]/.test(token)) {
+    throw new Error("companion control session unavailable");
+  }
   const options = {
     method,
     signal: AbortSignal.timeout(4000),
+    headers: { "x-openmausbot-session": token },
   };
   if (body !== undefined) {
     options.body = JSON.stringify(body);
-    options.headers = { "content-type": "application/json" };
+    options.headers["content-type"] = "application/json";
   }
   const res = await fetch(`http://127.0.0.1:${CONTROL_PORT}${urlPath}`, options);
   if (!res.ok && res.status !== 404) throw new Error(`companion control ${res.status}`);
-  return res.json();
+  return readBoundedResponseJson(res, 1024 * 1024, "companion control response exceeded 1 MB");
 }
 
 /** Whether this process owns a running sidecar. */
@@ -187,9 +201,33 @@ export function stopCompanion() {
 }
 
 /** startCompanion's body, run inside the transition queue. */
-async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
+async function start({
+  resourcesPath,
+  harnessPort,
+  hostedUrl = null,
+  harnessSessionToken = null,
+  controlSessionToken: requestedControlSessionToken = null,
+  log,
+}) {
   if (proc) return companionState();
+  controlSessionToken = null;
   lastError = null;
+  const harnessToken = typeof harnessSessionToken === "string" ? harnessSessionToken.trim() : "";
+  const controlToken = typeof requestedControlSessionToken === "string"
+    ? requestedControlSessionToken.trim()
+    : "";
+  if (
+    harnessToken.length < 32 ||
+    harnessToken.length > 512 ||
+    controlToken.length < 32 ||
+    controlToken.length > 512 ||
+    /[\r\n]/.test(harnessToken) ||
+    /[\r\n]/.test(controlToken) ||
+    harnessToken === controlToken
+  ) {
+    lastError = "the companion needs distinct private harness and control sessions";
+    return companionState();
+  }
   const resolved = entryPoint(resourcesPath);
   if (!resolved) {
     // In dev this now means even companion/src is gone — a broken checkout,
@@ -220,20 +258,22 @@ async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
   // passes this value only after it has verified the managed connector, and
   // an inherited value would bypass that gate and make Settings claim a dead
   // or attacker-selected route is ready.
-  const childEnvironment = { ...process.env };
-  delete childEnvironment.OMB_COMPANION_HOSTED_URL;
-  delete childEnvironment.OMB_COMPANION_INTERNAL_ORIGIN;
-  if (hostedUrl) childEnvironment.OMB_COMPANION_HOSTED_URL = hostedUrl;
-  childEnvironment.OMB_COMPANION_INTERNAL_ORIGIN = allocatedOrigin.socketPath;
+  // A provider shell on the same Linux user can read another process's
+  // startup environment from /proc. The human-app bearer therefore travels
+  // only over Electron's private parentPort channel after fork.
+  const childEnvironment = companionChildEnvironment(process.env, {
+    hostedUrl,
+    socketPath: allocatedOrigin.socketPath,
+    harnessPort,
+    companionPort: COMPANION_PORT,
+    controlPort: CONTROL_PORT,
+  });
 
   let child;
   try {
     child = utilityProcess.fork(resolved.entry, [], {
       env: {
         ...childEnvironment,
-        OMB_PORT: String(harnessPort),
-        OMB_COMPANION_PORT: String(COMPANION_PORT),
-        OMB_CONTROL_PORT: String(CONTROL_PORT),
       },
       // how the TS-source fallback gets --experimental-strip-types; empty for
       // compiled entries
@@ -243,6 +283,14 @@ async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
   } catch {
     cleanupOrigin();
     lastError = "the companion process could not be started";
+    return companionState();
+  }
+  try {
+    child.postMessage(companionSessionMessage(harnessToken, controlToken));
+  } catch {
+    try { child.kill(); } catch {}
+    cleanupOrigin();
+    lastError = "the companion's private harness session could not be established";
     return companionState();
   }
   child.stdout?.on("data", (d) => log?.(`[companion] ${String(d).trimEnd()}`));
@@ -258,6 +306,7 @@ async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
       proc = null;
       advertisedHostedUrl = null;
       originTarget = null;
+      controlSessionToken = null;
       lifecycleListener({
         type: "exit",
         expected: expectedStops.has(child),
@@ -277,7 +326,7 @@ async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
       return companionState();
     }
     try {
-      const state = await control("GET", "/state");
+      const state = await control("GET", "/state", undefined, controlToken);
       // An answer on the control port proves something is listening there,
       // not that it is the child we just forked. A sidecar started by hand,
       // or one left behind by a previous run, answers exactly the same and
@@ -300,6 +349,7 @@ async function start({ resourcesPath, harnessPort, hostedUrl = null, log }) {
       proc = child;
       advertisedHostedUrl = hostedUrl;
       originTarget = Object.freeze(target);
+      controlSessionToken = controlToken;
       return companionState();
     } catch {
       await new Promise((r) => setTimeout(r, 150));
@@ -320,6 +370,7 @@ async function stop() {
   proc = null;
   advertisedHostedUrl = null;
   originTarget = null;
+  controlSessionToken = null;
   lastError = null;
   if (!child) return companionState();
   expectedStops.add(child);

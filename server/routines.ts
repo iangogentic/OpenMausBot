@@ -4,10 +4,11 @@ import { dirname, join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import { nextZonedDailyOccurrence, normalizeTimeZone } from "../shared/routine-timezone.ts";
 
 export type RoutineSchedule =
   | { type: "once"; at: number }
-  | { type: "daily"; time: string; weekdays: number[] };
+  | { type: "daily"; time: string; weekdays: number[]; timeZone?: string };
 
 /** `cloud` runs the agent itself inside the bot's Box VM. `maus` keeps
  * using the provider selected on the MAUS and only borrows its configured
@@ -121,23 +122,25 @@ function cleanSchedule(schedule: RoutineSchedule): RoutineSchedule {
   if (schedule?.type === "daily") {
     const time = String(schedule.time ?? "");
     if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new Error("Time must use HH:MM");
-    return { type: "daily", time, weekdays: cleanDays(schedule.weekdays) };
+    return {
+      type: "daily",
+      time,
+      weekdays: cleanDays(schedule.weekdays),
+      timeZone: normalizeTimeZone(schedule.timeZone),
+    };
   }
   throw new Error("Choose a supported schedule");
 }
 
-/** Next wall-clock occurrence in this computer's timezone, strictly after `after`. */
+/** Next occurrence in the timezone saved by the controller that created the
+ * routine, strictly after `after`. The always-on server may live elsewhere. */
 export function nextOccurrence(schedule: RoutineSchedule, after: number): number | null {
   if (schedule.type === "once") return schedule.at > after ? schedule.at : null;
-  const [hour, minute] = schedule.time.split(":").map(Number);
-  const weekdays = new Set(cleanDays(schedule.weekdays));
-  for (let offset = 0; offset <= 8; offset++) {
-    const d = new Date(after);
-    d.setDate(d.getDate() + offset);
-    d.setHours(hour, minute, 0, 0);
-    if (d.getTime() > after && weekdays.has(d.getDay())) return d.getTime();
-  }
-  return null;
+  return nextZonedDailyOccurrence({
+    time: schedule.time,
+    weekdays: cleanDays(schedule.weekdays),
+    timeZone: normalizeTimeZone(schedule.timeZone),
+  }, after);
 }
 
 function sanitizeInput(input: RoutineInput): Omit<Routine, "id" | "createdAt" | "updatedAt" | "nextRunAt"> {
@@ -176,7 +179,11 @@ export class RoutineManager {
     try {
       const disk = JSON.parse(readFileSync(this.file, "utf8")) as Partial<RoutineFile>;
       this.routines = Array.isArray(disk.routines)
-        ? disk.routines.map((routine) => ({ ...routine, runOn: routine.runOn ?? "maus" }))
+        ? disk.routines.map((routine) => ({
+            ...routine,
+            runOn: routine.runOn ?? "maus",
+            schedule: cleanSchedule(routine.schedule),
+          }))
         : [];
       this.runs = Array.isArray(disk.runs)
         ? disk.runs.map((run) => ({ ...run, runOn: run.runOn ?? "maus" }))
@@ -217,6 +224,23 @@ export class RoutineManager {
       (candidate) => candidate.botId === botId && ["running", "waiting"].includes(candidate.status),
     );
     return run ? { ...run } : null;
+  }
+
+  /** Cancel unattended work that has not started yet. Bot Stop calls this
+   * both before and after its asynchronous provider drain so a queued webhook
+   * cannot become the successor turn behind the user's Stop action. */
+  cancelQueuedForBot(botId: string, message = "Cancelled by Stop before this run started"): number {
+    let cancelled = 0;
+    for (const run of this.runs) {
+      if (run.botId !== botId || run.status !== "queued") continue;
+      run.status = "cancelled";
+      run.finishedAt = this.now();
+      run.error = message.slice(0, 500);
+      this.emitRun(run);
+      cancelled += 1;
+    }
+    if (cancelled) this.save();
+    return cancelled;
   }
 
   isActiveThread(threadId: string): boolean {
@@ -382,11 +406,19 @@ export class RoutineManager {
   async cancelRun(id: string): Promise<RoutineRun | null> {
     const run = this.runs.find((r) => r.id === id);
     if (!run || !["queued", "running", "waiting"].includes(run.status)) return null;
+    // A remote Cloud routine is not cancelled merely because its receipt says
+    // so. Prove the exact dispatch owner stopped first; callers such as bot
+    // deletion must fail closed when the provider cannot acknowledge it.
+    if (run.threadId) {
+      await this.options.interruptTurn?.(run.botId, run.threadId, run.runOn ?? "maus");
+    }
+    // The terminal event may have settled the run while interrupt was in
+    // flight. Preserve that authoritative result instead of overwriting it.
+    if (!["queued", "running", "waiting"].includes(run.status)) return { ...run };
     run.status = "cancelled";
     run.finishedAt = this.now();
     this.save();
     this.emitRun(run);
-    if (run.threadId) await this.options.interruptTurn?.(run.botId, run.threadId, run.runOn ?? "maus").catch(() => {});
     queueMicrotask(() => void this.tick());
     return { ...run };
   }

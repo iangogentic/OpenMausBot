@@ -149,6 +149,21 @@ export type RequestOutcome = "allowed-once" | "rejected" | "answered" | "unavail
 // carrying the provider-native continuation (e.g. a claude session id).
 export interface SendTurnInput {
   threadId: ThreadId;
+  /** Exact runtime id allocated by the harness before provider registration.
+   * Drivers must use it for every event and return it unchanged. Direct
+   * adapter callers may omit it and let the driver allocate one. */
+  turnId?: TurnId;
+  /** Harness-owned cancellation for the pre-registration phase. Drivers that
+   * await a global lease or remote setup before spawning must stop that wait
+   * when this signal aborts. It is never serialized into provider input. */
+  dispatchSignal?: AbortSignal;
+  /** Stable owner of provider-private state. The harness passes the bot id;
+   * direct adapter callers may omit it and providers fall back to threadId. */
+  isolationKey?: string;
+  /** Server-staged artifacts visible to this exact provider process through
+   * the production OS sandbox. Drivers must forward only these harness-owned
+   * paths to spawnCli; providers may not add or broaden them. */
+  providerRuntimePaths?: Array<{ path: string; writable?: boolean }>;
   text: string;
   model?: string;
   effort?: EffortLevel;
@@ -170,8 +185,29 @@ export interface SendTurnInput {
     computer?: {
       kind?: "box";
       boxId: string;
-      token: string;
+      /** Opaque authority for one turn and one exact Box. The ascii.dev
+       * provider key remains inside the harness. */
+      broker: { url: string; token: string };
+      /** Harness-only cancellation proof for the in-process BoxAgent adapter.
+       * Drivers must never serialize these callbacks into a child MCP env. */
+      lifecycle?: {
+        interrupt(): Promise<void>;
+        promptStatus(promptId: string): Promise<unknown>;
+      };
       control?: { url: string; token: string };
+    };
+    /** Turn-scoped relay to Ian Brain. Hermes receives this opaque bearer,
+     * never the upstream MCP credential. */
+    ianBrain?: { url: string; token: string };
+    /** Exact-turn relay for a selected local model. Provider children receive
+     * only this opaque bearer and harness-local URL; the real desktop2/Spark
+     * endpoint and API key remain in the trusted server process. */
+    modelRelay?: {
+      openaiBaseUrl: string;
+      anthropicBaseUrl: string;
+      token: string;
+      host: string;
+      model: string;
     };
     /** Direct stdio connection to a Cua Driver MCP server (host, sandbox, or
      * VPS). `scope` is set only for the user's host desktop; isolated and

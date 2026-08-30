@@ -18,8 +18,8 @@ import { writeFileAtomic } from "./atomic.ts";
 import { getOrCreateChannel, mirrorExchange, type CommsBus } from "./comms-visibility.ts";
 import { DATA_DIR } from "./config.ts";
 import { newId } from "./contracts.ts";
-import { requestPeerApproval, type ApprovalBus } from "./peer-approval.ts";
-import type { BotRecord, GroupRecord } from "./store.ts";
+import { cancelPeerApprovalsFor, requestPeerApproval, type ApprovalBus } from "./peer-approval.ts";
+import { sectionKey, type BotRecord, type GroupRecord } from "./store.ts";
 
 export interface DelegationItem {
   toBotId: string;
@@ -30,11 +30,17 @@ export interface DelegationItem {
    * (= 1) for a user turn — so the peer has no agents integration, and
    * recursive delegation is structurally impossible. */
   depth: number;
+  /** Exact source dispatch. Production drains only after this generation's
+   * successful terminal event, never after a later turn or process restart. */
+  sourceGeneration?: string;
 }
 
 interface PendingDelegationItem extends DelegationItem {
   /** Stable acknowledgement key for crash-safe removal from the queue. */
   id: string;
+  /** Immutable source authority. A thread id alone is not identity: queued
+   * work must never be adopted by a different bot after an import/mutation. */
+  sourceBotId?: string;
 }
 
 export type QueueResult = "ok" | "no_target" | "self" | "too_deep" | "too_many";
@@ -46,7 +52,28 @@ export type QueueResult = "ok" | "no_target" | "self" | "too_deep" | "too_many";
  * and approvePeerComms are re-checked at drain time as always.) */
 const pendingDelegations = new Map<string, PendingDelegationItem[]>();
 const drainingThreads = new Set<string>();
+const deferredDrainGenerations = new Map<string, string[]>();
+// Stop is a generation change, not a one-time scan of whichever approval is
+// visible at that instant. A serial drain can be between items when Stop is
+// pressed; every item captures both endpoint epochs before the detached loop
+// starts and re-checks after each await.
+const cancellationEpochByBot = new Map<string, number>();
+const drainPromisesBySourceBot = new Map<string, Set<Promise<void>>>();
 const DELEGATIONS_FILE = join(DATA_DIR, "delegations.json");
+
+interface DelegationFence {
+  sourceBotId?: string;
+  sourceEpoch: number;
+  targetBotId: string;
+  targetEpoch: number;
+}
+
+const cancellationEpoch = (botId: string | undefined): number =>
+  botId ? cancellationEpochByBot.get(botId) ?? 0 : 0;
+
+const delegationFenceCurrent = (fence: DelegationFence): boolean =>
+  cancellationEpoch(fence.sourceBotId) === fence.sourceEpoch &&
+  cancellationEpoch(fence.targetBotId) === fence.targetEpoch;
 
 function savePending(): void {
   try {
@@ -73,10 +100,16 @@ export function _loadPending(): void {
         ) return [];
         return [{
           id: typeof item.id === "string" && item.id ? item.id : newId(),
+          ...(typeof item.sourceBotId === "string" && item.sourceBotId
+            ? { sourceBotId: item.sourceBotId }
+            : {}),
           toBotId: item.toBotId,
           message: item.message,
           ...(typeof item.reason === "string" ? { reason: item.reason } : {}),
           depth: Math.max(0, Math.trunc(item.depth!)),
+          ...(typeof item.sourceGeneration === "string" && item.sourceGeneration
+            ? { sourceGeneration: item.sourceGeneration }
+            : {}),
         }];
       });
       if (items.length) pendingDelegations.set(threadId, items);
@@ -129,7 +162,7 @@ export function queueDelegation(
   // making the caller wait. Without a cap, one turn can queue unboundedly
   // and fan out into as many real turns on the next settle.
   if (list.length >= MAX_QUEUED_PER_THREAD) return "too_many";
-  list.push({ ...item, id: newId() });
+  list.push({ ...item, id: newId(), sourceBotId: from.id });
   pendingDelegations.set(sourceThreadId, list);
   savePending();
   const label = `Delegated to @${target.name}${item.reason ? `: ${item.reason}` : ""}`;
@@ -158,22 +191,41 @@ export function drainDelegations(
     sourceThreadId: string,
     channel?: GroupRecord,
   ) => void | Promise<void>,
+  sourceGeneration?: string,
 ): void {
-  if (drainingThreads.has(threadId)) return;
+  if (drainingThreads.has(threadId)) {
+    if (sourceGeneration !== undefined) {
+      const deferred = deferredDrainGenerations.get(threadId) ?? [];
+      if (!deferred.includes(sourceGeneration)) deferred.push(sourceGeneration);
+      deferredDrainGenerations.set(threadId, deferred);
+    }
+    return;
+  }
   const list = pendingDelegations.get(threadId);
   if (!list?.length) return;
-  const from = bus.store.botByThread(threadId);
-  if (!from) {
-    pendingDelegations.delete(threadId);
+  const snapshot = sourceGeneration === undefined
+    ? [...list]
+    : list.filter((item) => item.sourceGeneration === sourceGeneration);
+  if (!snapshot.length) {
+    // Legacy/orphaned entries have no proof that their source turn settled
+    // successfully. Drop them instead of letting a later turn execute them.
+    const retained = list.filter((item) => item.sourceGeneration !== undefined);
+    if (retained.length) pendingDelegations.set(threadId, retained);
+    else pendingDelegations.delete(threadId);
     savePending();
     return;
   }
-  const snapshot = [...list];
+  const fences = new Map(snapshot.map((item) => [item.id, {
+    sourceBotId: item.sourceBotId,
+    sourceEpoch: cancellationEpoch(item.sourceBotId),
+    targetBotId: item.toBotId,
+    targetEpoch: cancellationEpoch(item.toBotId),
+  } satisfies DelegationFence]));
   drainingThreads.add(threadId);
-  void (async () => {
+  const work = (async () => {
     for (const item of snapshot) {
       try {
-        await processOne(bus, approvalBus, from, threadId, item, runTarget);
+        await processOne(bus, approvalBus, threadId, item, runTarget, fences.get(item.id)!);
       } catch (error) {
         const why = error instanceof Error ? error.message : String(error);
         try {
@@ -189,15 +241,60 @@ export function drainDelegations(
         acknowledgeDelegation(threadId, item.id);
       }
     }
-  })().finally(() => {
+  })();
+  const sourceBotIds = new Set(snapshot.flatMap((item) => item.sourceBotId ? [item.sourceBotId] : []));
+  for (const botId of sourceBotIds) {
+    const drains = drainPromisesBySourceBot.get(botId) ?? new Set<Promise<void>>();
+    drains.add(work);
+    drainPromisesBySourceBot.set(botId, drains);
+  }
+  void work.finally(() => {
+    for (const botId of sourceBotIds) {
+      const drains = drainPromisesBySourceBot.get(botId);
+      drains?.delete(work);
+      if (drains?.size === 0) drainPromisesBySourceBot.delete(botId);
+    }
     drainingThreads.delete(threadId);
-    // A later turn may have queued and settled while this thread was
-    // waiting for approval. Its items were not in our snapshot, so start a
-    // fresh drain instead of leaving them parked until another restart.
-    if (pendingDelegations.get(threadId)?.length) {
+    const deferred = deferredDrainGenerations.get(threadId);
+    const nextGeneration = deferred?.shift();
+    if (deferred && deferred.length === 0) deferredDrainGenerations.delete(threadId);
+    // A later turn may have settled while this one waited for approval. Its
+    // exact generation was recorded above; drain only that proven turn.
+    if (nextGeneration !== undefined) {
+      drainDelegations(bus, approvalBus, threadId, runTarget, nextGeneration);
+    } else if (sourceGeneration === undefined && pendingDelegations.get(threadId)?.length) {
+      // Unit/legacy callers without generation ownership keep their original
+      // in-memory behavior; production never enters this branch.
       drainDelegations(bus, approvalBus, threadId, runTarget);
     }
-  });
+  }).catch(() => {});
+}
+
+/** Cancel every queued or currently-draining handoff that names a bot.
+ * Source drains are awaited; target-only drains need not block because their
+ * captured target epoch becomes invalid synchronously before this returns. */
+export async function cancelDelegationsForBot(
+  bus: CommsBus,
+  botId: string,
+  reason = "the source bot was stopped",
+): Promise<void> {
+  cancellationEpochByBot.set(botId, cancellationEpoch(botId) + 1);
+  cancelPeerApprovalsFor(botId);
+  let changed = false;
+  for (const [threadId, list] of [...pendingDelegations]) {
+    const cancelled = list.filter((item) => item.sourceBotId === botId || item.toBotId === botId);
+    if (!cancelled.length) continue;
+    const retained = list.filter((item) => item.sourceBotId !== botId && item.toBotId !== botId);
+    if (retained.length) pendingDelegations.set(threadId, retained);
+    else pendingDelegations.delete(threadId);
+    for (const item of cancelled) reportDelegationCancellation(bus, threadId, item, reason);
+    changed = true;
+  }
+  if (changed) savePending();
+  const drains = [...(drainPromisesBySourceBot.get(botId) ?? [])];
+  const settled = await Promise.allSettled(drains);
+  const failures = settled.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length) throw new AggregateError(failures, "delegation cancellation did not settle");
 }
 
 /** Remove one terminal handoff only after approval/dispatch has settled. */
@@ -229,9 +326,8 @@ export function discardDelegations(bus: CommsBus, threadId: string): void {
 async function processOne(
   bus: CommsBus,
   approvalBus: ApprovalBus,
-  from: BotRecord,
   sourceThreadId: string,
-  item: DelegationItem,
+  item: PendingDelegationItem,
   runTarget: (
     toBotId: string,
     message: string,
@@ -239,25 +335,12 @@ async function processOne(
     sourceThreadId: string,
     channel?: GroupRecord,
   ) => void | Promise<void>,
+  fence: DelegationFence,
 ): Promise<void> {
-  let sender = from;
-  let target = bus.store.bot(item.toBotId);
-  if (!target) {
-    bus.store.appendMessage(sourceThreadId, {
-      role: "bot",
-      kind: "activity",
-      tool: { name: `error: delegation to ${item.toBotId} failed — no such bot`, ok: false },
-    });
-    return;
-  }
-  if (target.busy) {
-    bus.store.appendMessage(sourceThreadId, {
-      role: "bot",
-      kind: "activity",
-      tool: { name: `Delegation to @${target.name} canceled — @${target.name} is busy`, ok: false },
-    });
-    return;
-  }
+  if (!delegationFenceCurrent(fence)) return;
+  let route = liveDelegationRoute(bus, sourceThreadId, item);
+  if (!route.ok) return reportDelegationCancellation(bus, sourceThreadId, item, route.reason);
+  let { sender, target } = route;
   if (sender.approvePeerComms) {
     const verdict = await requestPeerApproval(
       approvalBus,
@@ -267,6 +350,13 @@ async function processOne(
       "delegate_bot",
       sourceThreadId,
     );
+    if (!delegationFenceCurrent(fence)) return;
+    // Approval may remain open for minutes. Re-read the immutable source
+    // owner/task and both section memberships before interpreting the answer;
+    // no stale approval may authorize a newly cross-section delegation.
+    route = liveDelegationRoute(bus, sourceThreadId, item);
+    if (!route.ok) return reportDelegationCancellation(bus, sourceThreadId, item, route.reason);
+    ({ sender, target } = route);
     if (verdict !== "allow") {
       bus.store.appendMessage(sourceThreadId, {
         role: "bot",
@@ -275,29 +365,76 @@ async function processOne(
       });
       return;
     }
-    // The approval could have been sitting for up to 15 minutes. Everything
-    // checked above is a stale snapshot now: re-read both bots and re-check
-    // busy, or an allow can start a second turn on a bot that is mid-turn —
-    // and mirror a "Messaged @X" chip for an exchange that never happens.
-    const current = bus.store.bot(item.toBotId);
-    const currentSender = bus.store.bot(from.id);
-    if (!current || !currentSender || !bus.store.taskByThread(currentSender.id, sourceThreadId)) return;
-    if (current.busy) {
-      bus.store.appendMessage(sourceThreadId, {
-        role: "bot",
-        kind: "activity",
-        tool: { name: `Delegation to @${current.name} canceled — @${current.name} is busy`, ok: false },
-      });
-      return;
-    }
-    sender = currentSender;
-    target = current;
   }
+  if (!delegationFenceCurrent(fence)) return;
+  // liveDelegationRoute is deliberately the final operation before creating
+  // visibility state or dispatching. getOrCreateChannel/mirror/runTarget are
+  // synchronous up to the target handoff, so nothing authority-bearing sits
+  // between this check and the work it authorizes.
   const channel = getOrCreateChannel(bus.store, sender, target);
   mirrorExchange(bus, sender, target, item.message, channel, sourceThreadId);
   const reasonLine = item.reason ? `\n\n[Reason: ${item.reason}]` : "";
   const prefixed = `[Delegated by @${sender.name}, another bot in this OpenMausBot workspace. Do the work and reply directly.]\n\n${item.message}${reasonLine}`;
   await runTarget(item.toBotId, prefixed, item.depth + 1, sourceThreadId, channel);
+}
+
+type LiveDelegationRoute =
+  | { ok: true; sender: BotRecord; target: BotRecord }
+  | { ok: false; reason: string };
+
+/** Resolve queued authority from immutable ids, never from whichever bot a
+ * thread happens to map to now. This is called at drain and after approval. */
+function liveDelegationRoute(
+  bus: CommsBus,
+  sourceThreadId: string,
+  item: PendingDelegationItem,
+): LiveDelegationRoute {
+  if (!item.sourceBotId) {
+    return { ok: false, reason: "queued source identity is missing" };
+  }
+  const sender = bus.store.bot(item.sourceBotId);
+  if (!sender) return { ok: false, reason: "the source bot no longer exists" };
+  if (!bus.store.taskByThread(sender.id, sourceThreadId)) {
+    return { ok: false, reason: `the queued source task no longer belongs to @${sender.name}` };
+  }
+  const target = bus.store.bot(item.toBotId);
+  if (!target) return { ok: false, reason: `no such bot (${item.toBotId})` };
+  if (sectionKey(sender.section) !== sectionKey(target.section)) {
+    return { ok: false, reason: `@${sender.name} and @${target.name} are no longer in the same section` };
+  }
+  if (target.busy) return { ok: false, reason: `@${target.name} is busy` };
+  return { ok: true, sender, target };
+}
+
+/** Every safe discard is visible when any source-owned task still exists.
+ * If the source was deleted, its transcripts were deleted with it; log the
+ * reason without recreating an orphan thread under a different bot. */
+function reportDelegationCancellation(
+  bus: CommsBus,
+  sourceThreadId: string,
+  item: PendingDelegationItem,
+  reason: string,
+): void {
+  // A pre-binding legacy queue item may use the thread mapping solely as a
+  // safe place to display its discard. It is never accepted as authority by
+  // liveDelegationRoute above.
+  const sender = item.sourceBotId
+    ? bus.store.bot(item.sourceBotId)
+    : bus.store.botByThread(sourceThreadId);
+  const reportThreadId = sender
+    ? (bus.store.taskByThread(sender.id, sourceThreadId)?.threadId ?? sender.threadId)
+    : null;
+  if (!reportThreadId) {
+    console.warn(`delegation ${item.id} discarded: ${reason}`);
+    return;
+  }
+  const target = bus.store.bot(item.toBotId);
+  const label = target ? `Delegation to @${target.name}` : "Queued delegation";
+  bus.store.appendMessage(reportThreadId, {
+    role: "bot",
+    kind: "activity",
+    tool: { name: `${label} canceled — ${reason}`, ok: false },
+  });
 }
 
 /** Test helper: how many items remain queued for a thread. */
@@ -309,4 +446,7 @@ export function _pendingCount(threadId: string): number {
 export function _resetPending(): void {
   pendingDelegations.clear();
   drainingThreads.clear();
+  deferredDrainGenerations.clear();
+  cancellationEpochByBot.clear();
+  drainPromisesBySourceBot.clear();
 }

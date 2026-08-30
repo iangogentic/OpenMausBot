@@ -57,6 +57,68 @@ const localFilePath = (href?: string): string | null => {
   return absolutePath(href);
 };
 
+const SAFE_DATA_IMAGE = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$/i;
+const MAX_DATA_IMAGE_CHARS = 2_000_000;
+
+/**
+ * A bot response is untrusted network content. In particular, an ordinary
+ * `<img src="http://127.0.0.1:…">` makes the controller Mac probe its own
+ * LAN while the bot actually runs on Razer. Only server-origin images and a
+ * small, non-scriptable raster data URI may load automatically. HTTP(S)
+ * image links remain an explicit click rather than a background request.
+ */
+export function safeBotImageSrc(src: string | undefined, pageOrigin: string): string | null {
+  if (!src) return null;
+  if (src.length <= MAX_DATA_IMAGE_CHARS && SAFE_DATA_IMAGE.test(src)) return src;
+  try {
+    const origin = new URL(pageOrigin).origin;
+    const url = new URL(src, origin);
+    if (url.origin !== origin || (url.protocol !== "http:" && url.protocol !== "https:")) return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+export function explicitImageLink(src: string | undefined): string | null {
+  if (!src) return null;
+  try {
+    const url = new URL(src);
+    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function BotImage({ src, alt }: { src?: string; alt?: string }) {
+  const pageOrigin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  const safe = safeBotImageSrc(src, pageOrigin);
+  if (safe) {
+    return (
+      <img
+        src={safe}
+        alt={alt ?? ""}
+        loading="lazy"
+        className="max-h-96 max-w-full rounded-lg border border-hairline/30"
+      />
+    );
+  }
+  const external = explicitImageLink(src);
+  if (!external) return <span className="text-[12px] text-ink-secondary">[unsafe image omitted]</span>;
+  return (
+    <a
+      href={external}
+      target="_blank"
+      rel="noreferrer"
+      className="inline-flex items-center rounded border border-hairline/40 px-2 py-1 text-[12px] text-accent hover:bg-raised"
+      title="Open image in your browser; it was not loaded by OpenMaus"
+    >
+      Open external image
+    </a>
+  );
+}
+
 function CodeBlock({ code, lang, streaming }: { code: string; lang: string; streaming: boolean }) {
   const [html, setHtml] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -251,14 +313,7 @@ function ChatMarkdownComponent({ text, streaming = false }: { text: string; stre
             return <CodeBlock code={code} lang={lang} streaming={streaming} />;
           },
           img({ src, alt }: { src?: string; alt?: string }) {
-            return (
-              <img
-                src={src}
-                alt={alt ?? ""}
-                loading="lazy"
-                className="max-h-96 max-w-full rounded-lg border border-hairline/30"
-              />
-            );
+            return <BotImage src={src} alt={alt} />;
           },
           code({ children }: { children?: ReactNode }) {
             return (

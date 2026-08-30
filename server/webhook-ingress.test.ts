@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -114,5 +115,57 @@ describe("webhook-only ingress", () => {
     });
     expect(oversized.status).toBe(413);
     expect(manager.listAttempts().filter((attempt) => attempt.webhookId === manager.list().find((webhook) => webhook.endpointId === endpointId)?.id && attempt.outcome === "rejected").length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe.runIf(process.platform !== "win32")("webhook deployment socket", () => {
+  it("binds a private UDS while reporting the persistent public port", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "openmaus-webhook-"));
+    chmodSync(directory, 0o700);
+    const socketPath = join(directory, "webhook.sock");
+    const isolatedManager = new WebhookManager({
+      file: join(directory, "webhooks.json"),
+      botState: () => "ready",
+      enqueue: () => ({ id: "run-uds" }),
+    });
+    let isolated: WebhookIngress | undefined;
+    try {
+      isolated = await listenWebhookIngress(isolatedManager, {
+        host: "127.0.0.1",
+        port: 8800,
+        socketPath,
+      });
+      expect(isolated.baseUrl).toBe("http://127.0.0.1:8800");
+      expect(isolated.port).toBe(8800);
+      expect(statSync(socketPath).mode & 0o777).toBe(0o600);
+      const health = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const outgoing = request({ socketPath, path: "/health" }, (incoming) => {
+          const chunks: Buffer[] = [];
+          incoming.on("data", (chunk) => chunks.push(chunk));
+          incoming.on("end", () => resolve({
+            status: incoming.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          }));
+        });
+        outgoing.once("error", reject);
+        outgoing.end();
+      });
+      expect(health.status).toBe(200);
+      expect(JSON.parse(health.body)).toEqual({ app: "openmausbot-webhooks", ready: true });
+    } finally {
+      if (isolated) await new Promise<void>((resolve) => isolated!.server.close(() => resolve()));
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a relative socket instead of falling back to TCP", async () => {
+    const isolatedManager = new WebhookManager({
+      botState: () => "ready",
+      enqueue: () => ({ id: "run-invalid" }),
+    });
+    await expect(listenWebhookIngress(isolatedManager, {
+      port: 8800,
+      socketPath: "webhook.sock",
+    })).rejects.toThrow("absolute Unix-socket path");
   });
 });

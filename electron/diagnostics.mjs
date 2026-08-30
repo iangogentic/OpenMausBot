@@ -19,6 +19,7 @@ export const CREDENTIAL_ENV_NAMES = [
   "OMB_OPENAI_IMAGE_KEY",
   "COMPOSIO_API_KEY",
   "OMB_COMPOSIO_BROKER_TOKEN",
+  "MCP_IAN_BRAIN_API_KEY",
 ];
 
 // Credential-shaped tokens (server/redact.ts parity): unmistakable formats

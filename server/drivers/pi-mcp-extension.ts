@@ -15,6 +15,8 @@ import { Type, type TObjectOptions, type TSchema, type TSchemaOptions } from "ty
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFileSync } from "node:fs";
 
+import { BoundedJsonLineDecoder, PROVIDER_NDJSON_LIMITS } from "./bounded-json-lines.ts";
+
 interface McpServerDef {
   command: string;
   args?: string[];
@@ -79,6 +81,8 @@ const MCP_STARTUP_TIMEOUT_MS = 8_000;
 const MCP_TOOL_TIMEOUT_MS = 10 * 60_000;
 const MCP_MAX_LIST_PAGES = 100;
 const MCP_MAX_FRAME_BYTES = 32 * 1024 * 1024;
+const MCP_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+const MCP_MAX_PENDING_REQUESTS = 64;
 const TOOL_OUTPUT_MAX_BYTES = 50 * 1024;
 const TOOL_OUTPUT_MAX_LINES = 2_000;
 const TOOL_NAME_MAX_LENGTH = 64;
@@ -87,7 +91,11 @@ const TOOL_NAME_MAX_LENGTH = 64;
  * newline-delimited house protocol. */
 export class StdioMcp {
   private child: ChildProcessWithoutNullStreams;
-  private buf = "";
+  private decoder = new BoundedJsonLineDecoder({
+    ...PROVIDER_NDJSON_LIMITS,
+    maxLineBytes: MCP_MAX_FRAME_BYTES,
+    maxBufferedBytes: MCP_MAX_FRAME_BYTES,
+  });
   private nextId = 1;
   private disposed = false;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
@@ -100,8 +108,7 @@ export class StdioMcp {
     this.child.stderr.on("data", () => {
       /* best-effort drain so a chatty server never blocks */
     });
-    this.child.stdout.setEncoding("utf8");
-    this.child.stdout.on("data", (chunk: string) => this.onData(chunk));
+    this.child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
     this.child.on("error", (err) => this.closeWithError(err));
     // A server that starts and then dies emits `exit`, never `error`; without
     // settling on it, an in-flight init/listTools would hang the extension
@@ -129,23 +136,17 @@ export class StdioMcp {
     }
   }
 
-  private onData(chunk: string): void {
-    this.buf += chunk;
-    let nl: number;
-    while ((nl = this.buf.indexOf("\n")) !== -1) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
-      if (!line) continue;
-      if (Buffer.byteLength(line, "utf8") > MCP_MAX_FRAME_BYTES) {
-        this.closeWithError(new Error(`MCP frame exceeded ${MCP_MAX_FRAME_BYTES} bytes`));
-        return;
-      }
-      let msg: { id?: unknown; method?: unknown; error?: { message?: string }; result?: unknown };
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
-      }
+  private onData(chunk: Buffer): void {
+    let frames: Array<{ value: unknown }>;
+    try {
+      frames = this.decoder.push(chunk);
+    } catch (error) {
+      this.closeWithError(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    for (const { value } of frames) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const msg = value as { id?: unknown; method?: unknown; error?: { message?: string }; result?: unknown };
       if (typeof msg.id === "number" && this.pending.has(msg.id)) {
         const p = this.pending.get(msg.id)!;
         this.pending.delete(msg.id);
@@ -166,21 +167,31 @@ export class StdioMcp {
       // Notifications (e.g. notifications/tools/list_changed) are intentionally
       // ignored for this single-shot mount.
     }
-    if (Buffer.byteLength(this.buf, "utf8") > MCP_MAX_FRAME_BYTES) {
-      this.closeWithError(new Error(`MCP frame exceeded ${MCP_MAX_FRAME_BYTES} bytes without a newline`));
-    }
   }
 
   private write(frame: unknown): void {
     if (this.disposed || this.child.stdin.destroyed || !this.child.stdin.writable) {
       throw new Error("MCP server stdin is closed");
     }
-    this.child.stdin.write(JSON.stringify(frame) + "\n");
+    const line = JSON.stringify(frame) + "\n";
+    const bytes = Buffer.byteLength(line);
+    if (
+      bytes > PROVIDER_NDJSON_LIMITS.maxLineBytes ||
+      this.child.stdin.writableLength + bytes > MCP_MAX_PENDING_BYTES
+    ) {
+      const error = new Error("MCP request exceeded its buffer limit");
+      this.closeWithError(error);
+      throw error;
+    }
+    this.child.stdin.write(line);
   }
 
   private call(method: string, params: unknown, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
     if (this.disposed) return Promise.reject(new Error("MCP client is closed"));
     if (signal?.aborted) return Promise.reject(new Error(`MCP ${method} aborted`));
+    if (this.pending.size >= MCP_MAX_PENDING_REQUESTS) {
+      return Promise.reject(new Error("MCP client has too many pending requests"));
+    }
 
     const id = this.nextId++;
     return new Promise<unknown>((resolve, reject) => {

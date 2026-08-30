@@ -7,16 +7,16 @@ protocols:
     schemes: [openmausbot]
 
 # In-app auto-update reads latest-mac.yml + the .zip (macOS) or latest.yml +
-# the NSIS .exe (Windows) from this PUBLIC releases repo (separate from the
-# source repo). Public → no token on users' machines. Baked into
+# the NSIS .exe (Windows) from this fork's PUBLIC releases. Public → no token
+# on users' machines. Baked into
 # app-update.yml; both metadata files are emitted here even with
 # --publish never, and must be uploaded to the GitHub release alongside the
 # artifacts — a release missing latest.yml leaves every Windows install
 # stranded on its installed version.
 publish:
   - provider: github
-    owner: milind-soni
-    repo: openmausbot-releases
+    owner: iangogentic
+    repo: OpenMausBot
 
 directories:
   buildResources: build
@@ -34,6 +34,7 @@ afterPack: ./scripts/after-pack.mjs
 files:
   - electron/**
   - "!electron/**/*.test.*"
+  - "!electron/**/*.node-test.*"
   - "!electron/resources/speech-helper"
   - "!electron/resources/speech-helper.swift"
   - "!electron/resources/speech-helper-Info.plist"
@@ -133,12 +134,10 @@ win:
   # No signing config yet (would go under win.signtoolOptions or
   # win.azureSignOptions — eb 26 nests it, there is no top-level
   # win.certificateFile). The installer is unsigned, so SmartScreen shows
-  # "unknown publisher" on first run (README says so). verifyUpdateCodeSignature
-  # defaults true, but electron-updater skips the check when app-update.yml
-  # carries no publisherName — so auto-update still works today. Do NOT set
-  # publisherName without actually signing, or every update is rejected as
-  # untrusted; and once signed, keep the cert subject stable (or list both old
-  # and new in publisherName) or you strand already-installed users.
+  # "unknown publisher" on first run (README says so). The app therefore
+  # disables Windows auto-update entirely. Do not re-enable it until CI
+  # verifies a valid Authenticode signature and app-update.yml pins the exact
+  # approved publisher identity.
 
 nsis:
   oneClick: true
@@ -162,7 +161,7 @@ linux:
   executableName: openmausbot
   synopsis: Your own team of AI bots, in a chat app
   description: A local-first chat app for running a team of AI agents.
-  maintainer: Milind Soni <46266943+milind-soni@users.noreply.github.com>
+  maintainer: OpenMausBot contributors
   vendor: OpenMausBot
   syncDesktopName: true
   # The reviewed x64 CLI runtime is staged before packaging and remains

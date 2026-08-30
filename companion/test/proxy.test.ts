@@ -70,6 +70,8 @@ let HARNESS = "";
 let SIDECAR = "";
 
 const TOKEN = "omb_test_token";
+const HARNESS_SESSION_TOKEN = "h".repeat(48);
+const CONTROL_SESSION_TOKEN = "s".repeat(48);
 let harness: ChildProcess;
 let sidecar: Server;
 let home: string;
@@ -105,7 +107,12 @@ const device = async (
 /** raw request with a chosen Host header — fetch will not let us set one */
 const withHost = (port: number, host: string, path = "/api/health", headers: Record<string, string> = {}) =>
   new Promise<number>((resolve, reject) => {
-    const r = request({ hostname: "127.0.0.1", port, path, headers: { host, ...headers } }, (res) => {
+    const r = request({
+      hostname: "127.0.0.1",
+      port,
+      path,
+      headers: { host, "x-openmausbot-session": CONTROL_SESSION_TOKEN, ...headers },
+    }, (res) => {
       res.resume();
       resolve(res.statusCode ?? 0);
     });
@@ -144,6 +151,7 @@ beforeAll(async () => {
       HOME: home,
       USERPROFILE: home,
       OMB_PORT: String(HARNESS_PORT),
+      OMB_UI_SESSION_TOKEN: HARNESS_SESSION_TOKEN,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -170,6 +178,7 @@ beforeAll(async () => {
   sidecar = createServer(
     createProxyHandler({
       harnessPort: HARNESS_PORT,
+      harnessSessionToken: HARNESS_SESSION_TOKEN,
       authenticate: (t) => (t === TOKEN ? { id: "d1", cloudDesktopAccess: true } : null),
       redeem: (code, deviceName) =>
         code === "424242"
@@ -332,15 +341,23 @@ describe("the sidecar in front of an unmodified harness", () => {
     const bot = body.bots[0];
 
     for (const [method, path, payload] of [
-      ["POST", `/api/threads/${bot.threadId}/respond`, { requestId: "nope", behavior: "allow" }],
+      ["POST", `/api/threads/${bot.threadId}/respond`, {
+        requestId: "nope",
+        messageId: "no-card",
+        behavior: "allow",
+      }],
       ["POST", `/api/bots/${bot.id}/messages`, { text: "hello from a test" }],
       ["POST", `/api/bots/${bot.id}/interrupt`, undefined],
       ["POST", `/api/bots/${bot.id}/read`, undefined],
     ] as const) {
       const res = await device(method, path, payload ? { body: payload } : {});
-      // whatever the harness decides, the sidecar must not be the one saying no
+      // Whatever the harness decides, the sidecar must not be the one saying
+      // no. The harness's generation-bound approval protocol now correctly
+      // answers 404 for a card that is not open, so that exact outcome is
+      // proof the narrow route reached it.
       expect(res.status, `${method} ${path} was blocked by the sidecar`).not.toBe(403);
-      expect(res.status, `${method} ${path} never reached the harness`).not.toBe(404);
+      if (path.endsWith("/respond")) expect(res.status).toBe(404);
+      else expect(res.status, `${method} ${path} never reached the harness`).not.toBe(404);
     }
   });
 
@@ -348,7 +365,7 @@ describe("the sidecar in front of an unmodified harness", () => {
     const { body } = await device("GET", "/api/bots");
     const bot = body.bots[0];
     const attempt = await device("POST", `/api/bots/${bot.id}/always-allow`, {
-      body: { allowKey: "Bash" },
+      body: { allowKey: "Bash", messageId: "no-card" },
     });
     expect(attempt.status).toBe(409);
 
@@ -700,6 +717,7 @@ describe("pairing, end to end", () => {
     const paired = createServer(
       createProxyHandler({
         harnessPort: HARNESS_PORT,
+        harnessSessionToken: HARNESS_SESSION_TOKEN,
         authenticate: (t) => registry.authenticate(t ?? undefined),
         redeem: (code, deviceName, pairRequestId) => registry.redeem(code, deviceName, pairRequestId),
         serverName: () => "Ada's computer",
@@ -715,6 +733,7 @@ describe("pairing, end to end", () => {
     const port = (paired.address() as { port: number }).port;
     const control = createControlServer({
       devices: registry,
+      sessionToken: CONTROL_SESSION_TOKEN,
       companionPort: port,
       discovery: () => ({ advertising: false, name: "OpenMausBot" }),
       connectedDeviceIds: connections.ids,
@@ -734,7 +753,10 @@ describe("pairing, end to end", () => {
       // the person clicks "Start pairing" on the computer
       // SAFETY: POST /pairing is this sidecar's own API and always answers
       // with both credentials; the matches below fail if the shape drifts.
-      const opened = (await (await fetch(`${ctl}/pairing`, { method: "POST" })).json()) as {
+      const opened = (await (await fetch(`${ctl}/pairing`, {
+        method: "POST",
+        headers: { "x-openmausbot-session": CONTROL_SESSION_TOKEN },
+      })).json()) as {
         code: string;
         token: string;
       };
@@ -812,7 +834,9 @@ describe("pairing, end to end", () => {
       // the computer can see the phone, and take it away again
       // SAFETY: /state's shape is this sidecar's own API, asserted by the
       // control-server tests above; a drifted shape fails the expects below.
-      const state = (await (await fetch(`${ctl}/state`)).json()) as {
+      const state = (await (await fetch(`${ctl}/state`, {
+        headers: { "x-openmausbot-session": CONTROL_SESSION_TOKEN },
+      })).json()) as {
         devices: Array<{ id: string; name: string }>;
         connectedDeviceIds: string[];
       };
@@ -822,7 +846,10 @@ describe("pairing, end to end", () => {
       // this test passing for the wrong reason.
       const ada = state.devices.find((d) => d.name === "Ada's iPhone")!;
       expect(state.connectedDeviceIds).toContain(ada.id);
-      const revoked = await fetch(`${ctl}/devices/${ada.id}`, { method: "DELETE" });
+      const revoked = await fetch(`${ctl}/devices/${ada.id}`, {
+        method: "DELETE",
+        headers: { "x-openmausbot-session": CONTROL_SESSION_TOKEN },
+      });
       expect(revoked.status).toBe(200);
       expect((await revoked.json() as { connectedDeviceIds: string[] }).connectedDeviceIds).not.toContain(ada.id);
       await eventStreamClosed;
@@ -838,6 +865,7 @@ describe("pairing, end to end", () => {
     const { createControlServer } = await import("../src/control.ts");
     const control = createControlServer({
       devices: new DeviceRegistry(),
+      sessionToken: CONTROL_SESSION_TOKEN,
       companionPort: 8800,
       discovery: () => ({ advertising: false, name: "OpenMausBot" }),
     });
@@ -869,6 +897,7 @@ describe("pairing, end to end", () => {
 
     const control = createControlServer({
       devices: new DeviceRegistry(),
+      sessionToken: CONTROL_SESSION_TOKEN,
       companionPort: 8800,
       discovery: () => ({ advertising: false, name: "OpenMausBot" }),
     });
@@ -903,6 +932,7 @@ describe("pairing, end to end", () => {
     const registry = new DeviceRegistry();
     const control = createControlServer({
       devices: registry,
+      sessionToken: CONTROL_SESSION_TOKEN,
       companionPort: 8800,
       discovery: () => ({ advertising: false, name: "OpenMausBot" }),
     });
@@ -920,15 +950,14 @@ describe("pairing, end to end", () => {
       // and no window opened on the way to being refused
       expect(registry.pairing()).toBe(null);
 
-      // A same-origin write is the control page itself, and must still work:
-      // the browser sends Origin on any method that is not GET or HEAD, so a
-      // blanket refusal would break the one legitimate browser there is.
+      // Same-origin is not authority: the informational page deliberately
+      // has no bearer, so it cannot mint a phone token either.
       const ours = await fetch(`${base}/pairing`, {
         method: "POST",
         headers: { origin: base },
       });
-      expect(ours.status).toBe(201);
-      expect(registry.pairing()).not.toBe(null);
+      expect(ours.status).toBe(401);
+      expect(registry.pairing()).toBe(null);
 
       // Revocation is the other write worth stealing.
       const stolen = await fetch(`${base}/devices/whatever`, {
@@ -952,6 +981,7 @@ describe("pairing, end to end", () => {
     const registry = new DeviceRegistry();
     const control = createControlServer({
       devices: registry,
+      sessionToken: CONTROL_SESSION_TOKEN,
       companionPort: 8800,
       discovery: () => ({ advertising: false, name: "OpenMausBot" }),
     });

@@ -11,6 +11,7 @@ import type { CommsBus } from "./comms-visibility.ts";
 import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
 import {
+  cancelDelegationsForBot,
   drainDelegations,
   pendingDelegationSnapshot,
   queueDelegation,
@@ -338,6 +339,59 @@ describe("drainDelegations", () => {
     expect(runTargetCalls).toEqual([]);
   });
 
+  it("discards a queued delegation when the target moves to another section", async () => {
+    store.patchBot(from.id, { section: "Work" });
+    store.patchBot(target.id, { section: "Work" });
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+    store.patchBot(target.id, { section: "Personal" });
+
+    drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    });
+
+    const chip = await waitFor(() =>
+      store.messagesFor(from.threadId).find((message) =>
+        message.tool?.ok === false && message.tool.name.includes("no longer in the same section")),
+    );
+    expect(chip.tool?.name).toContain(`@${from.name} and @Helper`);
+    expect(runTargetCalls).toEqual([]);
+    expect(store.groups.filter((group) => group.dm)).toEqual([]);
+  });
+
+  it("discards a queued delegation when the source moves to another section", async () => {
+    store.patchBot(from.id, { section: "Work" });
+    store.patchBot(target.id, { section: "Work" });
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+    store.patchBot(from.id, { section: "Personal" });
+
+    drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    });
+
+    await waitFor(() =>
+      store.messagesFor(from.threadId).find((message) =>
+        message.tool?.ok === false && message.tool.name.includes("no longer in the same section")),
+    );
+    expect(runTargetCalls).toEqual([]);
+    expect(store.groups.filter((group) => group.dm)).toEqual([]);
+  });
+
+  it("discards work whose exact queued source task no longer belongs to the source bot", async () => {
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+    store.patchBot(from.id, { tasks: [] });
+
+    drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    });
+
+    const chip = await waitFor(() =>
+      store.messagesFor(from.threadId).find((message) =>
+        message.tool?.ok === false && message.tool.name.includes("queued source task")),
+    );
+    expect(chip.tool?.name).toContain(`no longer belongs to @${from.name}`);
+    expect(runTargetCalls).toEqual([]);
+  });
+
   it("asks for approval when approvePeerComms is on, then runs only on allow", async () => {
     store.patchBot(from.id, { approvePeerComms: true });
     queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
@@ -361,6 +415,46 @@ describe("drainDelegations", () => {
     expect(runTargetCalls[0]!.commsDepth).toBe(1);
   });
 
+  it("re-reads a target section change after approval before creating a channel", async () => {
+    store.patchBot(from.id, { section: "Work", approvePeerComms: true });
+    store.patchBot(target.id, { section: "Work" });
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+    drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    });
+    const card = await waitFor(() => store.messagesFor(from.threadId).find((message) => message.card?.requestId));
+
+    store.patchBot(target.id, { section: "Personal" });
+    resolvePeerComms(approvalBus, card.card!.requestId!, "allow");
+
+    await waitFor(() =>
+      store.messagesFor(from.threadId).find((message) =>
+        message.tool?.ok === false && message.tool.name.includes("no longer in the same section")),
+    );
+    expect(runTargetCalls).toEqual([]);
+    expect(store.groups.filter((group) => group.dm)).toEqual([]);
+  });
+
+  it("re-reads a source section change after approval before creating a channel", async () => {
+    store.patchBot(from.id, { section: "Work", approvePeerComms: true });
+    store.patchBot(target.id, { section: "Work" });
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+    drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    });
+    const card = await waitFor(() => store.messagesFor(from.threadId).find((message) => message.card?.requestId));
+
+    store.patchBot(from.id, { section: "Personal" });
+    resolvePeerComms(approvalBus, card.card!.requestId!, "allow");
+
+    await waitFor(() =>
+      store.messagesFor(from.threadId).find((message) =>
+        message.tool?.ok === false && message.tool.name.includes("no longer in the same section")),
+    );
+    expect(runTargetCalls).toEqual([]);
+    expect(store.groups.filter((group) => group.dm)).toEqual([]);
+  });
+
   it("emits a denial chip and skips runTarget when the user denies", async () => {
     store.patchBot(from.id, { approvePeerComms: true });
     queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
@@ -380,6 +474,43 @@ describe("drainDelegations", () => {
     );
     expect(chip.tool?.ok).toBe(false);
     expect(runTargetCalls).toEqual([]);
+  });
+
+  it("Stop cancels a serial approval drain without opening the next card", async () => {
+    store.patchBot(from.id, { approvePeerComms: true });
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "first", depth: 0 }, 1);
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "second", depth: 0 }, 1);
+    drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    });
+    const firstCard = await waitFor(() =>
+      store.messagesFor(from.threadId).find((message) => message.card?.tool === "delegate_bot"),
+    );
+
+    await cancelDelegationsForBot(commsBus, from.id, "the bot was stopped");
+
+    expect(firstCard.card?.requestId).toBeTruthy();
+    const cards = store.messagesFor(from.threadId).filter((message) => message.card?.tool === "delegate_bot");
+    expect(cards).toHaveLength(1);
+    expect(store.messagesFor(from.threadId).find((message) => message.id === firstCard.id)?.card?.answered).toBe("deny");
+    expect(_pendingCount(from.threadId)).toBe(0);
+    expect(runTargetCalls).toEqual([]);
+  });
+
+  it("Stop generation fences an already-auto-approved delegation before dispatch", async () => {
+    store.patchBot(from.id, {
+      approvePeerComms: true,
+      alwaysAllow: [peerAllowKey("delegate_bot", target.id)],
+    });
+    queueDelegation(commsBus, from, { toBotId: target.id, message: "do this", depth: 0 }, 1);
+    drainDelegations(commsBus, approvalBus, from.threadId, (toBotId, message, commsDepth) => {
+      runTargetCalls.push({ toBotId, message, commsDepth });
+    });
+
+    await cancelDelegationsForBot(commsBus, from.id, "the bot was stopped");
+
+    expect(runTargetCalls).toEqual([]);
+    expect(_pendingCount(from.threadId)).toBe(0);
   });
 
   it("auto-allows when alwaysAllow already covers the pair (no card pushed)", async () => {
@@ -417,7 +548,7 @@ describe("drainDelegations", () => {
   });
 });
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { _loadPending, _resetPending, discardDelegations, pendingThreads } from "./delegations.ts";
 
@@ -444,7 +575,11 @@ describe("delegations survive a restart", () => {
     expect(existsSync(file())).toBe(true);
     const onDisk = JSON.parse(readFileSync(file(), "utf8")) as Record<string, unknown[]>;
     expect(onDisk[from.threadId]).toHaveLength(1);
-    expect(onDisk[from.threadId][0]).toMatchObject({ toBotId: target.id, message: "do this" });
+    expect(onDisk[from.threadId][0]).toMatchObject({
+      sourceBotId: from.id,
+      toBotId: target.id,
+      message: "do this",
+    });
 
     discardDelegations(buses.commsBus, from.threadId);
     expect(JSON.parse(readFileSync(file(), "utf8"))[from.threadId]).toBeUndefined();
@@ -515,6 +650,28 @@ describe("delegations survive a restart", () => {
     });
     await waitFor(() => ran.length === 1 && pendingThreads().length === 0);
     expect(ran[0]).toContain("left over");
+    expect(pendingThreads()).toEqual([]);
+  });
+
+  it("never adopts a legacy persisted handoff with no exact source identity", async () => {
+    queueDelegation(buses.commsBus, from, { toBotId: target.id, message: "legacy", depth: 0 }, 1);
+    const onDisk = JSON.parse(readFileSync(file(), "utf8")) as Record<string, Array<Record<string, unknown>>>;
+    delete onDisk[from.threadId]![0]!.sourceBotId;
+    writeFileSync(file(), JSON.stringify(onDisk));
+    _resetPending();
+    _loadPending();
+    const ran: string[] = [];
+
+    drainDelegations(buses.commsBus, buses.approvalBus, from.threadId, async (_to, message) => {
+      ran.push(message);
+    });
+
+    const chip = await waitFor(() =>
+      store.messagesFor(from.threadId).find((message) =>
+        message.tool?.ok === false && message.tool.name.includes("source identity is missing")),
+    );
+    expect(chip.tool?.name).toContain("canceled");
+    expect(ran).toEqual([]);
     expect(pendingThreads()).toEqual([]);
   });
 

@@ -27,6 +27,15 @@ describe("gemini auth detection (#28)", () => {
     expect(geminiIsAuthenticated({ GOOGLE_API_KEY: "AIza..." })).toBe(true);
   });
 
+  it("checks oauth in the exact instance HOME instead of the harness home", () => {
+    const instanceHome = join(geminiDir, "instance-home");
+    const instanceGemini = join(instanceHome, ".gemini");
+    mkdirSync(instanceGemini, { recursive: true });
+    writeFileSync(join(instanceGemini, "oauth_creds.json"), JSON.stringify({ access_token: "instance-token" }));
+    expect(geminiIsAuthenticated({ HOME: instanceHome })).toBe(true);
+    expect(geminiIsAuthenticated({ HOME: join(geminiDir, "missing-home") })).toBe(false);
+  });
+
   it("rejects blank API keys", () => {
     expect(geminiIsAuthenticated({ GEMINI_API_KEY: "  ", GOOGLE_API_KEY: "\t" })).toBe(false);
   });

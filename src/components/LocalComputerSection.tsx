@@ -4,7 +4,6 @@ import {
   AlertTriangle,
   Check,
   Circle,
-  ExternalLink,
   Loader2,
   RefreshCw,
   RotateCcw,
@@ -266,14 +265,9 @@ export function LocalComputerSection() {
             <RefreshCw size={12} /> Re-check
           </button>
           {ready && !perBot && (
-            <a
-              href={status?.viewer_url ?? c?.view}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-1.5 rounded-lg border border-hairline/40 px-2.5 py-1 text-[12.5px] text-ink hover:bg-control"
-            >
-              <ExternalLink size={12} /> Watch screen
-            </a>
+            <span className="text-[12px] text-ink-secondary">
+              Open an assigned bot's Computer panel to watch or control this desktop.
+            </span>
           )}
         </div>
         {error && <div className="mt-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger">{error}</div>}

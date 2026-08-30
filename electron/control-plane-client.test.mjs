@@ -42,11 +42,8 @@ describe("control-plane desktop client", () => {
     );
     const client = createControlPlaneClient({
       baseURL: "https://accounts.openmausbot.com",
-      fetchImpl: vi.fn(async () => ({
-        status: 200,
-        ok: true,
-        headers: new Headers({ "set-auth-token": ACCOUNT }),
-        json: async () => payload,
+      fetchImpl: vi.fn(async () => jsonResponse(payload, {
+        headers: { "set-auth-token": ACCOUNT },
       })),
     });
 
@@ -56,20 +53,10 @@ describe("control-plane desktop client", () => {
     });
   });
 
-  it("rejects non-plain response records instead of coercing them", async () => {
-    class Payload {
-      constructor() {
-        this.user = { id: "user-1", email: "ada@example.com" };
-      }
-    }
+  it("rejects a non-object wire response instead of coercing it", async () => {
     const client = createControlPlaneClient({
       baseURL: "https://accounts.openmausbot.com",
-      fetchImpl: vi.fn(async () => ({
-        status: 200,
-        ok: true,
-        headers: new Headers(),
-        json: async () => new Payload(),
-      })),
+      fetchImpl: vi.fn(async () => jsonResponse(["not", "an", "object"])),
     });
 
     await expect(client.me(ACCOUNT)).rejects.toMatchObject({ code: "invalid_response" });

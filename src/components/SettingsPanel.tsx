@@ -1,6 +1,7 @@
 import { ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
 import { useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
+import { canUseNativeWorkingFolderPicker, workingFolderPlaceholder } from "@/lib/working-folder";
 import { stateForBot } from "@/lib/mascot";
 import { CloudBackendPicker } from "./CloudBackendPicker";
 import { ModelPicker } from "./ModelPicker";
@@ -9,7 +10,12 @@ import { cn } from "@/lib/cn";
 import { requestNotificationPermission } from "@/lib/notify";
 import { botUsage, costCaption, formatTokens, formatUsd, hasFiniteCost } from "@/lib/usage";
 import { shortPath } from "@/lib/short-path";
-import { instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
+import {
+  autoSelectsLocalComputer,
+  instanceSupportsLocalComputer,
+  localComputerDisabledReason,
+  localComputerSelectable,
+} from "@/lib/local-computer";
 import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import { VoiceSettings } from "./VoiceSettings";
@@ -86,7 +92,10 @@ function WorkingFolder({ bot }: { bot: Bot }) {
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const canPick = Boolean(window.ogb?.pickFolder);
+  const canPick = canUseNativeWorkingFolderPicker(
+    capabilities.connection?.mode,
+    Boolean(window.ogb?.pickFolder),
+  );
   const task = bot.tasks?.find((t) => t.threadId === bot.threadId);
   const pinned = task?.cwd; // undefined = not yet, null = legacy home, string = folder
   const pinnedElsewhere = pinned !== undefined && (pinned ?? undefined) !== bot.cwd;
@@ -137,7 +146,10 @@ function WorkingFolder({ bot }: { bot: Bot }) {
         >
           <input
             className={cn(inputCls, "font-mono text-[12.5px]")}
-            placeholder="Private bot workspace — or an absolute path"
+            placeholder={workingFolderPlaceholder(
+              capabilities.connection?.mode,
+              capabilities.connection?.serverName,
+            )}
             value={draft ?? bot.cwd ?? ""}
             onChange={(e) => setDraft(e.target.value)}
           />
@@ -317,11 +329,11 @@ function MemoryCard({ bot }: { bot: Bot }) {
 
 export function SettingsPanel({ bot }: { bot: Bot }) {
   const { state, dispatch } = useStore();
-  const { capabilities } = useDesktopCapabilities();
+  const { capabilities, ready: capabilitiesReady } = useDesktopCapabilities();
   const computerCopy = computerLocationCopy(capabilities);
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
-  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | null>(null);
+  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | "auto-computer" | null>(null);
   const localDisabledReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
   const patch = (
     p: Partial<
@@ -353,7 +365,26 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
   const canUseConnectedApps = engine?.capabilities?.composioMcp === true;
-  const canUseVps = engine?.capabilities?.computerMcp === true && engine.driverKind !== "boxAgent";
+  const computerToolSupported = engine?.capabilities?.computerMcp === true;
+  const canUseVps = computerToolSupported && engine?.driverKind !== "boxAgent";
+  // Match ComputerPanel's capability gates exactly: a Local VM needs a live
+  // computer-capable engine, while Box itself remains a valid Cloud engine.
+  const vmSupported = Boolean(
+    engine?.snapshot.state === "available" && computerToolSupported && engine.driverKind !== "boxAgent",
+  );
+  const cloudBackend = bot.cloudBackend ?? "box";
+  const cloudSupported = cloudBackend === "vps"
+    ? canUseVps
+    : computerToolSupported || engine?.driverKind === "boxAgent";
+  const computerMode = bot.computer ?? "auto";
+  const computerHeld = state.computerControl[bot.id]?.held === true;
+  const computerLocked = computerHeld || bot.busy;
+  const autoMayUseLocal = autoSelectsLocalComputer({
+    platform: capabilities.host.platform,
+    computer: undefined,
+    capabilitiesReady,
+    localSelectable,
+  });
   const connectedAppsConfigured = state.config?.composio?.configured === true;
   const connectedAppsEnabled = bot.composio !== false;
   const sectionName = bot.section?.trim() || "General";
@@ -597,48 +628,79 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
             <div className="text-[15px] font-medium text-ink">Computer tools</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
               {computerCopy.remote
-                ? `${bot.name}'s model, shell, and files run on ${computerCopy.serverName}. Choose where its browser and computer-control tools act`
-                : "Choose where this bot's browser and computer-control tools act"}
-              {bot.computer ? "." : " (currently: Auto)."}
+                ? `${bot.name}'s model, shell, and files run on ${computerCopy.serverName}. Choose where its browser and computer-control tools act.`
+                : "Choose where this bot's browser and computer-control tools act."}
             </div>
+            {computerCopy.remote && capabilities.host.platform === "darwin" && (
+              <div className="mt-2 rounded-lg bg-inset px-3 py-2 text-[11.5px] leading-relaxed text-ink-secondary">
+                Closing the OpenMausBot window keeps the attended Mac bridge available in the background. Use OpenMausBot → Quit to disconnect this Mac. Work and private bot desktops on {computerCopy.serverName} keep running either way.
+              </div>
+            )}
             <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
               {([
+                ["auto", "Auto"],
                 ["cloud", "Cloud"],
                 ["vm", computerCopy.vmLabel],
                 ["local", computerCopy.localLabel],
                 ["off", "Off"],
               ] as const).map(([mode, label], i) => (
-                <button
-                  key={mode}
-                  aria-pressed={bot.computer === mode}
-                  disabled={mode === "local" && !localSelectable}
-                  title={mode === "local" && !localSelectable ? localDisabledReason ?? undefined : undefined}
-                  onClick={() => {
-                    if (mode === bot.computer) return;
-                    if (mode === "local" && bot.autoApprove) setLocalAutoWarning("local");
-                    else patch({ computer: mode });
-                  }}
-                  className={cn(
-                    "flex-1 py-1.5 text-[13px] capitalize",
-                    i > 0 && "border-l border-hairline/40",
-                    mode === "local" && !localSelectable && "cursor-not-allowed opacity-40",
-                    bot.computer === mode
-                      ? "bg-control text-ink"
-                      : "text-ink-secondary hover:bg-control/60 hover:text-ink",
-                  )}
-                >
-                  {label}
-                </button>
+                (() => {
+                  const disabled =
+                    computerLocked ||
+                    (mode === "cloud" && !cloudSupported) ||
+                    (mode === "vm" && !vmSupported) ||
+                    (mode === "local" && !localSelectable);
+                  const unavailableTitle =
+                    bot.busy
+                      ? "Stop this turn before changing its computer destination"
+                      : computerHeld
+                        ? "Hand computer control back before changing its destination"
+                    : mode === "vm" && !vmSupported
+                      ? "This model engine cannot use the Local VM"
+                      : mode === "cloud" && !cloudSupported
+                        ? "This model engine cannot use cloud computer tools"
+                        : mode === "local" && !localSelectable
+                          ? localDisabledReason ?? "Local computer control isn't ready"
+                          : undefined;
+                  return (
+                    <button
+                      key={mode}
+                      aria-pressed={computerMode === mode}
+                      disabled={disabled}
+                      title={unavailableTitle ?? label}
+                      onClick={() => {
+                        if (mode === computerMode) return;
+                        if (mode === "auto") {
+                          if (bot.autoApprove && autoMayUseLocal) setLocalAutoWarning("auto-computer");
+                          else dispatch({ type: "setComputerAuto", botId: bot.id });
+                        }
+                        else if (mode === "local" && bot.autoApprove) setLocalAutoWarning("local");
+                        else patch({ computer: mode });
+                      }}
+                      className={cn(
+                        "min-w-0 flex-1 px-1 py-1.5 text-[12.5px]",
+                        i > 0 && "border-l border-hairline/40",
+                        disabled && "cursor-not-allowed opacity-40",
+                        computerMode === mode
+                          ? "bg-control text-ink"
+                          : "text-ink-secondary hover:bg-control/60 hover:text-ink",
+                      )}
+                    >
+                      <span className="block truncate">{label}</span>
+                    </button>
+                  );
+                })()
               ))}
             </div>
-            {(!bot.computer || bot.computer === "cloud") && (
+            {(computerMode === "auto" || computerMode === "cloud") && (
               <>
                 <CloudBackendPicker
-                  value={bot.cloudBackend ?? "box"}
+                  value={cloudBackend}
                   vpsSupported={canUseVps}
+                  disabled={computerLocked}
                   onChange={(backend) => patch({ cloudBackend: backend })}
                 />
-                {!bot.computer && bot.cloudBackend === "vps" && (
+                {computerMode === "auto" && cloudBackend === "vps" && (
                   <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-inset px-3 py-2.5">
                     <div className="min-w-0">
                       <div className="text-[13px] text-ink">Start VPS automatically</div>
@@ -650,9 +712,11 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                       role="switch"
                       aria-checked={Boolean(bot.autoStartVps)}
                       aria-label="Start VPS automatically"
+                      disabled={computerLocked}
                       onClick={() => patch({ autoStartVps: !bot.autoStartVps })}
                       className={cn(
                         "relative h-6 w-11 shrink-0 rounded-full transition-colors",
+                        computerLocked && "cursor-not-allowed opacity-40",
                         bot.autoStartVps ? "bg-accent" : "bg-control",
                       )}
                     >
@@ -693,7 +757,12 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
               aria-checked={Boolean(bot.autoApprove)}
               aria-label="Auto mode"
               onClick={() => {
-                if (!bot.autoApprove && bot.computer === "local") setLocalAutoWarning("auto");
+                if (
+                  !bot.autoApprove &&
+                  (bot.computer === "local" || (computerMode === "auto" && autoMayUseLocal))
+                ) {
+                  setLocalAutoWarning("auto");
+                }
                 else patch({ autoApprove: !bot.autoApprove });
               }}
               className={cn(
@@ -752,6 +821,9 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
       onConfirm={() => {
         if (localAutoWarning === "auto") patch({ autoApprove: true, acknowledgeLocalAuto: true });
         if (localAutoWarning === "local") patch({ computer: "local", acknowledgeLocalAuto: true });
+        if (localAutoWarning === "auto-computer") {
+          dispatch({ type: "setComputerAuto", botId: bot.id, acknowledgeLocalAuto: true });
+        }
         setLocalAutoWarning(null);
       }}
     />

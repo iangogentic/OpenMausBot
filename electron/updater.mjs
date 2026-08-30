@@ -2,8 +2,9 @@
 // stages the downloaded ZIP immediately and the explicit restart applies it.
 // One state object is broadcast on every transition.
 //
-// Only runs in the packaged, signed+notarized app (mac auto-update requires
-// signing). In dev it's a no-op so the browser/dev shell is unaffected.
+// Only runs in a packaged build with a verifiable update trust path. Windows
+// auto-update stays disabled until its installer is Authenticode-signed and
+// the approved publisher is pinned. In dev it's a no-op.
 // electron-updater is vendored (electron/vendor/electron-updater.cjs) because
 // the packaged app ships no node_modules.
 import { app, ipcMain } from "electron";
@@ -46,17 +47,17 @@ function setState(patch) {
   }
 }
 
-export function registerUpdaterIpc() {
-  ipcMain.handle("update:get-state", () => state);
-  ipcMain.handle("update:check", () => updaterCoordinator?.check(true));
-  ipcMain.handle("update:download", () => updaterCoordinator?.download());
-  ipcMain.handle("update:install", () => updaterCoordinator?.install());
+export function registerUpdaterIpc(registerHandle = ipcMain.handle.bind(ipcMain)) {
+  registerHandle("update:get-state", () => state);
+  registerHandle("update:check", () => updaterCoordinator?.check(true));
+  registerHandle("update:download", () => updaterCoordinator?.download());
+  registerHandle("update:install", () => updaterCoordinator?.install());
 }
 
 export function startUpdater(mainWindow) {
   win = mainWindow;
   // dev / unsigned builds can't auto-update — leave the banner dormant
-  if (!app.isPackaged) {
+  if (!app.isPackaged || process.platform === "win32") {
     updaterCoordinator = null;
     setState({ status: "idle" });
     return;

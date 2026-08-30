@@ -5,8 +5,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
+import { decodeInjectId, localHost, localInjectConnection, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
+import { assertBoundedJsonShape, CATALOG_NDJSON_LIMITS } from "../bounded-json-lines.ts";
 import type { ModelCatalog, ProviderErrorCode } from "../../contracts.ts";
 import { execCli } from "../../procs.ts";
 
@@ -71,6 +72,7 @@ function localModelRecord(record: Record<string, unknown>): boolean {
  * only the first separator identifies the provider. Older CLIs may print just
  * the headers; those still produce a usable catalog without metadata. */
 export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
+  if (Buffer.byteLength(stdout, "utf8") > CATALOG_NDJSON_LIMITS.maxTotalBytes) return null;
   const options: ModelCatalog["options"] = [];
   const seen = new Set<string>();
   let slug: string | null = null;
@@ -86,6 +88,7 @@ export function parseOpenCodeModelsOutput(stdout: string): ModelCatalog | null {
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as unknown;
+        assertBoundedJsonShape(parsed, CATALOG_NDJSON_LIMITS);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           record = parsed as Record<string, unknown>;
         }
@@ -202,6 +205,7 @@ export function ensureOpenCodeInjectModel(
   if (!inject) return modelId;
   const host = localHost(inject.host);
   if (!host) return modelId;
+  const connection = localInjectConnection(host, inject.model, env);
 
   const native = `${inject.host}/${inject.model}`;
   const dir = opencodeConfigDir(env);
@@ -233,8 +237,8 @@ export function ensureOpenCodeInjectModel(
     existing.options && typeof existing.options === "object" && !Array.isArray(existing.options)
       ? { ...(existing.options as Record<string, unknown>) }
       : {};
-  options.baseURL = host.baseUrl;
-  if (!options.apiKey) options.apiKey = hostApiKey(host, env);
+  options.baseURL = connection.openaiBaseUrl;
+  options.apiKey = connection.apiKey;
   const models =
     existing.models && typeof existing.models === "object" && !Array.isArray(existing.models)
       ? { ...(existing.models as Record<string, unknown>) }

@@ -281,6 +281,14 @@ final class StoreTests: XCTestCase {
         state.apply(.unknown(kind: "routine.run"))
         XCTAssertEqual(state.bots.count, before)
     }
+
+    func testComputerControlFramesReplaceHydratedAuthority() throws {
+        var state = try hydrated()
+        state.computerControl["b1"] = FleetComputerControl(held: true, helpReason: "login")
+        state.apply(.computerControl(botId: "b1", held: false, helpReason: nil))
+        XCTAssertEqual(state.computerControl["b1"]?.held, false)
+        XCTAssertNil(state.computerControl["b1"]?.helpReason)
+    }
 }
 
 // MARK: - Live text

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   ensureRemoteCuaCommand,
   REMOTE_CUA_EXECUTABLE,
+  REMOTE_CDP_HELPER_SOURCE,
   REMOTE_CUA_SOCKET,
   REMOTE_CUA_VERSION,
   remoteComputerBootstrapCommand,
@@ -42,5 +43,21 @@ describe("remote Cua computer setup", () => {
     expect(command).toContain("openmausbot-cdp.mjs fill");
     expect(command).not.toContain("don't expand");
     expect(command).not.toContain("$HOME");
+  });
+
+  it("bounds remote DevTools HTTP, WebSocket, pending, JSON, and AX-tree work", () => {
+    expect(spawnSync(process.execPath, ["--input-type=module", "--check"], { input: REMOTE_CDP_HELPER_SOURCE }).status).toBe(0);
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("HTTP_MAX_BYTES = 1024 * 1024");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("WS_MAX_BYTES = 8 * 1024 * 1024");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("WS_MAX_TOTAL_BYTES = 32 * 1024 * 1024");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("WS_MAX_FRAMES_PER_SECOND = 2000");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("MAX_PENDING = 16");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("MAX_JSON_DEPTH = 32");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("MAX_JSON_NODES = 50000");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("AX_MAX_SCANNED_NODES = 10000");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain('TextDecoder("utf-8", { fatal: true })');
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain('import net from "node:net"');
+    expect(REMOTE_CDP_HELPER_SOURCE).not.toContain("new WebSocket");
+    expect(REMOTE_CDP_HELPER_SOURCE).not.toContain(".json()");
   });
 });

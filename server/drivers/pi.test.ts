@@ -76,18 +76,49 @@ describe("buildMcpServers", () => {
     });
   });
 
+  it("mounts Ian Brain through the harness-local exact-turn bridge", () => {
+    const servers = buildMcpServers({
+      threadId: "t",
+      text: "hi",
+      integrations: {
+        ianBrain: {
+          url: "http://127.0.0.1:8799/api/internal/ian-brain/mcp",
+          token: "opaque-turn-capability",
+        },
+      },
+    });
+    expect(servers?.ian_brain).toMatchObject({
+      command: process.execPath,
+      args: [expect.stringContaining("ian-brain-proxy")],
+      env: {
+        ELECTRON_RUN_AS_NODE: "1",
+        OMB_IAN_BRAIN_URL: "http://127.0.0.1:8799/api/internal/ian-brain/mcp",
+        OMB_IAN_BRAIN_CAPABILITY_TOKEN: "opaque-turn-capability",
+      },
+    });
+  });
+
   it("wraps the cloud computer in the computer-proxy spawn contract", () => {
     const servers = buildMcpServers({
       threadId: "t",
       text: "hi",
       integrations: {
-        computer: { kind: "box", boxId: "b1", token: "tok", control: { url: "http://c", token: "ct" } },
+        computer: {
+          kind: "box",
+          boxId: "b1",
+          broker: { url: "http://127.0.0.1:9/api/internal/box", token: "cap" },
+          control: { url: "http://c", token: "ct" },
+        },
       },
     });
     expect(servers?.computer).toMatchObject({
       command: process.execPath,
       args: [expect.stringContaining("computer-proxy")],
-      env: expect.objectContaining({ OGB_BOX_ID: "b1", OGB_BOX_TOKEN: "tok" }),
+      env: expect.objectContaining({
+        OGB_BOX_ID: "b1",
+        OMB_BOX_BROKER_URL: "http://127.0.0.1:9/api/internal/box",
+        OMB_BOX_CAPABILITY_TOKEN: "cap",
+      }),
     });
   });
 
@@ -360,7 +391,12 @@ describe("PiDriver turns (fake CLI)", () => {
       text: "hi",
       integrations: {
         composio: { command: "node", args: ["connector-proxy.js"], env: { COMPOSIO_KEY: "ck" } },
-        computer: { kind: "box", boxId: "b1", token: "bt", control: { url: "http://c", token: "ct" } },
+        computer: {
+          kind: "box",
+          boxId: "b1",
+          broker: { url: "http://127.0.0.1:9/api/internal/box", token: "box-cap" },
+          control: { url: "http://c", token: "ct" },
+        },
       },
     });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
@@ -382,9 +418,13 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(servers.composio).toMatchObject({ command: "node", args: ["connector-proxy.js"], env: { COMPOSIO_KEY: "ck" } });
     // the cloud computer wraps in the computer-proxy spawn contract
     expect(servers.computer.args[0]).toContain("computer-proxy");
-    expect(servers.computer.env).toMatchObject({ OGB_BOX_ID: "b1", OGB_BOX_TOKEN: "bt" });
-    // the box token lives in the 0600 config file, never in argv
-    expect(JSON.stringify(mcpRow!.argv)).not.toContain("bt");
+    expect(servers.computer.env).toMatchObject({
+      OGB_BOX_ID: "b1",
+      OMB_BOX_CAPABILITY_TOKEN: "box-cap",
+    });
+    expect(servers.computer.env.OGB_BOX_TOKEN).toBeUndefined();
+    // the opaque turn capability lives in the 0600 config file, never argv
+    expect(JSON.stringify(mcpRow!.argv)).not.toContain("box-cap");
   });
 
   it("rides the toolUse auto-continue and only settles on the final end_turn", async () => {
@@ -470,13 +510,15 @@ describe("PiDriver turns (fake CLI)", () => {
     await expect(instance.adapter.respondToRequest("t-none", "nope", { behavior: "allow" })).resolves.toBe("unavailable");
   });
 
-  it("interruptTurn cancels a running turn", async () => {
+  it("interruptTurn cancellation wins the child-close race after verified tree stop", async () => {
     await create("permission");
     await instance.adapter.sendTurn({ threadId: "t-interrupt", text: "go" });
     await recorder.until((e) => e.type === "request.opened");
     await instance.adapter.interruptTurn("t-interrupt");
     const done = await recorder.until((e) => e.type === "turn.completed");
     expect(done).toMatchObject({ ok: true, stopReason: "cancelled" });
+    expect(instance.adapter.hasSession("t-interrupt")).toBe(false);
+    expect(recorder.events.filter((event) => event.type === "turn.completed")).toEqual([done]);
   });
 });
 

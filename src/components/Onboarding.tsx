@@ -8,7 +8,7 @@ import { ProviderMark } from "./ProviderIcons";
 import { PhoneSetupFlow } from "./PhoneSetupFlow";
 import type { InstanceInfo } from "@/state/store";
 
-// First-run onboarding: who you are (email), what's installed (live engine
+// First-run onboarding: your local profile, what's installed (live engine
 // checks from the harness), what the app may use (TCC), then an optional
 // phone setup that can always be resumed from Settings → Phone.
 // Every check is skippable — onboarding must never brick the app.
@@ -197,8 +197,8 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
             <MausAvatar color="green" state="happy" size={72} />
             <h1 className="mt-4 text-[20px] font-semibold text-ink">Welcome to OpenMausBot</h1>
             <p className="mt-1.5 text-center text-[14px] leading-relaxed text-ink-secondary">
-              Bots that do real work on their own computer. Tell us who you are
-              and we&rsquo;ll let you know when big things ship.
+              Bots that do real work on their own computer. Your name and
+              optional email stay in your local OpenMaus profile.
             </p>
             <input
               autoFocus

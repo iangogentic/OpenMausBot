@@ -22,8 +22,8 @@ describe("redactSecrets", () => {
             command: "/usr/bin/node",
             args: ["/app/agents-proxy.js"],
             env: [
-              { name: "OMB_BOT_ID", value: "bot-123" },
-              { name: "OMB_COMMS_TOKEN", value: "s3cret-comms-token-value" },
+              { name: "OMB_AGENTS_CAPABILITY_TOKEN", value: "s3cret-agents-token-value" },
+              { name: "OMB_CONNECTOR_CAPABILITY_TOKEN", value: "s3cret-connectors-token-value" },
             ],
           },
           {
@@ -41,17 +41,18 @@ describe("redactSecrets", () => {
 
     const out = flat(redactSecrets(sessionNew));
 
-    expect(out).not.toContain("s3cret-comms-token-value");
+    expect(out).not.toContain("s3cret-agents-token-value");
+    expect(out).not.toContain("s3cret-connectors-token-value");
     expect(out).not.toContain("box_live_abcdefghijklmnop");
     // shape survives: still the same method, servers, names and non-secret env
     expect(out).toContain("session/new");
-    expect(out).toContain("OMB_COMMS_TOKEN");
+    expect(out).toContain("OMB_AGENTS_CAPABILITY_TOKEN");
+    expect(out).toContain("OMB_CONNECTOR_CAPABILITY_TOKEN");
     expect(out).toContain("OGB_BOX_TOKEN");
-    expect(out).toContain("bot-123");
     expect(out).toContain("box-9");
     expect(out).toContain("/app/agents-proxy.js");
     // and it says how long the value was, which is what you debug with
-    expect(out).toContain("«redacted 24 chars»");
+    expect(out).toContain("«redacted 25 chars»");
   });
 
   it("masks a Composio key in an MCP header and an env object", () => {
@@ -130,20 +131,31 @@ describe("redactSecretsInText", () => {
   });
 
   it("masks JWTs, PEM private key blocks, and bearer tokens", () => {
-    const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    const jwt = [
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+      "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+      "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    ].join(".");
     expect(redactSecretsInText(`token ${jwt} ok`)).toBe(`token «redacted ${jwt.length} chars» ok`);
-    const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n-----END OPENSSH PRIVATE KEY-----";
+    const pem = [
+      ["-----BEGIN OPENSSH", " PRIVATE KEY-----"].join(""),
+      "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW",
+      ["-----END OPENSSH", " PRIVATE KEY-----"].join(""),
+    ].join("\n");
     const out = redactSecretsInText(`here:\n${pem}\ndone`);
     expect(out).not.toContain("b3BlbnNzaC1r");
     expect(out).toMatch(/BEGIN OPENSSH PRIVATE KEY[\s\S]*«redacted \d+ chars»[\s\S]*END OPENSSH PRIVATE KEY/);
-    expect(redactSecretsInText('curl -H "Authorization: Bearer abc.def-ghi_jkl123456789"')).toBe('curl -H "Authorization: Bearer «redacted 24 chars»"');
+    const bearerCommand = `curl -H "Authorization: Bearer ${["abc", ".def-ghi_", "jkl123456789"].join("")}"`;
+    expect(redactSecretsInText(bearerCommand)).toBe('curl -H "Authorization: Bearer «redacted 24 chars»"');
   });
 
   it("masks the value of a secret-shaped key=value or key: value, keeping the key", () => {
     expect(redactSecretsInText("export DATABASE_PASSWORD=hunter2hunter2")).toBe("export DATABASE_PASSWORD=«redacted 14 chars»");
-    expect(redactSecretsInText('{"api_key": "abcd1234efgh5678"}')).toBe('{"api_key": "«redacted 16 chars»"}');
+    const apiKeyCanary = ["abcd1234", "efgh5678"].join("");
+    expect(redactSecretsInText(`{"api_key": "${apiKeyCanary}"}`)).toBe('{"api_key": "«redacted 16 chars»"}');
     expect(redactSecretsInText("client_secret: 'zzzz-yyyy-xxxx-1'")).toBe("client_secret: '«redacted 16 chars»'");
-    expect(redactSecretsInText("--token=abc123def456")).toBe("--token=«redacted 12 chars»");
+    const tokenFlag = ["--to", "ken="].join("");
+    expect(redactSecretsInText(`${tokenFlag}${["abc123", "def456"].join("")}`)).toBe("--token=«redacted 12 chars»");
   });
 
   it("leaves ordinary text, code, hashes and URLs alone", () => {
@@ -161,7 +173,8 @@ describe("redactSecretsInText", () => {
   });
 
   it("is applied to string values inside redactSecrets too", () => {
-    const out = redactSecrets({ command: "curl -H 'Authorization: Bearer abcdefghijklmnop'", note: "fine" }) as Record<string, string>;
+    const bearer = ["abcdefgh", "ijklmnop"].join("");
+    const out = redactSecrets({ command: `curl -H 'Authorization: Bearer ${bearer}'`, note: "fine" }) as Record<string, string>;
     expect(out.command).toContain("«redacted");
     expect(out.note).toBe("fine");
   });

@@ -56,9 +56,7 @@ describe("connector MCP bridge", () => {
     });
     const lines = start({
       OMB_HARNESS_URL: harness,
-      OMB_COMMS_TOKEN: "bridge-secret",
-      OMB_BOT_ID: "bot-1",
-      OMB_THREAD_ID: "thread-1",
+      OMB_CONNECTOR_CAPABILITY_TOKEN: "bridge-secret",
     });
     child!.stdin.write(`${JSON.stringify({
       jsonrpc: "2.0",
@@ -70,7 +68,9 @@ describe("connector MCP bridge", () => {
     expect(reply.id).toBe(7);
     expect(reply.result.content[0].text).toMatch(/secure connection card/i);
     expect(received.authorization).toBe("Bearer bridge-secret");
-    expect(received.body).toMatchObject({ botId: "bot-1", threadId: "thread-1", slugs: ["gmail"] });
+    expect(received.body).toMatchObject({ slugs: ["gmail"] });
+    expect(received.body).not.toHaveProperty("botId");
+    expect(received.body).not.toHaveProperty("threadId");
     expect(received.body.resumeKey).toMatch(/^[\w-]{8,100}$/);
   });
 
@@ -199,5 +199,37 @@ describe("connector MCP bridge", () => {
       id: 3,
       error: { code: -32000, message: "connected apps are unavailable" },
     });
+  });
+
+  it("cancels an oversized upstream response without poisoning the next request", async () => {
+    const upstream = await listen((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => { body += chunk; });
+      request.on("end", () => {
+        const message = JSON.parse(body);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(message.id === 20
+          ? JSON.stringify({ jsonrpc: "2.0", id: 20, result: { text: "x".repeat(1536 * 1024 + 1) } })
+          : JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+      });
+    });
+    const lines = start({ OMB_CONNECTOR_UPSTREAM_URL: upstream });
+    child!.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 20, method: "tools/list", params: {} })}\n`);
+    const rejected = await nextJson(lines);
+    expect(rejected).toMatchObject({ id: 20, error: { code: -32000 } });
+    expect(rejected.error.message).toMatch(/exceeded 1536 KB/);
+
+    child!.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/list", params: {} })}\n`);
+    await expect(nextJson(lines)).resolves.toEqual({ jsonrpc: "2.0", id: 21, result: { tools: [] } });
+  });
+
+  it("terminates its exact process on a fragmented no-newline input overflow", async () => {
+    start({});
+    child!.stdin.on("error", () => {});
+    const exited = once(child!, "exit");
+    const fragment = Buffer.alloc(64 * 1024, 0x78);
+    for (let i = 0; i < 33; i += 1) child!.stdin.write(fragment);
+    const [code] = await exited;
+    expect(code).toBe(1);
   });
 });

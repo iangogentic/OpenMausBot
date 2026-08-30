@@ -6,6 +6,7 @@ describe("Box trial provisioning", () => {
   let api: Server;
   let provisionBox: typeof import("./box.ts").provisionBox;
   const createBodies: Array<{ ttlSeconds: number; noEnv: boolean }> = [];
+  let desktopUrl = "https://desktop.ascii.dev/vnc";
 
   beforeAll(async () => {
     api = createServer((req, res) => {
@@ -40,7 +41,7 @@ describe("Box trial provisioning", () => {
           return res.end(JSON.stringify({ ok: true, exitCode: 0, stdout: "", stderr: "" }));
         }
         if (url.pathname.endsWith("/desktop")) {
-          return res.end(JSON.stringify({ ok: true, desktopUrl: "https://desktop.example/vnc" }));
+          return res.end(JSON.stringify({ ok: true, desktopUrl }));
         }
         res.writeHead(404).end(JSON.stringify({ ok: false, message: "unexpected request" }));
       });
@@ -67,5 +68,21 @@ describe("Box trial provisioning", () => {
       { ttlSeconds: 8 * 60 * 60, noEnv: true },
       { ttlSeconds: 2 * 60 * 60, noEnv: true },
     ]);
+  });
+
+  it("rejects an untrusted provider URL without echoing its bearer secret", async () => {
+    desktopUrl = "https://attacker.example/vnc?token=never-log-this";
+    try {
+      const error = await provisionBox(
+        { box: { token: "box_trial" } } as any,
+        "untrusted-url-bot",
+        "Untrusted URL Bot",
+      ).then(() => null, (reason: unknown) => reason);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(/trusted-host policy/);
+      expect((error as Error).message).not.toMatch(/never-log-this|attacker\.example/);
+    } finally {
+      desktopUrl = "https://desktop.ascii.dev/vnc";
+    }
   });
 });

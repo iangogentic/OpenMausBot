@@ -1,0 +1,18 @@
+[Unit]
+Description=Refuse to hide legacy OpenMaus state behind bounded mounts
+Before=var-lib-openmaus\x2dprovider-state.mount
+Before=var-lib-openmausbot\x2dworkspaces.mount
+Before=var-lib-openmausbot\x2dvm\x2dhomes.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/openmaus-storage-setup --preflight-unmounted
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX

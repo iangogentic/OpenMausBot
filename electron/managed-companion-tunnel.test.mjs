@@ -65,10 +65,10 @@ function fakeChild(pid = 4242) {
 }
 
 function healthyResponse() {
-  return {
-    ok: true,
-    text: async () => JSON.stringify({ app: "openmausbot" }),
-  };
+  return new Response(JSON.stringify({ app: "openmausbot" }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 afterEach(() => {
@@ -260,7 +260,7 @@ describe("managed connector lifecycle", () => {
       runtimeExecutable: RUNTIME,
       runtimeRoot: path.join(temporaryDirectory(), "runtime"),
       spawnProcess: vi.fn(() => child),
-      fetchImpl: vi.fn(async () => ({ ok: false, text: async () => "" })),
+      fetchImpl: vi.fn(async () => new Response("", { status: 503 })),
       verifyTimeoutMs: 0,
       maxRetryMs: 60_000,
     });

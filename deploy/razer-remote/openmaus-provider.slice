@@ -1,0 +1,9 @@
+[Unit]
+Description=Aggregate resource ceiling for hostile OpenMaus provider turns
+
+[Slice]
+MemoryHigh=12G
+MemoryMax=16G
+MemorySwapMax=0
+CPUQuota=400%
+TasksMax=1024

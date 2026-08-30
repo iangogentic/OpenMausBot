@@ -6,7 +6,7 @@
 // These used to be POSIX-only: the fake CLI is a shebang script Windows
 // cannot exec, and the broker is a unix socket. Both now go through
 // resolveCliSpawn / permissionSocketPath, so they run everywhere.
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -109,7 +109,7 @@ describe("ClaudeDriver.decodeConfig", () => {
 
   it.skipIf(process.platform !== "win32")("names permission pipes per harness process", () => {
     expect(permissionSocketPath("thread-abc")).toMatch(
-      new RegExp(`^\\\\\\\\\\.\\\\pipe\\\\openmausbot-perm-${process.pid}-thre[0-9a-f]{4}$`),
+      new RegExp(`^\\\\\\\\\\.\\\\pipe\\\\openmausbot-perm-${process.pid}-thre[0-9a-f]{16}$`),
     );
   });
 
@@ -291,7 +291,53 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv[seen.argv.indexOf("--model") + 1]).toBe("local-model");
     expect(seen.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8888");
-    expect(seen.env.ANTHROPIC_AUTH_TOKEN).toBe("unsloth-secret");
+    expect(seen.env.ANTHROPIC_AUTH_TOKEN).toBe("local");
+  });
+
+  it("routes a local model through the relay and rotates a retained process on the next turn token", async () => {
+    await create(undefined, {
+      UNSLOTH_STUDIO_AUTH_TOKEN: "real-upstream-secret",
+      OPENMAUSBOT_DESKTOP2_QWEN_URL: "http://127.0.0.1:18011/v1",
+    });
+    const dump = join(scratch, "relay.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    const connection = (token: string) => ({
+      openaiBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay/v1",
+      anthropicBaseUrl: "http://10.0.2.2:8799/api/internal/model-relay",
+      token,
+      host: "desktop2_qwen",
+      model: "Qwen3.8-27B-Abliterated",
+    });
+    const firstToken = "opaque-exact-turn-model-token-first";
+    const first = await instance.adapter.sendTurn({
+      threadId: "t-local-relay",
+      text: "one",
+      model: "desktop2_qwen::Qwen3.8-27B-Abliterated",
+      integrations: { modelRelay: connection(firstToken) },
+    });
+    await recorder.until((event) => event.type === "turn.completed" && event.turnId === first.turnId);
+    const firstDump = JSON.parse(readFileSync(dump, "utf8"));
+    expect(firstDump.env.ANTHROPIC_BASE_URL).toBe("http://10.0.2.2:8799/api/internal/model-relay");
+    expect(firstDump.env.ANTHROPIC_AUTH_TOKEN).toBe(firstToken);
+    expect(JSON.stringify(firstDump)).not.toContain("http://127.0.0.1:18011/v1");
+    expect(JSON.stringify(firstDump)).not.toContain("real-upstream-secret");
+    const announced = recorder.events.find(
+      (event) => event.type === "session.started" && event.turnId === first.turnId,
+    ) as { sessionId: string };
+
+    rmSync(dump);
+    const secondToken = "opaque-exact-turn-model-token-second";
+    const second = await instance.adapter.sendTurn({
+      threadId: "t-local-relay",
+      text: "two",
+      model: "desktop2_qwen::Qwen3.8-27B-Abliterated",
+      resumeCursor: announced.sessionId,
+      integrations: { modelRelay: connection(secondToken) },
+    });
+    await recorder.until((event) => event.type === "turn.completed" && event.turnId === second.turnId);
+    const secondDump = JSON.parse(readFileSync(dump, "utf8"));
+    expect(secondDump.env.ANTHROPIC_AUTH_TOKEN).toBe(secondToken);
+    expect(secondDump.pid).not.toBe(firstDump.pid);
   });
 
   it("injects a leftover API id when a local host is serving that model", async () => {
@@ -317,8 +363,8 @@ describe("ClaudeDriver turns (fake CLI)", () => {
       const seen = JSON.parse(readFileSync(dump, "utf8"));
       expect(seen.argv[seen.argv.indexOf("--model") + 1]).toBe("orcarouter/Qwen3.8-27B-Uncensored-GGUF");
       expect(seen.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8888");
-      expect(seen.env.ANTHROPIC_AUTH_TOKEN).toBe("unsloth-secret");
-      expect(seen.env.ANTHROPIC_API_KEY).toBe("unsloth-secret");
+      expect(seen.env.ANTHROPIC_AUTH_TOKEN).toBe("local");
+      expect(seen.env.ANTHROPIC_API_KEY).toBe("local");
     } finally {
       globalThis.fetch = previousFetch;
     }
@@ -336,7 +382,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
         agents: {
           command: process.execPath,
           args: ["/fake/agents-proxy.js"],
-          env: { OMB_HARNESS_URL: "http://127.0.0.1:1", OMB_BOT_ID: "b1", OMB_COMMS_TOKEN: "tok", OMB_TURN_DEPTH: "0" },
+          env: { OMB_HARNESS_URL: "http://127.0.0.1:1", OMB_AGENTS_CAPABILITY_TOKEN: "tok" },
         },
       },
     });
@@ -345,13 +391,35 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.mcpConfig.mcpServers.agents).toMatchObject({
       args: ["/fake/agents-proxy.js"],
-      env: { OMB_BOT_ID: "b1", OMB_COMMS_TOKEN: "tok" },
+      env: { OMB_AGENTS_CAPABILITY_TOKEN: "tok" },
     });
     // the config goes in a private file, never on argv, where `ps` would
     // show the comms token to every other user on the machine
     expect(JSON.stringify(seen.argv)).not.toContain("tok");
     const allowed = seen.argv[seen.argv.indexOf("--allowedTools") + 1];
     expect(allowed).toContain("mcp__agents");
+  });
+
+  it("mounts Ian Brain through a private config and pre-allows its tools", async () => {
+    await create();
+    const dump = join(scratch, "ian-brain.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-ian-brain",
+      text: "read my wiki",
+      integrations: {
+        ianBrain: {
+          url: "http://127.0.0.1:8799/api/internal/ian-brain/mcp",
+          token: "ian-brain-turn-token",
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.mcpConfig.mcpServers.ian_brain.args[0]).toContain("ian-brain-proxy");
+    expect(seen.mcpConfig.mcpServers.ian_brain.env.OMB_IAN_BRAIN_CAPABILITY_TOKEN).toBe("ian-brain-turn-token");
+    expect(JSON.stringify(seen.argv)).not.toContain("ian-brain-turn-token");
+    expect(seen.argv[seen.argv.indexOf("--allowedTools") + 1]).toContain("mcp__ian_brain");
   });
 
   it("passes normalized available and denied built-in tool sets to Claude", async () => {
@@ -562,6 +630,47 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(recorder.events.filter((e) => e.type === "turn.completed")).toHaveLength(2);
   });
 
+  it("replaces a retained process when the next turn needs a different attachment mount", async () => {
+    await create();
+    const firstMount = join(scratch, "attachment-turn-one");
+    const secondMount = join(scratch, "attachment-turn-two");
+    mkdirSync(firstMount);
+    mkdirSync(secondMount);
+    const dump = join(scratch, "attachment-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-live-attachment",
+      text: "one",
+      providerRuntimePaths: [{ path: firstMount }],
+    });
+    await recorder.until((e) => e.type === "turn.completed");
+    const firstPid = JSON.parse(readFileSync(dump, "utf8")).pid;
+    let firstProcessAlive = true;
+    try {
+      process.kill(firstPid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") firstProcessAlive = false;
+      else throw error;
+    }
+    // A deleted host path remains readable through a live bwrap bind mount.
+    // The terminal event (which lets the server delete staging) must therefore
+    // follow process-tree teardown for attachment-bearing Claude turns.
+    expect(firstProcessAlive).toBe(false);
+    const announced = (recorder.events.find((e) => e.type === "session.started") as { sessionId: string }).sessionId;
+
+    rmSync(dump);
+    const second = await instance.adapter.sendTurn({
+      threadId: "t-live-attachment",
+      text: "two",
+      resumeCursor: announced,
+      providerRuntimePaths: [{ path: secondMount }],
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    const secondDump = JSON.parse(readFileSync(dump, "utf8"));
+    expect(secondDump.pid).not.toBe(firstPid);
+    expect(secondDump.argv).toContain("--resume");
+  });
+
   it("denies late broker asks between retained turns without opening a zombie card", async () => {
     await create();
     await instance.adapter.sendTurn({ threadId: "t-retained-late", text: "one" });
@@ -617,6 +726,24 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     const second = await instance.adapter.sendTurn({ threadId: "t-idle", text: "two", resumeCursor: announced });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
     expect(JSON.parse(readFileSync(join(scratch, "idle-dump.json"), "utf8")).argv).toContain("--resume");
+  });
+
+  it("reaps an isolated per-bot process before another task can take its HOME lock", async () => {
+    await create(undefined, { OMB_PROVIDER_INSTANCE_HOME: join(scratch, "instance") });
+    const firstDump = join(scratch, "isolated-first.json");
+    process.env.FAKE_CLAUDE_DUMP = firstDump;
+    await instance.adapter.sendTurn({ threadId: "task-one", isolationKey: "bot-one", text: "one" });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "task-one");
+    const firstPid = JSON.parse(readFileSync(firstDump, "utf8")).pid as number;
+    expect(() => process.kill(firstPid, 0)).toThrow();
+
+    const secondDump = join(scratch, "isolated-second.json");
+    process.env.FAKE_CLAUDE_DUMP = secondDump;
+    await instance.adapter.sendTurn({ threadId: "task-two", isolationKey: "bot-one", text: "two" });
+    await recorder.until((event) => event.type === "turn.completed" && event.threadId === "task-two");
+    const secondPid = JSON.parse(readFileSync(secondDump, "utf8")).pid as number;
+    expect(secondPid).not.toBe(firstPid);
+    expect(() => process.kill(secondPid, 0)).toThrow();
   });
 
   it("an exit before result becomes runtime.error + failed turn", async () => {
@@ -809,6 +936,41 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     conn.end();
     await instance.adapter.interruptTurn("t-perm-abc");
     await recorder.until((e) => e.type === "turn.completed");
+  });
+
+  it("terminates the exact provider turn when its permission socket floods without a frame", async () => {
+    await create("hang");
+    await Promise.all([
+      instance.adapter.sendTurn({ threadId: "t-perm-flood", text: "go" }),
+      instance.adapter.sendTurn({ threadId: "t-perm-flood-sibling", text: "keep running" }),
+    ]);
+    await Promise.all([
+      recorder.until((event) => event.threadId === "t-perm-flood" && event.type === "session.started"),
+      recorder.until((event) => event.threadId === "t-perm-flood-sibling" && event.type === "session.started"),
+    ]);
+
+    const conn = await connectSocket(permissionSocketPath("t-perm-flood"));
+    conn.on("error", () => {});
+    const fragment = "x".repeat(64 * 1024);
+    for (let i = 0; i < 5; i++) conn.write(fragment);
+
+    const done = await recorder.until(
+      (event) => event.threadId === "t-perm-flood" && event.type === "turn.completed",
+      15_000,
+    );
+    expect(done).toMatchObject({ ok: false, stopReason: "provider_output_limit" });
+    const floodError = recorder.events.find(
+      (event) => event.threadId === "t-perm-flood" && event.type === "runtime.error",
+    );
+    expect(floodError).toBeDefined();
+    if (floodError?.type !== "runtime.error") throw new Error("missing permission-flood runtime.error");
+    expect(floodError.message).toMatch(/line_bytes/);
+    expect(instance.adapter.hasSession("t-perm-flood")).toBe(false);
+    expect(instance.adapter.hasSession("t-perm-flood-sibling")).toBe(true);
+    expect(recorder.events.some((event) => event.threadId === "t-perm-flood-sibling" && event.type === "turn.completed")).toBe(false);
+    conn.destroy();
+    await instance.adapter.interruptTurn("t-perm-flood-sibling");
+    await recorder.until((event) => event.threadId === "t-perm-flood-sibling" && event.type === "turn.completed");
   });
 
   it("answers to unknown or already-resolved asks resolve `unavailable` — typed, never a throw", async () => {

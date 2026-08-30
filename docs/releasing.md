@@ -3,8 +3,7 @@
 One workflow builds everything: **Actions → Release → Run workflow**. It
 builds macOS (arm64 + x64, signed, notarized, stapled), Windows, and Ubuntu
 from a single pinned commit, verifies every artifact the way a user would
-receive it, assembles a complete draft on
-[openmausbot-releases](https://github.com/milind-soni/openmausbot-releases),
+receive it, assembles a complete draft in this fork's GitHub Releases,
 and — if you ticked **publish** — flips it live. Leave publish unticked to
 review the draft notes first, then publish from the GitHub UI.
 
@@ -22,7 +21,7 @@ stapling silently invalidating every published hash, and a finished release
 sitting invisible as a draft. Don't remove a gate without reading the comment
 above it.
 
-## One-time setup: four secrets
+## One-time setup: signing and notarization secrets
 
 Set these in **OpenMausBot → Settings → Secrets and variables → Actions**.
 
@@ -51,13 +50,8 @@ password for CI — revocable, scoped, no 2FA dance):
 base64 -i AuthKey_XXXXXXXX.p8 | pbcopy   # → APPLE_API_KEY_P8_BASE64
 ```
 
-### 3. `RELEASES_PAT`
-
-A fine-grained personal access token that lets the workflow write to the
-separate releases repo: **GitHub → Settings → Developer settings →
-Fine-grained tokens** → repository access: only `openmausbot-releases` →
-permissions: **Contents: Read and write**. Set a long expiry and a calendar
-reminder.
+The workflow publishes to the repository that ran it using the short-lived
+GitHub Actions token. No cross-repository release token is accepted or needed.
 
 ### Local fallback
 

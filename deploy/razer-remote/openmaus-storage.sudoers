@@ -1,0 +1,7 @@
+# Server may ask only the immutable leaf helper for one fixed operation and
+# one regex-validated identity. The helper rejects extra argv and every other
+# caller; no shell, interpreter, SETENV, or arbitrary command is granted.
+openmaus-server ALL=(root) NOPASSWD: /usr/local/libexec/openmaus-storage-leaf --ensure-workspace *
+openmaus-server ALL=(root) NOPASSWD: /usr/local/libexec/openmaus-storage-leaf --retire-workspace *
+openmaus-server ALL=(root) NOPASSWD: /usr/local/libexec/openmaus-storage-leaf --ensure-vm *
+openmaus-server ALL=(root) NOPASSWD: /usr/local/libexec/openmaus-storage-leaf --retire-vm *

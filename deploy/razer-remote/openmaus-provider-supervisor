@@ -1,0 +1,1583 @@
+#!/usr/bin/python3
+"""Root supervisor and per-turn sandbox for one hostile provider CLI.
+
+The trusted server invokes this immutable program through one narrow sudoers
+rule. It consumes a server-owned launch manifest, opens every allowed path
+before dropping privilege, then runs the provider through bubblewrap with a
+private PID/mount/IPC/UTS scope. This process remains root, acts as a Linux
+child subreaper, and proves every descendant has exited before returning.
+"""
+
+import ctypes
+import fcntl
+import json
+import os
+import pwd
+import grp
+import re
+import shutil
+import signal
+import select
+import stat
+import subprocess
+import sys
+import time
+
+PROVIDER_USER = "openmaus-provider"
+SERVER_USER = "openmaus-server"
+RUNTIME_GROUP = "openmaus-runtime"
+WORKSPACE_GROUP = "openmaus-workspace"
+PROVIDER_ROOT = "/var/lib/openmaus-provider"
+PROVIDER_INSTANCES = "/var/lib/openmaus-provider/instances"
+PROVIDER_STATE = "/var/lib/openmaus-provider/state"
+WORKSPACE_BASE = "/var/lib/openmausbot-workspaces"
+SERVER_STATE = "/var/lib/openmausbot"
+RUNTIME_BASE = "/run/openmaus-provider"
+BWRAP = "/usr/bin/bwrap"
+BTRFS = "/usr/bin/btrfs"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+SYSTEMCTL = "/usr/bin/systemctl"
+SLIRP4NETNS = "/usr/bin/slirp4netns"
+PROVIDER_SLICE = "openmaus-provider.slice"
+MANIFEST_ENV = "OMB_PROVIDER_LAUNCH_MANIFEST"
+SANDBOX_ENV_PATH = "/run/openmaus-provider-environment.json"
+ROOT_EXEC_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+}
+TERM_GRACE_SECONDS = 0.75
+KILL_REAP_SECONDS = 4.0
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_RUNTIME_PATHS = 33
+MAX_RUNTIME_NODES = 4096
+MAX_INSTANCE_HOME_BYTES = 128 * 1024 * 1024
+MAX_PERSISTENT_HOME_BYTES = 128 * 1024 * 1024
+MAX_PERSISTENT_HOME_NODES = 16384
+MAX_INSTANCE_PERSISTENT_HOMES = 64
+MAX_INSTANCE_STATE_BYTES = 8 * 1024 * 1024 * 1024
+MAX_HOME_IMPORT_BYTES = 16 * 1024 * 1024
+HOST_RUNTIME_CLIENTS = (
+    "/usr/bin/docker",
+    "/usr/bin/podman",
+    "/usr/bin/nerdctl",
+    "/usr/bin/ctr",
+    "/usr/local/bin/docker",
+    "/usr/local/bin/podman",
+)
+PR_SET_CHILD_SUBREAPER = 36
+PR_SET_NO_NEW_PRIVS = 38
+
+CONTROL_ENV = {
+    "CREDENTIALS_DIRECTORY",
+    "OMB_UI_SESSION_TOKEN",
+    "OMB_UI_SESSION_TOKEN_SHA256",
+    "OMB_COMPANION_SESSION_TOKEN",
+    "OMB_DATA_DIR",
+    "OMB_USER_DATA",
+    "OMB_STATIC_DIR",
+    "OMB_PORT",
+    "OMB_WEBHOOK_PORT",
+    "OMB_LISTEN_SOCKET",
+    "OMB_WEBHOOK_LISTEN_SOCKET",
+    "OMB_COMPANION_PORT",
+    "OMB_CONTROL_PORT",
+    "OMB_COMPANION_LISTEN_SOCKET",
+    "OMB_CONTROL_LISTEN_SOCKET",
+    "OMB_PROVIDER_LAUNCHER",
+    "OMB_REQUIRE_PROVIDER_ISOLATION",
+    "OMB_PROVIDER_LAUNCH_MANIFEST",
+    "OMB_PROVIDER_SANDBOX_PATHS",
+    "OMB_PROVIDER_INSTANCE_HOME",
+    "OMB_PROVIDER_INSTANCE_STATE",
+    "OMB_PROVIDER_STATE_DIR",
+    "OMB_PROVIDER_MEMORY_HIGH_BYTES",
+    "OMB_PROVIDER_MEMORY_MAX_BYTES",
+    "OMB_PROVIDER_MEMORY_SWAP_MAX_BYTES",
+    "OMB_PROVIDER_CPU_QUOTA_PERCENT",
+    "OMB_PROVIDER_TASKS_MAX",
+    "OMB_PROVIDER_PARENT_UNIT",
+}
+
+libc = ctypes.CDLL(None, use_errno=True)
+
+
+def prctl(option: int, value: int) -> None:
+    if libc.prctl(option, value, 0, 0, 0) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def descendants(root_pid: int) -> list[int]:
+    """Return every descendant, including subreaper-adopted daemons."""
+    children: dict[int, list[int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/status", "r", encoding="ascii", errors="ignore") as status_file:
+                parent = None
+                for line in status_file:
+                    if line.startswith("PPid:"):
+                        parent = int(line.split(":", 1)[1].strip())
+                        break
+            if parent is not None:
+                children.setdefault(parent, []).append(pid)
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+    found: list[int] = []
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop()
+        direct = children.get(parent, [])
+        found.extend(direct)
+        pending.extend(direct)
+    return found
+
+
+def reap(main_pid: int, main_status: int | None) -> int | None:
+    while True:
+        try:
+            pid, status_value = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return main_status
+        if pid == 0:
+            return main_status
+        if pid == main_pid:
+            main_status = status_value
+
+
+def signal_descendants(sig: int) -> None:
+    for pid in reversed(descendants(os.getpid())):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+
+
+def unit_active(unit: str) -> bool:
+    result = subprocess.run(
+        [SYSTEMCTL, "is-active", "--quiet", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def signal_unit(unit: str, sig: str) -> None:
+    subprocess.run(
+        [SYSTEMCTL, "kill", "--kill-whom=all", f"--signal={sig}", unit],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def drain(main_pid: int, main_status: int | None, unit: str) -> int | None:
+    deadline = time.monotonic() + TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        signal_unit(unit, "TERM")
+        signal_descendants(signal.SIGTERM)
+        main_status = reap(main_pid, main_status)
+        if not unit_active(unit) and not descendants(os.getpid()):
+            return main_status
+        time.sleep(0.02)
+    deadline = time.monotonic() + KILL_REAP_SECONDS
+    warned = False
+    while True:
+        signal_unit(unit, "KILL")
+        signal_descendants(signal.SIGKILL)
+        main_status = reap(main_pid, main_status)
+        if not unit_active(unit) and not descendants(os.getpid()):
+            return main_status
+        if not warned and time.monotonic() >= deadline:
+            # Never exit and orphan a hostile process. Staying root and
+            # continuing SIGKILL/reap is safer than a false timeout success.
+            print("provider cleanup exceeded four seconds; continuing root reap", file=sys.stderr)
+            warned = True
+        time.sleep(0.02)
+
+
+def canonical_child(parent: str, candidate: str) -> bool:
+    try:
+        return os.path.commonpath((parent, candidate)) == parent and candidate != parent
+    except ValueError:
+        return False
+
+
+def trusted_binary(path: str) -> None:
+    info = os.lstat(path)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or os.path.realpath(path) != path
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or not info.st_mode & 0o111
+    ):
+        raise RuntimeError("bubblewrap must be a root-owned immutable executable")
+
+
+def btrfs_checked(args: list[str]) -> None:
+    result = subprocess.run(
+        [BTRFS, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=ROOT_EXEC_ENV,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("provider persistent state requires enforced btrfs qgroups")
+
+
+def btrfs_output(args: list[str]) -> str:
+    result = subprocess.run(
+        [BTRFS, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        env=ROOT_EXEC_ENV,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("provider persistent state requires enforced btrfs qgroups")
+    return result.stdout
+
+
+def qgroup_exclusive_bytes(path: str) -> int:
+    root_id = btrfs_output(["inspect-internal", "rootid", path]).strip()
+    if not root_id.isdigit():
+        raise RuntimeError("provider state subvolume id is invalid")
+    expected = f"0/{root_id}"
+    output = btrfs_output(["qgroup", "show", "--raw", "--no-sync", path])
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == expected and fields[1].isdigit() and fields[2].isdigit():
+            return int(fields[2])
+    raise RuntimeError("provider state qgroup accounting is absent")
+
+
+def validate_btrfs_quota(path: str) -> None:
+    btrfs_checked(["qgroup", "show", "--raw", path])
+
+
+def validate_btrfs_home(path: str) -> None:
+    btrfs_checked(["subvolume", "show", path])
+    # Reapply the immutable hard referenced-byte ceiling on every launch.
+    # qgroup enforcement occurs while the turn is writing, not just at exit.
+    btrfs_checked(["qgroup", "limit", str(MAX_PERSISTENT_HOME_BYTES), path])
+
+
+def checked_directory(path: str, owner: int, group: int, mode: int) -> os.stat_result:
+    info = os.lstat(path)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or os.path.realpath(path) != path
+        or info.st_uid != owner
+        or info.st_gid != group
+        or stat.S_IMODE(info.st_mode) != mode
+    ):
+        raise RuntimeError(f"unsafe deployment directory: {path}")
+    return info
+
+
+def read_exact_manifest(server_uid: int, runtime_gid: int) -> dict:
+    manifest_path = os.environ.get(MANIFEST_ENV, "")
+    if not manifest_path or "\x00" in manifest_path or not os.path.isabs(manifest_path):
+        raise RuntimeError("missing provider launch manifest")
+    if os.path.basename(manifest_path) != "launch.json":
+        raise RuntimeError("invalid provider launch manifest name")
+    scope = os.path.dirname(manifest_path)
+    if (
+        os.path.dirname(scope) != RUNTIME_BASE
+        or not re.fullmatch(r"spawn-[A-Za-z0-9_-]{6,64}", os.path.basename(scope))
+    ):
+        raise RuntimeError("provider launch manifest escaped its turn scope")
+    checked_directory(RUNTIME_BASE, server_uid, runtime_gid, 0o2750)
+    checked_directory(scope, server_uid, runtime_gid, 0o2750)
+    before = os.lstat(manifest_path)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or os.path.realpath(manifest_path) != manifest_path
+        or before.st_uid != server_uid
+        or before.st_gid != runtime_gid
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size <= 0
+        or before.st_size > MAX_MANIFEST_BYTES
+    ):
+        raise RuntimeError("unsafe provider launch manifest")
+    fd = os.open(manifest_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError("provider launch manifest changed during validation")
+        payload = b""
+        while len(payload) <= MAX_MANIFEST_BYTES:
+            chunk = os.read(fd, min(65536, MAX_MANIFEST_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise RuntimeError("provider launch manifest is too large")
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(manifest_path)
+        except FileNotFoundError:
+            pass
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("invalid provider launch manifest JSON") from error
+    if not isinstance(parsed, dict) or parsed.get("version") != 1:
+        raise RuntimeError("unsupported provider launch manifest")
+    return parsed
+
+
+def validate_runtime_tree(path: str, server_uid: int, runtime_gid: int) -> None:
+    root = os.lstat(path)
+    root_device = root.st_dev
+    count = 0
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        info = os.lstat(current)
+        count += 1
+        if count > MAX_RUNTIME_NODES:
+            raise RuntimeError("provider runtime tree is unexpectedly large")
+        if info.st_dev != root_device or stat.S_ISLNK(info.st_mode):
+            raise RuntimeError("provider runtime tree contains a link or nested mount")
+        if info.st_uid != server_uid or info.st_gid != runtime_gid:
+            raise RuntimeError("provider runtime inode has unsafe ownership")
+        if info.st_mode & 0o007:
+            raise RuntimeError("provider runtime inode is accessible to unrelated users")
+        if stat.S_ISDIR(info.st_mode):
+            if info.st_mode & 0o050 != 0o050:
+                raise RuntimeError("provider runtime directory is not runtime-group traversable")
+            with os.scandir(current) as entries:
+                pending.extend(entry.path for entry in entries)
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1 or info.st_mode & 0o040 != 0o040:
+                raise RuntimeError("provider runtime file is not a unique runtime-group file")
+        elif stat.S_ISSOCK(info.st_mode):
+            if info.st_mode & 0o060 != 0o060:
+                raise RuntimeError("provider runtime socket is not runtime-group accessible")
+        else:
+            raise RuntimeError("provider runtime tree contains an unsupported inode")
+
+
+def validate_instance_seed(path: str, provider_uid: int, runtime_gid: int) -> None:
+    pending = [path]
+    count = 0
+    total_bytes = 0
+    while pending:
+        current = pending.pop()
+        info = os.lstat(current)
+        count += 1
+        if count > MAX_RUNTIME_NODES:
+            raise RuntimeError("provider instance home has too many files")
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != provider_uid or info.st_gid != runtime_gid or info.st_mode & 0o007:
+            raise RuntimeError("provider instance home contains an unsafe inode")
+        if stat.S_ISDIR(info.st_mode):
+            with os.scandir(current) as entries:
+                pending.extend(entry.path for entry in entries)
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise RuntimeError("provider instance home contains a hard link")
+            total_bytes += info.st_size
+            if total_bytes > MAX_INSTANCE_HOME_BYTES:
+                raise RuntimeError("provider instance home exceeds 128 MiB")
+        else:
+            raise RuntimeError("provider instance home contains an unsupported inode")
+
+
+def validate_persistent_home(
+    path: str,
+    provider_uid: int,
+    runtime_gid: int,
+    workspace_gid: int,
+) -> tuple[int, int]:
+    pending = [path]
+    count = 0
+    total_bytes = 0
+    while pending:
+        current = pending.pop()
+        info = os.lstat(current)
+        count += 1
+        if count > MAX_PERSISTENT_HOME_NODES:
+            raise RuntimeError("provider persistent home has too many files")
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or info.st_uid != provider_uid
+            or info.st_gid not in (runtime_gid, workspace_gid)
+            or info.st_mode & 0o077
+        ):
+            raise RuntimeError("provider persistent home contains an unsafe inode")
+        if stat.S_ISDIR(info.st_mode):
+            with os.scandir(current) as entries:
+                pending.extend(entry.path for entry in entries)
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise RuntimeError("provider persistent home contains a hard link")
+            total_bytes += info.st_size
+            if total_bytes > MAX_PERSISTENT_HOME_BYTES:
+                raise RuntimeError("provider persistent home exceeds 128 MiB")
+        else:
+            raise RuntimeError("provider persistent home contains an unsupported inode")
+    return count, total_bytes
+
+
+def instance_state_usage(instance_state: str) -> tuple[int, int]:
+    homes = 0
+    total_bytes = 0
+    with os.scandir(instance_state) as entries:
+        for entry in entries:
+            if re.fullmatch(r"[0-9a-f]{48}", entry.name):
+                if not entry.is_dir(follow_symlinks=False):
+                    raise RuntimeError("provider state contains an invalid home entry")
+                homes += 1
+                total_bytes += qgroup_exclusive_bytes(entry.path)
+            elif re.fullmatch(r"\.init-[0-9a-f]{48}-[0-9]+", entry.name):
+                if not entry.is_dir(follow_symlinks=False):
+                    raise RuntimeError("provider state contains an invalid initializer entry")
+                total_bytes += qgroup_exclusive_bytes(entry.path)
+            elif entry.name == ".instance.lock" or re.fullmatch(r"\.lock-[0-9a-f]{48}", entry.name):
+                info = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1:
+                    raise RuntimeError("provider state contains an unsafe lock")
+            else:
+                raise RuntimeError("provider state contains an unexpected entry")
+    # Each home also has a hard 128 MiB qgroup. This aggregate allocated-byte
+    # check cannot be poisoned by a sparse file or malformed sibling inode.
+    if total_bytes > MAX_INSTANCE_STATE_BYTES:
+        raise RuntimeError("provider instance state exceeds 8 GiB allocated")
+    return homes, total_bytes
+
+
+def copy_seed_file(source: str, destination: str, provider_uid: int, runtime_gid: int) -> None:
+    source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    destination_fd = -1
+    try:
+        source_info = os.fstat(source_fd)
+        if not stat.S_ISREG(source_info.st_mode) or source_info.st_nlink != 1:
+            raise RuntimeError("provider instance seed changed during initialization")
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                view = view[written:]
+        os.fchown(destination_fd, provider_uid, runtime_gid)
+        owner_mode = stat.S_IMODE(source_info.st_mode) & 0o700
+        os.fchmod(destination_fd, owner_mode | 0o400)
+    finally:
+        os.close(source_fd)
+        if destination_fd >= 0:
+            os.close(destination_fd)
+
+
+def copy_instance_seed(source: str, destination: str, provider_uid: int, runtime_gid: int) -> None:
+    for root, directories, files in os.walk(source, topdown=True, followlinks=False):
+        relative_root = os.path.relpath(root, source)
+        target_root = destination if relative_root == "." else os.path.join(destination, relative_root)
+        for directory in directories:
+            source_path = os.path.join(root, directory)
+            source_info = os.lstat(source_path)
+            if not stat.S_ISDIR(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+                raise RuntimeError("provider instance seed changed during initialization")
+            target = os.path.join(target_root, directory)
+            os.mkdir(target, 0o700)
+            os.chown(target, provider_uid, runtime_gid, follow_symlinks=False)
+            os.chmod(target, 0o700, follow_symlinks=False)
+        for filename in files:
+            copy_seed_file(
+                os.path.join(root, filename),
+                os.path.join(target_root, filename),
+                provider_uid,
+                runtime_gid,
+            )
+
+
+def apply_home_imports(
+    home: str,
+    imports: list[dict],
+    provider_uid: int,
+    runtime_gid: int,
+) -> None:
+    for index, item in enumerate(imports):
+        current = home
+        parts = item["destination"].split("/")
+        for part in parts[:-1]:
+            current = os.path.join(current, part)
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                os.mkdir(current, 0o700)
+                os.chown(current, provider_uid, runtime_gid, follow_symlinks=False)
+                os.chmod(current, 0o700, follow_symlinks=False)
+                info = os.lstat(current)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != provider_uid
+                or info.st_gid != runtime_gid
+                or info.st_mode & 0o077
+            ):
+                raise RuntimeError("provider home import destination is unsafe")
+        destination = os.path.join(home, *parts)
+        if not item["replace"]:
+            try:
+                existing = os.lstat(destination)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                if (
+                    not stat.S_ISREG(existing.st_mode)
+                    or stat.S_ISLNK(existing.st_mode)
+                    or existing.st_uid != provider_uid
+                    or existing.st_gid != runtime_gid
+                    or existing.st_nlink != 1
+                    or existing.st_mode & 0o077
+                ):
+                    raise RuntimeError("provider home import destination is unsafe")
+                continue
+        temporary = os.path.join(os.path.dirname(destination), f".openmaus-import-{os.getpid()}-{index}")
+        destination_fd = -1
+        try:
+            destination_fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+            os.lseek(item["fd"], 0, os.SEEK_SET)
+            copied = 0
+            while True:
+                chunk = os.read(item["fd"], 1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAX_HOME_IMPORT_BYTES:
+                    raise RuntimeError("provider home import exceeds 16 MiB")
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    view = view[written:]
+            os.fchown(destination_fd, provider_uid, runtime_gid)
+            os.fchmod(destination_fd, 0o600)
+            os.fsync(destination_fd)
+            os.close(destination_fd)
+            destination_fd = -1
+            os.replace(temporary, destination)
+        finally:
+            if destination_fd >= 0:
+                os.close(destination_fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def remove_initializing_tree(path: str) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise RuntimeError("provider persistent-home initializer path is unsafe")
+    for root, directories, files in os.walk(path, topdown=False, followlinks=False):
+        for filename in files:
+            child = os.path.join(root, filename)
+            if os.path.islink(child):
+                raise RuntimeError("provider persistent-home initializer contains a link")
+            os.unlink(child)
+        for directory in directories:
+            child = os.path.join(root, directory)
+            if os.path.islink(child):
+                raise RuntimeError("provider persistent-home initializer contains a link")
+            os.rmdir(child)
+    btrfs_checked(["subvolume", "delete", path])
+
+
+def prepare_persistent_home(
+    instance_state: str,
+    key: str,
+    seed: str,
+    provider_uid: int,
+    runtime_gid: int,
+    workspace_gid: int,
+) -> tuple[str, int, int]:
+    instance_lock_path = os.path.join(instance_state, ".instance.lock")
+    instance_lock_fd = os.open(
+        instance_lock_path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    lock_fd = -1
+    try:
+        instance_lock_info = os.fstat(instance_lock_fd)
+        if (
+            not stat.S_ISREG(instance_lock_info.st_mode)
+            or instance_lock_info.st_uid != 0
+            or instance_lock_info.st_nlink != 1
+        ):
+            raise RuntimeError("provider instance-state lock is unsafe")
+        os.fchown(instance_lock_fd, 0, runtime_gid)
+        os.fchmod(instance_lock_fd, 0o600)
+        fcntl.flock(instance_lock_fd, fcntl.LOCK_EX)
+
+        lock_path = os.path.join(instance_state, f".lock-{key}")
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != 0 or lock_info.st_nlink != 1:
+            raise RuntimeError("provider persistent-home lock is unsafe")
+        os.fchown(lock_fd, 0, runtime_gid)
+        os.fchmod(lock_fd, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("provider persistent home is already active") from error
+        path = os.path.join(instance_state, key)
+        home_count, instance_bytes = instance_state_usage(instance_state)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            if home_count >= MAX_INSTANCE_PERSISTENT_HOMES:
+                raise RuntimeError("provider instance already has 64 persistent homes")
+            initializing = os.path.join(instance_state, f".init-{key}-{os.getpid()}")
+            remove_initializing_tree(initializing)
+            btrfs_checked(["subvolume", "create", initializing])
+            os.chown(initializing, provider_uid, runtime_gid, follow_symlinks=False)
+            os.chmod(initializing, 0o700, follow_symlinks=False)
+            try:
+                btrfs_checked(["qgroup", "limit", str(MAX_PERSISTENT_HOME_BYTES), initializing])
+                copy_instance_seed(seed, initializing, provider_uid, runtime_gid)
+                validate_persistent_home(
+                    initializing,
+                    provider_uid,
+                    runtime_gid,
+                    workspace_gid,
+                )
+                initializing_bytes = qgroup_exclusive_bytes(initializing)
+                if instance_bytes + initializing_bytes > MAX_INSTANCE_STATE_BYTES:
+                    raise RuntimeError("provider instance state would exceed 8 GiB")
+                os.rename(initializing, path)
+            except BaseException:
+                remove_initializing_tree(initializing)
+                raise
+        validate_btrfs_home(path)
+        validate_persistent_home(path, provider_uid, runtime_gid, workspace_gid)
+        home_fd, _ = open_mount(path)
+        return path, home_fd, lock_fd
+    except BaseException:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        raise
+    finally:
+        os.close(instance_lock_fd)
+
+
+def sandbox_home_init(source: str, destination: str, argv: list[str]) -> int:
+    if (
+        os.geteuid() == 0
+        or source != "/run/openmaus-instance-seed"
+        or not os.path.isabs(destination)
+        or not argv
+        or not os.path.isabs(argv[0])
+    ):
+        return 64
+    os.umask(0o077)
+    for root, directories, files in os.walk(source, topdown=True, followlinks=False):
+        relative = os.path.relpath(root, source)
+        target_root = destination if relative == "." else os.path.join(destination, relative)
+        os.makedirs(target_root, mode=0o700, exist_ok=True)
+        os.chmod(target_root, 0o700)
+        for directory in directories:
+            source_path = os.path.join(root, directory)
+            if os.path.islink(source_path):
+                return 65
+            os.makedirs(os.path.join(target_root, directory), mode=0o700, exist_ok=True)
+        for filename in files:
+            source_path = os.path.join(root, filename)
+            if os.path.islink(source_path):
+                return 65
+            target_path = os.path.join(target_root, filename)
+            shutil.copyfile(source_path, target_path, follow_symlinks=False)
+            owner_mode = stat.S_IMODE(os.stat(source_path, follow_symlinks=False).st_mode) & 0o700
+            os.chmod(target_path, owner_mode | 0o400)
+    os.execve(argv[0], argv, dict(os.environ))
+    return 126
+
+
+def sandbox_network_exec(argv: list[str]) -> int:
+    """Run bwrap in a private netns with one user-mode public-egress gateway.
+
+    Abstract Unix sockets and loopback are consequently per-turn. slirp's
+    host-side connections retain the provider UID, so the root-owned nft
+    policy still denies host/LAN/Tailscale and permits only public egress plus
+    the capability-authenticated harness listener.
+    """
+    try:
+        provider_uid = pwd.getpwnam(PROVIDER_USER).pw_uid
+    except KeyError:
+        return 64
+    if os.geteuid() != provider_uid or not argv or argv[0] != BWRAP:
+        return 64
+    block_read, block_write = os.pipe2(os.O_CLOEXEC)
+    ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
+    os.set_inheritable(block_read, True)
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(block_write)
+            os.close(ready_read)
+            os.close(ready_write)
+            os.execve(
+                BWRAP,
+                [BWRAP, "--unshare-net", "--block-fd", str(block_read), *argv[1:]],
+                ROOT_EXEC_ENV,
+            )
+        except BaseException:
+            os._exit(126)
+    os.close(block_read)
+    slirp = None
+    try:
+        slirp = subprocess.Popen(
+            [
+                SLIRP4NETNS,
+                "--configure",
+                "--mtu=65520",
+                f"--ready-fd={ready_write}",
+                str(child),
+                "tap0",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(ready_write,),
+            env=ROOT_EXEC_ENV,
+        )
+        os.close(ready_write)
+        ready_write = -1
+        readable, _, _ = select.select([ready_read], [], [], 5.0)
+        if not readable or not os.read(ready_read, 1):
+            raise RuntimeError("private provider network did not become ready")
+        os.write(block_write, b"1")
+        os.close(block_write)
+        block_write = -1
+        _pid, status = os.waitpid(child, 0)
+        return exit_code(status, None)
+    except (OSError, RuntimeError):
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(child, 0)
+        except ChildProcessError:
+            pass
+        return 69
+    finally:
+        if block_write >= 0:
+            os.close(block_write)
+        if ready_write >= 0:
+            os.close(ready_write)
+        os.close(ready_read)
+        if slirp is not None:
+            slirp.terminate()
+            try:
+                slirp.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                slirp.kill()
+                slirp.wait()
+
+
+def change_runtime_ownership(path: str, uid: int, gid: int) -> None:
+    pending = [path]
+    count = 0
+    while pending:
+        current = pending.pop()
+        info = os.lstat(current)
+        count += 1
+        if count > MAX_RUNTIME_NODES:
+            raise RuntimeError("provider runtime tree grew beyond the restoration limit")
+        os.chown(current, uid, gid, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            with os.scandir(current) as entries:
+                pending.extend(entry.path for entry in entries)
+
+
+def open_mount(path: str) -> tuple[int, os.stat_result]:
+    before = os.lstat(path)
+    fd = os.open(path, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
+    opened = os.fstat(fd)
+    if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+        os.close(fd)
+        raise RuntimeError("provider mount path changed during validation")
+    os.set_inheritable(fd, True)
+    return fd, opened
+
+
+def open_readonly(path: str) -> tuple[int, os.stat_result]:
+    before = os.lstat(path)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    opened = os.fstat(fd)
+    if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+        os.close(fd)
+        raise RuntimeError("provider import source changed during validation")
+    return fd, opened
+
+
+def parent_directories(base: str, destination: str) -> list[str]:
+    relative = os.path.relpath(destination, base)
+    parts = relative.split(os.sep)[:-1]
+    result: list[str] = []
+    current = base
+    for part in parts:
+        current = os.path.join(current, part)
+        result.append(current)
+    return result
+
+
+def validate_environment(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict) or len(raw) > 512:
+        raise RuntimeError("provider environment is invalid")
+    environment: dict[str, str] = {}
+    for name, value in raw.items():
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+            or not isinstance(value, str)
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 262144
+        ):
+            raise RuntimeError("provider environment contains an invalid entry")
+        if name not in CONTROL_ENV:
+            environment[name] = value
+    return environment
+
+
+def environment_memfd(environment: dict[str, str], account: pwd.struct_passwd) -> int:
+    """Seal provider env in an anonymous fd; never exec a root binary with it."""
+    payload = json.dumps(environment, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not payload or len(payload) > MAX_MANIFEST_BYTES:
+        raise RuntimeError("provider environment is too large")
+    required_flags = getattr(os, "MFD_CLOEXEC", 0) | getattr(os, "MFD_ALLOW_SEALING", 0)
+    if not hasattr(os, "memfd_create") or not getattr(os, "MFD_ALLOW_SEALING", 0):
+        raise RuntimeError("sealed provider environment fds are unavailable")
+    descriptor = os.memfd_create("openmaus-provider-environment", required_flags)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.fchown(descriptor, account.pw_uid, account.pw_gid)
+        os.fchmod(descriptor, 0o400)
+        seals = (
+            getattr(fcntl, "F_SEAL_SEAL", 0)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0)
+            | getattr(fcntl, "F_SEAL_GROW", 0)
+            | getattr(fcntl, "F_SEAL_WRITE", 0)
+        )
+        if not seals or not hasattr(fcntl, "F_ADD_SEALS"):
+            raise RuntimeError("provider environment sealing is unavailable")
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
+        os.set_inheritable(descriptor, True)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def sandbox_exec_environment(path: str, argv: list[str]) -> int:
+    """Load the sealed turn environment only after UID drop and bwrap entry."""
+    if os.geteuid() == 0 or path != SANDBOX_ENV_PATH or not argv or not os.path.isabs(argv[0]):
+        return 64
+    try:
+        info = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o400
+            or info.st_size <= 0
+            or info.st_size > MAX_MANIFEST_BYTES
+        ):
+            return 65
+        with open(path, "rb", buffering=0) as environment_file:
+            payload = environment_file.read(MAX_MANIFEST_BYTES + 1)
+        if len(payload) > MAX_MANIFEST_BYTES:
+            return 65
+        raw = json.loads(payload.decode("utf-8"))
+        if not isinstance(raw, dict) or len(raw) > 512:
+            return 65
+        environment: dict[str, str] = {}
+        for name, value in raw.items():
+            if (
+                not isinstance(name, str)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                or not isinstance(value, str)
+                or "\x00" in value
+            ):
+                return 65
+            environment[name] = value
+        os.execve(argv[0], argv, environment)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return 65
+    return 126
+
+
+def validate_limits(raw: object) -> dict[str, int]:
+    expected = {"memoryHigh", "memoryMax", "memorySwapMax", "cpuQuotaPercent", "tasksMax"}
+    if not isinstance(raw, dict) or set(raw) != expected:
+        raise RuntimeError("provider resource limit manifest is invalid")
+    if any(not isinstance(raw[name], int) or isinstance(raw[name], bool) for name in expected):
+        raise RuntimeError("provider resource limits must be integers")
+    if not (128 * 1024 * 1024 <= raw["memoryMax"] <= 64 * 1024**3):
+        raise RuntimeError("provider MemoryMax is outside the supported range")
+    if not (64 * 1024 * 1024 <= raw["memoryHigh"] <= raw["memoryMax"]):
+        raise RuntimeError("provider MemoryHigh is outside the supported range")
+    if not (0 <= raw["memorySwapMax"] <= 16 * 1024**3):
+        raise RuntimeError("provider MemorySwapMax is outside the supported range")
+    if not (10 <= raw["cpuQuotaPercent"] <= 800) or not (16 <= raw["tasksMax"] <= 2048):
+        raise RuntimeError("provider CPU or task limit is outside the supported range")
+    return raw
+
+
+def prepare_sandbox(
+    parsed: dict,
+    account: pwd.struct_passwd,
+    server_uid: int,
+    runtime_gid: int,
+    workspace_gid: int,
+) -> dict:
+    provider_home = parsed.get("providerHome")
+    provider_state = parsed.get("providerState")
+    persistent_home_key = parsed.get("persistentHomeKey")
+    if (
+        parsed.get("providerRoot") != PROVIDER_ROOT
+        or parsed.get("providerStateRoot") != PROVIDER_STATE
+        or parsed.get("runtimeBase") != RUNTIME_BASE
+    ):
+        raise RuntimeError("provider launch manifest names the wrong deployment boundary")
+    if account.pw_dir != PROVIDER_ROOT:
+        raise RuntimeError("provider passwd home differs from the deployment root")
+    checked_directory(PROVIDER_ROOT, 0, runtime_gid, 0o750)
+    checked_directory(PROVIDER_INSTANCES, 0, runtime_gid, 0o750)
+    checked_directory(PROVIDER_STATE, 0, runtime_gid, 0o750)
+    if not isinstance(provider_home, str) or not canonical_child(PROVIDER_INSTANCES, provider_home):
+        raise RuntimeError("provider instance home escaped its root")
+    relative_home = os.path.relpath(provider_home, PROVIDER_INSTANCES).split(os.sep)
+    if len(relative_home) != 2 or not re.fullmatch(r"[0-9a-f]{24}", relative_home[0]) or not re.fullmatch(r"[0-9a-f]{32}", relative_home[1]):
+        raise RuntimeError("provider instance home mapping is invalid")
+    checked_directory(os.path.dirname(provider_home), 0, runtime_gid, 0o750)
+    checked_directory(provider_home, account.pw_uid, runtime_gid, 0o2750)
+    validate_instance_seed(provider_home, account.pw_uid, runtime_gid)
+    expected_state = os.path.join(PROVIDER_STATE, *relative_home)
+    if provider_state != expected_state or not canonical_child(PROVIDER_STATE, provider_state):
+        raise RuntimeError("provider instance state mapping is invalid")
+    checked_directory(os.path.dirname(provider_state), 0, runtime_gid, 0o750)
+    checked_directory(provider_state, 0, runtime_gid, 0o750)
+    if persistent_home_key is not None and (
+        not isinstance(persistent_home_key, str)
+        or not re.fullmatch(r"[0-9a-f]{48}", persistent_home_key)
+    ):
+        raise RuntimeError("provider persistent home key is invalid")
+    limits = validate_limits(parsed.get("limits"))
+    parent_unit = parsed.get("parentUnit")
+    if not isinstance(parent_unit, str) or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}\.service", parent_unit):
+        raise RuntimeError("provider parent unit is invalid")
+    turn_directory = parsed.get("turnDirectory")
+    paths = parsed.get("paths")
+    raw_imports = parsed.get("homeImports", [])
+    if not isinstance(turn_directory, str) or not isinstance(paths, list) or not (1 <= len(paths) <= MAX_RUNTIME_PATHS):
+        raise RuntimeError("provider runtime mount manifest is invalid")
+    if not isinstance(raw_imports, list) or len(raw_imports) > 16:
+        raise RuntimeError("provider home import manifest is invalid")
+    if os.path.dirname(turn_directory) != RUNTIME_BASE or not os.path.basename(turn_directory).startswith("spawn-"):
+        raise RuntimeError("provider turn scope escaped runtime base")
+    mounts: list[dict] = []
+    seen: list[str] = []
+    saw_turn = False
+    for item in paths:
+        if not isinstance(item, dict) or set(item) != {"path", "writable"}:
+            raise RuntimeError("provider runtime mount entry is invalid")
+        path = item.get("path")
+        writable = item.get("writable")
+        if not isinstance(path, str) or not isinstance(writable, bool) or not os.path.isabs(path):
+            raise RuntimeError("provider runtime mount entry is invalid")
+        if not canonical_child(RUNTIME_BASE, path) or os.path.realpath(path) != path:
+            raise RuntimeError("provider runtime mount escaped runtime base")
+        for previous in seen:
+            if os.path.commonpath((previous, path)) in (previous, path):
+                if previous == path:
+                    raise RuntimeError("provider runtime mount is duplicated")
+                # The private turn scope is never a host bind mount and may
+                # not contain any declared artifact.
+                if previous == turn_directory or path == turn_directory:
+                    raise RuntimeError("provider runtime mount overlaps its private turn scope")
+        seen.append(path)
+        if path == turn_directory:
+            if not writable or saw_turn:
+                raise RuntimeError("provider private turn scope is invalid")
+            checked_directory(path, server_uid, runtime_gid, 0o2750)
+            saw_turn = True
+            continue
+        validate_runtime_tree(path, server_uid, runtime_gid)
+        fd, info = open_mount(path)
+        candidate = {"path": path, "writable": writable, "fd": fd, "directory": stat.S_ISDIR(info.st_mode)}
+        for previous in mounts:
+            common = os.path.commonpath((previous["path"], path))
+            if common not in (previous["path"], path):
+                continue
+            ancestor, descendant = (previous, candidate) if common == previous["path"] else (candidate, previous)
+            # A single exact file may be mounted over a read-only directory.
+            # This is required for Hermes' nonce proof and does not grant the
+            # provider write access to the surrounding policy directory.
+            if ancestor["writable"] or descendant["directory"]:
+                os.close(fd)
+                raise RuntimeError("provider runtime mounts overlap unsafely")
+        mounts.append(candidate)
+    if not saw_turn:
+        raise RuntimeError("provider private turn scope is missing")
+    mounts.sort(key=lambda item: (item["path"].count(os.sep), item["path"]))
+    imports: list[dict] = []
+    for item in raw_imports:
+        if not isinstance(item, dict) or set(item) != {"source", "destination", "replace"}:
+            raise RuntimeError("provider home import entry is invalid")
+        source = item.get("source")
+        destination = item.get("destination")
+        replace = item.get("replace")
+        if (
+            not isinstance(source, str)
+            or not isinstance(destination, str)
+            or not isinstance(replace, bool)
+            or not canonical_child(RUNTIME_BASE, source)
+            or os.path.realpath(source) != source
+            or not re.fullmatch(r"[^/\x00]+(?:/[^/\x00]+)*", destination)
+            or any(part in (".", "..") for part in destination.split("/"))
+        ):
+            raise RuntimeError("provider home import entry is invalid")
+        validate_runtime_tree(source, server_uid, runtime_gid)
+        fd, info = open_readonly(source)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_HOME_IMPORT_BYTES:
+            os.close(fd)
+            raise RuntimeError("provider home import source is invalid")
+        imports.append({"source": source, "destination": destination, "replace": replace, "fd": fd})
+    cwd = os.path.realpath(os.getcwd())
+    cwd_info = os.lstat(cwd)
+    if not stat.S_ISDIR(cwd_info.st_mode) or stat.S_ISLNK(cwd_info.st_mode):
+        raise RuntimeError("provider cwd is not a canonical directory")
+    cwd_fd = None
+    if cwd == provider_home:
+        pass
+    elif canonical_child(WORKSPACE_BASE, cwd):
+        cwd_fd, _ = open_mount(cwd)
+    else:
+        raise RuntimeError("provider cwd must be its exact private home or one exact managed workspace")
+    environment = validate_environment(parsed.get("environment"))
+    persistent_home = None
+    persistent_lock_fd = None
+    if persistent_home_key is None:
+        if imports:
+            raise RuntimeError("provider home imports require a persistent owner home")
+        home_fd, _ = open_mount(provider_home)
+    else:
+        persistent_home, home_fd, persistent_lock_fd = prepare_persistent_home(
+            provider_state,
+            persistent_home_key,
+            provider_home,
+            account.pw_uid,
+            runtime_gid,
+            workspace_gid,
+        )
+        apply_home_imports(persistent_home, imports, account.pw_uid, runtime_gid)
+        validate_persistent_home(persistent_home, account.pw_uid, runtime_gid, workspace_gid)
+    environment.update({
+        "HOME": provider_home,
+        "USER": account.pw_name,
+        "LOGNAME": account.pw_name,
+        "XDG_CONFIG_HOME": os.path.join(provider_home, ".config"),
+        "XDG_CACHE_HOME": os.path.join(provider_home, ".cache"),
+        "XDG_DATA_HOME": os.path.join(provider_home, ".local", "share"),
+        "PATH": f"{provider_home}/.local/bin:/opt/openmaus-provider/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "OMB_PROVIDER_HOME": PROVIDER_ROOT,
+        "OMB_PROVIDER_RUNTIME_DIR": RUNTIME_BASE,
+        "OMB_PROVIDER_TURN_DIR": turn_directory,
+    })
+    environment_fd = environment_memfd(environment, account)
+    return {
+        "cwd": cwd,
+        "cwd_fd": cwd_fd,
+        "home_fd": home_fd,
+        "provider_home": provider_home,
+        "provider_state": provider_state,
+        "persistent_home": persistent_home,
+        "persistent_lock_fd": persistent_lock_fd,
+        "mounts": mounts,
+        "imports": imports,
+        "turn_directory": turn_directory,
+        "environment": environment,
+        "environment_fd": environment_fd,
+        "server_uid": server_uid,
+        "runtime_gid": runtime_gid,
+        "workspace_gid": workspace_gid,
+        "limits": limits,
+        "parent_unit": parent_unit,
+        "resource_unit": f"openmaus-provider-turn-{os.path.basename(turn_directory)[6:]}.service",
+    }
+
+
+def close_sandbox_fds(sandbox: dict, close_lock: bool = True) -> None:
+    fds = [sandbox.get("cwd_fd"), sandbox.get("home_fd"), sandbox.get("environment_fd")]
+    if close_lock:
+        fds.append(sandbox.get("persistent_lock_fd"))
+    fds.extend(mount.get("fd") for mount in sandbox.get("mounts", []))
+    fds.extend(item.get("fd") for item in sandbox.get("imports", []))
+    for fd in fds:
+        if isinstance(fd, int):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def sandbox_argv(sandbox: dict, argv: list[str]) -> list[str]:
+    cwd = sandbox["cwd"]
+    provider_home = sandbox["provider_home"]
+    turn_directory = sandbox["turn_directory"]
+    args = [
+        BWRAP,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--hostname", "openmaus-provider",
+        "--ro-bind", "/", "/",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--size", str(512 * 1024 * 1024), "--tmpfs", "/tmp",
+        "--size", str(256 * 1024 * 1024), "--tmpfs", "/var/tmp",
+        "--tmpfs", "/run",
+        "--tmpfs", SERVER_STATE,
+        "--tmpfs", WORKSPACE_BASE,
+        "--tmpfs", PROVIDER_ROOT,
+    ]
+    args.extend(("--ro-bind-fd", str(sandbox["environment_service_fd"]), SANDBOX_ENV_PATH))
+    args.extend(("--dir", PROVIDER_INSTANCES))
+    for parent in parent_directories(PROVIDER_INSTANCES, provider_home):
+        args.extend(("--dir", parent))
+    args.extend(("--dir", provider_home))
+    if sandbox["persistent_home"] is None:
+        args.extend((
+            "--size", str(MAX_INSTANCE_HOME_BYTES), "--tmpfs", provider_home,
+            "--dir", "/run/openmaus-instance-seed",
+            "--ro-bind-fd", str(sandbox["home_service_fd"]), "/run/openmaus-instance-seed",
+        ))
+    else:
+        args.extend(("--bind-fd", str(sandbox["home_service_fd"]), provider_home))
+    if sandbox["cwd_fd"] is not None:
+        for parent in parent_directories(WORKSPACE_BASE, cwd):
+            args.extend(("--dir", parent))
+        args.extend(("--bind-fd", str(sandbox["cwd_service_fd"]), cwd))
+    args.extend(("--dir", RUNTIME_BASE))
+    runtime_parents: set[str] = set()
+    for mount in sandbox["mounts"]:
+        runtime_parents.update(parent_directories(RUNTIME_BASE, mount["path"]))
+    for parent in sorted(runtime_parents, key=lambda item: (item.count(os.sep), item)):
+        args.extend(("--dir", parent))
+    args.extend(("--dir", turn_directory, "--size", str(64 * 1024 * 1024), "--tmpfs", turn_directory))
+    for mount in sandbox["mounts"]:
+        option = "--bind-fd" if mount["writable"] else "--ro-bind-fd"
+        args.extend((option, str(mount["service_fd"]), mount["path"]))
+    # The provider has no daemon socket or docker group, and the common host
+    # runtime clients are masked too. Local VM access exists only through the
+    # exact turn-scoped trusted harness broker.
+    for runtime_client in HOST_RUNTIME_CLIENTS:
+        if os.path.exists(runtime_client):
+            args.extend(("--ro-bind", "/dev/null", runtime_client))
+    args.extend((
+        "--gid", str(sandbox["workspace_gid"]),
+        "--cap-drop", "ALL",
+        "--disable-userns",
+        "--unsetenv", "LISTEN_FDS",
+        "--unsetenv", "LISTEN_PID",
+        "--unsetenv", "LISTEN_FDNAMES",
+        "--chdir", cwd,
+        "--",
+    ))
+    provider_exec = [
+        "/usr/local/libexec/openmaus-provider-supervisor",
+        "--sandbox-exec-environment",
+        SANDBOX_ENV_PATH,
+        "--",
+        *argv,
+    ]
+    if sandbox["persistent_home"] is None:
+        args.extend((
+            "/usr/local/libexec/openmaus-provider-supervisor",
+            "--sandbox-home-init",
+            "/run/openmaus-instance-seed",
+            provider_home,
+            "--",
+            *provider_exec,
+        ))
+    else:
+        args.extend(provider_exec)
+    return args
+
+
+def systemd_run_argv(account: pwd.struct_passwd, sandbox: dict, argv: list[str]) -> list[str]:
+    next_service_fd = 3
+    open_files: list[tuple[int, str]] = []
+    sandbox["home_service_fd"] = next_service_fd
+    open_files.append((
+        sandbox["home_fd"],
+        "persistent-home" if sandbox["persistent_home"] is not None else "instance-home",
+    ))
+    next_service_fd += 1
+    sandbox["environment_service_fd"] = next_service_fd
+    open_files.append((sandbox["environment_fd"], "provider-environment"))
+    next_service_fd += 1
+    if sandbox["cwd_fd"] is not None:
+        sandbox["cwd_service_fd"] = next_service_fd
+        open_files.append((sandbox["cwd_fd"], "workspace"))
+        next_service_fd += 1
+    for index, mount in enumerate(sandbox["mounts"]):
+        mount["service_fd"] = next_service_fd
+        open_files.append((mount["fd"], f"runtime-{index}"))
+        next_service_fd += 1
+    limits = sandbox["limits"]
+    command = [
+        SYSTEMD_RUN,
+        "--quiet",
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--service-type=exec",
+        f"--slice={PROVIDER_SLICE}",
+        f"--unit={sandbox['resource_unit']}",
+        f"--uid={account.pw_name}",
+        f"--gid={account.pw_name}",
+        f"--working-directory={sandbox['cwd']}",
+        f"--property=SupplementaryGroups={RUNTIME_GROUP} {WORKSPACE_GROUP}",
+        f"--property=BindsTo={sandbox['parent_unit']}",
+        f"--property=After={sandbox['parent_unit']}",
+        "--property=KillMode=control-group",
+        "--property=SendSIGKILL=yes",
+        "--property=TimeoutStopSec=1s",
+        "--property=RuntimeMaxSec=1h",
+        "--property=OOMPolicy=stop",
+        "--property=NoNewPrivileges=yes",
+        # Durable per-bot homes are revalidated as owner-only on every
+        # launch; make ordinary provider-created files 0600 and dirs 0700.
+        "--property=UMask=0077",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes",
+        "--property=RestrictSUIDSGID=yes",
+        "--property=LockPersonality=yes",
+        "--property=RestrictNamespaces=~cgroup",
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        # Each bwrap gets a separate network namespace. Its user-mode gateway
+        # is still provider-UID traffic on the host and is constrained by the
+        # persistent nft boundary. A small fd ceiling also bounds concurrent
+        # outbound sockets independently of task count.
+        "--property=LimitNOFILE=1024",
+        f"--property=LimitFSIZE={MAX_PERSISTENT_HOME_BYTES}",
+        "--property=LimitCORE=0",
+        # Unified-cgroup accounting is always enabled on the supported
+        # systemd release. Setting the legacy accounting toggles produces a
+        # deprecation warning and does not strengthen the boundary.
+        f"--property=MemoryHigh={limits['memoryHigh']}",
+        f"--property=MemoryMax={limits['memoryMax']}",
+        f"--property=MemorySwapMax={limits['memorySwapMax']}",
+        f"--property=CPUQuota={limits['cpuQuotaPercent']}%",
+        f"--property=TasksMax={limits['tasksMax']}",
+    ]
+    if sandbox["cwd_fd"] is not None:
+        command.append(f"--property=ReadWritePaths={sandbox['cwd']}")
+    if sandbox["persistent_home"] is not None:
+        command.append(f"--property=ReadWritePaths={sandbox['persistent_home']}")
+    for mount in sandbox["mounts"]:
+        if mount["writable"]:
+            command.append(f"--property=ReadWritePaths={mount['path']}")
+    own_pid = os.getpid()
+    for fd, name in open_files:
+        command.append(f"--property=OpenFile=/proc/{own_pid}/fd/{fd}:{name}:read-only")
+    for name, value in ROOT_EXEC_ENV.items():
+        command.append(f"--setenv={name}={value}")
+    command.extend((
+        "--",
+        "/usr/local/libexec/openmaus-provider-supervisor",
+        "--sandbox-network-exec",
+        "--",
+        *sandbox_argv(sandbox, argv),
+    ))
+    return command
+
+
+def child_exec(account: pwd.struct_passwd, sandbox: dict, argv: list[str]) -> None:
+    os.setsid()
+    os.umask(0o077)
+    # Provider values can include dynamic-loader and runtime-control knobs.
+    # They are sealed in an fd for the already-unprivileged sandbox helper;
+    # no root executable ever inherits them.
+    os.execve(SYSTEMD_RUN, systemd_run_argv(account, sandbox, argv), ROOT_EXEC_ENV)
+
+
+def exit_code(status_value: int | None, received_signal: int | None) -> int:
+    if received_signal is not None:
+        return 128 + received_signal
+    if status_value is None:
+        return 70
+    if os.WIFEXITED(status_value):
+        return os.WEXITSTATUS(status_value)
+    if os.WIFSIGNALED(status_value):
+        return 128 + os.WTERMSIG(status_value)
+    return 70
+
+
+def retire_owner_state(parsed: dict, server_uid: int, runtime_gid: int, workspace_gid: int) -> None:
+    if (
+        parsed.get("operation") != "retire-owner"
+        or parsed.get("providerRoot") != PROVIDER_ROOT
+        or parsed.get("providerStateRoot") != PROVIDER_STATE
+        or parsed.get("runtimeBase") != RUNTIME_BASE
+    ):
+        raise RuntimeError("provider retirement manifest names the wrong boundary")
+    key = parsed.get("persistentHomeKey")
+    if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{48}", key):
+        raise RuntimeError("provider retirement owner mapping is invalid")
+    checked_directory(PROVIDER_ROOT, 0, runtime_gid, 0o750)
+    checked_directory(PROVIDER_STATE, 0, runtime_gid, 0o750)
+    validate_btrfs_quota(PROVIDER_STATE)
+    states: list[str] = []
+    with os.scandir(PROVIDER_STATE) as drivers:
+        for driver in drivers:
+            if not re.fullmatch(r"[0-9a-f]{24}", driver.name):
+                raise RuntimeError("provider state contains an unexpected driver namespace")
+            checked_directory(driver.path, 0, runtime_gid, 0o750)
+            with os.scandir(driver.path) as instances:
+                for instance in instances:
+                    if not re.fullmatch(r"[0-9a-f]{32}", instance.name):
+                        raise RuntimeError("provider state contains an unexpected instance namespace")
+                    checked_directory(instance.path, 0, runtime_gid, 0o750)
+                    states.append(instance.path)
+    locks: list[tuple[str, int, int]] = []
+    try:
+        deadline = time.monotonic() + 2.0
+        for state in sorted(states):
+            instance_lock = os.open(
+                os.path.join(state, ".instance.lock"),
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+            instance_lock_info = os.fstat(instance_lock)
+            if (
+                not stat.S_ISREG(instance_lock_info.st_mode)
+                or instance_lock_info.st_uid != 0
+                or instance_lock_info.st_nlink != 1
+                or stat.S_IMODE(instance_lock_info.st_mode) != 0o600
+            ):
+                raise RuntimeError("provider retirement instance lock is unsafe")
+            os.fchown(instance_lock, 0, runtime_gid)
+            os.fchmod(instance_lock, 0o600)
+            while True:
+                try:
+                    fcntl.flock(instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("provider instance state stayed busy during retirement")
+                    time.sleep(0.02)
+            lock_path = os.path.join(state, f".lock-{key}")
+            owner_lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+            lock_info = os.fstat(owner_lock)
+            if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != 0 or lock_info.st_nlink != 1:
+                raise RuntimeError("provider retirement lock is unsafe")
+            os.fchown(owner_lock, 0, runtime_gid)
+            os.fchmod(owner_lock, 0o600)
+            try:
+                fcntl.flock(owner_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError("provider bot state is still active") from error
+            path = os.path.join(state, key)
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                pass
+            else:
+                validate_btrfs_home(path)
+                validate_persistent_home(path, pwd.getpwnam(PROVIDER_USER).pw_uid, runtime_gid, workspace_gid)
+            locks.append((state, instance_lock, owner_lock))
+        # Nothing is removed until every provisioned instance's exact bot
+        # lock is held, so active-state refusal cannot produce a partial wipe.
+        for state, _instance_lock, _owner_lock in locks:
+            path = os.path.join(state, key)
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                pass
+            else:
+                remove_initializing_tree(path)
+            os.unlink(os.path.join(state, f".lock-{key}"))
+            instance_state_usage(state)
+    finally:
+        for _state, instance_lock, owner_lock in reversed(locks):
+            os.close(owner_lock)
+            os.close(instance_lock)
+
+
+def main() -> int:
+    if len(sys.argv) >= 6 and sys.argv[1] == "--sandbox-home-init" and sys.argv[4] == "--":
+        return sandbox_home_init(sys.argv[2], sys.argv[3], sys.argv[5:])
+    if len(sys.argv) >= 5 and sys.argv[1] == "--sandbox-exec-environment" and sys.argv[3] == "--":
+        return sandbox_exec_environment(sys.argv[2], sys.argv[4:])
+    if len(sys.argv) >= 4 and sys.argv[1] == "--sandbox-network-exec" and sys.argv[2] == "--":
+        return sandbox_network_exec(sys.argv[3:])
+    if len(sys.argv) == 2 and sys.argv[1] == "--retire-owner":
+        if os.geteuid() != 0:
+            return 64
+        try:
+            server_uid = pwd.getpwnam(SERVER_USER).pw_uid
+            runtime_gid = grp.getgrnam(RUNTIME_GROUP).gr_gid
+            workspace_gid = grp.getgrnam(WORKSPACE_GROUP).gr_gid
+            trusted_binary(BTRFS)
+            parsed = read_exact_manifest(server_uid, runtime_gid)
+            retire_owner_state(parsed, server_uid, runtime_gid, workspace_gid)
+            return 0
+        except (KeyError, OSError, RuntimeError, ValueError):
+            return 69
+    if os.geteuid() != 0 or len(sys.argv) < 3 or sys.argv[1] != "--":
+        return 64
+    argv = sys.argv[2:]
+    if not os.path.isabs(argv[0]) or "\x00" in argv[0]:
+        return 64
+    sandbox = None
+    ownership_changed: list[str] = []
+    try:
+        account = pwd.getpwnam(PROVIDER_USER)
+        server_uid = pwd.getpwnam(SERVER_USER).pw_uid
+        runtime_gid = grp.getgrnam(RUNTIME_GROUP).gr_gid
+        workspace_gid = grp.getgrnam(WORKSPACE_GROUP).gr_gid
+        trusted_binary(BWRAP)
+        trusted_binary(BTRFS)
+        trusted_binary(SYSTEMD_RUN)
+        trusted_binary(SYSTEMCTL)
+        trusted_binary(SLIRP4NETNS)
+        parsed = read_exact_manifest(server_uid, runtime_gid)
+        validate_btrfs_quota(PROVIDER_STATE)
+        sandbox = prepare_sandbox(parsed, account, server_uid, runtime_gid, workspace_gid)
+        for mount in sandbox["mounts"]:
+            ownership_changed.append(mount["path"])
+            change_runtime_ownership(mount["path"], account.pw_uid, runtime_gid)
+        prctl(PR_SET_CHILD_SUBREAPER, 1)
+    except (KeyError, OSError, RuntimeError, ValueError):
+        if sandbox is not None:
+            close_sandbox_fds(sandbox)
+        for path in reversed(ownership_changed):
+            try:
+                change_runtime_ownership(path, locals().get("server_uid", 0), locals().get("runtime_gid", 0))
+            except (OSError, RuntimeError):
+                pass
+        return 69
+
+    received_signal: int | None = None
+
+    def request_stop(sig: int, _frame: object) -> None:
+        nonlocal received_signal
+        if received_signal is None:
+            received_signal = sig
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, request_stop)
+    try:
+        main_pid = os.fork()
+    except OSError:
+        close_sandbox_fds(sandbox)
+        for path in reversed(ownership_changed):
+            try:
+                change_runtime_ownership(path, server_uid, runtime_gid)
+            except (OSError, RuntimeError):
+                pass
+        return 69
+    if main_pid == 0:
+        try:
+            child_exec(account, sandbox, argv)
+        except BaseException:
+            os._exit(126)
+    # Keep the root-owned flock for the full turn. It rejects a second process
+    # against the same durable HOME even after systemd-run has inherited the
+    # mount FD, preventing concurrent session/config corruption.
+    close_sandbox_fds(sandbox, close_lock=False)
+    main_status: int | None = None
+    cleanup_failed = False
+    try:
+        while main_status is None and received_signal is None:
+            main_status = reap(main_pid, main_status)
+            if main_status is None:
+                time.sleep(0.02)
+        main_status = drain(main_pid, main_status, sandbox["resource_unit"])
+    except RuntimeError:
+        cleanup_failed = True
+    finally:
+        for path in reversed(ownership_changed):
+            try:
+                change_runtime_ownership(path, server_uid, runtime_gid)
+            except (OSError, RuntimeError):
+                cleanup_failed = True
+        if sandbox.get("persistent_home") is not None:
+            try:
+                instance_lock_fd = os.open(
+                    os.path.join(sandbox["provider_state"], ".instance.lock"),
+                    os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+                )
+                try:
+                    fcntl.flock(instance_lock_fd, fcntl.LOCK_EX)
+                    validate_persistent_home(
+                        sandbox["persistent_home"],
+                        account.pw_uid,
+                        runtime_gid,
+                        workspace_gid,
+                    )
+                    instance_state_usage(sandbox["provider_state"])
+                finally:
+                    os.close(instance_lock_fd)
+            except (OSError, RuntimeError):
+                cleanup_failed = True
+        persistent_lock_fd = sandbox.get("persistent_lock_fd")
+        if isinstance(persistent_lock_fd, int):
+            try:
+                os.close(persistent_lock_fd)
+            except OSError:
+                cleanup_failed = True
+    if cleanup_failed:
+        return 70
+    return exit_code(main_status, received_signal)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

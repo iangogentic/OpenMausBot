@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { chmodSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { z } from "zod";
 
 import { parseJson, type JsonValue } from "./schema.ts";
@@ -147,18 +149,51 @@ export function createWebhookIngressHandler(manager: WebhookManager) {
 
 export async function listenWebhookIngress(
   manager: WebhookManager,
-  options: { host?: string; port: number },
+  options: { host?: string; port: number; socketPath?: string },
 ): Promise<WebhookIngress> {
   const host = options.host ?? "127.0.0.1";
+  const socketPath = options.socketPath?.trim();
+  if (
+    socketPath &&
+    (
+      process.platform === "win32" ||
+      !isAbsolute(socketPath) ||
+      !socketPath.endsWith(".sock") ||
+      /[\0\r\n]/.test(socketPath) ||
+      Buffer.byteLength(socketPath) > 96
+    )
+  ) {
+    throw new Error("webhook listen socket must be an absolute Unix-socket path ending in .sock");
+  }
   const server = createServer(createWebhookIngressHandler(manager));
   await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => reject(error);
-    server.once("error", onError);
-    server.listen(options.port, host, () => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
       server.off("error", onError);
+      if (socketPath) {
+        try {
+          chmodSync(socketPath, 0o600);
+        } catch (error) {
+          server.close();
+          reject(error);
+          return;
+        }
+      }
       resolve();
-    });
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    if (socketPath) server.listen(socketPath);
+    else server.listen(options.port, host);
   });
+  if (socketPath) {
+    // This is the systemd-owned public port, deliberately not a property of
+    // the private UDS. Credentials returned to webhook senders stay dialable.
+    return { server, host, port: options.port, baseUrl: `http://${host}:${options.port}` };
+  }
   const address = serverAddressSchema.safeParse(server.address());
   if (!address.success) {
     server.close();

@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { ModelCatalog } from "../../contracts.ts";
-import { decodeInjectId, hostApiKey, localHost, mergeLocalInject } from "../local-inject.ts";
+import { decodeInjectId, localHost, localInjectConnection, mergeLocalInject } from "../local-inject.ts";
 import { createAcpDriver, type AcpSupport } from "./core.ts";
 
 export const STATIC_GROK_MODELS: ModelCatalog = {
@@ -24,6 +24,12 @@ const SLUG = /^[a-z0-9][a-z0-9._-]*$/i;
 function grokHome(env: Record<string, string | undefined>): string {
   if (env.GROK_HOME) return env.GROK_HOME;
   return join(env.HOME || env.USERPROFILE || homedir(), ".grok");
+}
+
+/** Resolve auth from the exact instance identity, never the harness user's
+ * ambient home (which may differ under the provider-UID deployment). */
+export function grokIsAuthenticated(env: Record<string, string | undefined>): boolean {
+  return existsSync(join(grokHome(env), "auth.json"));
 }
 
 function unquote(raw: string): string {
@@ -112,6 +118,29 @@ function quoteToml(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
+function grokInjectBlock(slug: string, model: string, label: string, baseUrl: string, apiKey: string): string {
+  const heading = /[^a-z0-9_-]/i.test(slug) ? `[model."${slug}"]` : `[model.${slug}]`;
+  return [
+    heading,
+    `model = ${quoteToml(model)}`,
+    `base_url = ${quoteToml(baseUrl)}`,
+    `name = ${quoteToml(label)}`,
+    `api_backend = "chat_completions"`,
+    `api_key = ${quoteToml(apiKey)}`,
+    "",
+  ].join("\n");
+}
+
+function replaceGrokModelBlock(text: string, slug: string, block: string): string {
+  const lines = text.split(/\r?\n/);
+  const headings = new Set([`[model.${slug}]`, `[model."${slug}"]`]);
+  const start = lines.findIndex((line) => headings.has(line.trim()));
+  if (start < 0) return text;
+  let end = start + 1;
+  while (end < lines.length && !lines[end]!.trim().startsWith("[")) end += 1;
+  return [...lines.slice(0, start), ...block.replace(/\n$/, "").split("\n"), ...lines.slice(end)].join("\n");
+}
+
 /** Write a [model.slug] block so `grok -m` can reach the injected host. */
 export function ensureGrokInjectSlug(
   modelId: string,
@@ -121,6 +150,7 @@ export function ensureGrokInjectSlug(
   if (!inject) return modelId;
   const host = localHost(inject.host);
   if (!host) return modelId;
+  const connection = localInjectConnection(host, inject.model, env);
 
   const path = join(grokHome(env), "config.toml");
   let text = "";
@@ -135,7 +165,7 @@ export function ensureGrokInjectSlug(
   const flush = () => {
     if (!current) return;
     taken.add(current.slug);
-    if (current.model === inject.model && current.baseUrl === host.baseUrl) {
+    if (current.model === inject.model && current.slug.startsWith(`${inject.host}-`)) {
       found = current.slug;
     }
     current = null;
@@ -162,19 +192,24 @@ export function ensureGrokInjectSlug(
     if (key === "base_url") current.baseUrl = value;
   }
   flush();
-  if (found) return found;
+  if (found) {
+    const next = replaceGrokModelBlock(
+      text,
+      found,
+      grokInjectBlock(found, inject.model, `${inject.model} (${host.label})`, connection.openaiBaseUrl, connection.apiKey),
+    );
+    if (next !== text) writeFileSync(path, next);
+    return found;
+  }
 
   const slug = suggestGrokSlug(inject.host, inject.model, taken);
-  const heading = /[^a-z0-9_-]/i.test(slug) ? `[model."${slug}"]` : `[model.${slug}]`;
-  const block = [
-    heading,
-    `model = ${quoteToml(inject.model)}`,
-    `base_url = ${quoteToml(host.baseUrl)}`,
-    `name = ${quoteToml(`${inject.model} (${host.label})`)}`,
-    `api_backend = "chat_completions"`,
-    `api_key = ${quoteToml(hostApiKey(host, env))}`,
-    "",
-  ].join("\n");
+  const block = grokInjectBlock(
+    slug,
+    inject.model,
+    `${inject.model} (${host.label})`,
+    connection.openaiBaseUrl,
+    connection.apiKey,
+  );
   const next = text && !text.endsWith("\n") ? `${text}\n\n${block}` : `${text}${text ? "\n" : ""}${block}`;
   writeFileSync(path, next);
   return slug;
@@ -251,7 +286,7 @@ const support: AcpSupport = {
   // an unauthenticated CLI is a user action, not something to paper over.
   pickAuthMethod: (methods) => (methods.some((m) => m.id === "cached_token") ? "cached_token" : null),
   authFailure: "fail",
-  isAuthenticated: () => existsSync(join(homedir(), ".grok", "auth.json")),
+  isAuthenticated: grokIsAuthenticated,
 
   // `--append-system-prompt`/`--rules` are accepted by the CLI but do NOT
   // reach the agent-stdio system prompt (verified against 1.0.0), so the

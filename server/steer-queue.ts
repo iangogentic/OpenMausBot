@@ -11,11 +11,9 @@
 // (same as delegations / approvals). The composer shows a pending chip
 // until drain appends the words.
 //
-// Unlike the delegation drain, an interrupted or failed turn does NOT
-// discard this queue: delegations are a bot's fan-out (dropping them on
-// Stop is a safety property), but these are the user's own words —
-// stop-then-steer (queue a correction, hit Stop, the correction runs) is
-// the feature.
+// A provider failure may still drain this queue, but a literal user Stop is
+// stronger: it preserves the words in the transcript without silently
+// launching a successor turn after Stop returned.
 
 import { newId } from "./contracts.ts";
 import type { BotRecord, Message } from "./store.ts";
@@ -105,6 +103,31 @@ export function drainSteeredMessages(
       appended.map((message) => message.id),
     );
   }
+}
+
+/**
+ * A literal Stop is stronger than a turn settlement: queued user words are
+ * preserved in the transcript, but they do not silently become a successor
+ * provider turn after Stop returned. Returning the affected threads lets the
+ * harness append one visible explanation per conversation.
+ */
+export function cancelSteeredMessages(store: SteerStore, botId: string): string[] {
+  const affected: string[] = [];
+  for (const [threadId, entry] of queues) {
+    if (entry.botId !== botId) continue;
+    queues.delete(threadId);
+    affected.push(threadId);
+    for (const item of entry.items) {
+      store.appendMessage(threadId, {
+        role: "user",
+        kind: "text",
+        text: item.text,
+        replyToId: item.replyToId,
+        queueId: item.messageId,
+      });
+    }
+  }
+  return affected;
 }
 
 /** Test helper: how many messages remain queued for a thread. */

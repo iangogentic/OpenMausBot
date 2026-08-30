@@ -64,10 +64,10 @@ describe("managed Composio desktop registration", () => {
   it("registers a new installation and persists it", async () => {
     const credentials = {};
     const saveCredentials = vi.fn(async () => {});
-    const fetchImpl = vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ token: TOKEN, installationId: "installation-test" }),
-    }));
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      token: TOKEN,
+      installationId: "installation-test",
+    }), { status: 200, headers: { "content-type": "application/json" } }));
 
     await ensureManagedComposioCredentials({
       brokerUrl: "https://broker.example",

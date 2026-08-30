@@ -23,6 +23,8 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useDesktopCapabilities } from "./DesktopCapabilities";
+import { canUseNativeWorkingFolderPicker, workingFolderPlaceholder } from "@/lib/working-folder";
 
 const MAX_TEAM_FILE_BYTES = 1_000_000;
 const COMMUNITY_TEAMS_REPOSITORY = "https://github.com/milind-soni/openmausbot-teams";
@@ -127,6 +129,11 @@ export function TeamLibraryPanel({
   returnFocusRef: React.RefObject<HTMLButtonElement | null>;
   initialUrl?: string;
 }) {
+  const { capabilities } = useDesktopCapabilities();
+  const canPickServerFolder = canUseNativeWorkingFolderPicker(
+    capabilities.connection?.mode,
+    Boolean(window.ogb?.pickFolder),
+  );
   const { state, dispatch } = useStore();
   const dialogRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -753,11 +760,15 @@ export function TeamLibraryPanel({
                       value={scoutFolder}
                       onChange={(event) => setScoutFolder(event.target.value)}
                       onKeyDown={(event) => event.key === "Enter" && scoutTarget && void runScout(scoutTarget)}
-                      placeholder="/path/to/your/project"
+                      placeholder={workingFolderPlaceholder(
+                        capabilities.connection?.mode,
+                        capabilities.connection?.serverName,
+                        "Project folder",
+                      )}
                       aria-label="Project folder to scout"
                       className="min-w-0 flex-1 rounded-xl bg-raised/80 px-3 py-2.5 text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
                     />
-                    {Boolean(window.ogb?.pickFolder) && (
+                    {canPickServerFolder && (
                       <button
                         onClick={() => void pickScoutFolder()}
                         disabled={scouting}

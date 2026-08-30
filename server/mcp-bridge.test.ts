@@ -2,9 +2,13 @@
 // e2e wait is too slow for the suite, and the property that matters is not
 // the constant but the decision table — silence alone never kills, only
 // silence PLUS a failed liveness probe does, and traffic always vetoes.
-import { describe, expect, it, vi } from "vitest";
+import { spawn } from "node:child_process";
+import { createServer, type Server } from "node:http";
+
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
+  augmentToolsListResponse,
   createGateInterceptor,
   createInactivityWatchdog,
   createLineSplitter,
@@ -131,7 +135,7 @@ describe("runLivenessProbe", () => {
 describe("createLineSplitter", () => {
   it("reassembles lines across arbitrary chunk boundaries", () => {
     const lines: string[] = [];
-    const splitter = createLineSplitter((line) => lines.push(line));
+    const splitter = createLineSplitter((line) => { lines.push(line); });
     splitter.push('{"a"');
     splitter.push(':1}\n{"b":2}\n{"c"');
     expect(lines).toEqual(['{"a":1}', '{"b":2}']);
@@ -141,7 +145,7 @@ describe("createLineSplitter", () => {
 
   it("does not corrupt a UTF-8 character split between buffers", () => {
     const lines: string[] = [];
-    const splitter = createLineSplitter((line) => lines.push(line));
+    const splitter = createLineSplitter((line) => { lines.push(line); });
     const bytes = Buffer.from('{"text":"mouse 🐭"}\n');
     const splitAt = bytes.indexOf(Buffer.from("🐭")) + 2;
     splitter.push(bytes.subarray(0, splitAt));
@@ -149,25 +153,85 @@ describe("createLineSplitter", () => {
     splitter.flush();
     expect(lines).toEqual(['{"text":"mouse 🐭"}']);
   });
+
+  it("bounds a fragmented unterminated frame across every pushed chunk", () => {
+    const lines: string[] = [];
+    const overflow = vi.fn();
+    const splitter = createLineSplitter((line) => { lines.push(line); }, {
+      maxLineBytes: 8,
+      onOverflow: overflow,
+    });
+    expect(splitter.push("1234")).toBe(true);
+    expect(splitter.push("5678")).toBe(true);
+    expect(splitter.push("9")).toBe(false);
+    expect(splitter.push("\nnext\n")).toBe(false);
+    expect(splitter.flush()).toBe(false);
+    expect(overflow).toHaveBeenCalledTimes(1);
+    expect(lines).toEqual([]);
+  });
+
+  it("rejects an oversized complete frame before delivering it", () => {
+    const lines: string[] = [];
+    const overflow = vi.fn();
+    const splitter = createLineSplitter((line) => { lines.push(line); }, {
+      maxLineBytes: 4,
+      onOverflow: overflow,
+    });
+    expect(splitter.push("12345\n")).toBe(false);
+    expect(overflow).toHaveBeenCalledOnce();
+    expect(lines).toEqual([]);
+  });
+
+  it("applies the byte cap per line rather than per input chunk", () => {
+    const lines: string[] = [];
+    const splitter = createLineSplitter((line) => { lines.push(line); }, { maxLineBytes: 4 });
+    expect(splitter.push("1234\na\nbb\n")).toBe(true);
+    expect(lines).toEqual(["1234", "a", "bb"]);
+  });
+
+  it("fails closed on invalid UTF-8 and valid-frame floods", () => {
+    const invalid = vi.fn();
+    const invalidSplitter = createLineSplitter(vi.fn(), { onOverflow: invalid });
+    expect(invalidSplitter.push(Buffer.from([0xff, 0x0a]))).toBe(false);
+    expect(invalid).toHaveBeenCalledOnce();
+
+    const flooded = vi.fn();
+    const floodSplitter = createLineSplitter(vi.fn(), {
+      maxFrames: 2,
+      maxFramesPerWindow: 2,
+      onOverflow: flooded,
+    });
+    expect(floodSplitter.push("{}\n{}\n{}\n")).toBe(false);
+    expect(flooded).toHaveBeenCalledOnce();
+  });
 });
 
 describe("createGateInterceptor", () => {
   const frame = (method: string, id?: number) => JSON.stringify({ jsonrpc: "2.0", id, method, params: {} });
   const drain = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-  function harness(isHeld: () => Promise<boolean>) {
+  function harness(beginAction: () => Promise<
+    | { allowed: true; actionId: string }
+    | { allowed: false; reason: "human-control" | "takeover-pending" | "action-active" | "unavailable" }
+  >) {
     const forwarded: string[] = [];
     const refused: string[] = [];
+    const actions: Array<{ requestId: string; actionId: string }> = [];
     const intercept = createGateInterceptor({
-      isHeld,
+      beginAction,
       forward: (line) => forwarded.push(line),
       refuse: (line) => refused.push(line),
+      actionForwarded: (requestId, actionId) => actions.push({ requestId, actionId }),
     });
-    return { forwarded, refused, intercept };
+    return { forwarded, refused, actions, intercept };
   }
 
   it("forwards everything untouched while nobody is driving", async () => {
-    const { forwarded, refused, intercept } = harness(async () => false);
+    let action = 0;
+    const { forwarded, refused, actions, intercept } = harness(async () => ({
+      allowed: true,
+      actionId: `action-${++action}`,
+    }));
     for (const line of [frame("initialize", 1), frame("tools/list", 2), frame("tools/call", 3), "not json at all"]) {
       intercept(line);
     }
@@ -176,10 +240,11 @@ describe("createGateInterceptor", () => {
     expect(forwarded).toHaveLength(4);
     // byte-for-byte: the transparent path must not re-serialize a frame
     expect(forwarded[3]).toBe("not json at all");
+    expect(actions).toEqual([{ requestId: "number:3", actionId: "action-1" }]);
   });
 
   it("refuses only tools/call while the person is driving", async () => {
-    const { forwarded, refused, intercept } = harness(async () => true);
+    const { forwarded, refused, intercept } = harness(async () => ({ allowed: false, reason: "human-control" }));
     intercept(frame("tools/list", 1));
     intercept(frame("tools/call", 2));
     await drain();
@@ -191,6 +256,15 @@ describe("createGateInterceptor", () => {
     expect(answer.result.content[0].text).toMatch(/taken control/i);
   });
 
+  it("does not forward a second mutation while this target already has one in flight", async () => {
+    const { forwarded, refused, intercept } = harness(async () => ({ allowed: false, reason: "action-active" }));
+    intercept(frame("tools/call", 2));
+    await drain();
+    expect(forwarded).toEqual([]);
+    expect(refused).toHaveLength(1);
+    expect(JSON.parse(refused[0]!).result.content[0].text).toMatch(/another computer action is still in progress/i);
+  });
+
   it("preserves protocol order even though the held-check is async", async () => {
     const order: string[] = [];
     let calls = 0;
@@ -199,7 +273,11 @@ describe("createGateInterceptor", () => {
     let drained!: () => void;
     const allForwarded = new Promise<void>((resolve) => (drained = resolve));
     const intercept = createGateInterceptor({
-      isHeld: () => (calls++ === 0 ? first : Promise.resolve(false)),
+      beginAction: async () => {
+        const sequence = calls++;
+        if (sequence === 0) await first;
+        return { allowed: true, actionId: `action-${sequence + 1}` };
+      },
       forward: (line) => {
         const parsed = JSON.parse(line);
         order.push(`fwd:${parsed.id ?? parsed.marker}`);
@@ -216,13 +294,286 @@ describe("createGateInterceptor", () => {
     expect(order).toEqual(["fwd:1", "fwd:2", "fwd:drained"]);
   });
 
-  it("fails open: a broken held-check forwards rather than wedging the computer", async () => {
+  it("fails closed: a broken authority check refuses the mutation", async () => {
     const { forwarded, refused, intercept } = harness(async () => {
       throw new Error("harness went away");
     });
     intercept(frame("tools/call", 1));
     await drain();
-    expect(refused).toEqual([]);
-    expect(forwarded).toHaveLength(1);
+    expect(forwarded).toEqual([]);
+    expect(refused).toHaveLength(1);
+    expect(JSON.parse(refused[0]!).result.content[0].text).toMatch(/authority could not be verified/i);
+  });
+
+  it("fails closed when a tools/call has no correlatable JSON-RPC id", async () => {
+    const { forwarded, refused, intercept } = harness(async () => ({ allowed: true, actionId: "must-not-leak" }));
+    intercept(JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: {} }));
+    await drain();
+    expect(forwarded).toEqual([]);
+    expect(refused).toHaveLength(1);
+    expect(JSON.parse(refused[0]!).id).toBeNull();
+  });
+
+  it("rejects an entire JSON-RPC batch before any embedded computer call is ticketed", async () => {
+    const beginAction = vi.fn(async () => ({ allowed: true as const, actionId: "must-not-run" }));
+    const { forwarded, refused, intercept } = harness(beginAction);
+    intercept(JSON.stringify([
+      { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "click", arguments: {} } },
+    ]));
+    await intercept.drain();
+    expect(beginAction).not.toHaveBeenCalled();
+    expect(forwarded).toEqual([]);
+    expect(refused).toHaveLength(1);
+    expect(JSON.parse(refused[0]!)).toEqual({
+      jsonrpc: "2.0",
+      id: null,
+      error: expect.objectContaining({ code: -32600, message: expect.stringMatching(/batches/i) }),
+    });
+  });
+
+  it("rejects a duplicate live request id on the serialized gate queue", async () => {
+    const forwarded: string[] = [];
+    const refused: string[] = [];
+    const live = new Set<string>();
+    const beginAction = vi.fn(async () => ({ allowed: true as const, actionId: "action-a" }));
+    const intercept = createGateInterceptor({
+      beginAction,
+      requestIdAvailable: (id) => !live.has(id),
+      actionForwarded: (id) => { live.add(id); },
+      forward: (line) => forwarded.push(line),
+      refuse: (line) => refused.push(line),
+    });
+    intercept(frame("tools/call", 5));
+    intercept(frame("tools/call", 5));
+    await intercept.drain();
+    expect(beginAction).toHaveBeenCalledOnce();
+    expect(forwarded).toEqual([frame("tools/call", 5)]);
+    expect(JSON.parse(refused[0]!).error).toMatchObject({ code: -32600 });
+  });
+
+  it("does not let a tool call reuse an unanswered initialize id", async () => {
+    const forwarded: string[] = [];
+    const refused: string[] = [];
+    const live = new Set<string>();
+    const beginAction = vi.fn(async () => ({ allowed: true as const, actionId: "must-not-run" }));
+    const intercept = createGateInterceptor({
+      beginAction,
+      requestIdAvailable: (id) => !live.has(id),
+      requestForwarded: (id) => { live.add(id); },
+      forward: (line) => forwarded.push(line),
+      refuse: (line) => refused.push(line),
+    });
+    intercept(frame("initialize", 8));
+    intercept(frame("tools/call", 8));
+    await intercept.drain();
+    expect(beginAction).not.toHaveBeenCalled();
+    expect(forwarded).toEqual([frame("initialize", 8)]);
+    expect(JSON.parse(refused[0]!).error).toMatchObject({ code: -32600 });
+  });
+
+  it("handles computer_request_help locally without acquiring or forwarding a driver action", async () => {
+    const beginAction = vi.fn(async () => ({ allowed: true as const, actionId: "should-not-run" }));
+    const requestHelp = vi.fn(async () => ({ text: "handed back" }));
+    const forwarded: string[] = [];
+    const responses: string[] = [];
+    const intercept = createGateInterceptor({
+      beginAction,
+      requestHelp,
+      forward: (line) => forwarded.push(line),
+      refuse: (line) => responses.push(line),
+    });
+    intercept(JSON.stringify({
+      jsonrpc: "2.0",
+      id: "help-1",
+      method: "tools/call",
+      params: { name: "computer_request_help", arguments: { reason: "captcha" } },
+    }));
+    await drain();
+    expect(beginAction).not.toHaveBeenCalled();
+    expect(forwarded).toEqual([]);
+    expect(requestHelp).toHaveBeenCalledWith("captcha");
+    expect(JSON.parse(responses[0]!).result).toEqual({ content: [{ type: "text", text: "handed back" }] });
+  });
+
+  it("bounds its async queue and releases an action acquired after fail-closed overflow", async () => {
+    let release!: (permit: { allowed: true; actionId: string }) => void;
+    const firstPermit = new Promise<{ allowed: true; actionId: string }>((resolve) => { release = resolve; });
+    const abandoned = vi.fn();
+    const overflow = vi.fn();
+    const forwarded: string[] = [];
+    const intercept = createGateInterceptor({
+      beginAction: () => firstPermit,
+      forward: (line) => { forwarded.push(line); },
+      refuse: vi.fn(),
+      actionAbandoned: abandoned,
+      onOverflow: overflow,
+      maxPendingFrames: 1,
+      maxPendingBytes: 1024,
+    });
+    expect(intercept(frame("tools/call", 1))).toBe(true);
+    await Promise.resolve();
+    expect(intercept(frame("initialize", 2))).toBe(false);
+    release({ allowed: true, actionId: "late-action" });
+    await intercept.drain();
+    expect(overflow).toHaveBeenCalledOnce();
+    expect(abandoned).toHaveBeenCalledWith("late-action");
+    expect(forwarded).toEqual([]);
+  });
+
+  it("rejects parsed frames that exceed the shared JSON depth bound", async () => {
+    const overflow = vi.fn();
+    const forwarded = vi.fn();
+    const intercept = createGateInterceptor({
+      beginAction: async () => ({ allowed: true, actionId: "unused" }),
+      forward: forwarded,
+      refuse: vi.fn(),
+      onOverflow: overflow,
+    });
+    let nested: unknown = { method: "ping" };
+    for (let i = 0; i < 70; i += 1) nested = { nested };
+    expect(intercept(JSON.stringify(nested))).toBe(true);
+    await intercept.drain();
+    expect(overflow).toHaveBeenCalledOnce();
+    expect(forwarded).not.toHaveBeenCalled();
+  });
+
+  it("adds the handoff tool only to a correlated tools/list response", async () => {
+    const pending = new Set(["number:7"]);
+    const line = JSON.stringify({ jsonrpc: "2.0", id: 7, result: { tools: [{ name: "screenshot" }] } });
+    const augmented = JSON.parse(augmentToolsListResponse(line, pending));
+    expect(augmented.result.tools.map((tool: any) => tool.name)).toEqual(["screenshot", "computer_request_help"]);
+    expect(pending.size).toBe(0);
+    expect(augmentToolsListResponse(line, pending)).toBe(line);
+  });
+});
+
+describe("gated bridge transport teardown", () => {
+  let controlServer: Server;
+  let controlPort = 0;
+  let sequence = 0;
+  const operations: Array<{ op: string; actionId?: string }> = [];
+  const moduleUrl = new URL("./mcp-bridge.ts", import.meta.url).href;
+
+  const waitUntil = async (predicate: () => boolean, message: string, ms = 4_000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(message);
+  };
+
+  const spawnBridge = (driverSource: string) => {
+    const launcher = [
+      `import { runMcpBridge } from ${JSON.stringify(moduleUrl)};`,
+      `runMcpBridge({`,
+      `  command: process.execPath,`,
+      `  args: ["-e", ${JSON.stringify(driverSource)}],`,
+      `  label: "fake CUA driver",`,
+      `  gate: { url: ${JSON.stringify(`http://127.0.0.1:${controlPort}/control`)}, token: "secret" },`,
+      `});`,
+    ].join("\n");
+    return spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", launcher], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  };
+
+  beforeAll(async () => {
+    controlServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        const parsed = JSON.parse(body || "{}");
+        operations.push(parsed);
+        res.writeHead(200, { "content-type": "application/json" });
+        if (req.method === "POST" && parsed.op === "begin-action") {
+          res.end(JSON.stringify({ valid: true, allowed: true, actionId: `action-${++sequence}` }));
+          return;
+        }
+        if (req.method === "DELETE" && parsed.op === "end-action") {
+          res.end(JSON.stringify({ valid: true, ended: true }));
+          return;
+        }
+        res.end(JSON.stringify({ valid: true, held: false, helpOpen: false }));
+      });
+    });
+    await new Promise<void>((resolve) => controlServer.listen(0, "127.0.0.1", resolve));
+    controlPort = (controlServer.address() as any).port;
+  });
+
+  afterAll(() => {
+    controlServer?.closeAllConnections?.();
+    controlServer?.close();
+  });
+
+  it("drains a delayed normal result after stdin EOF before ending its exact ticket", async () => {
+    const driver = `
+      let buffer = "";
+      let ended = false;
+      let pending = 0;
+      const settle = () => { if (ended && pending === 0) process.exitCode = 0; };
+      process.stdin.on("data", (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf("\\n")) !== -1) {
+          const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          const frame = JSON.parse(line);
+          if (frame.method === "tools/call") {
+            pending += 1;
+            setTimeout(() => {
+              process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: { content: [{ type: "text", text: "done" }] } }) + "\\n");
+              pending -= 1;
+              settle();
+            }, 250);
+          }
+        }
+      });
+      process.stdin.on("end", () => { ended = true; settle(); });
+    `;
+    const bridge = spawnBridge(driver);
+    const closed = new Promise<void>((resolve) => bridge.once("close", () => resolve()));
+    let stdout = "";
+    bridge.stdout!.on("data", (chunk) => (stdout += chunk));
+    bridge.stdin!.end(JSON.stringify({ jsonrpc: "2.0", id: 71, method: "tools/call", params: { name: "click" } }) + "\n");
+
+    await waitUntil(() => operations.some((entry) => entry.op === "begin-action"), "bridge action never began");
+    expect(operations.some((entry) => entry.op === "end-action")).toBe(false);
+    await waitUntil(
+      () => operations.some((entry) => entry.op === "end-action" && entry.actionId === "action-1"),
+      "bridge did not end the exact completed action",
+    );
+    await Promise.race([
+      closed,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("bridge did not drain and exit")), 3_000)),
+    ]);
+    expect(stdout).toContain('"id":71');
+    expect(operations.some((entry) => entry.op === "end-all-actions")).toBe(false);
+  });
+
+  it("quarantines the ticket when the driver is SIGKILLed mid-action", async () => {
+    const driver = `
+      let buffer = "";
+      process.stdin.on("data", (chunk) => {
+        buffer += chunk;
+        if (buffer.includes("\\n")) setTimeout(() => process.kill(process.pid, "SIGKILL"), 50);
+      });
+    `;
+    const bridge = spawnBridge(driver);
+    const closed = new Promise<void>((resolve) => bridge.once("close", () => resolve()));
+    bridge.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id: 72, method: "tools/call", params: { name: "click" } }) + "\n");
+    await waitUntil(
+      () => operations.filter((entry) => entry.op === "begin-action").length === 2,
+      "killed bridge action never began",
+    );
+    await Promise.race([
+      closed,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("killed bridge did not exit")), 3_000)),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(operations.some((entry) => entry.op === "end-action" && entry.actionId === "action-2")).toBe(false);
+    expect(operations.some((entry) => entry.op === "end-all-actions")).toBe(false);
+    expect(operations.some((entry) => entry.op === "quarantine-actions")).toBe(true);
   });
 });

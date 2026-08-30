@@ -1,0 +1,56 @@
+[Unit]
+Description=OpenMausBot paired-device companion
+Wants=network-online.target
+After=network-online.target openmausbot.service
+Requires=openmausbot.service
+
+[Service]
+Type=simple
+User=openmaus-companion
+Group=openmaus-companion
+UMask=0077
+WorkingDirectory=/var/lib/openmausbot-companion
+StateDirectory=openmausbot-companion
+StateDirectoryMode=0700
+RuntimeDirectory=openmausbot-companion
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/rm -f /run/openmausbot-companion/companion.sock /run/openmausbot-companion/control.sock
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=/var/lib/openmausbot-companion"
+Environment="USER=openmaus-companion"
+Environment="OMB_PORT=8799"
+Environment="OMB_WEBHOOK_PORT=8800"
+Environment="OMB_COMPANION_PORT=8810"
+Environment="OMB_CONTROL_PORT=8811"
+Environment="OMB_COMPANION_LISTEN_SOCKET=/run/openmausbot-companion/companion.sock"
+Environment="OMB_CONTROL_LISTEN_SOCKET=/run/openmausbot-companion/control.sock"
+Environment="OMB_COMPANION_NAME=Razer"
+LoadCredential=openmausbot-ui-session:/etc/credstore/openmausbot-ui-session
+LoadCredential=openmausbot-companion-session:/etc/credstore/openmausbot-companion-session
+ExecStart=/usr/bin/node /opt/openmausbot/current/dist-companion/index.js
+ExecStopPost=-/usr/bin/rm -f /run/openmausbot-companion/companion.sock /run/openmausbot-companion/control.sock
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/openmausbot-companion /run/openmausbot-companion
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

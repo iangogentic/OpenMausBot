@@ -22,6 +22,7 @@ function status(overrides: Partial<ContainerComputerStatus> = {}): ContainerComp
     problem: null,
     image_ref: "image",
     image_id: "image-id",
+    vm_generation: "a".repeat(64),
     base_image_ref: "base",
     driver_version: "0.20.0",
     container_name: "openmausbot-computer",

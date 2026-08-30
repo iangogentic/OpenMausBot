@@ -18,6 +18,7 @@ const FAKE_CLI = join(SERVER_DIR, "testing", "fake-acp-cli.ts");
 const PORT = 18800 + Math.floor(Math.random() * 10_000);
 const WEBHOOK_PORT = 39000 + Math.floor(Math.random() * 10_000);
 const BASE = `http://127.0.0.1:${PORT}`;
+const UI_SESSION_TOKEN = `notifications-ui-session-${"s".repeat(43)}`;
 const posixOnly = describe.skipIf(process.platform === "win32");
 
 let child: ChildProcess;
@@ -45,7 +46,10 @@ const api = async (
 ): Promise<{ status: number; body: any }> => {
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
+    headers: {
+      "x-openmausbot-session": UI_SESSION_TOKEN,
+      ...(body ? { "content-type": "application/json" } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   return { status: res.status, body: res.status === 204 ? null : await res.json() };
@@ -76,8 +80,10 @@ posixOnly("routine failure notification wiring", () => {
     const env: NodeJS.ProcessEnv = {
       HOME: home,
       USERPROFILE: home,
+      VITEST: process.env.VITEST ?? "true",
       OMB_PORT: String(PORT),
       OMB_WEBHOOK_PORT: String(WEBHOOK_PORT),
+      OMB_UI_SESSION_TOKEN: UI_SESSION_TOKEN,
     };
     if (process.env.PATH) env.PATH = process.env.PATH;
     if (process.env.SystemRoot) env.SystemRoot = process.env.SystemRoot;
@@ -131,7 +137,9 @@ posixOnly("routine failure notification wiring", () => {
       });
       expect(created.status).toBe(201);
 
-      const stream = await openSse(`${BASE}/api/events`);
+      const stream = await openSse(`${BASE}/api/events`, {
+        "x-openmausbot-session": UI_SESSION_TOKEN,
+      });
       try {
         await stream.until((frame) => frame.kind === "hello");
         const launched = await api("POST", `/api/routines/${created.body.routine.id}/run`);

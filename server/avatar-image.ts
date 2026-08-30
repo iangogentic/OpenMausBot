@@ -1,10 +1,13 @@
 import { z } from "zod";
 
+import { readBoundedResponseText } from "./bounded-response.ts";
+import { assertBoundedJsonShape, CATALOG_NDJSON_LIMITS, PROVIDER_NDJSON_LIMITS } from "./drivers/bounded-json-lines.ts";
 import type { BotRecord } from "./store.ts";
 
 export const AVATAR_DIRECTION_MAX_CHARS = 400;
 export const AVATAR_IMAGE_TIMEOUT_MS = 120_000;
 const MAX_UPSTREAM_RESPONSE_BYTES = 15 * 1024 * 1024;
+const MAX_GENERATED_IMAGE_BYTES = 12 * 1024 * 1024;
 
 export const avatarGenerationRequestSchema = z.object({
   prompt: z.string().trim().max(AVATAR_DIRECTION_MAX_CHARS).default(""),
@@ -54,38 +57,33 @@ export interface GeneratedAvatarImage {
   mime: "image/webp";
 }
 
+/** Require a complete WebP RIFF container, not just provider-declared MIME. */
+export function wholeGeneratedWebp(bytes: Buffer): boolean {
+  if (bytes.length < 20 || bytes.length > MAX_GENERATED_IMAGE_BYTES) return false;
+  if (bytes.toString("ascii", 0, 4) !== "RIFF" || bytes.toString("ascii", 8, 12) !== "WEBP") return false;
+  if (bytes.readUInt32LE(4) !== bytes.length - 8) return false;
+  const chunk = bytes.toString("ascii", 12, 16);
+  if (chunk !== "VP8 " && chunk !== "VP8L" && chunk !== "VP8X") return false;
+  const chunkBytes = bytes.readUInt32LE(16);
+  const minimum = chunk === "VP8X" ? 10 : chunk === "VP8L" ? 5 : 10;
+  if (chunkBytes < minimum) return false;
+  return 20 + chunkBytes + (chunkBytes & 1) <= bytes.length;
+}
+
 /**
  * Read an untrusted provider response without first materialising an
  * arbitrarily large body. The image API returns base64 JSON, so a byte cap is
  * the real memory boundary; decoding happens only after the bounded read.
  */
 async function boundedResponseText(response: Response): Promise<string> {
-  const advertised = Number(response.headers.get("content-length"));
-  if (Number.isFinite(advertised) && advertised > MAX_UPSTREAM_RESPONSE_BYTES) {
-    await response.body?.cancel().catch(() => {});
-    throw Object.assign(new Error("Generated avatar exceeded the response limit"), { status: 502 });
-  }
-  const reader = response.body?.getReader();
-  if (!reader) return "";
-
-  const decoder = new TextDecoder();
-  const chunks: string[] = [];
-  let received = 0;
   try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      received += value.byteLength;
-      if (received > MAX_UPSTREAM_RESPONSE_BYTES) {
-        await reader.cancel().catch(() => {});
-        throw Object.assign(new Error("Generated avatar exceeded the response limit"), { status: 502 });
-      }
-      chunks.push(decoder.decode(value, { stream: true }));
-    }
-    chunks.push(decoder.decode());
-    return chunks.join("");
-  } finally {
-    reader.releaseLock();
+    return await readBoundedResponseText(
+      response,
+      MAX_UPSTREAM_RESPONSE_BYTES,
+      "Generated avatar exceeded the response limit",
+    );
+  } catch (error) {
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { status: 502 });
   }
 }
 
@@ -139,7 +137,9 @@ export async function generateAvatarImage(
   if (!response.ok) {
     let message = `OpenAI image generation failed (HTTP ${response.status})`;
     try {
-      const parsed = z.object({ error: z.object({ message: z.string() }) }).safeParse(JSON.parse(text));
+      const json: unknown = JSON.parse(text);
+      assertBoundedJsonShape(json, CATALOG_NDJSON_LIMITS);
+      const parsed = z.object({ error: z.object({ message: z.string() }) }).safeParse(json);
       if (parsed.success) message = parsed.data.error.message.slice(0, 500);
     } catch {
       // Keep the bounded status-only message for malformed upstream errors.
@@ -150,6 +150,7 @@ export async function generateAvatarImage(
   let parsedJson: unknown;
   try {
     parsedJson = JSON.parse(text);
+    assertBoundedJsonShape(parsedJson, PROVIDER_NDJSON_LIMITS);
   } catch {
     throw Object.assign(new Error("OpenAI returned an invalid image response"), { status: 502 });
   }
@@ -162,8 +163,8 @@ export async function generateAvatarImage(
     throw Object.assign(new Error("OpenAI returned invalid image data"), { status: 502 });
   }
   const bytes = Buffer.from(encoded, "base64");
-  if (bytes.byteLength === 0) {
-    throw Object.assign(new Error("OpenAI returned an empty image"), { status: 502 });
+  if (!wholeGeneratedWebp(bytes)) {
+    throw Object.assign(new Error("OpenAI returned invalid WebP image data"), { status: 502 });
   }
   return { bytes, mime: "image/webp" };
 }

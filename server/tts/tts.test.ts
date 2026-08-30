@@ -36,11 +36,29 @@ beforeAll(async () => {
       // reject it, which is exactly the bug this stub exists to catch.
       if (path === "/v1/user") return send(401, { detail: { status: "missing_permissions" } });
       if (path === "/v1/voices") {
+        if (req.headers["xi-api-key"] === "oversized-json") {
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "content-length": String(2 * 1024 * 1024),
+          });
+          return res.end("{}");
+        }
         return send(200, {
           voices: [{ voice_id: "v-1", name: "Rachel", labels: { accent: "american", description: "calm" } }],
         });
       }
       if (path.startsWith("/v1/text-to-speech/")) {
+        if (path.endsWith("/oversized-audio")) {
+          res.writeHead(200, {
+            "content-type": "audio/mpeg",
+            "content-length": String(17 * 1024 * 1024),
+          });
+          return res.end(MP3);
+        }
+        if (path.endsWith("/invalid-audio")) {
+          res.writeHead(200, { "content-type": "audio/mpeg" });
+          return res.end(Buffer.from([1, 2, 3, 4]));
+        }
         res.writeHead(200, { "content-type": "audio/mpeg" });
         return res.end(MP3);
       }
@@ -159,6 +177,19 @@ describe("ElevenLabs", () => {
     const message = await speak(cfg(ready), "hi").catch((e: Error) => e.message);
     refuse = null;
     expect(message).toContain("exceeded your quota");
+  });
+
+  it("rejects dishonest oversized voice and audio responses before buffering them", async () => {
+    const { listVoices, speak } = await voice();
+    await expect(listVoices(cfg({ key: "oversized-json" }))).rejects.toThrow("exceeded 1 MB");
+    await expect(speak(cfg({ key: "el-key", voice: "oversized-audio" }), "hi"))
+      .rejects.toThrow("exceeded 16 MB");
+  });
+
+  it("rejects a declared MP3 whose bytes have no MPEG frame", async () => {
+    const { speak } = await voice();
+    await expect(speak(cfg({ key: "el-key", voice: "invalid-audio" }), "hi"))
+      .rejects.toThrow("invalid MP3 audio");
   });
 });
 

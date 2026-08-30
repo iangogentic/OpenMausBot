@@ -1,4 +1,7 @@
+import { readBoundedResponseJson } from "./bounded-response.mjs";
+
 const TOKEN = /^[0-9a-f]{64}$/;
+const MAX_BROKER_RESPONSE_BYTES = 64 * 1024;
 
 export function normalizeManagedComposioBrokerUrl(value) {
   if (typeof value !== "string" || !value.trim()) return "";
@@ -55,11 +58,17 @@ export async function ensureManagedComposioCredentials({
         redirect: "error",
         signal: timeoutSignal(existingCredentialTimeoutMs),
       });
-      if (check.ok) return credentials;
+      if (check.ok) {
+        await check.body?.cancel().catch(() => {});
+        return credentials;
+      }
       // Only a definitive auth failure rotates the credential. A transient
       // outage keeps the existing identity so reconnecting cannot strand the
       // user's already-authorized accounts under a new installation.
-      if (check.status !== 401) return credentials;
+      if (check.status !== 401) {
+        await check.body?.cancel().catch(() => {});
+        return credentials;
+      }
       delete credentials.composioBrokerToken;
       delete credentials.composioInstallationId;
     } catch {
@@ -74,7 +83,11 @@ export async function ensureManagedComposioCredentials({
       redirect: "error",
       signal: timeoutSignal(registrationTimeoutMs),
     });
-    const body = await response.json().catch(() => null);
+    const body = await readBoundedResponseJson(
+      response,
+      MAX_BROKER_RESPONSE_BYTES,
+      "connected-apps registration response exceeded 64 KB",
+    ).catch(() => null);
     if (!response.ok) throw new Error(body?.error || `HTTP ${response.status}`);
     if (!TOKEN.test(body?.token ?? "") || typeof body?.installationId !== "string") {
       throw new Error("the connected-apps service returned invalid credentials");

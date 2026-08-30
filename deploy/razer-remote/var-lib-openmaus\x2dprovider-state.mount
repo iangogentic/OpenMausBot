@@ -1,0 +1,15 @@
+[Unit]
+Description=Bounded OpenMaus provider state
+After=local-fs.target
+Requires=openmaus-storage-preflight.service
+After=openmaus-storage-preflight.service
+Before=openmaus-storage-prepare.service
+
+[Mount]
+What=/var/lib/openmaus-provider-state.btrfs
+Where=/var/lib/openmaus-provider/state
+Type=btrfs
+Options=loop,nodev,nosuid,noatime
+
+[Install]
+WantedBy=multi-user.target
