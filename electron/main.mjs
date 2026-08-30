@@ -29,7 +29,7 @@ import {
   removeLegacyBridgeSecrets,
 } from "./remote-client.mjs";
 import { startOwnedRemoteSshConnector } from "./remote-ssh-connector.mjs";
-import { selectPhysicalCaptureSource, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
+import { composePhysicalCapture, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -2052,11 +2052,7 @@ app.whenReady().then(async () => {
         });
         if (signal.aborted) throw new Error("physical screenshot capture was cancelled");
         const activeDisplay = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-        const source = selectPhysicalCaptureSource(sources, activeDisplay?.id);
-        if (!source || source.thumbnail.isEmpty()) throw new Error("physical screen is unavailable");
-        let bytes = source.thumbnail.toJPEG(72);
-        if (bytes.byteLength > 512_000) bytes = source.thumbnail.resize({ width: 960 }).toJPEG(62);
-        if (bytes.byteLength <= 0 || bytes.byteLength > 512_000) throw new Error("physical screenshot is too large");
+        const bytes = composePhysicalCapture(sources, activeDisplay?.id, nativeImage);
         return { mimeType: "image/jpeg", dataBase64: bytes.toString("base64") };
       },
       approveConnection: async ({ signal, botId, botLabel, taskLabel, sessionId }) => {

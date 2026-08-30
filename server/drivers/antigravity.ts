@@ -17,8 +17,9 @@
 // ensureAntigravityComputerMcp below. Full-auto instances only; the host
 // desktop stays off (no approval channel in print mode, ever).
 import { describeSpawnFailure, execCli, spawnCli, terminateCliTree } from "../procs.ts";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import type { ProviderHomeImport } from "../procs.ts";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
@@ -27,6 +28,7 @@ import { computerProxyEnv } from "../container-computer.ts";
 import { augmentedPath } from "../env-path.ts";
 import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { providerChildEnvironment } from "../provider-child-env.ts";
+import { createProviderTempDirectory, writeProviderRuntimeFile } from "../provider-runtime.ts";
 
 import type { ChildProcess } from "node:child_process";
 import type {
@@ -132,6 +134,62 @@ export interface AntigravityComputerMcpServer {
   command: string;
   args: string[];
   env: Record<string, string>;
+}
+
+const ANTIGRAVITY_AUTH_FILES = [
+  "google_accounts.json", "oauth_creds.json", "installation_id", "state.json", "user_id", "settings.json",
+] as const;
+
+/** Operator turns get a private HOME containing copied login material and an
+ * exact MCP config. Another agy process using the user's normal HOME therefore
+ * cannot discover or invoke this turn's bearer. */
+export function createAntigravityOperatorEnvironment(
+  baseEnv: Record<string, string | undefined>,
+  server: AntigravityComputerMcpServer,
+): { env: Record<string, string | undefined>; cleanup: () => void; home: string; providerHomeImports: ProviderHomeImport[] } {
+  const sourceHome = baseEnv.HOME || baseEnv.USERPROFILE || homedir();
+  const home = mkdtempSync(join(tmpdir(), "omb-agy-operator-"));
+  chmodSync(home, 0o700);
+  const sourceGemini = join(sourceHome, ".gemini");
+  const targetGemini = join(home, ".gemini");
+  mkdirSync(join(targetGemini, "config"), { recursive: true, mode: 0o700 });
+  for (const name of ANTIGRAVITY_AUTH_FILES) {
+    const source = join(sourceGemini, name);
+    if (!existsSync(source)) continue;
+    const target = join(targetGemini, name);
+    copyFileSync(source, target);
+    chmodSync(target, 0o600);
+  }
+  atomicPrivateWrite(
+    join(targetGemini, "config", "mcp_config.json"),
+    `${JSON.stringify({ mcpServers: { [ANTIGRAVITY_COMPUTER_MCP_KEY]: server } }, null, 2)}\n`,
+  );
+  const staged = createProviderTempDirectory("agy-operator-");
+  const providerHomeImports: ProviderHomeImport[] = [];
+  for (const name of ANTIGRAVITY_AUTH_FILES) {
+    const source = join(targetGemini, name);
+    if (!existsSync(source)) continue;
+    const stagedPath = writeProviderRuntimeFile(staged, name, readFileSync(source, "utf8"));
+    providerHomeImports.push({ source: stagedPath, destination: `.gemini/${name}`, replace: true });
+  }
+  const stagedConfig = writeProviderRuntimeFile(
+    staged,
+    "mcp_config.json",
+    readFileSync(join(targetGemini, "config", "mcp_config.json"), "utf8"),
+  );
+  providerHomeImports.push({ source: stagedConfig, destination: ".gemini/config/mcp_config.json", replace: true });
+  let cleaned = false;
+  return {
+    home,
+    providerHomeImports,
+    env: { ...baseEnv, HOME: home, USERPROFILE: home },
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(staged.path, { recursive: true, force: true });
+    },
+  };
 }
 
 // agy's MCP file is machine-global. Hold this lease for the complete child
@@ -351,8 +409,7 @@ export function ensureAntigravityComputerMcp(
   if (options.exclusive) {
     atomicPrivateWrite(journalPath, `${JSON.stringify({ original, mounted })}\n`);
   }
-  writeFileSync(path, mounted, { mode: 0o600 });
-  chmodSync(path, 0o600);
+  atomicPrivateWrite(path, mounted);
 
   const hadOriginalEntry = ANTIGRAVITY_COMPUTER_MCP_KEY in (config.mcpServers ?? {});
   const originalEntry = config.mcpServers?.[ANTIGRAVITY_COMPUTER_MCP_KEY];
@@ -601,14 +658,30 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
         settle(false, "disposed");
         return { turnId };
       }
+      let operatorEnvironment: ReturnType<typeof createAntigravityOperatorEnvironment> | null = null;
+      try {
+        const operatorServer = turn.integrations?.computerOperator
+          ? antigravityComputerMcpServer(turn.integrations)
+          : null;
+        operatorEnvironment = operatorServer
+          ? createAntigravityOperatorEnvironment(env, operatorServer)
+          : null;
+      } catch (error) {
+        releaseMcpLease();
+        clearPending();
+        throw error;
+      }
+      const turnEnv = operatorEnvironment?.env ?? env;
       let restoreMcp = () => {};
       try {
-        restoreMcp = ensureAntigravityComputerMcp(
-          antigravityComputerMcpServer(turn.integrations),
-          env,
-          { exclusive: Boolean(turn.integrations?.computerOperator) },
-        );
+        if (!operatorEnvironment) {
+          restoreMcp = ensureAntigravityComputerMcp(
+            antigravityComputerMcpServer(turn.integrations),
+            turnEnv,
+          );
+        }
       } catch (error) {
+        operatorEnvironment?.cleanup();
         releaseMcpLease();
         clearPending();
         emit({
@@ -641,17 +714,19 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       try {
         child = spawnCli(config.cli, args, {
           cwd,
-          env,
+          env: turnEnv,
           stdio: ["ignore", "pipe", "pipe"], // prompt is on argv; stdin is unused
           providerRuntimePaths: turn.providerRuntimePaths,
           providerPersistentHome: {
             ownerKey: turn.isolationKey ?? threadId,
           },
+          providerHomeImports: operatorEnvironment?.providerHomeImports,
         });
       } catch (error) {
         try {
           restoreMcp();
         } finally {
+          operatorEnvironment?.cleanup();
           releaseMcpLease();
         }
         pending.delete(threadId);
@@ -679,6 +754,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
             message: `could not restore Antigravity's MCP config: ${error instanceof Error ? error.message : String(error)}`,
           });
         } finally {
+          operatorEnvironment?.cleanup();
           releaseMcpLease();
         }
       };

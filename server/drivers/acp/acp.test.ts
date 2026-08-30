@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDirs } from "../../config.ts";
 import type { ProviderInstance } from "../../contracts.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
-import { createAcpDriver, skipSubscriptionAuthForLocalInject, type AcpSupport } from "./core.ts";
+import { createAcpDriver, skipSubscriptionAuthForLocalInject, trustedComputerOperatorPermission, type AcpSupport } from "./core.ts";
 import { GrokAgentDriver } from "./grok.ts";
 import { GeminiAgentDriver } from "./gemini.ts";
 import { KimiAgentDriver } from "./kimi.ts";
@@ -79,6 +79,24 @@ describe("skipSubscriptionAuthForLocalInject", () => {
     expect(skipSubscriptionAuthForLocalInject("unsloth::orcarouter/Qwen3.8-27B-Uncensored-GGUF")).toBe(true);
     expect(skipSubscriptionAuthForLocalInject("grok-4.6")).toBe(false);
     expect(skipSubscriptionAuthForLocalInject(undefined)).toBe(false);
+  });
+});
+
+describe("trusted hidden computer operator permission policy", () => {
+  it("allows only exact computer MCP calls", () => {
+    expect(trustedComputerOperatorPermission({ kind: "other", serverName: "computer", toolName: "mcp__computer__click" })).toBe("allow");
+    expect(trustedComputerOperatorPermission({ kind: "other", title: "computer: screenshot" })).toBe("deny");
+    expect(trustedComputerOperatorPermission({ kind: "other", serverName: "evil", toolName: "mcp__computer__click" })).toBe("deny");
+  });
+
+  it.each([
+    { kind: "execute", rawInput: { command: "rm file" } },
+    { kind: "edit", title: "edit file" },
+    { kind: "read", title: "read secrets" },
+    { kind: "other", title: "unknown helper" },
+    null,
+  ])("denies native shell, file, and unknown tools", (toolCall) => {
+    expect(trustedComputerOperatorPermission(toolCall)).toBe("deny");
   });
 });
 
@@ -486,6 +504,25 @@ describe("ACP turns (fake CLI)", () => {
       env: [{ name: "CUA_DRIVER_EMBEDDED", value: "1" }],
     });
     expect(instance.adapter.capabilities.localComputerMcp).toBe(true);
+  });
+
+  it("auto-resolves trusted operator computer permissions without an invisible request", async () => {
+    await create(GrokAgentDriver, "permission-computer");
+    await instance.adapter.sendTurn({
+      threadId: "t-trusted-operator-permission",
+      text: "click",
+      integrations: {
+        localComputer: {
+          command: "/cua-driver",
+          args: ["mcp"],
+          env: {},
+          platform: "darwin",
+          scope: "trusted-computer-operator",
+        },
+      },
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    expect(recorder.events.some((event) => event.type === "request.opened")).toBe(false);
   });
 
   it("mounts Ian Brain in every generic MCP-capable ACP session", async () => {

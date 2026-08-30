@@ -20,7 +20,7 @@ describe("computer operator model preflight", () => {
     const fetcher = vi.fn(async (input: string | URL | Request) => new Response(JSON.stringify(
       String(input).endsWith("/models")
         ? { data: [{ id: "Qwen3.8-27B-Abliterated" }] }
-        : { choices: [{ message: { content: "OK" } }] },
+        : { model: "qwen3.8-27b-abliterated", choices: [{ message: { content: "O" } }] },
     )));
     await expect(preflightComputerOperatorModel(host, "secret", signal(), fetcher)).resolves.toBeUndefined();
     expect(fetcher).toHaveBeenCalledWith("http://127.0.0.1:18011/v1/models", expect.objectContaining({
@@ -48,6 +48,23 @@ describe("computer operator model preflight", () => {
         ? new Response(JSON.stringify({ data: [{ id: "qwen3.8-27b-abliterated" }] }))
         : new Response("offline", { status: 503 });
     })).rejects.toThrow("inference probe returned HTTP 503");
+  });
+
+  it("rejects inference from an alias or an empty completion", async () => {
+    const responses = (completion: unknown) => {
+      let calls = 0;
+      return async () => new Response(JSON.stringify(++calls === 1
+        ? { data: [{ id: "qwen3.8-27b-abliterated" }] }
+        : completion));
+    };
+    await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
+      model: "compatible-alias",
+      choices: [{ message: { content: "O" } }],
+    }))).rejects.toThrow("wrong model identity");
+    await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
+      model: "qwen3.8-27b-abliterated",
+      choices: [{ message: { content: "   " } }],
+    }))).rejects.toThrow("no completion");
   });
 
   it("bounds a dishonest catalog response before parsing", async () => {

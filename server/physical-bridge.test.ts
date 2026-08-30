@@ -61,6 +61,10 @@ const ids = [
   "00000000-0000-4000-8000-000000000002",
   "00000000-0000-4000-8000-000000000003",
   "00000000-0000-4000-8000-000000000004",
+  "00000000-0000-4000-8000-000000000005",
+  "00000000-0000-4000-8000-000000000006",
+  "00000000-0000-4000-8000-000000000007",
+  "00000000-0000-4000-8000-000000000008",
 ];
 
 function attach(registry: PhysicalBridgeRegistry, socket = new FakeSocket(), generation = ids[3]!) {
@@ -195,6 +199,7 @@ describe("outbound physical bridge registry", () => {
       registration.executorGeneration,
       new AbortController().signal,
     );
+    await vi.waitFor(() => expect(socket.frames().some((frame) => frame.type === "capture")).toBe(true));
     const request = socket.frames().find((frame) => frame.type === "capture")!;
     expect(request).toMatchObject({
       registrationId: registration.registrationId,
@@ -216,6 +221,24 @@ describe("outbound physical bridge registry", () => {
     )).rejects.toThrow(/authority is unavailable/);
   });
 
+  it("serializes concurrent preview and action captures on the exact executor", async () => {
+    const queue = [...ids];
+    const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });
+    const socket = attach(registry);
+    const registration = registry.current!;
+    const first = registry.captureScreenshot(registration.registrationId, registration.executorGeneration, new AbortController().signal);
+    const second = registry.captureScreenshot(registration.registrationId, registration.executorGeneration, new AbortController().signal);
+    await vi.waitFor(() => expect(socket.frames().filter((frame) => frame.type === "capture")).toHaveLength(1));
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    let request = socket.frames().find((frame) => frame.type === "capture")!;
+    socket.receive({ type: "capture-result", captureId: request.captureId, executorGeneration: registration.executorGeneration, mimeType: "image/jpeg", data: jpeg.toString("base64") });
+    await first;
+    await vi.waitFor(() => expect(socket.frames().filter((frame) => frame.type === "capture")).toHaveLength(2));
+    request = socket.frames().filter((frame) => frame.type === "capture")[1]!;
+    socket.receive({ type: "capture-result", captureId: request.captureId, executorGeneration: registration.executorGeneration, mimeType: "image/jpeg", data: jpeg.toString("base64") });
+    await expect(second).resolves.toMatchObject({ mimeType: "image/jpeg" });
+  });
+
   it("rejects an authenticated screenshot that exceeds the decoded capture boundary", async () => {
     const queue = [...ids];
     const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });
@@ -226,6 +249,7 @@ describe("outbound physical bridge registry", () => {
       registration.executorGeneration,
       new AbortController().signal,
     );
+    await vi.waitFor(() => expect(socket.frames().some((frame) => frame.type === "capture")).toBe(true));
     const request = socket.frames().find((frame) => frame.type === "capture")!;
     const oversized = Buffer.alloc(PHYSICAL_CAPTURE_MAX_BYTES + 1, 0x61);
     oversized[0] = 0xff; oversized[1] = 0xd8; oversized[2] = 0xff;
@@ -243,6 +267,71 @@ describe("outbound physical bridge registry", () => {
 });
 
 describe("physical MCP gate", () => {
+  it("attaches a server-owned post-action screen before releasing the action ticket", async () => {
+    const queue = [...ids];
+    const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });
+    const device = attach(registry);
+    const broker = new FakeSocket();
+    const endAction = vi.fn(() => true);
+    attachPhysicalMcpBroker({
+      broker: broker as unknown as RawWebSocket,
+      registry,
+      authority: {
+        capabilityToken: "p".repeat(43),
+        registrationId: registry.current!.registrationId,
+        executorGeneration: registry.current!.executorGeneration,
+        botId: "bot-1",
+        targetKey: "physical:host",
+        bridgeId: "bridge-1",
+      },
+      stillAuthorized: () => true,
+      beginAction: () => ({ allowed: true, actionId: "action-1" }),
+      endAction,
+      quarantine: vi.fn(),
+      requestHelp: async () => ({ text: "done" }),
+      approvalGate: permissiveApprovalGate(),
+    });
+    await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "open")).toBe(true));
+    const open = device.frames().find((frame) => frame.type === "open")!;
+    device.receive({ type: "approved", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
+    device.receive({ type: "opened", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
+    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "click" } }) + "\n"), true);
+    await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "data")).toBe(true));
+    device.receive({
+      type: "data",
+      sessionId: open.sessionId,
+      data: Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { content: [{ type: "text", text: "clicked" }] } }) + "\n").toString("base64"),
+    });
+    await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "capture")).toBe(true));
+    expect(endAction).not.toHaveBeenCalled();
+    const capture = device.frames().find((frame) => frame.type === "capture")!;
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    device.receive({
+      type: "capture-result",
+      captureId: capture.captureId,
+      executorGeneration: registry.current!.executorGeneration,
+      mimeType: "image/jpeg",
+      data: jpeg.toString("base64"),
+    });
+    await vi.waitFor(() => expect(endAction).toHaveBeenCalledWith("action-1"));
+    const reply = broker.sent.filter((entry) => entry.type === "binary").at(-1)!.data.toString();
+    expect(reply).toContain('"type":"image"');
+    expect(reply).toContain(jpeg.toString("base64"));
+
+    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "click" } }) + "\n"), true);
+    await vi.waitFor(() => expect(device.frames().filter((frame) => frame.type === "data")).toHaveLength(2));
+    device.receive({
+      type: "data",
+      sessionId: open.sessionId,
+      data: Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 8, result: { content: [] } }) + "\n").toString("base64"),
+    });
+    await vi.waitFor(() => expect(device.frames().filter((frame) => frame.type === "capture")).toHaveLength(2));
+    const failedCapture = device.frames().filter((frame) => frame.type === "capture")[1]!;
+    device.receive({ type: "capture-error", captureId: failedCapture.captureId, executorGeneration: registry.current!.executorGeneration });
+    await vi.waitFor(() => expect(broker.sent.at(-1)!.data.toString()).toContain("visual postcondition unproven"));
+    expect(broker.sent.at(-1)!.data.toString()).toContain('"isError":true');
+  });
+
   it("accounts a child action before it can reach the physical computer and exposes close proof", async () => {
     const queue = [...ids];
     const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });
@@ -256,6 +345,7 @@ describe("physical MCP gate", () => {
       authority: {
         capabilityToken: "a".repeat(43),
         registrationId: registry.current!.registrationId,
+        executorGeneration: registry.current!.executorGeneration,
         botId: "bot-1",
         targetKey: "physical:host",
         bridgeId: "bridge-1",
@@ -297,6 +387,7 @@ describe("physical MCP gate", () => {
       authority: {
         capabilityToken: "z".repeat(43),
         registrationId: registry.current!.registrationId,
+        executorGeneration: registry.current!.executorGeneration,
         botId: "bot-1",
         targetKey: "physical:host",
         bridgeId: "bridge-1",
@@ -331,6 +422,7 @@ describe("physical MCP gate", () => {
       authority: {
         capabilityToken: "x".repeat(43),
         registrationId: registry.current!.registrationId,
+        executorGeneration: registry.current!.executorGeneration,
         botId: "bot-1",
         targetKey: "physical:host",
         bridgeId: "bridge-1",
@@ -365,6 +457,9 @@ describe("physical MCP gate", () => {
       sessionId: open.sessionId,
       data: Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [] } }) + "\n").toString("base64"),
     });
+    await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "capture")).toBe(true));
+    const actionCapture = device.frames().find((frame) => frame.type === "capture")!;
+    device.receive({ type: "capture-result", captureId: actionCapture.captureId, executorGeneration: registry.current!.executorGeneration, mimeType: "image/jpeg", data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64") });
     await vi.waitFor(() => expect(endAction).toHaveBeenCalledWith("action-1"));
   });
 
@@ -381,6 +476,7 @@ describe("physical MCP gate", () => {
       authority: {
         capabilityToken: "y".repeat(43),
         registrationId: registry.current!.registrationId,
+        executorGeneration: registry.current!.executorGeneration,
         botId: "bot-1",
         targetKey: "physical:host",
         bridgeId: "bridge-1",
@@ -429,6 +525,7 @@ describe("physical MCP gate", () => {
       authority: {
         capabilityToken: botId.repeat(43).slice(0, 43),
         registrationId: registry.current!.registrationId,
+        executorGeneration: registry.current!.executorGeneration,
         botId,
         botLabel: botId,
         taskLabel: `Task for ${botId}`,
@@ -473,6 +570,9 @@ describe("physical MCP gate", () => {
       sessionId: openA.sessionId,
       data: Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 11, result: { content: [] } }) + "\n").toString("base64"),
     });
+    await vi.waitFor(() => expect(device.frames().filter((frame) => frame.type === "capture")).toHaveLength(1));
+    let actionCapture = device.frames().filter((frame) => frame.type === "capture")[0]!;
+    device.receive({ type: "capture-result", captureId: actionCapture.captureId, executorGeneration: registry.current!.executorGeneration, mimeType: "image/jpeg", data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64") });
     await vi.waitFor(() => expect(control.targetBusy("physical:host")).toEqual({ busy: false, reason: null }));
     brokerB.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "type_text" } }) + "\n"), true);
     await vi.waitFor(() => expect(device.frames().filter((entry) => entry.type === "data")).toHaveLength(2));
@@ -481,6 +581,9 @@ describe("physical MCP gate", () => {
       sessionId: openB.sessionId,
       data: Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 13, result: { content: [] } }) + "\n").toString("base64"),
     });
+    await vi.waitFor(() => expect(device.frames().filter((frame) => frame.type === "capture")).toHaveLength(2));
+    actionCapture = device.frames().filter((frame) => frame.type === "capture")[1]!;
+    device.receive({ type: "capture-result", captureId: actionCapture.captureId, executorGeneration: registry.current!.executorGeneration, mimeType: "image/jpeg", data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64") });
     await vi.waitFor(() => expect(control.targetBusy("physical:host")).toEqual({ busy: false, reason: null }));
     control.dispose();
   });

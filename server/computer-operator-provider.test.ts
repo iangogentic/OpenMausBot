@@ -114,4 +114,27 @@ describe("computer operator hidden provider child", () => {
     });
     expect(childThread).toMatch(/^computer-operator-/);
   });
+
+  it("denies any provider permission request that escapes the trusted operator policy", async () => {
+    const fake = fakeAdapter((input, emit) => {
+      emit({
+        provider: "hermesAgent",
+        threadId: input.threadId,
+        turnId: input.turnId!,
+        type: "request.opened",
+        requestId: "hidden-request",
+        requestType: "permission",
+        tool: "shell",
+        summary: "run command",
+      });
+      emit({ provider: "hermesAgent", threadId: input.threadId, turnId: input.turnId!, type: "turn.completed", ok: true, stopReason: null, cost: null });
+    });
+    const child = await createComputerOperatorProviderRuntime({ prepare: async () => ({ adapter: fake.adapter }) }).launch(launchInput);
+    await expect(child.completion).resolves.toMatchObject({ status: "completed" });
+    expect(fake.adapter.respondToRequest).toHaveBeenCalledWith(
+      expect.stringMatching(/^computer-operator-/),
+      "hidden-request",
+      { behavior: "deny" },
+    );
+  });
 });

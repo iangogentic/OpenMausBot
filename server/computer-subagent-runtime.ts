@@ -51,7 +51,7 @@ export interface ComputerSubagentRuntimeOptions {
   provider: ComputerSubagentProviderRuntime;
   acquireTarget: (handle: ComputerSubagentHandle, parent: ComputerSubagentParent, signal: AbortSignal) => Promise<ComputerSubagentCapabilityDescriptor>;
   releaseTarget: (childId: string, parent: ComputerSubagentParent, target: ComputerSubagentCapabilityDescriptor) => Promise<void>;
-  captureFinalScreenshot: (input: { childId: string; parent: ComputerSubagentParent; target: ComputerSubagentCapabilityDescriptor }) => Promise<ComputerSubagentFinalScreenshot>;
+  captureFinalScreenshot: (input: { childId: string; parent: ComputerSubagentParent; target: ComputerSubagentCapabilityDescriptor; signal: AbortSignal }) => Promise<ComputerSubagentFinalScreenshot>;
   /** Exact parent turn/generation fence. Uncertainty must return false. */
   isParentCurrent: (parent: ComputerSubagentParent) => boolean | Promise<boolean>;
   /** Must contain/revoke every child-owned action lane even when an acquire,
@@ -443,10 +443,21 @@ export class ComputerSubagentRuntime {
         output = undefined;
       }
       else try {
-        const captured = await this.bounded(this.captureFinalScreenshot({ childId: execution.handle.childId, parent: cloneParent(execution.input.parent), target: execution.target }), this.operationTimeoutMs);
+        const captured = await this.bounded(this.captureFinalScreenshot({
+          childId: execution.handle.childId,
+          parent: cloneParent(execution.input.parent),
+          target: execution.target,
+          signal: execution.abortController.signal,
+        }), this.operationTimeoutMs);
         if (!captured.ok) throw new Error(captured.error ?? captured.reason);
         finalScreenshot = validateScreenshot(captured.value);
-      } catch (captureError) { status = "failed"; error = `final screenshot failed: ${captureError instanceof Error ? captureError.message : String(captureError)}`; output = undefined; }
+      } catch (captureError) {
+        status = execution.abortController.signal.aborted ? "aborted" : "failed";
+        error = execution.abortController.signal.aborted
+          ? "aborted during final screenshot"
+          : `final screenshot failed: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
+        output = undefined;
+      }
     }
     let capabilityReleased = !execution.target;
     if (cleanupProven && execution.target) {

@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { Duplex, PassThrough, Writable } from "node:stream";
 import test from "node:test";
 
-import { ClientWebSocket, selectPhysicalCaptureSource, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
+import { ClientWebSocket, composePhysicalCapture, selectPhysicalCaptureSource, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
 import {
   PHYSICAL_BRIDGE_ORIGIN,
   PHYSICAL_BRIDGE_PATH,
@@ -21,6 +21,27 @@ test("selects the display nearest the cursor with a primary-order fallback", () 
   assert.equal(selectPhysicalCaptureSource(sources, 2), sources[1]);
   assert.equal(selectPhysicalCaptureSource(sources, 999), sources[0]);
   assert.equal(selectPhysicalCaptureSource([], 1), null);
+});
+
+test("composes every display with the active display first", () => {
+  const seen = [];
+  const thumbnail = (id) => ({
+    isEmpty: () => false,
+    resize: () => ({
+      getSize: () => ({ width: 2, height: 1 }),
+      toBitmap: () => { seen.push(id); return Buffer.alloc(8, id); },
+    }),
+  });
+  const sources = [{ display_id: "1", thumbnail: thumbnail(1) }, { display_id: "2", thumbnail: thumbnail(2) }];
+  const nativeImageApi = {
+    createFromBitmap: (bitmap, size) => {
+      assert.deepEqual(size, { width: 2, height: 2, scaleFactor: 1 });
+      assert.equal(bitmap.byteLength, 16);
+      return { toJPEG: () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]) };
+    },
+  };
+  assert.deepEqual(composePhysicalCapture(sources, 2, nativeImageApi), Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+  assert.deepEqual(seen, [2, 1]);
 });
 
 test("Mac bridge WebSocket surfaces write backpressure instead of retaining an unbounded queue", () => {

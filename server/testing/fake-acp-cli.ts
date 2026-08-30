@@ -567,7 +567,7 @@ function handle(msg: any) {
       }
       if (mode === "interleave") playInterleaveTurn();
       else if (mode !== "empty-reply") playTurn();
-      if (mode === "permission") {
+      if (mode === "permission" || mode === "permission-computer" || mode === "permission-unknown") {
         // ask the client to approve a tool, then complete once answered
         pendingPermissionId = 9001;
         onPermissionAnswered = complete;
@@ -576,7 +576,11 @@ function handle(msg: any) {
           id: pendingPermissionId,
           method: "session/request_permission",
           params: {
-            toolCall: { kind: "execute", rawInput: { command: "echo hi" }, title: "echo hi" },
+            toolCall: mode === "permission-computer"
+              ? { kind: "other", serverName: "computer", toolName: "mcp__computer__click", title: "computer: click" }
+              : mode === "permission-unknown"
+              ? { kind: "other", title: "mystery tool" }
+              : { kind: "execute", rawInput: { command: "echo hi" }, title: "echo hi" },
             options: [
               { optionId: "allow-once", kind: "allow_once" },
               { optionId: "reject", kind: "reject_once" },

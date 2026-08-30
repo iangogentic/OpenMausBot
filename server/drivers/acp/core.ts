@@ -200,6 +200,17 @@ const INIT_TIMEOUT = 20_000;
 const SESSION_CONFIG_TIMEOUT = 20_000; // configureSession's per-request default
 const NEW_SESSION_TIMEOUT = 30_000;
 const LOAD_SESSION_TIMEOUT = 120_000; // history replay on a long thread is slow
+const DENY_TIMEOUT_NOTE =
+  "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
+
+export function trustedComputerOperatorPermission(toolCall: unknown): "allow" | "deny" {
+  if (!toolCall || typeof toolCall !== "object") return "deny";
+  const call = toolCall as Record<string, unknown>;
+  const serverName = call.serverName;
+  const toolName = call.toolName;
+  if (serverName !== "computer" || typeof toolName !== "string" || toolName.length > 160) return "deny";
+  return /^(?:mcp__computer__|mcp_computer_)[A-Za-z0-9_-]+$/.test(toolName) ? "allow" : "deny";
+}
 
 function decodeAcpConfig(defaultCli: string) {
   return (raw: unknown): AcpConfig => {
@@ -220,9 +231,6 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
   const DRIVER_KIND = support.driverKind;
   const SOURCE = support.nativeSource;
   const decodeConfig = decodeAcpConfig(support.defaultCli);
-  const DENY_TIMEOUT_NOTE =
-    "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
-
   return {
     driverKind: DRIVER_KIND,
     metadata: {
@@ -339,6 +347,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const { threadId } = turn;
         if (active.has(threadId)) throw new Error("a turn is already running on this thread");
         const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
+        const trustedComputerOperator = turn.integrations?.localComputer?.scope === "trusted-computer-operator";
         if (controlsHost && config.fullAuto) {
           throw new Error("local computer control requires interactive provider approvals");
         }
@@ -482,6 +491,16 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             });
 
           const toolCall = params.toolCall ?? {};
+          if (trustedComputerOperator) {
+            const behavior = trustedComputerOperatorPermission(toolCall);
+            const optionId = optionFor(behavior === "allow" ? "allow" : "reject");
+            if (!optionId) missing(behavior === "allow" ? "allow" : "reject");
+            return send({
+              jsonrpc: "2.0",
+              id: msg.id,
+              result: optionId ? { outcome: { outcome: "selected", optionId } } : cancelled,
+            });
+          }
           if (config.fullAuto) {
             const allow = optionFor("allow");
             if (!allow) missing("allow");

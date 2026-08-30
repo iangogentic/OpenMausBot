@@ -106,7 +106,20 @@ export async function preflightComputerOperatorModel(
   const choices = completionJson && typeof completionJson === "object"
     ? (completionJson as { choices?: unknown }).choices
     : null;
-  if (!Array.isArray(choices) || choices.length < 1 || !choices[0] || typeof choices[0] !== "object") {
+  const servedModel = completionJson && typeof completionJson === "object"
+    ? (completionJson as { model?: unknown }).model
+    : null;
+  if (servedModel !== COMPUTER_OPERATOR_MODEL_ID) {
+    throw new Error("computer operator inference probe returned the wrong model identity");
+  }
+  const first = Array.isArray(choices) && choices[0] && typeof choices[0] === "object"
+    ? choices[0] as { message?: unknown; text?: unknown }
+    : null;
+  const message = first?.message && typeof first.message === "object"
+    ? (first.message as { content?: unknown }).content
+    : null;
+  const output = typeof message === "string" ? message : typeof first?.text === "string" ? first.text : "";
+  if (!first || !output.trim() || Buffer.byteLength(output, "utf8") > 256) {
     throw new Error("computer operator model inference probe returned no completion");
   }
 }

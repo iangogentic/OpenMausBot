@@ -27,6 +27,45 @@ export function selectPhysicalCaptureSource(sources, displayId) {
   return sources.find((source) => String(source?.display_id ?? "") === wanted) ?? sources[0] ?? null;
 }
 
+/** Build one bounded all-display frame so keyboard/mouse results remain
+ * visually provable even when focus moved to a monitor other than the cursor's
+ * original display. The active display is placed first, followed by every
+ * other display in Electron's stable source order. */
+export function composePhysicalCapture(sources, displayId, nativeImageApi) {
+  const active = selectPhysicalCaptureSource(sources, displayId);
+  const ordered = active ? [active, ...sources.filter((source) => source !== active)] : [];
+  const images = ordered
+    .filter((source) => source?.thumbnail && !source.thumbnail.isEmpty())
+    .map((source) => source.thumbnail.resize({ width: 720 }));
+  if (!images.length) throw new Error("physical screen is unavailable");
+  const sizes = images.map((image) => image.getSize());
+  const width = Math.max(...sizes.map((size) => size.width));
+  const height = sizes.reduce((sum, size) => sum + size.height, 0);
+  if (width <= 0 || height <= 0 || width * height * 4 > 24 * 1024 * 1024) {
+    throw new Error("physical screen composite is too large");
+  }
+  const bitmap = Buffer.alloc(width * height * 4);
+  let y = 0;
+  for (let index = 0; index < images.length; index += 1) {
+    const image = images[index];
+    const size = sizes[index];
+    const source = image.toBitmap();
+    if (source.byteLength !== size.width * size.height * 4) throw new Error("physical screen bitmap is invalid");
+    for (let row = 0; row < size.height; row += 1) {
+      source.copy(bitmap, ((y + row) * width) * 4, row * size.width * 4, (row + 1) * size.width * 4);
+    }
+    y += size.height;
+  }
+  let composite = nativeImageApi.createFromBitmap(bitmap, { width, height, scaleFactor: 1 });
+  let bytes = composite.toJPEG(70);
+  if (bytes.byteLength > CAPTURE_MAX_BYTES) {
+    composite = composite.resize({ width: 560 });
+    bytes = composite.toJPEG(58);
+  }
+  if (bytes.byteLength <= 0 || bytes.byteLength > CAPTURE_MAX_BYTES) throw new Error("physical screenshot is too large");
+  return bytes;
+}
+
 function loopback(hostname) {
   const value = hostname.replace(/^\[|\]$/g, "").toLowerCase();
   return value === "localhost" || value.endsWith(".localhost") || value === "::1" ||

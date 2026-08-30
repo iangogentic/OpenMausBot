@@ -187,6 +187,7 @@ import {
 } from "./computer-subagent-runtime.ts";
 import { createComputerOperatorProviderRuntime } from "./computer-operator-provider.ts";
 import { ComputerOperatorRequestError, executeComputerOperatorRequest } from "./computer-operator-surface.ts";
+import { reserveComputerOperator } from "./computer-operator-active.ts";
 import { imageDimensions } from "./image-dimensions.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
@@ -988,6 +989,7 @@ function finalizeVerifiedCancelledTurn(turn: InternalCapabilityTurn | null): voi
   stopScreenPoller(turn.botId);
   closeOpenApprovals(turn.threadId);
   SUCCESSFUL_DELEGATION_GENERATIONS.delete(turn.threadId);
+  PROVIDER_RUNTIME_TURN_IDS.delete(turnAttachmentHandoffKey(turn));
   for (const [runtimeKey, expected] of EXPECTED_RUNTIME_TURNS) {
     if (!sameInternalTurn(expected, turn)) continue;
     EXPECTED_RUNTIME_TURNS.delete(runtimeKey);
@@ -1363,7 +1365,8 @@ const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
     return { ...computerOperatorTarget(context), opaqueCapability };
   },
   releaseTarget: async (childId) => closeComputerOperatorChildTarget(childId, "computer operator finished"),
-  captureFinalScreenshot: async ({ childId, parent, target }): Promise<ComputerSubagentFinalScreenshot> => {
+  captureFinalScreenshot: async ({ childId, parent, target, signal }): Promise<ComputerSubagentFinalScreenshot> => {
+    signal.throwIfAborted();
     if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn is stale");
     const capability = COMPUTER_OPERATOR_CHILD_TARGETS.get(childId);
     if (!capability || capability !== target.opaqueCapability) throw new Error("computer operator screenshot authority is unavailable");
@@ -1385,11 +1388,12 @@ const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
       const captured = await PHYSICAL_BRIDGES.captureScreenshot(
         capability.registrationId,
         capability.executorGeneration,
-        new AbortController().signal,
+        signal,
       );
       mimeType = captured.mimeType;
       dataBase64 = captured.dataBase64;
     }
+    signal.throwIfAborted();
     const bytes = Buffer.from(dataBase64, "base64");
     if (bytes.byteLength <= 0 || bytes.byteLength > MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES) {
       throw new Error("computer operator final screenshot exceeded its bounded size");
@@ -4081,6 +4085,21 @@ async function startTurn(
           throw new Error("this model engine cannot control this computer — choose Claude or an ACP engine, or select another destination");
         }
         if (outbound) {
+          const previewRegistrationId = outbound.registrationId;
+          const previewExecutorGeneration = outbound.executorGeneration;
+          previewCapture = async () => {
+            const current = physicalRegistration();
+            if (
+              current?.registrationId !== previewRegistrationId ||
+              current.executorGeneration !== previewExecutorGeneration
+            ) throw new Error("the physical computer generation changed before preview capture");
+            const captured = await PHYSICAL_BRIDGES.captureScreenshot(
+              previewRegistrationId,
+              previewExecutorGeneration,
+              new AbortController().signal,
+            );
+            return { png: captured.dataBase64, format: captured.mimeType === "image/jpeg" ? "jpeg" : "png" };
+          };
           if (instance.adapter.capabilities.computerOperatorMcp === true) {
             const operatorModel = await selectComputerOperatorModel(bot.id);
             PENDING_TURN_DISPATCHES.assertPending(internalTurn);
@@ -6045,24 +6064,21 @@ const server = createServer(async (req, res) => {
               if (!parent || !isComputerOperatorParentCurrent(parent)) {
                 throw new Error("the computer operator parent runtime turn is unavailable");
               }
-              const handle = COMPUTER_SUBAGENT_RUNTIME.start({
-                parent,
-                target: operatorTarget,
-                operatorModel: context.operatorModel,
-                prompt: task,
-              });
               const parentKey = computerOperatorParentKey(parent);
-              const active: ActiveComputerOperator = { parent, handle };
-              if (ACTIVE_COMPUTER_OPERATORS.has(parentKey)) {
-                void COMPUTER_SUBAGENT_RUNTIME.abort(handle);
-                throw Object.assign(new Error("this parent turn already has an active computer operator"), { status: 409 });
-              }
-              ACTIVE_COMPUTER_OPERATORS.set(parentKey, active);
+              const active = reserveComputerOperator(ACTIVE_COMPUTER_OPERATORS, parentKey, () => {
+                const handle = COMPUTER_SUBAGENT_RUNTIME.start({
+                  parent,
+                  target: operatorTarget,
+                  operatorModel: context.operatorModel,
+                  prompt: task,
+                });
+                return { parent, handle } satisfies ActiveComputerOperator;
+              });
               const abortChild = () => { void COMPUTER_SUBAGENT_RUNTIME.abort(active.handle).catch(() => undefined); };
               executionSignal.addEventListener("abort", abortChild, { once: true });
               if (executionSignal.aborted) abortChild();
               try {
-                const completion = await handle.done;
+                const completion = await active.handle.done;
                 if (!completion) return { text: "computer operator ended without a terminal result", isError: true };
                 const text = completion.output?.trim() || completion.error?.trim() ||
                   (completion.status === "completed" ? "Computer task completed." : `Computer task ${completion.status}.`);

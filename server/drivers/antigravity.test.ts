@@ -18,6 +18,7 @@ import {
   ANTIGRAVITY_COMPUTER_MCP_KEY,
   AntigravityDriver,
   antigravityComputerMcpServer,
+  createAntigravityOperatorEnvironment,
   ensureAntigravityComputerMcp,
   recoverAntigravityOperatorMcp,
   readAntigravityModelCatalog,
@@ -261,6 +262,34 @@ describe("Antigravity computer MCP config", () => {
     },
   };
   const boxEntry = () => antigravityComputerMcpServer(boxIntegrations)!;
+
+  it("isolates operator credentials and MCP config from the user's normal HOME", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-user-home-"));
+    try {
+      mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+      writeFileSync(join(home, ".gemini", "oauth_creds.json"), '{"token":"login"}');
+      const original = '{"mcpServers":{"global-computer":{"command":"global"}}}\n';
+      writeFileSync(configPath(home), original);
+      const operator = { command: "operator", args: [], env: { TOKEN: "exact-turn" } };
+      const isolated = createAntigravityOperatorEnvironment({ HOME: home }, operator);
+      try {
+        expect(isolated.home).not.toBe(home);
+        expect(readFileSync(join(isolated.home, ".gemini", "oauth_creds.json"), "utf8")).toContain("login");
+        expect(readFileSync(configPath(home), "utf8")).toBe(original);
+        expect(readConfig(isolated.home).mcpServers).toEqual({
+          [ANTIGRAVITY_COMPUTER_MCP_KEY]: operator,
+        });
+        expect(isolated.providerHomeImports).toContainEqual(expect.objectContaining({
+          destination: ".gemini/config/mcp_config.json",
+          replace: true,
+        }));
+      } finally {
+        isolated.cleanup();
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it("builds the cloud-box spec on the shared computer proxy (never path-resolved locally)", () => {
     expect(antigravityComputerMcpServer(boxIntegrations)).toEqual({

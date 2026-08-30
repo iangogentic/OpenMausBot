@@ -72,7 +72,7 @@ function fakeChild(): FakeChild {
 function harness(overrides: {
   isParentCurrent?: (parent: ComputerSubagentParent) => boolean | Promise<boolean>;
   quarantineChild?: () => void | Promise<void>;
-  captureFinalScreenshot?: () => Promise<ComputerSubagentFinalScreenshot>;
+  captureFinalScreenshot?: (signal: AbortSignal) => Promise<ComputerSubagentFinalScreenshot>;
 } = {}) {
   const manager = new ComputerSubagentManager();
   const launched: ComputerSubagentProviderLaunchInput[] = [];
@@ -97,7 +97,7 @@ function harness(overrides: {
       return { ...target, opaqueCapability: { childId: handle.childId, nonce: acquired.length } };
     },
     releaseTarget: async (childId) => { released.push(childId); },
-    captureFinalScreenshot: async ({ childId }) => { screenshots.push(childId); events.push("screenshot"); return overrides.captureFinalScreenshot ? overrides.captureFinalScreenshot() : screenshot; },
+    captureFinalScreenshot: async ({ childId, signal }) => { screenshots.push(childId); events.push("screenshot"); return overrides.captureFinalScreenshot ? overrides.captureFinalScreenshot(signal) : screenshot; },
     isParentCurrent: overrides.isParentCurrent ?? (() => true),
     quarantineChild: overrides.quarantineChild ?? (async () => undefined),
     operationTimeoutMs: 500,
@@ -517,6 +517,24 @@ describe("ComputerSubagentRuntime", () => {
     expect(completion).toMatchObject({ status: "aborted", finalScreenshotCaptured: false });
     expect(h.screenshots).toEqual([]);
     expect(h.completions).toEqual([]);
+  });
+
+  it("aborts a final capture immediately instead of waiting for its timeout", async () => {
+    const captureStarted = deferred<AbortSignal>();
+    const h = harness({
+      captureFinalScreenshot: async (signal) => {
+        captureStarted.resolve(signal);
+        return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      },
+    });
+    const handle = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "work", childId: "abort-capture" });
+    await vi.waitFor(() => expect(h.children).toHaveLength(1));
+    h.children[0]!.completionControl.resolve({ status: "completed", output: "done" });
+    h.children[0]!.cleanupControl.resolve();
+    const signal = await captureStarted.promise;
+    const completion = await h.runtime.abort(handle);
+    expect(signal.aborted).toBe(true);
+    expect(completion).toMatchObject({ status: "aborted", finalScreenshotCaptured: false });
   });
 
   it("rechecks the parent immediately before callback publication", async () => {

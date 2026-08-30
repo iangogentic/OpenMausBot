@@ -85,6 +85,15 @@ export function createComputerOperatorProviderRuntime(
           output.append(event.text);
           return;
         }
+        if (event.type === "request.opened") {
+          // Trusted ACP operators resolve exact computer calls internally.
+          // Any request that still escapes that policy is denied immediately
+          // so a hidden child can never wait forever for an invisible card.
+          if (event.requestId) {
+            void adapter.respondToRequest(threadId, event.requestId, { behavior: "deny" }).catch(() => undefined);
+          }
+          return;
+        }
         if (event.type === "turn.completed") {
           if (completedNormally(event)) settle({ status: "completed", ...(output.text ? { output: output.text } : {}) });
           else if (/(?:cancel|interrupt|stopp)/i.test(event.stopReason ?? "")) {

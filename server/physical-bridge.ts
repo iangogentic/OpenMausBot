@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   COMPUTER_REQUEST_HELP_TOOL,
@@ -27,6 +27,15 @@ export const PHYSICAL_MAX_BUFFERED_BYTES = 1024 * 1024;
 export const PHYSICAL_MAX_ENVELOPE_BYTES = 2 * 1024 * 1024;
 export const PHYSICAL_CAPTURE_MAX_BYTES = 512_000;
 export const PHYSICAL_CAPTURE_TIMEOUT_MS = 20_000;
+
+const PHYSICAL_ACT_AND_OBSERVE_TOOLS = new Set([
+  "bring_to_front", "browser_click", "browser_dialog", "browser_navigate", "browser_pointer",
+  "browser_set_input_files", "browser_type", "click", "clipboard_write", "computer_batch", "double_click", "drag", "hotkey",
+  "invoke_menu", "kill_app", "launch_app", "mouse_button_down", "mouse_button_up", "mouse_drag",
+  "move_cursor", "page", "parallel_mouse_drag", "press_key", "replay_trajectory", "right_click", "scroll",
+  "set_agent_cursor_location", "set_agent_cursor_visibility", "set_config", "set_value", "set_window_frame",
+  "start_recording", "start_session", "stop_recording", "type_text",
+]);
 
 type PhysicalPlatform = "darwin" | "win32";
 
@@ -125,6 +134,7 @@ export class PhysicalBridgeRegistry {
   private readonly now: () => number;
   private readonly idFactory: () => string;
   private readonly approvalTimeoutMs: number;
+  private captureQueue: Promise<void> = Promise.resolve();
 
   constructor(options: {
     now?: () => number;
@@ -265,6 +275,16 @@ export class PhysicalBridgeRegistry {
   }
 
   captureScreenshot(
+    registrationId: string,
+    executorGeneration: string,
+    signal: AbortSignal,
+  ): Promise<PhysicalCapture> {
+    const scheduled = this.captureQueue.then(() => this.captureScreenshotNow(registrationId, executorGeneration, signal));
+    this.captureQueue = scheduled.then(() => undefined, () => undefined);
+    return scheduled;
+  }
+
+  private captureScreenshotNow(
     registrationId: string,
     executorGeneration: string,
     signal: AbortSignal,
@@ -526,6 +546,7 @@ export class PhysicalBridgeRegistry {
 export interface PhysicalMcpAuthority {
   readonly capabilityToken: string;
   readonly registrationId: string;
+  readonly executorGeneration: string;
   readonly botId: string;
   readonly botLabel?: string;
   readonly taskLabel?: string;
@@ -617,6 +638,8 @@ export function attachPhysicalMcpBroker(options: {
   let pendingBytes = 0;
   const pending: Buffer[] = [];
   const pendingActions = new Map<string, string>();
+  const stagedActionTools = new Map<string, string>();
+  const pendingActionTools = new Map<string, string>();
   const pendingToolsList = new Set<string>();
   let outboundQueue: Promise<void> = Promise.resolve();
   let outboundPendingFrames = 0;
@@ -626,10 +649,12 @@ export function attachPhysicalMcpBroker(options: {
   let offPhysicalDrain: () => void = () => {};
   let resolveClosed!: () => void;
   const closedPromise = new Promise<void>((resolve) => { resolveClosed = resolve; });
+  const captureController = new AbortController();
 
   const finish = (reason: string, quarantine: boolean) => {
     if (closed) return;
     closed = true;
+    captureController.abort();
     offBrokerDrain();
     offPhysicalDrain();
     physical?.resumeInput();
@@ -707,7 +732,12 @@ export function attachPhysicalMcpBroker(options: {
       }
       return permit;
     },
-    actionForwarded: (requestId, actionId) => pendingActions.set(requestId, actionId),
+    actionForwarded: (requestId, actionId) => {
+      pendingActions.set(requestId, actionId);
+      const toolName = stagedActionTools.get(requestId);
+      stagedActionTools.delete(requestId);
+      if (toolName) pendingActionTools.set(requestId, toolName);
+    },
     actionAbandoned: async (actionId) => {
       if (!(await options.endAction(actionId))) await options.quarantine();
     },
@@ -728,6 +758,15 @@ export function attachPhysicalMcpBroker(options: {
       finish("MCP frame exceeded its limit", false);
       return;
     }
+    try {
+      const frame = JSON.parse(line) as { id?: unknown; method?: unknown; params?: { name?: unknown } };
+      if (frame?.method === "tools/call" && typeof frame.params?.name === "string") {
+        const id = typeof frame.id === "string" || typeof frame.id === "number"
+          ? `${typeof frame.id}:${String(frame.id)}`
+          : null;
+        if (id) stagedActionTools.set(id, frame.params.name);
+      }
+    } catch {}
     return gate(line);
   }, {
     maxLineBytes: PHYSICAL_MAX_BUFFERED_BYTES,
@@ -762,17 +801,53 @@ export function attachPhysicalMcpBroker(options: {
       const id = typeof frame?.id === "string" || typeof frame?.id === "number"
         ? `${typeof frame.id}:${String(frame.id)}`
         : null;
+      let responseLine = line;
       if (id && ("result" in (frame ?? {}) || "error" in (frame ?? {}))) {
         const actionId = pendingActions.get(id);
         if (actionId) {
+          const toolName = pendingActionTools.get(id) ?? "";
+          if (PHYSICAL_ACT_AND_OBSERVE_TOOLS.has(toolName)) {
+            try {
+              const screenshot = await options.registry.captureScreenshot(
+                options.authority.registrationId,
+                options.authority.executorGeneration,
+                captureController.signal,
+              );
+              const hash = createHash("sha256")
+                .update(screenshot.mimeType).update("\0").update(screenshot.dataBase64).digest("hex");
+              const upstreamFailed = "error" in (frame ?? {});
+              const result = frame?.result && typeof frame.result === "object" && !Array.isArray(frame.result)
+                ? frame.result as Record<string, unknown>
+                : {};
+              const content = Array.isArray(result.content) ? [...result.content] : [];
+              if (upstreamFailed) content.push({ type: "text", text: `${toolName} reported an error; the resulting screen is attached for verification.` });
+              content.push({ type: "text", text: `Trusted post-action screen attached for ${toolName} (sha256=${hash}).` });
+              content.push({ type: "image", data: screenshot.dataBase64, mimeType: screenshot.mimeType });
+              responseLine = JSON.stringify({
+                jsonrpc: frame?.jsonrpc ?? "2.0",
+                id: frame?.id ?? null,
+                result: { ...result, content, ...(upstreamFailed ? { isError: true } : {}) },
+              });
+            } catch {
+              responseLine = JSON.stringify({
+                jsonrpc: "2.0",
+                id: frame?.id ?? null,
+                result: {
+                  content: [{ type: "text", text: `FAILED: visual postcondition unproven for ${toolName} because the trusted post-action screen was unavailable.` }],
+                  isError: true,
+                },
+              });
+            }
+          }
           if (!(await options.endAction(actionId))) {
             finish("computer control did not acknowledge the completed action", true);
             return;
           }
           pendingActions.delete(id);
+          pendingActionTools.delete(id);
         }
       }
-      emitBroker(augmentToolsListResponse(line, pendingToolsList));
+      emitBroker(augmentToolsListResponse(responseLine, pendingToolsList));
     });
     outboundQueue = task.catch(() => {
       finish("physical MCP response processing failed", pendingActions.size > 0);

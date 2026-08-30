@@ -42,8 +42,14 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("registration.executorGeneration !== context.executorGeneration");
     expect(source).toContain("PHYSICAL_BRIDGES.captureScreenshot(");
     expect(source).toContain("computer operator physical generation changed before final screenshot");
+    expect(source).toContain("the physical computer generation changed before preview capture");
+    expect(source).toMatch(/previewCapture = async \(\) => \{[\s\S]*?PHYSICAL_BRIDGES\.captureScreenshot\(/);
     expect(source).toContain('scope: child ? "trusted-computer-operator" : "local-computer"');
     expect(source).toMatch(/if \(instance\.adapter\.capabilities\.computerOperatorMcp === true\)[\s\S]*?integrations\.computerOperator = physicalComputerOperatorIntegration/);
+  });
+
+  it("rejects an already-active parent before starting another child", () => {
+    expect(source).toContain("reserveComputerOperator(ACTIVE_COMPUTER_OPERATORS, parentKey, () => {");
   });
 
   it("cleans exact-turn contexts and aborts active children at turn finish", () => {
@@ -51,5 +57,6 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.cancelParent(operatorParent)");
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.abort(active.handle)");
     expect(source).toContain("closeComputerOperatorChildTarget(childId, \"server shutting down\")");
+    expect(source).toMatch(/function finalizeVerifiedCancelledTurn[\s\S]*?PROVIDER_RUNTIME_TURN_IDS\.delete\(turnAttachmentHandoffKey\(turn\)\)/);
   });
 });
