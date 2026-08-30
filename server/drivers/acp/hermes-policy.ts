@@ -516,9 +516,11 @@ def _install():
             original_after_call = guard.after_call
             original_reset_for_turn = guard.reset_for_turn
             guard._openmaus_search_calls = 0
+            guard._openmaus_observation_calls = 0
 
             def guarded_reset_for_turn():
                 guard._openmaus_search_calls = 0
+                guard._openmaus_observation_calls = 0
                 return original_reset_for_turn()
 
             def guarded_after_call(name, call_args, call_result, **call_kwargs):
@@ -535,6 +537,29 @@ def _install():
                             ),
                             tool_name=name,
                             count=guard._openmaus_search_calls,
+                        )
+                if name in {
+                    "mcp_computer_get_desktop_state",
+                    "mcp_computer_get_window_state",
+                    "mcp_computer_list_windows",
+                    "mcp_computer_zoom",
+                }:
+                    guard._openmaus_observation_calls += 1
+                    if (
+                        guard._openmaus_observation_calls >= 3
+                        and not decision.should_halt
+                    ):
+                        return ToolGuardrailDecision(
+                            action="warn",
+                            code="openmaus_observation_budget_warning",
+                            message=(
+                                "You already have three or more screen observations this turn. "
+                                "Use the newest attached pixels and structured state now. Do not "
+                                "capture again unless a later action actually changes the screen; "
+                                "either take the needed action or finish the user's task."
+                            ),
+                            tool_name=name,
+                            count=guard._openmaus_observation_calls,
                         )
                 return decision
 

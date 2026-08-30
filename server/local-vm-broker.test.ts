@@ -180,6 +180,10 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
     const response = JSON.parse(socket.sent.map((value) => value.toString()).join("").trim());
     expect(response.result.content).toContainEqual({
+      type: "text",
+      text: "Fresh post-action screen attached for click. Inspect this image before requesting another desktop capture.",
+    });
+    expect(response.result.content).toContainEqual({
       type: "image",
       data: "aW1hZ2U=",
       mimeType: "image/png",

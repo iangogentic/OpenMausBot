@@ -475,6 +475,10 @@ export function attachLocalVmMcpBroker(options: {
                 if (!content.some((item) => (
                   item && typeof item === "object" && (item as Record<string, unknown>).type === "image"
                 ))) {
+                  content.push({
+                    type: "text",
+                    text: `Fresh post-action screen attached for ${toolName}. Inspect this image before requesting another desktop capture.`,
+                  });
                   content.push({ type: "image", data: screenshot.data, mimeType: screenshot.mimeType });
                   responseLine = JSON.stringify({
                     ...frame,
