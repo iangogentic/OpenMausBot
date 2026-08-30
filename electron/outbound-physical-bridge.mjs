@@ -487,6 +487,7 @@ export async function startOutboundPhysicalBridge({
       cancelDrain: null,
       cancelInputDrain: null,
     };
+    log.info?.("[physical-bridge] local approval requested");
     // Fence every already-open physical CUA session before yielding to the
     // async dialog provider. A bot that already controls the desktop must not
     // be able to click Allow on a later bot's connection prompt.
@@ -532,6 +533,7 @@ export async function startOutboundPhysicalBridge({
     if (record.approvalTimer) clearTimeout(record.approvalTimer);
     record.approvalTimer = null;
     if (!decision || record.controller.signal.aborted || sessions.get(frame.sessionId) !== record || !transport?.open) {
+      log.info?.("[physical-bridge] local approval did not complete");
       if (sessions.get(frame.sessionId) === record) {
         send({ type: "denied", sessionId: frame.sessionId });
         closeSession(frame.sessionId, false);
@@ -542,6 +544,7 @@ export async function startOutboundPhysicalBridge({
     // person was deciding. Ask it to revalidate before any CUA process is
     // spawned; only its correlated `spawn` reply crosses that final fence.
     record.approved = true;
+    log.info?.("[physical-bridge] local approval granted");
     if (!send({ type: "approved", sessionId: frame.sessionId, executorGeneration: generation })) {
       closeSession(frame.sessionId, false);
     }
@@ -632,6 +635,7 @@ export async function startOutboundPhysicalBridge({
     if (!send({ type: "opened", sessionId: frame.sessionId, executorGeneration: generation })) {
       closeSession(frame.sessionId, false);
     } else {
+      log.info?.("[physical-bridge] local CUA session opened");
       // The approval prompt is gone and the exact server-correlated child is
       // live. Only now may already-open sessions receive further CUA input.
       releaseApprovalFence(record);
@@ -648,6 +652,7 @@ export async function startOutboundPhysicalBridge({
         return;
       }
       registrationId = frame.registrationId;
+      log.info?.("[physical-bridge] controller registered");
       return;
     }
     if (frame.type === "open") { void handleOpen(frame); return; }

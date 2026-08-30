@@ -61,10 +61,12 @@ describe("Razer hostile-provider deployment assets", () => {
     for (const marker of [
       "provider-bandwidth-v1",
       "provider-harness-v4-v1",
+      "provider-harness-slirp-v1",
       "provider-private-v4-v1",
       "provider-private-v6-v1",
       "vm-host-viewer-output-v1",
       "vm-host-output-deny-v1",
+      "vm-host-return-v1",
       "vm-host-deny-v1",
       "vm-bandwidth-v1",
       "vm-cross-deny-v1",
@@ -75,6 +77,15 @@ describe("Razer hostile-provider deployment assets", () => {
       "vm-return-v1",
       "vm-unsolicited-inbound-deny-v1",
     ]) expect(network).toContain(marker);
+    expect(network.split("\n").find((line) => line.includes("provider-harness-slirp-v1"))?.trim()).toBe(
+      'meta skuid {uid} ip daddr 10.0.2.2 tcp dport 8799 accept comment \\"provider-harness-slirp-v1\\"',
+    );
+    expect(network.split("\n").find((line) => line.includes("vm-host-viewer-output-v1"))?.trim()).toBe(
+      'oifname \\"ombvm*\\" tcp dport 6901 accept comment \\"vm-host-viewer-output-v1\\"',
+    );
+    expect(network.split("\n").find((line) => line.includes("vm-loopback-viewer-v1"))?.trim()).toBe(
+      'oifname \\"ombvm*\\" ip saddr 127.0.0.0/8 tcp dport 6901 ct state new accept comment \\"vm-loopback-viewer-v1\\"',
+    );
     expect(network).toContain('semantic_objects(expected, table_alias=(probe_table, "openmaus_provider")) != semantic_objects(loaded)');
     expect(network).toContain("Preserve every other present field");
     expect(network).toContain('kind not in ("table", "chain", "rule")');

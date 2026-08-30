@@ -989,8 +989,23 @@ ipcMain.on("desktop:claim-renderer-document", (event, documentToken) => {
     if (!controller) return;
     controller.claim(event, documentToken);
     event.returnValue = true;
-  } catch {
+  } catch (error) {
+    console.error(`[desktop] preload claim failed: ${error?.message ?? error}`);
     // The preload fails closed and does not expose window.ogb.
+  }
+});
+
+// The first synchronous claim can run against BrowserWindow's transient blank
+// document. Once the trusted page is loaded, preload retries through invoke;
+// this handler applies the identical controller checks and returns no detail.
+ipcMain.handle("desktop:claim-renderer-document-async", (event, documentToken) => {
+  try {
+    const controller = privilegedRendererController;
+    if (!controller) return false;
+    controller.claim(event, documentToken);
+    return true;
+  } catch {
+    return false;
   }
 });
 

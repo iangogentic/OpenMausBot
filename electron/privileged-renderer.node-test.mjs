@@ -104,6 +104,26 @@ test("a valid exact main-frame event receives a generation-bound proof", () => {
   assert.throws(() => controller.claim(ipcEvent(window), "not-a-document-token"), /claim rejected/);
 });
 
+test("document claims reject Electron's transient blank document", () => {
+  const origin = "http://127.0.0.1:5199";
+  const window = new FakeWindow(`${origin}/`);
+  const controller = createPrivilegedRendererController({
+    expectedOrigin: origin,
+    getMainWindow: () => window,
+  });
+  controller.attach(window);
+  assert.equal(controller.beginNavigation(window, `${origin}/`), true);
+
+  window.webContents.url = "";
+  window.webContents.mainFrame.url = "";
+  assert.throws(() => controller.claim(ipcEvent(window), TOKEN_A), /claim rejected/);
+
+  window.webContents.url = `${origin}/`;
+  window.webContents.mainFrame.url = `${origin}/`;
+  assert.equal(controller.claim(ipcEvent(window), TOKEN_A), true);
+  assert.doesNotThrow(() => controller.authorize(ipcEvent(window), TOKEN_A));
+});
+
 test("wrong windows, webContents, frames, and origins are rejected", () => {
   const { controller, setCurrentWindow, window } = readyHarness();
   const other = new FakeWindow("http://127.0.0.1:5199/");
@@ -331,16 +351,17 @@ test("every exposed preload action carries the isolated document token", async (
   );
 });
 
-test("preload exposes no bridge when the document claim is rejected", () => {
+test("a preload rejected for the blank document exposes only an inert bridge", async () => {
   const source = fs.readFileSync(new URL("./preload.cjs", import.meta.url), "utf8");
-  let exposed = false;
-  assert.throws(
+  let api;
+  assert.doesNotThrow(
     () => vm.runInNewContext(source, {
       console,
       crypto: { randomUUID: () => TOKEN_A },
       process: { platform: "darwin" },
+      setTimeout,
       require: () => ({
-        contextBridge: { exposeInMainWorld: () => { exposed = true; } },
+        contextBridge: { exposeInMainWorld: (_name, value) => { api = value; } },
         ipcRenderer: {
           invoke: () => Promise.resolve(),
           on: () => {},
@@ -351,9 +372,9 @@ test("preload exposes no bridge when the document claim is rejected", () => {
         webUtils: {},
       }),
     }),
-    /could not claim/,
   );
-  assert.equal(exposed, false);
+  assert.ok(api);
+  await assert.rejects(api.connection(), /could not claim/);
 });
 
 test("all privileged preload registrations use the central gate", () => {
@@ -362,9 +383,10 @@ test("all privileged preload registrations use the central gate", () => {
   const delegated = ["./android-device.mjs", "./cua.mjs", "./updater.mjs"]
     .map((file) => fs.readFileSync(new URL(file, import.meta.url), "utf8"))
     .join("\n");
-  assert.equal((main.match(/ipcMain\.handle\(/g) ?? []).length, 1);
+  assert.equal((main.match(/ipcMain\.handle\(/g) ?? []).length, 2);
   assert.equal((main.match(/ipcMain\.on\(/g) ?? []).length, 2);
   assert.match(main, /ipcMain\.on\("desktop:claim-renderer-document"/);
+  assert.match(main, /ipcMain\.handle\("desktop:claim-renderer-document-async"/);
   assert.match(main, /registerCuaIpc\(registerPrivilegedIpcHandle\)/);
   assert.match(main, /androidDevice\.registerIpc\(\{ handle: registerPrivilegedIpcHandle \}\)/);
   assert.match(main, /registerUpdaterIpc\(registerPrivilegedIpcHandle\)/);

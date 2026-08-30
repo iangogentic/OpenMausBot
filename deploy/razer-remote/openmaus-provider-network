@@ -22,17 +22,26 @@ table inet openmaus_provider {{
     meta skuid {uid} limit rate over 50 mbytes/second burst 100 mbytes drop comment \"provider-bandwidth-v1\"
     meta skuid {uid} ip daddr 127.0.0.1 tcp dport 8799 accept comment \"provider-harness-v4-v1\"
     meta skuid {uid} ip6 daddr ::1 tcp dport 8799 accept comment \"provider-harness-v6-v1\"
+    # slirp exposes the host harness at one fixed gateway inside each hostile
+    # provider netns. Permit only that exact address and harness port before
+    # the private-range deny below; no other host/LAN authority is widened.
+    meta skuid {uid} ip daddr 10.0.2.2 tcp dport 8799 accept comment \"provider-harness-slirp-v1\"
     meta skuid {uid} ip daddr 100.100.100.100 udp dport 53 accept comment \"provider-dns-v4-udp-v1\"
     meta skuid {uid} ip daddr 100.100.100.100 tcp dport 53 accept comment \"provider-dns-v4-tcp-v1\"
     meta skuid {uid} ip6 daddr fd7a:115c:a1e0::53 udp dport 53 accept comment \"provider-dns-v6-udp-v1\"
     meta skuid {uid} ip6 daddr fd7a:115c:a1e0::53 tcp dport 53 accept comment \"provider-dns-v6-tcp-v1\"
     meta skuid {uid} ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 224.0.0.0/4, 240.0.0.0/4 }} reject with icmpx type admin-prohibited comment \"provider-private-v4-v1\"
     meta skuid {uid} ip6 daddr {{ ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8 }} reject with icmpx type admin-prohibited comment \"provider-private-v6-v1\"
-    oifname \"ombvm*\" ip saddr 127.0.0.0/8 tcp dport 6901 accept comment \"vm-host-viewer-output-v1\"
+    # Docker rewrites the loopback-published port to the VM address before
+    # route selection, so the packet's source becomes that bridge's gateway.
+    # Constrain host-to-VM authority by bridge name and noVNC port; the next
+    # rule still drops every other host-originated packet into a VM.
+    oifname \"ombvm*\" tcp dport 6901 accept comment \"vm-host-viewer-output-v1\"
     oifname \"ombvm*\" drop comment \"vm-host-output-deny-v1\"
   }}
   chain input {{
     type filter hook input priority -150; policy accept;
+    iifname \"ombvm*\" ct state established,related accept comment \"vm-host-return-v1\"
     iifname \"ombvm*\" drop comment \"vm-host-deny-v1\"
   }}
   chain forward {{
@@ -42,7 +51,9 @@ table inet openmaus_provider {{
     iifname \"ombvm*\" ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 224.0.0.0/4, 240.0.0.0/4 }} reject with icmpx type admin-prohibited comment \"vm-private-v4-v1\"
     iifname \"ombvm*\" ip6 daddr {{ ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 100::/64, 2001:db8::/32, fc00::/7, fe80::/10, ff00::/8 }} reject with icmpx type admin-prohibited comment \"vm-private-v6-v1\"
     iifname \"ombvm*\" accept comment \"vm-public-egress-v1\"
-    iifname \"lo\" oifname \"ombvm*\" ip saddr 127.0.0.0/8 tcp dport 6901 ct state new accept comment \"vm-loopback-viewer-v1\"
+    # Locally generated packets have no input interface in the forward hook
+    # after Docker's OUTPUT DNAT. The loopback source is the stable boundary.
+    oifname \"ombvm*\" ip saddr 127.0.0.0/8 tcp dport 6901 ct state new accept comment \"vm-loopback-viewer-v1\"
     oifname \"ombvm*\" ct state established,related accept comment \"vm-return-v1\"
     oifname \"ombvm*\" drop comment \"vm-unsolicited-inbound-deny-v1\"
   }}

@@ -127,7 +127,9 @@ function createPrivilegedRendererController({ expectedOrigin, getMainWindow }) {
       binding.navigationGeneration < 1 ||
       !DOCUMENT_TOKEN_PATTERN.test(documentToken)
     ) {
-      throw new Error("Renderer document claim rejected");
+      throw new Error(
+        `Renderer document claim rejected (current=${current(window)}, navigation=${binding?.navigationGeneration ?? 0}, token=${DOCUMENT_TOKEN_PATTERN.test(documentToken)})`,
+      );
     }
     const webContents = binding.webContents;
     const eventFrame = event?.senderFrame;
@@ -139,7 +141,9 @@ function createPrivilegedRendererController({ expectedOrigin, getMainWindow }) {
       !exactRendererUrl(eventFrame?.url, origin) ||
       !exactRendererUrl(currentWebContentsUrl(webContents), origin)
     ) {
-      throw new Error("Renderer document claim rejected");
+      throw new Error(
+        `Renderer document claim rejected (sender=${event?.sender === webContents}, frame=${Boolean(frame)}, sameFrame=${sameFrame(eventFrame, frame)}, frameOrigin=${exactRendererUrl(eventFrame?.url, origin)}, webContentsOrigin=${exactRendererUrl(currentWebContentsUrl(webContents), origin)})`,
+      );
     }
     binding.documentToken = documentToken;
     binding.ready = true;

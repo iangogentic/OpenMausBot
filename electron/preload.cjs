@@ -7,15 +7,58 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 // frame routing IDs. The page never sees it; every outbound bridge call adds
 // it automatically and main rejects tokens from an earlier document.
 const rendererDocumentToken = globalThis.crypto.randomUUID();
-if (ipcRenderer.sendSync("desktop:claim-renderer-document", rendererDocumentToken) !== true) {
-  throw new Error("The OpenMausBot renderer document could not claim its desktop bridge");
-}
+let rendererDocumentClaimed =
+  ipcRenderer.sendSync("desktop:claim-renderer-document", rendererDocumentToken) === true;
+
+// BrowserWindow creates an initial about:blank document before createWindow
+// can bind its origin controller. Expose the narrow API, but keep it powerless
+// until the first call from the loaded trusted document can claim authority.
+// The main process validates the final frame, origin, window and navigation
+// generation before it accepts the claim or any action.
+const ensureRendererDocumentClaimed = () => {
+  if (rendererDocumentClaimed) return true;
+  rendererDocumentClaimed =
+    ipcRenderer.sendSync("desktop:claim-renderer-document", rendererDocumentToken) === true;
+  return rendererDocumentClaimed;
+};
+let rendererClaimPromise = null;
+const waitForRendererDocumentClaim = () => {
+  if (ensureRendererDocumentClaimed()) return Promise.resolve();
+  if (rendererClaimPromise) return rendererClaimPromise;
+  rendererClaimPromise = new Promise((resolve, reject) => {
+    let attempts = 0;
+    const retry = async () => {
+      rendererDocumentClaimed =
+        await ipcRenderer.invoke("desktop:claim-renderer-document-async", rendererDocumentToken) === true;
+      if (rendererDocumentClaimed) {
+        rendererClaimPromise = null;
+        resolve();
+        return;
+      }
+      attempts += 1;
+      if (attempts >= 20) {
+        rendererClaimPromise = null;
+        reject(new Error("The OpenMausBot renderer document could not claim its desktop bridge"));
+        return;
+      }
+      setTimeout(() => void retry(), 25);
+    };
+    setTimeout(() => void retry(), 0);
+  });
+  return rendererClaimPromise;
+};
 const invokePrivileged = (channel, ...args) =>
-  ipcRenderer.invoke(channel, rendererDocumentToken, ...args);
-const sendPrivileged = (channel, ...args) =>
-  ipcRenderer.send(channel, rendererDocumentToken, ...args);
-const sendPrivilegedSync = (channel, ...args) =>
-  ipcRenderer.sendSync(channel, rendererDocumentToken, ...args);
+  waitForRendererDocumentClaim().then(() =>
+    ipcRenderer.invoke(channel, rendererDocumentToken, ...args));
+const sendPrivileged = (channel, ...args) => {
+  void waitForRendererDocumentClaim()
+    .then(() => ipcRenderer.send(channel, rendererDocumentToken, ...args))
+    .catch(() => {});
+};
+const sendPrivilegedSync = (channel, ...args) => {
+  if (!ensureRendererDocumentClaimed()) return false;
+  return ipcRenderer.sendSync(channel, rendererDocumentToken, ...args);
+};
 
 let pendingPackageInstallUrl = null;
 const packageInstallListeners = new Set();
