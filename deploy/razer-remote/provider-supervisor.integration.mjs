@@ -356,10 +356,14 @@ try {
     mkdirSync(path, { mode: 0o2750 });
     chownMode(path, server.uid, runtimeGid, 0o2750);
   }
+  // Match Hermes' real cross-UID proof leaf: the server can traverse the
+  // nonce-bound directory but cannot list it. The exact proof file is the
+  // only writable overlap granted to the provider.
+  chownMode(policyRuntime, server.uid, runtimeGid, 0o2710);
   writeFileSync(join(declaredRuntime, "seed"), "declared", { mode: 0o640 });
   chownMode(join(declaredRuntime, "seed"), server.uid, runtimeGid, 0o640);
-  writeFileSync(policyProof, "pending", { mode: 0o660 });
-  chownMode(policyProof, server.uid, runtimeGid, 0o660);
+  writeFileSync(policyProof, "pending", { mode: 0o640 });
+  chownMode(policyProof, server.uid, runtimeGid, 0o640);
   writeFileSync(join(siblingRuntime, "secret"), "sibling-secret", { mode: 0o640 });
   chownMode(join(siblingRuntime, "secret"), server.uid, runtimeGid, 0o640);
   writeFileSync(homeBaseline, "baseline", { mode: 0o640 });
