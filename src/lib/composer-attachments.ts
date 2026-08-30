@@ -283,6 +283,69 @@ export function splitAttachedImages(text: string): { display: string; images: st
   return { display: display.trim(), images };
 }
 
+export type TranscriptFileAttachment = {
+  path: string;
+  name: string;
+  preview: "pdf" | "xlsx" | null;
+};
+
+function decodeAttribute(value: string): string {
+  return value
+    .replaceAll("&#9;", "\t")
+    .replaceAll("&#10;", "\n")
+    .replaceAll("&#13;", "\r")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
+/** Parse app-authored attachment tags for transcript presentation. Paths
+ * remain private component state: the visible label is always a basename,
+ * never a tooltip or text node containing the server's full path. */
+export function splitTranscriptAttachments(text: string) {
+  const images: string[] = [];
+  const files: TranscriptFileAttachment[] = [];
+  const tags: string[] = [];
+  const display = text.replace(
+    /<(attached-image|attached-file)\s+path="([^"]*)"\s*\/?>(?:\s*\n)?/g,
+    (match, tag: string, encodedPath: string) => {
+      tags.push(match.trim());
+      const path = decodeAttribute(encodedPath);
+      if (!path) return "";
+      if (tag === "attached-image") {
+        images.push(path);
+      } else {
+        const rawName = attachmentBasename(path);
+        const name = safeAttachmentDisplayName(rawName);
+        const extension = name.split(".").pop()?.toLowerCase();
+        files.push({
+          path,
+          name,
+          preview: extension === "pdf" ? "pdf" : extension === "xlsx" ? "xlsx" : null,
+        });
+      }
+      return "";
+    },
+  );
+  return { display: display.trim(), images, files, tags };
+}
+
+/** Keep attachments on message edit without exposing their path-bearing
+ * transport tags inside the editor. */
+export function replaceTranscriptDisplayText(original: string, edited: string): string {
+  const tags = splitTranscriptAttachments(original).tags;
+  return [edited.trim(), ...tags].filter(Boolean).join("\n\n");
+}
+
+/** Uploaded files are stored as UUID-original-name. Hide the storage UUID
+ * while retaining a useful filename; control characters never reach UI. */
+export function safeAttachmentDisplayName(name: string): string {
+  const clean = name.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  const withoutStorageId = clean.replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i, "");
+  return (withoutStorageId || "attachment").slice(0, 180);
+}
+
 /** The bare filename a saved attachment path ends in — what the serving
  * route expects. Works for POSIX and Windows separators. */
 export function attachmentBasename(path: string): string {

@@ -14,8 +14,10 @@ import {
   pasteSummary,
   type Attachment,
   type PasteAttachment,
+  type TranscriptFileAttachment,
 } from "@/lib/composer-attachments";
 import { AttachmentPreviewDialog, previewImage, type PreviewImage } from "./AttachmentPreview";
+import { AttachmentFilePreviewDialog } from "./AttachmentFilePreview";
 
 /** Electron 32 removed File.path — only the preload can name a file. */
 export function pathForFile(file: File): string {
@@ -45,6 +47,7 @@ export function ComposerAttachments({
 }) {
   const [dragging, setDragging] = useState(false);
   const [preview, setPreview] = useState<PreviewImage | null>(null);
+  const [filePreview, setFilePreview] = useState<TranscriptFileAttachment | null>(null);
   // dragenter/dragleave fire once per element crossed, so the overlay
   // tracks depth rather than the last event it happened to see
   const depth = useRef(0);
@@ -171,20 +174,30 @@ export function ComposerAttachments({
                 <div className="mt-1 truncate text-[10.5px] text-ink-secondary/70">{formatSize(a.size)}</div>
               </Chip>
             ) : (
-              <Chip key={a.id} label="FILE" title={a.path} onRemove={() => onRemove(a.id)}>
-                <div className="flex h-[76px] items-center gap-2">
+              <Chip key={a.id} label="FILE" title={a.name} onRemove={() => onRemove(a.id)}>
+                <button
+                  type="button"
+                  disabled={!remote}
+                  onClick={() => {
+                    const extension = a.name.split(".").pop()?.toLowerCase();
+                    setFilePreview({ path: a.path, name: a.name, preview: extension === "pdf" ? "pdf" : extension === "xlsx" ? "xlsx" : null });
+                  }}
+                  className="flex h-[76px] w-full items-center gap-2 text-left disabled:cursor-default"
+                  aria-label={remote ? (/\.(pdf|xlsx)$/i.test(a.name) ? `Preview ${a.name}` : `Download ${a.name}`) : `Attached file ${a.name}`}
+                >
                   <FileIcon size={16} className="shrink-0 text-ink-secondary" />
                   <div className="min-w-0">
                     <div className="truncate text-[12px] text-ink">{a.name}</div>
                     <div className="text-[10.5px] text-ink-secondary/70">{formatSize(a.size)}</div>
                   </div>
-                </div>
+                </button>
               </Chip>
             ),
           )}
         </div>
       )}
       {preview && <AttachmentPreviewDialog image={preview} onClose={() => setPreview(null)} />}
+      {filePreview && <AttachmentFilePreviewDialog attachment={filePreview} onClose={() => setFilePreview(null)} />}
     </>
   );
 }

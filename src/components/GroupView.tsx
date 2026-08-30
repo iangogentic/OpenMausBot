@@ -37,7 +37,8 @@ import { useFocusMessage } from "@/lib/focus-message";
 import { shortPath } from "@/lib/short-path";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import { showWorkingDots } from "@/lib/turn-tail";
-import { splitAttachedImages } from "@/lib/composer-attachments";
+import { splitTranscriptAttachments } from "@/lib/composer-attachments";
+import { AttachedFileGallery } from "./AttachmentFilePreview";
 import {
   TRANSCRIPT_WINDOW_SIZE,
   expandWindowStart,
@@ -167,7 +168,7 @@ const Transcript = memo(function Transcript({
         }
         const m = item.message;
         const user = m.role === "user";
-        const attachedImages = user && m.text ? splitAttachedImages(m.text) : null;
+        const attachedImages = user && m.text ? splitTranscriptAttachments(m.text) : null;
         const newCluster = !prev || prev.role !== m.role || prev.from?.botId !== m.from?.botId || newDay;
         const row =
           // a member can hit a permission ask mid-turn; without this the
@@ -225,6 +226,9 @@ const Transcript = memo(function Transcript({
                     <>
                       {attachedImages && attachedImages.images.length > 0 && (
                         <AttachedImageGallery paths={attachedImages.images} />
+                      )}
+                      {attachedImages && attachedImages.files.length > 0 && (
+                        <AttachedFileGallery files={attachedImages.files} />
                       )}
                       {attachedImages?.display ?? m.text}
                     </>

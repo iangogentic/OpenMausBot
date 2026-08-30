@@ -24,6 +24,29 @@ export const FILE_MAX_BYTES = 25 * 1024 * 1024;
  * a 36-byte UUID plus one dash, leaving this many UTF-8 bytes for metadata. */
 export const UPLOAD_DISPLAY_NAME_MAX_BYTES = 218;
 
+export type SafeViewerKind = "pdf" | "xlsx";
+
+/** Parser routing is based on both the inert filename and file signature,
+ * never an attacker-controlled Content-Type header. ZIP is only a candidate
+ * XLSX here; the renderer additionally validates its central directory and
+ * SheetJS must parse the Office workbook structure in a disposable worker. */
+export function safeViewerKind(name: string, bytes: Uint8Array): SafeViewerKind | null {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".pdf") && bytes.length >= 5 && Buffer.from(bytes.subarray(0, 5)).equals(Buffer.from("%PDF-"))) {
+    return "pdf";
+  }
+  if (
+    lower.endsWith(".xlsx") &&
+    bytes.length >= 4 &&
+    bytes[0] === 0x50 &&
+    bytes[1] === 0x4b &&
+    ((bytes[2] === 0x03 && bytes[3] === 0x04) || (bytes[2] === 0x05 && bytes[3] === 0x06))
+  ) {
+    return "xlsx";
+  }
+  return null;
+}
+
 /** Mimes the endpoint accepts, mapped to the extension stored on disk.
  * Sniffing is not attempted — a lie here only changes the filename. */
 const IMAGE_MIMES: Record<string, string> = {

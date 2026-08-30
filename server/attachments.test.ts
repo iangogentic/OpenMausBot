@@ -19,6 +19,7 @@ const {
   extensionForMime,
   readAttachment,
   readSavableServerFile,
+  safeViewerKind,
   safeUploadName,
   saveImage,
   saveUploadedFile,
@@ -43,6 +44,16 @@ describe("extensionForMime", () => {
     expect(extensionForMime("image/svg+xml")).toBeNull();
     expect(extensionForMime("text/plain")).toBeNull();
     expect(extensionForMime(undefined)).toBeNull();
+  });
+});
+
+describe("safeViewerKind", () => {
+  it("requires matching inert extensions and magic bytes", () => {
+    expect(safeViewerKind("report.pdf", Buffer.from("%PDF-1.7"))).toBe("pdf");
+    expect(safeViewerKind("report.pdf", Buffer.from("not-pdf"))).toBeNull();
+    expect(safeViewerKind("sheet.xlsx", Buffer.from([0x50, 0x4b, 0x03, 0x04]))).toBe("xlsx");
+    expect(safeViewerKind("sheet.xlsm", Buffer.from([0x50, 0x4b, 0x03, 0x04]))).toBeNull();
+    expect(safeViewerKind("payload.html", Buffer.from("%PDF-1.7"))).toBeNull();
   });
 });
 

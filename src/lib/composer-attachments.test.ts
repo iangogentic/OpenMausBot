@@ -9,6 +9,8 @@ import {
   composeMessage,
   isImageFile,
   splitAttachedImages,
+  splitTranscriptAttachments,
+  replaceTranscriptDisplayText,
   uploadFileNameHeader,
   type ImageAttachment,
 } from "./composer-attachments";
@@ -86,6 +88,29 @@ describe("splitAttachedImages", () => {
     const { display, images } = splitAttachedImages(stored);
     expect(display).toBe(stored);
     expect(images).toEqual([]);
+  });
+});
+
+describe("splitTranscriptAttachments", () => {
+  it("extracts safe file chips and hides all full paths from display text", () => {
+    const stored = 'Review these\n<attached-file path="/private/server/123e4567-e89b-12d3-a456-426614174000-report.pdf" />\n<attached-file path="C:\\secret\\budget.xlsx" />';
+    const result = splitTranscriptAttachments(stored);
+    expect(result.display).toBe("Review these");
+    expect(result.files).toEqual([
+      { path: "/private/server/123e4567-e89b-12d3-a456-426614174000-report.pdf", name: "report.pdf", preview: "pdf" },
+      { path: "C:\\secret\\budget.xlsx", name: "budget.xlsx", preview: "xlsx" },
+    ]);
+  });
+
+  it("keeps unsupported attachments as inert filename-only chips", () => {
+    expect(splitTranscriptAttachments('<attached-file path="/secret/archive.zip" />').files).toEqual([
+      { path: "/secret/archive.zip", name: "archive.zip", preview: null },
+    ]);
+  });
+
+  it("preserves hidden attachment tags when visible message text is edited", () => {
+    const original = 'old\n\n<attached-file path="/secret/report.pdf" />';
+    expect(replaceTranscriptDisplayText(original, "new")).toBe('new\n\n<attached-file path="/secret/report.pdf" />');
   });
 });
 

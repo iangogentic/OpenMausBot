@@ -60,7 +60,8 @@ import { useFocusMessage } from "@/lib/focus-message";
 import { groupActivityRuns } from "@/lib/activity-runs";
 import { ActivityRun } from "./ActivityRun";
 import { webhookMessageView } from "@/lib/webhook-message";
-import { splitAttachedImages } from "@/lib/composer-attachments";
+import { replaceTranscriptDisplayText, splitTranscriptAttachments } from "@/lib/composer-attachments";
+import { AttachedFileGallery } from "./AttachmentFilePreview";
 import { BOTTOM_FOLLOW_THRESHOLD, shouldResumeBottomFollow } from "@/lib/bottom-follow";
 import {
   TRANSCRIPT_WINDOW_SIZE,
@@ -303,7 +304,7 @@ function Bubble({
   const [expanded, setExpanded] = useState(false);
   const text = message.text ?? "";
   const webhookView = user ? webhookMessageView(text) : null;
-  const attachedImages = user && !webhookView ? splitAttachedImages(text) : null;
+  const attachedImages = user && !webhookView ? splitTranscriptAttachments(text) : null;
   const visibleText = webhookView?.task ?? attachedImages?.display ?? text;
   const collapsible =
     user && !webhookView && !expanded && (visibleText.length > USER_COLLAPSE_CHARS || visibleText.split("\n").length > USER_COLLAPSE_LINES);
@@ -311,7 +312,11 @@ function Bubble({
   if (user && editing && !webhookView) {
     return (
       <div className="flex w-full justify-end">
-        <BubbleEditor initial={text} onCancel={onCancelEdit} onSubmit={onSubmitEdit} />
+        <BubbleEditor
+          initial={attachedImages?.display ?? text}
+          onCancel={onCancelEdit}
+          onSubmit={(edited) => onSubmitEdit(replaceTranscriptDisplayText(text, edited))}
+        />
       </div>
     );
   }
@@ -408,6 +413,9 @@ function Bubble({
             <>
               {attachedImages && attachedImages.images.length > 0 && (
                 <AttachedImageGallery paths={attachedImages.images} />
+              )}
+              {attachedImages && attachedImages.files.length > 0 && (
+                <AttachedFileGallery files={attachedImages.files} />
               )}
               <div
                 className={cn(collapsible && "max-h-40 overflow-hidden [mask-image:linear-gradient(to_bottom,black_60%,transparent)]")}
