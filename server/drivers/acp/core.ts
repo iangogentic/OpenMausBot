@@ -166,6 +166,10 @@ export interface AcpSupport {
    * provider-scoped by the support implementation; streaming deltas remain
    * untouched so the adapter cannot silently rewrite another harness. */
   normalizeAssistantText?(text: string, turn: SendTurnInput): string;
+  /** Drop provider-visible narration that arrived immediately before a tool
+   * call. Used only by supports whose model exposes hidden planning as normal
+   * assistant text; the tool activity itself is still emitted. */
+  discardAssistantTextBeforeTool?(text: string, turn: SendTurnInput): boolean;
   /** Rewrite a picker id (`omlx::model`) into the CLI-native id before spawn
    * and session/select. Local inject writers live here so the child sees a
    * model it already knows. */
@@ -549,7 +553,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               break;
             }
             case "tool_call": {
-              flushAssistantText();
+              if (support.discardAssistantTextBeforeTool?.(state.text, cliTurn)) state.text = "";
+              else flushAssistantText();
               emit({
                 ...base(threadId, turnId),
                 type: "item.started",

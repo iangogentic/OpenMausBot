@@ -32,6 +32,7 @@ describe("normalizeHermesAssistantText", () => {
     const answer = "GLM_POSTDEPLOY_OK — 1280x900 @1x; 22425 events.";
     expect(normalizeHermesAssistantText(`\n\n${answer}${answer}`, spark)).toBe(`\n\n${answer}`);
     expect(normalizeHermesAssistantText(`${answer}\n${answer}\n`, spark)).toBe(`${answer}\n`);
+    expect(normalizeHermesAssistantText(`${answer}${answer}擎`, spark)).toBe(answer);
   });
 
   it("preserves partial repeats, short answers, and every other Hermes route", () => {
@@ -528,7 +529,19 @@ mcp_servers:
       ].join("\n"),
     );
     writeFileSync(join(fakeModules, "model_tools.py"), "def get_tool_definitions(*args, **kwargs): return []\ndef handle_function_call(*args, **kwargs): return None\n");
-    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs):\n  self.tools = []\n");
+    writeFileSync(
+      join(fakeModules, "run_agent.py"),
+      [
+        "from types import SimpleNamespace",
+        "class Transport:",
+        " def normalize_response(self, response, **kwargs): return SimpleNamespace(**response)",
+        "class AIAgent:",
+        " def __init__(self, *args, **kwargs): self.tools = []",
+        " def _get_transport(self, *args, **kwargs): return Transport()",
+        " def _should_treat_stop_as_truncated(self, *args, **kwargs): return True",
+        "",
+      ].join("\n"),
+    );
     writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
     writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
     const script = [
@@ -538,7 +551,13 @@ mcp_servers:
       "hidden = split.feed('private planning') + split.feed('</thi') + split.feed('nk>FINAL_OK') + split.flush()",
       "plain = StreamingThinkScrubber()",
       "fallback = plain.feed('ordinary answer without tags') + plain.flush()",
-      "print(json.dumps({'hidden': hidden, 'fallback': fallback}))",
+      "from run_agent import AIAgent",
+      "agent = AIAgent()",
+      "short = agent._get_transport().normalize_response({'content': 'complete answer.', 'tool_calls': None, 'finish_reason': 'length'}).finish_reason",
+      "tool = agent._get_transport().normalize_response({'content': '', 'tool_calls': ['call'], 'finish_reason': 'length'}).finish_reason",
+      "long = agent._get_transport().normalize_response({'content': 'x' * 8192, 'tool_calls': None, 'finish_reason': 'length'}).finish_reason",
+      "heuristic = agent._should_treat_stop_as_truncated('stop', None, [])",
+      "print(json.dumps({'hidden': hidden, 'fallback': fallback, 'short': short, 'tool': tool, 'long': long, 'heuristic': heuristic}))",
     ].join("\n");
     const executed = spawnSync("python3", ["-c", script], {
       env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
@@ -548,6 +567,10 @@ mcp_servers:
     expect(JSON.parse(executed.stdout.trim())).toEqual({
       hidden: "FINAL_OK",
       fallback: "ordinary answer without tags",
+      short: "stop",
+      tool: "length",
+      long: "length",
+      heuristic: false,
     });
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });

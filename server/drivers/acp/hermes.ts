@@ -193,14 +193,16 @@ export function normalizeHermesAssistantText(text: string, modelId: string | und
   const leading = text.match(/^\s*/u)?.[0] ?? "";
   const trailing = text.match(/\s*$/u)?.[0] ?? "";
   const body = text.slice(leading.length, text.length - trailing.length);
-  for (let separatorLength = 0; separatorLength <= 4; separatorLength += 1) {
-    const repeatedLength = body.length - separatorLength;
-    if (repeatedLength < 24 || repeatedLength % 2 !== 0) continue;
-    const unitLength = repeatedLength / 2;
-    const first = body.slice(0, unitLength);
-    const separator = body.slice(unitLength, unitLength + separatorLength);
-    const second = body.slice(unitLength + separatorLength);
-    if (separator.trim() === "" && first === second) return `${leading}${first}${trailing}`;
+  for (let tailLength = 0; tailLength <= 4; tailLength += 1) {
+    for (let separatorLength = 0; separatorLength <= 4; separatorLength += 1) {
+      const repeatedLength = body.length - separatorLength - tailLength;
+      if (repeatedLength < 24 || repeatedLength % 2 !== 0) continue;
+      const unitLength = repeatedLength / 2;
+      const first = body.slice(0, unitLength);
+      const separator = body.slice(unitLength, unitLength + separatorLength);
+      const second = body.slice(unitLength + separatorLength, body.length - tailLength);
+      if (separator.trim() === "" && first === second) return `${leading}${first}${trailing}`;
+    }
   }
   return text;
 }
@@ -605,6 +607,7 @@ const support: AcpSupport = {
   },
   buildPromptText: (turn) => (turn.system ? `${turn.system}\n\n${turn.text}` : turn.text),
   normalizeAssistantText: (text, turn) => normalizeHermesAssistantText(text, turn.model),
+  discardAssistantTextBeforeTool: (_text, turn) => decodeInjectId(turn.model)?.host === "spark_glm",
 };
 
 export const HermesAgentDriver = createAcpDriver(support);

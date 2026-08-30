@@ -263,6 +263,44 @@ def _install():
             for item in self.tools
             if _allowed_tool(item.get("function", {}).get("name"))
         }
+        if _SPARK_IMPLICIT_THINK and hasattr(self, "_get_transport"):
+            # This Spark endpoint has repeatedly labelled short, complete
+            # post-tool answers as length (and Hermes' GLM heuristic also
+            # upgrades an otherwise normal stop when a stray final glyph is
+            # present). Hermes then asks the model to continue, exposing its
+            # recovery prompt and duplicating the answer. Treat only short,
+            # text-only Spark responses as terminal; genuine large truncations
+            # and tool-call responses keep their native finish reason.
+            original_get_transport = self._get_transport
+
+            class OpenMausSparkTransport:
+                def __init__(self, delegate):
+                    self._delegate = delegate
+
+                def __getattr__(self, name):
+                    return getattr(self._delegate, name)
+
+                def normalize_response(self, response, **normalize_kwargs):
+                    normalized = self._delegate.normalize_response(
+                        response, **normalize_kwargs
+                    )
+                    content = getattr(normalized, "content", None)
+                    if (
+                        getattr(normalized, "finish_reason", None) == "length"
+                        and isinstance(content, str)
+                        and 0 < len(content.encode("utf-8")) < 8192
+                        and not getattr(normalized, "tool_calls", None)
+                    ):
+                        normalized.finish_reason = "stop"
+                    return normalized
+
+            def openmaus_get_transport(*transport_args, **transport_kwargs):
+                return OpenMausSparkTransport(
+                    original_get_transport(*transport_args, **transport_kwargs)
+                )
+
+            self._get_transport = openmaus_get_transport
+            self._should_treat_stop_as_truncated = lambda *_args, **_kwargs: False
         # Upstream Hermes only applies its successful-result no-progress
         # circuit breaker to a short built-in read-tool allowlist. Scoped MCP
         # tools otherwise can repeat forever (including a mutating computer
