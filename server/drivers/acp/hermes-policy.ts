@@ -206,8 +206,12 @@ def _install():
         }
         for server_name in sorted(required):
             if not _has_mcp_server_tool(names, server_name):
+                visible = ",".join(sorted(
+                    name for name in registered_names if isinstance(name, str)
+                ))[:1000]
                 raise RuntimeError(
-                    "OpenMaus required MCP server '" + server_name + "' exposed no tools"
+                    "OpenMaus required MCP server '" + server_name
+                    + "' exposed no tools (registered: " + visible + ")"
                 )
 
     HermesACPAgent._register_session_mcp_servers = guarded_register_mcp
