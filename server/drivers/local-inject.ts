@@ -36,6 +36,7 @@ export const LOCAL_HOSTS: LocalHost[] = [
     id: "desktop2_qwen",
     label: "desktop2 · Qwen 3.8 27B Abliterated",
     baseUrl: process.env.OPENMAUSBOT_DESKTOP2_QWEN_URL || "http://127.0.0.1:18011/v1",
+    apiKeyEnv: "OPENMAUSBOT_DESKTOP2_QWEN_API_KEY",
     apiKey: "local",
   },
   {

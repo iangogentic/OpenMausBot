@@ -4,7 +4,8 @@ import type { LocalHost } from "./drivers/local-inject.ts";
 import { encodeInjectId } from "./drivers/local-inject.ts";
 
 export const COMPUTER_OPERATOR_HOST_ID = "desktop2_qwen";
-export const COMPUTER_OPERATOR_MODEL_ID = "qwen3.8-27b-abliterated";
+export const COMPUTER_OPERATOR_MODEL_ID = "qwen-quality-canary";
+export const COMPUTER_OPERATOR_UPSTREAM_MODEL_ID = "qwen38-huihui-w8-quality-canary";
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_MAX_BYTES = 256 * 1024;
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS = 5_000;
 
@@ -109,16 +110,22 @@ export async function preflightComputerOperatorModel(
   const servedModel = completionJson && typeof completionJson === "object"
     ? (completionJson as { model?: unknown }).model
     : null;
-  if (servedModel !== COMPUTER_OPERATOR_MODEL_ID) {
+  if (servedModel !== COMPUTER_OPERATOR_UPSTREAM_MODEL_ID) {
     throw new Error("computer operator inference probe returned the wrong model identity");
   }
   const first = Array.isArray(choices) && choices[0] && typeof choices[0] === "object"
     ? choices[0] as { message?: unknown; text?: unknown }
     : null;
   const message = first?.message && typeof first.message === "object"
-    ? (first.message as { content?: unknown }).content
+    ? (first.message as { content?: unknown; reasoning?: unknown })
     : null;
-  const output = typeof message === "string" ? message : typeof first?.text === "string" ? first.text : "";
+  const output = typeof message?.content === "string"
+    ? message.content
+    : typeof message?.reasoning === "string"
+      ? message.reasoning
+      : typeof first?.text === "string"
+        ? first.text
+        : "";
   if (!first || !output.trim() || Buffer.byteLength(output, "utf8") > 256) {
     throw new Error("computer operator model inference probe returned no completion");
   }

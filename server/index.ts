@@ -1249,6 +1249,7 @@ function isComputerOperatorParentCurrent(parent: ComputerSubagentParent): boolea
 async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSelection> {
   const preferred = store.bot(parentBotId);
   const candidates = [preferred, ...store.bots.filter((bot) => bot.id !== parentBotId)].filter(Boolean);
+  let readinessFailure = "no enabled Hermes bot is configured for the trusted desktop2 Qwen model";
   for (const candidate of candidates) {
     const selection = candidate!.modelSelection;
     const inject = decodeInjectId(selection.model);
@@ -1256,14 +1257,27 @@ async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSe
     const canonicalModel = canonicalComputerOperatorModel(inject.host, inject.model);
     if (!canonicalModel) continue;
     const instance = registry.get(selection.instanceId);
-    if (!instance || !instance.enabled || instance.driverKind !== "hermesAgent") continue;
-    const snapshot = await instance.snapshot().catch(() => null);
-    if (snapshot?.state !== "available") continue;
+    if (!instance || !instance.enabled || instance.driverKind !== "hermesAgent") {
+      readinessFailure = "the configured Hermes provider is unavailable";
+      continue;
+    }
+    const snapshot = await instance.snapshot().catch((error) => {
+      readinessFailure = boundedComputerOperatorFailure("Hermes readiness check failed", error);
+      return null;
+    });
+    if (snapshot?.state !== "available") {
+      if (snapshot) readinessFailure = `Hermes is ${snapshot.state}`;
+      continue;
+    }
     const host = localHost(inject.host);
-    if (!host) continue;
+    if (!host) {
+      readinessFailure = "the trusted desktop2 model host is not configured";
+      continue;
+    }
     try {
       await preflightComputerOperatorModel(host, hostApiKey(host, process.env), new AbortController().signal);
-    } catch {
+    } catch (error) {
+      readinessFailure = boundedComputerOperatorFailure("desktop2 Qwen readiness check failed", error);
       continue;
     }
     return {
@@ -1272,9 +1286,14 @@ async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSe
     };
   }
   throw Object.assign(
-    new Error("a live Hermes bot configured for the desktop2 Qwen model is required for computer operation"),
+    new Error(`a live Hermes bot configured for the desktop2 Qwen model is required for computer operation: ${readinessFailure}`),
     { status: 409 },
   );
+}
+
+function boundedComputerOperatorFailure(prefix: string, error: unknown): string {
+  const detail = (error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").trim();
+  return detail ? `${prefix}: ${detail}`.slice(0, 320) : prefix;
 }
 
 async function closeComputerOperatorChildTarget(childId: string, reason: string): Promise<void> {

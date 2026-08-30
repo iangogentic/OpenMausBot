@@ -12,15 +12,15 @@ const signal = () => new AbortController().signal;
 
 describe("computer operator model preflight", () => {
   it("canonicalizes a mixed-case configured Qwen id before relay launch", () => {
-    expect(canonicalComputerOperatorModel("desktop2_qwen", "Qwen3.8-27B-Abliterated"))
-      .toBe("desktop2_qwen::qwen3.8-27b-abliterated");
+    expect(canonicalComputerOperatorModel("desktop2_qwen", "QWEN-QUALITY-CANARY"))
+      .toBe("desktop2_qwen::qwen-quality-canary");
     expect(canonicalComputerOperatorModel("desktop2_qwen", "compatible-alias")).toBeNull();
   });
   it("accepts only the exact model advertised by desktop2", async () => {
     const fetcher = vi.fn(async (input: string | URL | Request) => new Response(JSON.stringify(
       String(input).endsWith("/models")
-        ? { data: [{ id: "Qwen3.8-27B-Abliterated" }] }
-        : { model: "qwen3.8-27b-abliterated", choices: [{ message: { content: "O" } }] },
+        ? { data: [{ id: "QWEN-QUALITY-CANARY" }] }
+        : { model: "qwen38-huihui-w8-quality-canary", choices: [{ message: { content: "O" } }] },
     )));
     await expect(preflightComputerOperatorModel(host, "secret", signal(), fetcher)).resolves.toBeUndefined();
     expect(fetcher).toHaveBeenCalledWith("http://127.0.0.1:18011/v1/models", expect.objectContaining({
@@ -37,7 +37,7 @@ describe("computer operator model preflight", () => {
   it("fails closed for a live endpoint serving the wrong model", async () => {
     await expect(preflightComputerOperatorModel(host, "secret", signal(), async () =>
       new Response(JSON.stringify({ data: [{ id: "some-compatible-alias" }] })),
-    )).rejects.toThrow("is not serving qwen3.8-27b-abliterated");
+    )).rejects.toThrow("is not serving qwen-quality-canary");
   });
 
   it("fails closed when the exact advertised model cannot perform a tiny inference", async () => {
@@ -45,7 +45,7 @@ describe("computer operator model preflight", () => {
     await expect(preflightComputerOperatorModel(host, "secret", signal(), async () => {
       calls += 1;
       return calls === 1
-        ? new Response(JSON.stringify({ data: [{ id: "qwen3.8-27b-abliterated" }] }))
+        ? new Response(JSON.stringify({ data: [{ id: "qwen-quality-canary" }] }))
         : new Response("offline", { status: 503 });
     })).rejects.toThrow("inference probe returned HTTP 503");
   });
@@ -54,7 +54,7 @@ describe("computer operator model preflight", () => {
     const responses = (completion: unknown) => {
       let calls = 0;
       return async () => new Response(JSON.stringify(++calls === 1
-        ? { data: [{ id: "qwen3.8-27b-abliterated" }] }
+        ? { data: [{ id: "qwen-quality-canary" }] }
         : completion));
     };
     await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
@@ -62,9 +62,13 @@ describe("computer operator model preflight", () => {
       choices: [{ message: { content: "O" } }],
     }))).rejects.toThrow("wrong model identity");
     await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
-      model: "qwen3.8-27b-abliterated",
+      model: "qwen38-huihui-w8-quality-canary",
       choices: [{ message: { content: "   " } }],
     }))).rejects.toThrow("no completion");
+    await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
+      model: "qwen38-huihui-w8-quality-canary",
+      choices: [{ message: { content: null, reasoning: "O" } }],
+    }))).resolves.toBeUndefined();
   });
 
   it("bounds a dishonest catalog response before parsing", async () => {
@@ -78,7 +82,7 @@ describe("computer operator model preflight", () => {
       { ...host, id: "compatible_alias" },
       "secret",
       signal(),
-      async () => new Response(JSON.stringify({ data: [{ id: "qwen3.8-27b-abliterated" }] })),
+      async () => new Response(JSON.stringify({ data: [{ id: "qwen-quality-canary" }] })),
     )).rejects.toThrow("host is not trusted");
   });
 });

@@ -18,6 +18,8 @@ describe("production computer operator wiring", () => {
     expect(source).toContain('instance.driverKind !== "hermesAgent"');
     expect(source).toContain('snapshot?.state !== "available"');
     expect(source).toContain("a live Hermes bot configured for the desktop2 Qwen model is required");
+    expect(source).toContain('boundedComputerOperatorFailure("desktop2 Qwen readiness check failed", error)');
+    expect(source).toContain("readinessFailure" + "}`)");
   });
 
   it("authorizes the blocking route and accounts only child VM actions", () => {

@@ -60,6 +60,7 @@ describe("inject ids", () => {
       id: "desktop2_qwen",
       label: "desktop2 · Qwen 3.8 27B Abliterated",
       baseUrl: "http://127.0.0.1:18011/v1",
+      apiKeyEnv: "OPENMAUSBOT_DESKTOP2_QWEN_API_KEY",
       apiKey: "local",
     });
     expect(decodeInjectId("desktop2_qwen::qwen3.8-27b")).toEqual({
