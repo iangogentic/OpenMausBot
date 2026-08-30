@@ -10,6 +10,15 @@ export const SYSTEMD_CONTROL_SESSION_CREDENTIAL = "openmausbot-companion-session
 // Compatibility name for callers that only validate one credential file.
 export const SYSTEMD_SESSION_CREDENTIAL = SYSTEMD_HARNESS_SESSION_CREDENTIAL;
 
+export function hasPrivateCredentialMode(stat: { mode: number; uid: number; gid: number }): boolean {
+  const access = stat.mode & 0o777;
+  if ((access & 0o027) !== 0) return false;
+  // Some systemd builds expose LoadCredential files as root:root 0440 inside
+  // the unit's private credential mount. Permit that exact root-owned shape;
+  // an ordinary user/group-readable file remains invalid.
+  return (access & 0o050) === 0 || (access & 0o070) === 0o040 && stat.uid === 0 && stat.gid === 0;
+}
+
 /** Read the systemd-provided credential through one descriptor. `O_NOFOLLOW`
  * and `fstat` bind the checks to the object actually read rather than to a
  * pathname an attacker could swap after `lstat`. The credential directory is
@@ -21,7 +30,7 @@ export function readSystemdSessionCredential(file: string | undefined): string |
   try {
     descriptor = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
     const stat = fstatSync(descriptor);
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0) return null;
+    if (!stat.isFile() || !hasPrivateCredentialMode(stat)) return null;
     const token = readFileSync(descriptor, "utf8").trim();
     return TOKEN.test(token) ? token : null;
   } catch {

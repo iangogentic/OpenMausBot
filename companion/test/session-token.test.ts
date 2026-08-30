@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   readSystemdSessionCredential,
+  hasPrivateCredentialMode,
   SYSTEMD_CONTROL_SESSION_CREDENTIAL,
   SYSTEMD_HARNESS_SESSION_CREDENTIAL,
   SYSTEMD_SESSION_CREDENTIAL,
@@ -26,6 +27,13 @@ afterEach(() => {
 });
 
 describe("headless companion session credential", () => {
+  it("accepts systemd's root-owned 0440 credential shape without widening ordinary files", () => {
+    expect(hasPrivateCredentialMode({ mode: 0o100440, uid: 0, gid: 0 })).toBe(true);
+    expect(hasPrivateCredentialMode({ mode: 0o100440, uid: 501, gid: 20 })).toBe(false);
+    expect(hasPrivateCredentialMode({ mode: 0o100444, uid: 0, gid: 0 })).toBe(false);
+    expect(hasPrivateCredentialMode({ mode: 0o100660, uid: 0, gid: 0 })).toBe(false);
+  });
+
   it("accepts only the private regular credential systemd mapped into its unit", () => {
     const root = directory();
     const secure = join(root, "session");
