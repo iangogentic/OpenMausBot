@@ -337,6 +337,7 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_get_desktop_state"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_context_store_stats"');
     expect(HERMES_POLICY_PYTHON).toContain("tool_search_module._core_tool_names = guarded_core_tool_names");
+    expect(HERMES_POLICY_PYTHON).toContain('code="openmaus_search_loop_halt"');
   });
 
   it("recognizes the canonical Hermes MCP names for both mounted integrations", () => {

@@ -149,7 +149,10 @@ def _install():
     # caused valid function names to be confused; deferring every MCP tool
     # caused requested computer tools to look absent. This split preserves
     # both accuracy and complete reachability.
-    tool_search_module = sys.modules.get("tools.tool_search")
+    try:
+        from tools import tool_search as tool_search_module
+    except ImportError:
+        tool_search_module = None
     if _RESTRICT_NATIVE and tool_search_module is not None:
         original_core_tool_names = tool_search_module._core_tool_names
 
@@ -210,6 +213,38 @@ def _install():
             guard._is_idempotent = lambda name: (
                 isinstance(name, str) and name.startswith("mcp_")
             ) or original_is_idempotent(name)
+            # Search is a bridge, not productive work by itself. Some local
+            # models vary the query forever, evading exact-call detection.
+            # Bound consecutive bridge exploration while leaving repeated
+            # direct computer actions governed by result-based progress.
+            from agent.tool_guardrails import ToolGuardrailDecision
+            original_after_call = guard.after_call
+            original_reset_for_turn = guard.reset_for_turn
+            guard._openmaus_search_calls = 0
+
+            def guarded_reset_for_turn():
+                guard._openmaus_search_calls = 0
+                return original_reset_for_turn()
+
+            def guarded_after_call(name, call_args, call_result, **call_kwargs):
+                decision = original_after_call(name, call_args, call_result, **call_kwargs)
+                if name in {"tool_search", "tool_describe"}:
+                    guard._openmaus_search_calls += 1
+                    if guard._openmaus_search_calls >= 5 and not decision.should_halt:
+                        return ToolGuardrailDecision(
+                            action="halt",
+                            code="openmaus_search_loop_halt",
+                            message=(
+                                "Stopped repeated tool discovery after five searches. "
+                                "Use a discovered tool directly or answer with the available result."
+                            ),
+                            tool_name=name,
+                            count=guard._openmaus_search_calls,
+                        )
+                return decision
+
+            guard.reset_for_turn = guarded_reset_for_turn
+            guard.after_call = guarded_after_call
         return result
 
     run_agent.AIAgent.__init__ = guarded_agent_init
