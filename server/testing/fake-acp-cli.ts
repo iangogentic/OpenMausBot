@@ -132,7 +132,15 @@ if (
 ) {
   writeFileSync(
     process.env.OPENMAUSBOT_HERMES_POLICY_PROOF,
-    JSON.stringify({ version: 1, nonce: process.env.OPENMAUSBOT_HERMES_POLICY_NONCE }),
+    JSON.stringify({
+      version: 2,
+      nonce: process.env.OPENMAUSBOT_HERMES_POLICY_NONCE,
+      // The fake stands in for an installed Hermes process whose startup
+      // policy successfully patched both required computer hooks. Hook
+      // behavior itself is exercised by hermes.test.ts's Python fixtures.
+      image_cache_hook: process.env.OPENMAUSBOT_HERMES_REQUIRE_COMPUTER_HOOKS === "1",
+      guardrail_hook: process.env.OPENMAUSBOT_HERMES_REQUIRE_COMPUTER_HOOKS === "1",
+    }),
     { mode: 0o600 },
   );
 }
