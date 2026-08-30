@@ -1488,7 +1488,11 @@ async function validateWorkspaceLocation(target: LocalVmTarget, create: boolean)
     info.isSymbolicLink() ||
     dirname(canonical) !== canonicalRoot ||
     (CONFIGURED_VM_WORKSPACE_ROOT !== null && canonical !== resolve(target.workspaceDir)) ||
-    info.dev !== rootInfo.dev
+    // Linux reports a distinct st_dev for each Btrfs subvolume. In the
+    // configured deployment the privileged storage helper has already
+    // validated this exact direct child as a non-mounted, quota-bounded
+    // subvolume; retain the same-device check for ordinary/dev directories.
+    (CONFIGURED_VM_WORKSPACE_ROOT === null && info.dev !== rootInfo.dev)
   ) {
     throw new Error("Local VM workspace must be one canonical directory on its bounded filesystem");
   }
