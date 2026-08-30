@@ -327,6 +327,7 @@ function handle(msg: any) {
       const servers: McpEntry[] = Array.isArray(msg.params?.mcpServers) ? msg.params.mcpServers : [];
       if (process.env.FAKE_ACP_DUMP) {
         dumpState.mcpServers = servers;
+        dumpState.sessionCwd = msg.params?.cwd;
         writeFileSync(process.env.FAKE_ACP_DUMP, JSON.stringify(dumpState, null, 2));
       }
       agentsMcp = servers.find((s: any) => s?.name === "agents") ?? null;

@@ -14,6 +14,7 @@
 // session/update notifications, so updates are double-gated: nothing emits
 // before the prompt is sent, and `_meta.isReplay` updates are dropped.
 import { homedir } from "node:os";
+import { isAbsolute, resolve } from "node:path";
 
 import { applyModelRelayEnvironment, decodeInjectId } from "../local-inject.ts";
 import {
@@ -352,8 +353,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           throw new Error("local computer control requires interactive provider approvals");
         }
         const turnId = turn.turnId ?? newId();
-        const cwd = turn.cwd ?? config.workspace ?? homedir();
         const env = childEnv();
+        const privateProviderHome = env.OMB_PROVIDER_INSTANCE_HOME?.trim();
+        if (
+          turn.providerPrivateCwd &&
+          privateProviderHome &&
+          (!isAbsolute(privateProviderHome) || /[\0\r\n]/.test(privateProviderHome))
+        ) {
+          throw new Error("private provider cwd must be an absolute directory path");
+        }
+        // With OS isolation, omitting the spawn cwd makes spawnCli select the
+        // exact supervisor-validated provider HOME. ACP still needs an
+        // explicit cwd in session/new, so give it the same trusted path.
+        const cwd = turn.providerPrivateCwd
+          ? resolve(privateProviderHome || homedir())
+          : turn.cwd ?? config.workspace ?? homedir();
+        const spawnCwd = turn.providerPrivateCwd && privateProviderHome ? undefined : cwd;
         applyModelRelayEnvironment(env, turn.model, turn.integrations?.modelRelay);
         if (
           support.requireAuthenticationBeforeSpawn
@@ -390,7 +405,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // logical HOME while the supervisor imports only those exact files.
         const providerHomeImports = support.providerHomeImports?.(env, { turn: cliTurn, config }) ?? [];
         const child = spawnCli(spawnTarget.cli, spawnTarget.args, {
-          cwd,
+          cwd: spawnCwd,
           env,
           stdio: ["pipe", "pipe", "pipe"],
           providerRuntimePaths,

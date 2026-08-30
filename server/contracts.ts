@@ -160,6 +160,9 @@ export interface SendTurnInput {
   /** Stable owner of provider-private state. The harness passes the bot id;
    * direct adapter callers may omit it and providers fall back to threadId. */
   isolationKey?: string;
+  /** Run from the provider's exact private HOME instead of exposing a bot
+   * workspace. Harness code sets this only for restricted hidden workers. */
+  providerPrivateCwd?: boolean;
   /** Server-staged artifacts visible to this exact provider process through
    * the production OS sandbox. Drivers must forward only these harness-owned
    * paths to spawnCli; providers may not add or broaden them. */

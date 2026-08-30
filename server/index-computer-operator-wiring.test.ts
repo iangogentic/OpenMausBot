@@ -44,7 +44,9 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("registration.executorGeneration !== context.executorGeneration");
     expect(source).toContain("PHYSICAL_BRIDGES.captureScreenshot(");
     expect(source).toContain("computer operator physical generation changed before final screenshot");
-    expect(source).toContain("cwd: ensureWorkspace(input.parent.botId)");
+    expect(source).toContain("isolationKey: `computer-operator:${input.parent.botId}:${input.target.targetKey}`");
+    expect(source).toContain("providerPrivateCwd: true");
+    expect(source).not.toContain("cwd: ensureWorkspace(input.parent.botId)");
     expect(source).toContain("onFinalScreenshot: ({ childId, screenshot }) =>");
     expect(source).toContain("publishComputerChildFrame(childId");
     expect(source).toContain("the physical computer generation changed before preview capture");
