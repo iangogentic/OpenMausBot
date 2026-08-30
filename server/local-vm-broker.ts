@@ -483,13 +483,33 @@ export function attachLocalVmMcpBroker(options: {
             return { content: [{ type: "text", text: `The computer batch stopped safely after ${completed} actions because its authority expired.` }], isError: true };
           }
           const response = await callBatchDriver(action);
-          if ("error" in response) {
+          const nestedResult = response.result;
+          if (
+            "error" in response ||
+            (nestedResult !== null &&
+              typeof nestedResult === "object" &&
+              !Array.isArray(nestedResult) &&
+              (nestedResult as Record<string, unknown>).isError === true)
+          ) {
             return { content: [{ type: "text", text: `The computer batch stopped after ${completed} completed actions because action ${completed + 1} failed.` }], isError: true };
           }
           completed += 1;
         }
         const finalTool = actions.at(-1)?.name ?? "computer_batch";
-        const screenshot = await options.captureAfterAction?.(finalTool);
+        let screenshot: LocalVmActionScreenshot | null | undefined;
+        // Cua's screenshot RPC can transiently collide with the just-finished
+        // input RPC on the same guest socket. The mechanical actions must
+        // never be replayed, but observation itself is safe to retry once.
+        for (let attempt = 0; attempt < 2 && !screenshot; attempt += 1) {
+          try {
+            screenshot = await options.captureAfterAction?.(finalTool);
+          } catch {
+            screenshot = null;
+          }
+          if (!screenshot && attempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          }
+        }
         if (!screenshot || screenshot.data.length > LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES) {
           result = { content: [{ type: "text", text: `All ${completed} computer batch actions completed, but the bounded final screenshot was unavailable.` }], isError: true };
         } else {

@@ -205,6 +205,27 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await handle.closed;
   });
 
+  it("retries only the final observation after a transient capture failure", async () => {
+    const socket = new FakeSocket();
+    const captureAfterAction = vi.fn()
+      .mockRejectedValueOnce(new Error("guest screenshot socket was briefly busy"))
+      .mockResolvedValueOnce({ data: "aW1hZ2U=", mimeType: "image/png" as const });
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { captureAfterAction }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 111,
+      method: "tools/call",
+      params: { name: "computer_batch", arguments: { actions: [{ name: "press_key", arguments: { key: "enter" } }] } },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 111)).toBe(true));
+    const response = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 111);
+    expect(captureAfterAction).toHaveBeenCalledTimes(2);
+    expect(response.result.isError).toBeUndefined();
+    expect(JSON.stringify(response)).toContain('"type":"image"');
+    handle.close("capture retry complete");
+    await handle.closed;
+  });
+
   it("rejects ten batch actions atomically without truncation or a control ticket", async () => {
     const socket = new FakeSocket();
     const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "must-not-run" }));
