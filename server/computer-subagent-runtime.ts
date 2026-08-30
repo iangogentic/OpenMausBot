@@ -5,10 +5,10 @@ import type { ComputerChildMonitor, ComputerChildMonitorListener } from "../shar
 
 export const MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES = 512_000;
 export const DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS = 30_000;
-export const DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 480_000;
+export const DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 420_000;
 export const DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS = 2_000;
 export const DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS = 10_000;
-export const MAX_COMPUTER_SUBAGENT_TIMEOUT_MS = 900_000;
+export const MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 420_000;
 
 export interface ComputerSubagentTargetSelection { targetKey: string; targetGeneration: string; boxId?: string }
 export interface ComputerSubagentCapabilityDescriptor extends ComputerSubagentTargetSelection { readonly opaqueCapability: unknown }
@@ -95,7 +95,7 @@ interface Execution {
   interruptPromise: Promise<void> | null;
   interruptRequested: boolean;
   abortRequested: boolean;
-  stopCause: "caller-abort" | "steer" | "execution-timeout" | null;
+  stopCause: "caller-abort" | "steer" | "operation-timeout" | "execution-timeout" | null;
   steering: boolean;
   acceptingActions: boolean;
   terminalized: boolean;
@@ -192,7 +192,10 @@ export class ComputerSubagentRuntime {
   async abort(handle: ComputerSubagentHandle): Promise<ComputerSubagentCompletion | null> {
     const execution = this.execution(handle);
     if (execution.terminalized) return execution.chain.done.promise;
-    if (!this.latchStop(execution, "caller-abort")) return execution.chain.done.promise;
+    this.latchStop(execution, "caller-abort");
+    // Cancellation intent is stronger than diagnostic first-writer ordering:
+    // a Stop after steer must suppress the queued successor, while a Stop
+    // after timeout must still help reap the already-expired child.
     execution.abortRequested = true; execution.interruptRequested = true;
     execution.abortController.abort();
     void this.interruptIfAvailable(execution);
@@ -247,7 +250,12 @@ export class ComputerSubagentRuntime {
       cloneParent(execution.input.parent),
       execution.abortController.signal,
     ));
-    const acquired = await this.racePhase(execution, acquirePromise, this.operationTimeoutMs);
+    const acquired = await this.racePhase(
+      execution,
+      acquirePromise,
+      this.operationTimeoutMs,
+      () => this.latchStop(execution, "operation-timeout"),
+    );
     if (!acquired.ok) {
       this.cleanupLateAcquire(execution, acquirePromise);
       const contained = await this.quarantine(execution);
@@ -273,7 +281,12 @@ export class ComputerSubagentRuntime {
       target: acquired.value,
       signal: execution.abortController.signal,
     }));
-    const launched = await this.racePhase(execution, launchPromise, this.operationTimeoutMs);
+    const launched = await this.racePhase(
+      execution,
+      launchPromise,
+      this.operationTimeoutMs,
+      () => this.latchStop(execution, "operation-timeout"),
+    );
     if (!launched.ok) {
       this.cleanupLateLaunch(execution, launchPromise);
       const contained = await this.quarantine(execution);
@@ -316,7 +329,7 @@ export class ComputerSubagentRuntime {
     execution: Execution,
     promise: Promise<T>,
     timeoutMs: number,
-    onTimeout?: () => void,
+    onTimeout?: () => boolean,
   ): Promise<PhaseResult<T>> {
     return new Promise((resolve) => {
       let settled = false;
@@ -338,7 +351,9 @@ export class ComputerSubagentRuntime {
       if (execution.abortController.signal.aborted) onAbort();
       if (timeoutMs > 0) {
         timeout = setTimeout(() => {
-          onTimeout?.();
+          // An abort/steer timer may already be armed. Preserve that first
+          // writer instead of returning a false timeout from the same tick.
+          if (onTimeout && !onTimeout()) return;
           execution.abortController.abort();
           finish({ ok: false, reason: "timeout" });
         }, timeoutMs);
@@ -632,7 +647,7 @@ export class ComputerSubagentRuntime {
     return value;
   }
   private validExecutionTimeout(value: number): number {
-    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_COMPUTER_SUBAGENT_TIMEOUT_MS) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS) {
       throw new TypeError("executionTimeoutMs must be a positive bounded safe integer");
     }
     return value;

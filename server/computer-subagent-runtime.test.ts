@@ -3,6 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import type { ComputerChildMonitor } from "../shared/computer-child-monitor.ts";
 import { ComputerSubagentManager, type ComputerSubagentParent } from "./computer-subagent-manager.ts";
 import {
+  DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS,
+  DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS,
+  DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS,
   ComputerSubagentRuntime,
   type ComputerSubagentCapabilityDescriptor,
   type ComputerSubagentFinalScreenshot,
@@ -10,6 +13,7 @@ import {
   type ComputerSubagentProviderLaunchInput,
   type ComputerSubagentProviderOutcome,
 } from "./computer-subagent-runtime.ts";
+import { HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS } from "./drivers/acp/hermes-policy.ts";
 
 const parent: ComputerSubagentParent = {
   botId: "bot-a",
@@ -76,6 +80,9 @@ function harness(overrides: {
   captureFinalScreenshot?: (signal: AbortSignal) => Promise<ComputerSubagentFinalScreenshot>;
   acquireTarget?: (childId: string) => Promise<ComputerSubagentCapabilityDescriptor>;
   executionTimeoutMs?: number;
+  operationTimeoutMs?: number;
+  cleanupTimeoutMs?: number;
+  launch?: (input: ComputerSubagentProviderLaunchInput) => Promise<ComputerSubagentProviderChild>;
 } = {}) {
   const manager = new ComputerSubagentManager();
   const launched: ComputerSubagentProviderLaunchInput[] = [];
@@ -91,6 +98,7 @@ function harness(overrides: {
     provider: {
       launch: async (input) => {
         launched.push(input);
+        if (overrides.launch) return overrides.launch(input);
         const child = fakeChild();
         children.push(child);
         return child;
@@ -105,10 +113,10 @@ function harness(overrides: {
     captureFinalScreenshot: async ({ childId, signal }) => { screenshots.push(childId); events.push("screenshot"); return overrides.captureFinalScreenshot ? overrides.captureFinalScreenshot(signal) : screenshot; },
     isParentCurrent: overrides.isParentCurrent ?? (() => true),
     quarantineChild: overrides.quarantineChild ?? (async () => undefined),
-    operationTimeoutMs: 500,
+    operationTimeoutMs: overrides.operationTimeoutMs ?? 500,
     executionTimeoutMs: overrides.executionTimeoutMs ?? 500,
     abortGraceMs: 5,
-    cleanupTimeoutMs: 50,
+    cleanupTimeoutMs: overrides.cleanupTimeoutMs ?? 50,
     onComplete: (completion) => {
       events.push("complete");
       completions.push({
@@ -140,6 +148,15 @@ async function settle(child: FakeChild, outcome: ComputerSubagentProviderOutcome
 }
 
 describe("ComputerSubagentRuntime", () => {
+  it("keeps a full cleanup and callback margin below the parent Hermes MCP deadline", () => {
+    const worstCaseMs = (
+      2 * DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS
+      + DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS
+      + 6 * DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS
+    );
+    expect(HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS - worstCaseMs).toBeGreaterThanOrEqual(60_000);
+  });
+
   it("publishes authority-free snapshots for queued, running, human handoff, terminal, and release", async () => {
     const h = harness();
     const monitorParent = { ...parent, generation: "secret-parent-fence" };
@@ -412,6 +429,105 @@ describe("ComputerSubagentRuntime", () => {
     expect(completion?.status).toBe("aborted");
     expect(h.manager.get(handle.childId)?.leaseHeld).toBe(false);
     expect(h.completions).toHaveLength(1);
+  });
+
+  it("suppresses a queued steer successor when Stop arrives after steer", async () => {
+    const h = harness();
+    const first = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "first",
+      childId: "child-steer-then-stop",
+    });
+    const child = await waitForChild(h.children);
+    const successor = h.runtime.steer(first, "must never launch");
+    const stopped = h.runtime.abort(first);
+    await vi.waitFor(() => expect(child.interrupted).toBe(true));
+    child.completionControl.resolve({ status: "aborted", reason: "steer" });
+    child.cleanupControl.resolve();
+    await expect(successor).rejects.toThrow("aborted before steer successor launch");
+    expect((await stopped)?.status).toBe("aborted");
+    expect(h.launched).toHaveLength(1);
+    expect(h.completions).toHaveLength(1);
+  });
+
+  it("preserves caller-abort classification when the execution deadline fires later", async () => {
+    const h = harness({ executionTimeoutMs: 100 });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-abort-before-deadline",
+    });
+    const child = await waitForChild(h.children);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const stopped = h.runtime.abort(handle);
+    await vi.waitFor(() => expect(child.interrupted).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    child.completionControl.resolve({ status: "aborted", reason: "caller" });
+    child.cleanupControl.resolve();
+    expect(await stopped).toMatchObject({
+      status: "aborted",
+      error: "provider completion cancelled: aborted",
+    });
+  });
+
+  it("keeps an acquisition timeout classified as failure after a late Stop", async () => {
+    const acquisition = deferred<ComputerSubagentCapabilityDescriptor>();
+    const quarantine = deferred<void>();
+    const h = harness({
+      acquireTarget: () => acquisition.promise,
+      quarantineChild: () => quarantine.promise,
+      operationTimeoutMs: 15,
+      cleanupTimeoutMs: 100,
+    });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-acquire-timeout-late-stop",
+    });
+    await vi.waitFor(() => expect(h.manager.get(handle.childId)?.status).toBe("running"));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const stopped = h.runtime.abort(handle);
+    quarantine.resolve();
+    expect(await stopped).toMatchObject({
+      status: "failed",
+      error: "target acquisition failed: timeout",
+    });
+    expect(h.launched).toHaveLength(0);
+    acquisition.reject("late acquisition failure");
+  });
+
+  it("keeps a provider-launch timeout classified as failure after a late Stop", async () => {
+    const launch = deferred<ComputerSubagentProviderChild>();
+    const quarantine = deferred<void>();
+    const h = harness({
+      launch: () => launch.promise,
+      quarantineChild: () => quarantine.promise,
+      operationTimeoutMs: 15,
+      cleanupTimeoutMs: 100,
+    });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-launch-timeout-late-stop",
+    });
+    await vi.waitFor(() => expect(h.launched).toHaveLength(1));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const stopped = h.runtime.abort(handle);
+    quarantine.resolve();
+    expect(await stopped).toMatchObject({
+      status: "failed",
+      error: "provider launch failed: timeout",
+    });
+    expect(h.children).toHaveLength(0);
+    launch.reject("late launch failure");
   });
 
   it("interrupts a child that arrives after abort during pending provider launch", async () => {

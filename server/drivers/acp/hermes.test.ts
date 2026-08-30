@@ -17,6 +17,7 @@ import {
 } from "./hermes.ts";
 import {
   HERMES_DISABLED_NATIVE_TOOLSETS,
+  HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS,
   HERMES_POLICY_PYTHON,
   HERMES_POLICY_VERSION,
   hermesIsolationHome,
@@ -388,6 +389,8 @@ mcp_servers:
   });
 
   it("hard-denies Ian Brain credential tools in both catalog and dispatch policy", () => {
+    expect(HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS).toBe(600_000);
+    expect(HERMES_POLICY_PYTHON).toContain("_COMPUTER_OPERATOR_MCP_TIMEOUT_SECONDS = 600");
     expect(HERMES_POLICY_PYTHON).toContain('"mcp__ian_brain__creds_"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp__ian_brain__mcp_ian_brain_creds_"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_creds_"');
