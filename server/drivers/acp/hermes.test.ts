@@ -18,6 +18,7 @@ import {
 import {
   HERMES_DISABLED_NATIVE_TOOLSETS,
   HERMES_POLICY_PYTHON,
+  HERMES_POLICY_VERSION,
   hermesIsolationHome,
   hermesMcpToolMatchesServer,
   prepareHermesPolicyEnvironment,
@@ -455,7 +456,7 @@ mcp_servers:
     expect(isolatedDotenv).toBe("OPENROUTER_API_KEY=model-key\n");
     expect(isolatedDotenv).not.toContain("real-upstream-secret");
 
-    writeFileSync(proof!.path, JSON.stringify({ version: 1, nonce: proof!.nonce }), { mode: 0o600 });
+    writeFileSync(proof!.path, JSON.stringify({ version: HERMES_POLICY_VERSION, nonce: proof!.nonce }), { mode: 0o600 });
     expect(() => verifyHermesPolicyProof(proof!)).not.toThrow();
   });
 
@@ -490,7 +491,7 @@ mcp_servers:
     expect(statSync(join(env.HERMES_HOME!, "config.yaml")).mode & 0o777).toBe(0o600);
     expect(readFileSync(join(env.HERMES_HOME!, ".env"), "utf8")).toBe("OPENROUTER_API_KEY=test\n");
 
-    writeFileSync(proof!.path, JSON.stringify({ version: 1, nonce: proof!.nonce }), { mode: 0o600 });
+    writeFileSync(proof!.path, JSON.stringify({ version: HERMES_POLICY_VERSION, nonce: proof!.nonce }), { mode: 0o600 });
     expect(() => verifyHermesPolicyProof(proof!)).not.toThrow();
     expect(() => verifyHermesPolicyProof(proof!)).toThrow(/did not load/);
   });
@@ -633,6 +634,7 @@ mcp_servers:
       dataDir: runtime,
       isolationKey: "mcp-multimodal",
       restricted: true,
+      computerMounted: true,
     })!;
     const fakeModules = join(root, "fake-modules");
     const cache = join(root, "image-cache");
@@ -641,11 +643,14 @@ mcp_servers:
     mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
     mkdirSync(cache, { recursive: true });
     const png = join(cache, "real.png");
-    writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+    const pngCopy = join(cache, "same-pixels-different-path.png");
+    const pixelBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    writeFileSync(png, pixelBytes);
+    writeFileSync(pngCopy, pixelBytes);
     writeFileSync(join(fakeModules, "tools", "__init__.py"), "");
     writeFileSync(
       join(fakeModules, "tools", "mcp_tool.py"),
-      `def _cache_mcp_image_block(block): return "MEDIA:${png}"\ndef _existing_tool_names(): return set()\n`,
+      "def _cache_mcp_image_block(block): return 'MEDIA:' + block\ndef _existing_tool_names(): return set()\n",
     );
     writeFileSync(join(fakeModules, "gateway", "__init__.py"), "");
     writeFileSync(join(fakeModules, "gateway", "platforms", "__init__.py"), "");
@@ -658,9 +663,9 @@ mcp_servers:
       [
         "import json",
         "def get_tool_definitions(*args, **kwargs): return []",
-        "def handle_function_call(*args, **kwargs):",
+        "def handle_function_call(name, args, **kwargs):",
         " from tools import mcp_tool",
-        " tag = mcp_tool._cache_mcp_image_block(object())",
+        " tag = mcp_tool._cache_mcp_image_block(args['path'])",
         " return json.dumps({'result': 'desktop state\\n' + tag, 'structuredContent': {'width': 1, 'height': 1}})",
         "",
       ].join("\n"),
@@ -678,17 +683,21 @@ mcp_servers:
     writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
     const script = [
       "import json, model_tools",
-      "result = model_tools.handle_function_call('mcp_computer_get_desktop_state', {})",
+      `paths = ${JSON.stringify([png, pngCopy])}`,
+      "results = [model_tools.handle_function_call('mcp_computer_get_desktop_state', {'path': path}) for path in paths]",
       "from run_agent import AIAgent",
-      "result = AIAgent()._append_guardrail_observation('mcp_computer_get_desktop_state', {}, result, failed=False)",
-      "print(json.dumps(result))",
+      "agent = AIAgent()",
+      "results = [agent._append_guardrail_observation('mcp_computer_get_desktop_state', {}, result, failed=False) for result in results]",
+      "print(json.dumps(results))",
     ].join("\n");
     const executed = spawnSync("python3", ["-c", script], {
       env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
       encoding: "utf8",
     });
     expect(executed.status, executed.stderr).toBe(0);
-    const result = JSON.parse(executed.stdout.trim());
+    const results = JSON.parse(executed.stdout.trim());
+    expect(results).toHaveLength(2);
+    const [result, copyResult] = results;
     expect(result._multimodal).toBe(true);
     expect(result.content[0]).toMatchObject({ type: "text" });
     expect(result.content[0].text).toContain("[guarded]");
@@ -696,7 +705,133 @@ mcp_servers:
     expect(result.content[1].type).toBe("image_url");
     expect(result.content[1].image_url.url).toMatch(/^data:image\/png;base64,/);
     expect(result.text_summary).toContain("[guarded]");
+    expect(result.text_summary).not.toContain(png);
+    expect(copyResult.text_summary).not.toContain(pngCopy);
+    expect(result.text_summary).toMatch(/\[screen attached sha256=[a-f0-9]{64}\]/);
+    expect(copyResult.text_summary).toBe(result.text_summary);
+    expect(proof.requiresComputerHooks).toBe(true);
+    expect(JSON.parse(readFileSync(proof.path, "utf8"))).toMatchObject({
+      version: HERMES_POLICY_VERSION,
+      image_cache_hook: true,
+      guardrail_hook: true,
+    });
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
+  });
+
+  it.runIf(process.platform !== "win32")("bounds visual-only loops and identical computer mutations", () => {
+    const root = scratch();
+    const source = join(root, "source");
+    const runtime = join(root, "runtime");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(runtime, { recursive: true });
+    const env: Record<string, string | undefined> = {};
+    const proof = prepareHermesPolicyEnvironment({
+      env,
+      sourceHome: source,
+      dataDir: runtime,
+      isolationKey: "guardrail-bounds",
+      restricted: true,
+      computerMounted: false,
+    })!;
+    const fakeModules = join(root, "fake-modules");
+    mkdirSync(join(fakeModules, "agent"), { recursive: true });
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    writeFileSync(join(fakeModules, "agent", "__init__.py"), "");
+    writeFileSync(
+      join(fakeModules, "agent", "tool_guardrails.py"),
+      [
+        "class ToolGuardrailDecision:",
+        " def __init__(self, action='allow', code=None, message=None, tool_name=None, count=0, signature=None):",
+        "  self.action, self.code, self.message = action, code, message",
+        "  self.tool_name, self.count, self.signature = tool_name, count, signature",
+        " @property",
+        " def should_halt(self): return self.action == 'halt'",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(fakeModules, "run_agent.py"),
+      [
+        "from agent.tool_guardrails import ToolGuardrailDecision",
+        "class Guard:",
+        " def reset_for_turn(self): return None",
+        " def _is_idempotent(self, name): return False",
+        " def after_call(self, name, args, result, **kwargs): return ToolGuardrailDecision()",
+        "class AIAgent:",
+        " def __init__(self, *args, **kwargs): self.tools = []; self._tool_guardrails = Guard()",
+        " def _append_guardrail_observation(self, name, args, result, *, failed): return result",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(fakeModules, "model_tools.py"), "def get_tool_definitions(*args, **kwargs): return []\ndef handle_function_call(*args, **kwargs): return None\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const script = [
+      "import json",
+      "from run_agent import AIAgent",
+      "guard = AIAgent()._tool_guardrails",
+      "visual = [guard.after_call('mcp_computer_get_desktop_state', {}, 'frame-' + str(i), failed=False).action for i in range(5)]",
+      "guard.reset_for_turn()",
+      "before_action = [guard.after_call('mcp_computer_zoom', {}, 'zoom-' + str(i), failed=False).action for i in range(4)]",
+      "guard.after_call('mcp_computer_click', {'x': 1, 'y': 2}, 'clicked', failed=False)",
+      "after_action = guard.after_call('mcp_computer_zoom', {}, 'new-frame', failed=False).action",
+      "guard.reset_for_turn()",
+      "mutations = [guard.after_call('mcp_computer_type_text', {'text': 'same'}, 'changed-' + str(i), failed=False).action for i in range(3)]",
+      "guard.reset_for_turn()",
+      "alternating = []",
+      "for i in range(3):",
+      " alternating.append(guard.after_call('mcp_computer_type_text', {'text': 'terminal-command'}, 'typed-' + str(i), failed=False).action)",
+      " alternating.append(guard.after_call('mcp_computer_press_key', {'key': 'ENTER'}, 'pressed-' + str(i), failed=False).action)",
+      " alternating.append(guard.after_call('mcp_computer_get_desktop_state', {}, 'screen-' + str(i), failed=False).action)",
+      "print(json.dumps({'visual': visual, 'before_action': before_action, 'after_action': after_action, 'mutations': mutations, 'alternating': alternating}))",
+    ].join("\n");
+    const executed = spawnSync("python3", ["-c", script], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status, executed.stderr).toBe(0);
+    expect(JSON.parse(executed.stdout.trim())).toEqual({
+      visual: ["allow", "allow", "warn", "warn", "halt"],
+      before_action: ["allow", "allow", "warn", "warn"],
+      after_action: "allow",
+      mutations: ["allow", "warn", "halt"],
+      alternating: [
+        "allow", "allow", "allow",
+        "warn", "allow", "allow",
+        "halt", "warn", "allow",
+      ],
+    });
+    expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
+  });
+
+  it.runIf(process.platform !== "win32")("fails closed when a mounted computer lacks required Hermes hooks", () => {
+    const root = scratch();
+    const source = join(root, "source");
+    const runtime = join(root, "runtime");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(runtime, { recursive: true });
+    const env: Record<string, string | undefined> = {};
+    const proof = prepareHermesPolicyEnvironment({
+      env,
+      sourceHome: source,
+      dataDir: runtime,
+      isolationKey: "missing-computer-hooks",
+      restricted: true,
+      computerMounted: true,
+    })!;
+    const fakeModules = join(root, "fake-modules");
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    writeFileSync(join(fakeModules, "model_tools.py"), "def get_tool_definitions(*args, **kwargs): return []\ndef handle_function_call(*args, **kwargs): return None\n");
+    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs): self.tools = []\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const executed = spawnSync("python3", ["-c", "pass"], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status).toBe(78);
+    expect(executed.stderr).toContain("requires both Hermes image-cache and guardrail hooks");
+    expect(() => verifyHermesPolicyProof(proof)).toThrow(/proof was invalid/);
   });
 
   it.runIf(process.platform !== "win32")("refuses arbitrary MEDIA paths that did not come from MCP ImageContent", () => {
@@ -804,7 +939,7 @@ mcp_servers:
   it("rejects a proof from any other process/turn nonce", () => {
     const root = scratch();
     const path = join(root, "proof.json");
-    writeFileSync(path, JSON.stringify({ version: 1, nonce: "wrong" }), { mode: 0o600 });
+    writeFileSync(path, JSON.stringify({ version: HERMES_POLICY_VERSION, nonce: "wrong" }), { mode: 0o600 });
     expect(() => verifyHermesPolicyProof({ path, nonce: "right", home: root })).toThrow(/proof was invalid/);
   });
 

@@ -24,7 +24,7 @@ import { dirname, join, posix, win32 } from "node:path";
 
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
-export const HERMES_POLICY_VERSION = 1;
+export const HERMES_POLICY_VERSION = 2;
 export const IAN_BRAIN_MCP_URL = "http://127.0.0.1:15050/mcp";
 
 export interface HermesIanBrainBroker {
@@ -68,6 +68,7 @@ const POLICY_FILENAME = "sitecustomize.py";
 export const HERMES_POLICY_PYTHON = String.raw`"""OpenMaus Hermes ACP containment. Installed and verified per turn."""
 import json
 import base64
+import hashlib
 import mimetypes
 import os
 import stat
@@ -113,6 +114,38 @@ _MCP_IMAGE_PROVENANCE_TTL_SECONDS = 60
 _MCP_IMAGE_PROVENANCE_LIMIT = 128
 _MCP_IMAGE_PROVENANCE = {}
 _MCP_IMAGE_PROVENANCE_LOCK = threading.Lock()
+_IMAGE_CACHE_HOOK_INSTALLED = False
+_GUARDRAIL_HOOK_INSTALLED = False
+
+_VISUAL_OBSERVATION_TOOLS = frozenset({
+    "mcp_computer_get_desktop_state",
+    "mcp_computer_screenshot",
+    "mcp_computer_zoom",
+})
+_MUTATING_COMPUTER_TOOLS = frozenset({
+    "mcp_computer_bring_to_front", "mcp_computer_browser_click",
+    "mcp_computer_browser_dialog", "mcp_computer_browser_navigate",
+    "mcp_computer_browser_set_input_files", "mcp_computer_browser_type",
+    "mcp_computer_click", "mcp_computer_clipboard_write",
+    "mcp_computer_double_click", "mcp_computer_drag",
+    "mcp_computer_end_session", "mcp_computer_hotkey",
+    "mcp_computer_invoke_menu", "mcp_computer_kill_app",
+    "mcp_computer_launch_app", "mcp_computer_mouse_button_down",
+    "mcp_computer_mouse_button_up", "mcp_computer_mouse_drag",
+    "mcp_computer_move_cursor", "mcp_computer_page",
+    "mcp_computer_parallel_mouse_drag", "mcp_computer_press_key",
+    "mcp_computer_replay_trajectory", "mcp_computer_right_click",
+    "mcp_computer_scroll", "mcp_computer_set_agent_cursor_location",
+    "mcp_computer_set_agent_cursor_visibility", "mcp_computer_set_config",
+    "mcp_computer_set_value", "mcp_computer_set_window_frame",
+    "mcp_computer_start_recording", "mcp_computer_start_session",
+    "mcp_computer_stop_recording", "mcp_computer_type_text",
+})
+_HIGH_RISK_REPEAT_TOOLS = frozenset({
+    "mcp_computer_browser_type",
+    "mcp_computer_set_value",
+    "mcp_computer_type_text",
+})
 
 
 def _remember_mcp_image_media_tag(media_tag):
@@ -158,7 +191,7 @@ def _image_mime_from_magic(data):
     return None
 
 
-def _validated_mcp_image_data_url(path):
+def _validated_mcp_image(path):
     """Load one provenance-bound cache image without following symlinks."""
     if not _consume_mcp_image_provenance(path):
         return None
@@ -193,7 +226,10 @@ def _validated_mcp_image_data_url(path):
         if extension_mime != magic_mime:
             return None
         encoded = base64.b64encode(data).decode("ascii")
-        return "data:" + magic_mime + ";base64," + encoded
+        return (
+            "data:" + magic_mime + ";base64," + encoded,
+            hashlib.sha256(data).hexdigest(),
+        )
     except (OSError, RuntimeError, ValueError):
         return None
 
@@ -211,18 +247,24 @@ def _promote_mcp_images_to_multimodal(result):
     with _MCP_IMAGE_PROVENANCE_LOCK:
         candidates = list(_MCP_IMAGE_PROVENANCE)
     image_parts = []
+    stable_result = result
     for path in candidates:
         if "MEDIA:" + path not in result:
             continue
-        data_url = _validated_mcp_image_data_url(path)
-        if data_url:
+        validated = _validated_mcp_image(path)
+        if validated:
+            data_url, pixel_hash = validated
             image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            stable_result = stable_result.replace(
+                "MEDIA:" + path,
+                "[screen attached sha256=" + pixel_hash + "]",
+            )
     if not image_parts:
         return result
     return {
         "_multimodal": True,
-        "content": [{"type": "text", "text": result}] + image_parts,
-        "text_summary": result,
+        "content": [{"type": "text", "text": stable_result}] + image_parts,
+        "text_summary": stable_result,
     }
 
 
@@ -264,6 +306,7 @@ def _filter_definitions(definitions):
 
 
 def _install():
+    global _IMAGE_CACHE_HOOK_INSTALLED, _GUARDRAIL_HOOK_INSTALLED
     # The reviewed Spark GLM chat template sometimes emits Qwen-style hidden
     # reasoning without the opening <think>, followed by </think> and the real
     # answer. Upstream Hermes deliberately removes only the orphan close tag,
@@ -345,6 +388,7 @@ def _install():
                 return _remember_mcp_image_media_tag(original_cache_mcp_image(block))
 
             mcp_tool_module._cache_mcp_image_block = openmaus_cache_mcp_image
+            _IMAGE_CACHE_HOOK_INSTALLED = True
 
     # Keep a compact everyday MCP rail visible while Hermes progressively
     # discloses the long tail. Pushing all 93 schemas at a 27B local model
@@ -386,6 +430,9 @@ def _install():
     # loaded before the tool catalog is filtered.
     import run_agent
     original_init = run_agent.AIAgent.__init__
+    _GUARDRAIL_HOOK_INSTALLED = callable(
+        getattr(run_agent.AIAgent, "_append_guardrail_observation", None)
+    )
 
     def guarded_agent_init(self, *args, **kwargs):
         if _RESTRICT_NATIVE:
@@ -517,10 +564,12 @@ def _install():
             original_reset_for_turn = guard.reset_for_turn
             guard._openmaus_search_calls = 0
             guard._openmaus_observation_calls = 0
+            guard._openmaus_mutating_signature_counts = {}
 
             def guarded_reset_for_turn():
                 guard._openmaus_search_calls = 0
                 guard._openmaus_observation_calls = 0
+                guard._openmaus_mutating_signature_counts = {}
                 return original_reset_for_turn()
 
             def guarded_after_call(name, call_args, call_result, **call_kwargs):
@@ -538,13 +587,72 @@ def _install():
                             tool_name=name,
                             count=guard._openmaus_search_calls,
                         )
-                if name in {
-                    "mcp_computer_get_desktop_state",
-                    "mcp_computer_get_window_state",
-                    "mcp_computer_list_windows",
-                    "mcp_computer_zoom",
-                }:
+                succeeded = call_kwargs.get("failed") is not True
+                if name in _MUTATING_COMPUTER_TOOLS and succeeded:
+                    # An action makes a fresh observation meaningful. It does
+                    # not, however, erase exact-action counts: a model cannot
+                    # evade the bound by alternating type, Enter, and screen
+                    # observations. Keep the per-turn map explicitly bounded.
+                    guard._openmaus_observation_calls = 0
+                    try:
+                        signature_args = json.dumps(
+                            call_args or {}, sort_keys=True,
+                            separators=(",", ":"), default=str,
+                        )
+                    except Exception:
+                        signature_args = repr(call_args)
+                    signature = name + ":" + signature_args
+                    counts = guard._openmaus_mutating_signature_counts
+                    if signature not in counts and len(counts) >= 128:
+                        counts.pop(next(iter(counts)))
+                    repeat_count = counts.get(signature, 0) + 1
+                    counts[signature] = repeat_count
+                    warn_after = 2 if name in _HIGH_RISK_REPEAT_TOOLS else 3
+                    halt_after = 3 if name in _HIGH_RISK_REPEAT_TOOLS else 5
+                    if repeat_count >= halt_after and not decision.should_halt:
+                        return ToolGuardrailDecision(
+                            action="halt",
+                            code="openmaus_mutating_repeat_halt",
+                            message=(
+                                "Stopped an identical computer mutation repeated too many "
+                                "times this turn. "
+                                "Do not type, click, or invoke the exact same action again; "
+                                "verify the current screen or finish the task."
+                            ),
+                            tool_name=name,
+                            count=repeat_count,
+                            signature=signature,
+                        )
+                    if repeat_count >= warn_after and not decision.should_halt:
+                        return ToolGuardrailDecision(
+                            action="warn",
+                            code="openmaus_mutating_repeat_warning",
+                            message=(
+                                "This exact computer mutation has already been repeated. "
+                                "Inspect the result and choose a different action instead of "
+                                "typing or clicking the same thing again."
+                            ),
+                            tool_name=name,
+                            count=repeat_count,
+                            signature=signature,
+                        )
+                if name in _VISUAL_OBSERVATION_TOOLS:
                     guard._openmaus_observation_calls += 1
+                    if (
+                        guard._openmaus_observation_calls >= 5
+                        and not decision.should_halt
+                    ):
+                        return ToolGuardrailDecision(
+                            action="halt",
+                            code="openmaus_observation_budget_halt",
+                            message=(
+                                "Stopped five consecutive visual observations without a "
+                                "computer action. Use the newest attached pixels to act or "
+                                "finish; another screenshot will not advance the task."
+                            ),
+                            tool_name=name,
+                            count=guard._openmaus_observation_calls,
+                        )
                     if (
                         guard._openmaus_observation_calls >= 3
                         and not decision.should_halt
@@ -670,6 +778,15 @@ def _install():
     nonce = os.environ.get("OPENMAUSBOT_HERMES_POLICY_NONCE", "")
     if not proof or not nonce:
         raise RuntimeError("OpenMaus Hermes policy proof variables are missing")
+    require_computer_hooks = (
+        os.environ.get("OPENMAUSBOT_HERMES_REQUIRE_COMPUTER_HOOKS") == "1"
+    )
+    if require_computer_hooks and not (
+        _IMAGE_CACHE_HOOK_INSTALLED and _GUARDRAIL_HOOK_INSTALLED
+    ):
+        raise RuntimeError(
+            "OpenMaus computer route requires both Hermes image-cache and guardrail hooks"
+        )
     # The harness pre-creates this exact regular file. In cross-UID mode the
     # surrounding policy directory is server-owned and not provider-writable,
     # so creating a sibling temporary and replacing it would (correctly) fail.
@@ -678,11 +795,13 @@ def _install():
     fd = os.open(proof, flags)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         json.dump({
-            "version": 1,
+            "version": 2,
             "nonce": nonce,
             "pid": os.getpid(),
             "restrict_native": _RESTRICT_NATIVE,
             "allowed_native": sorted(_ALLOWED_NATIVE),
+            "image_cache_hook": _IMAGE_CACHE_HOOK_INSTALLED,
+            "guardrail_hook": _GUARDRAIL_HOOK_INSTALLED,
         }, stream)
         stream.flush()
         os.fsync(stream.fileno())
@@ -948,6 +1067,7 @@ export interface HermesPolicyProof {
   nonce: string;
   home: string;
   policyDir?: string;
+  requiresComputerHooks?: boolean;
 }
 
 export interface ManagedHermesPythonTarget {
@@ -1134,6 +1254,8 @@ export function prepareHermesPolicyEnvironment(input: {
   input.env.OPENMAUSBOT_HERMES_RESTRICT_NATIVE = input.restricted ? "1" : "0";
   input.env.OPENMAUSBOT_HERMES_POLICY_NONCE = nonce;
   input.env.OPENMAUSBOT_HERMES_POLICY_PROOF = proofPath;
+  const requiresComputerHooks = input.computerMounted === true;
+  input.env.OPENMAUSBOT_HERMES_REQUIRE_COMPUTER_HOOKS = requiresComputerHooks ? "1" : "0";
   if (input.sharedAcrossUid) input.env.OPENMAUSBOT_HERMES_POLICY_SHARED = "1";
   else delete input.env.OPENMAUSBOT_HERMES_POLICY_SHARED;
   const requiresIanBrain = Boolean(object(object(parseYaml(config))?.mcp_servers)?.ian_brain);
@@ -1151,7 +1273,7 @@ export function prepareHermesPolicyEnvironment(input: {
   delete input.env.PYTHONHOME;
   delete input.env.PYTHONSTARTUP;
 
-  return { path: proofPath, nonce, home, policyDir };
+  return { path: proofPath, nonce, home, policyDir, requiresComputerHooks };
 }
 
 /** The prompt is never sent unless the exact child process proved policy load. */
@@ -1165,8 +1287,17 @@ export function verifyHermesPolicyProof(proof: HermesPolicyProof): void {
     throw new Error("Hermes containment policy did not load; refusing to send the prompt");
   }
   try {
-    const parsed = JSON.parse(raw) as { version?: unknown; nonce?: unknown };
+    const parsed = JSON.parse(raw) as {
+      version?: unknown;
+      nonce?: unknown;
+      image_cache_hook?: unknown;
+      guardrail_hook?: unknown;
+    };
     if (parsed.version !== HERMES_POLICY_VERSION || parsed.nonce !== proof.nonce) throw new Error("mismatch");
+    if (
+      proof.requiresComputerHooks
+      && (parsed.image_cache_hook !== true || parsed.guardrail_hook !== true)
+    ) throw new Error("computer hook mismatch");
   } catch {
     throw new Error("Hermes containment policy proof was invalid; refusing to send the prompt");
   } finally {
