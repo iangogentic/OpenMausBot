@@ -1,4 +1,5 @@
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -433,7 +434,18 @@ mcp_servers:
     expect(statSync(proof.path).mode & 0o777).toBe(0o600);
     expect(dirname(proof.path)).not.toBe(env.PYTHONPATH);
     expect(statSync(dirname(proof.path)).mode & 0o777).toBe(0o710);
-    writeFileSync(proof.path, JSON.stringify({ version: 1, nonce: proof.nonce }));
+    const fakeModules = join(root, "fake-modules");
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    writeFileSync(join(fakeModules, "model_tools.py"), "def get_tool_definitions(*args, **kwargs): return []\ndef handle_function_call(*args, **kwargs): return None\n");
+    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs):\n  self.tools = []\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const executed = spawnSync("python3", ["-c", "pass"], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status, executed.stderr).toBe(0);
+    expect(statSync(proof.path).mode & 0o777).toBe(0o640);
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });
 

@@ -234,6 +234,8 @@ def _install():
             "restrict_native": _RESTRICT_NATIVE,
             "allowed_native": sorted(_ALLOWED_NATIVE),
         }, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
     # The privileged cross-UID launcher temporarily owns this exact proof
     # leaf while Hermes is alive. Restore group readability only on
     # the nonce-bound proof after writing it so the server can verify the
@@ -241,8 +243,6 @@ def _install():
     # mode 0600 and the directory remains non-listable to the runtime group.
     if os.environ.get("OPENMAUSBOT_HERMES_POLICY_SHARED") == "1":
         os.chmod(proof, 0o640)
-        stream.flush()
-        os.fsync(stream.fileno())
 
 
 if _ACTIVE:
