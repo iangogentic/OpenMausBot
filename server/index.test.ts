@@ -2558,6 +2558,29 @@ describe("harness HTTP API", () => {
     await api("PATCH", "/api/config", { features: { skillRecorder: false } });
   });
 
+  it("round-trips the fleet permission policy without exposing a writable admin ceiling", async () => {
+    const before = await api("GET", "/api/config");
+    expect(before.body.permissions).toMatchObject({
+      requested: "ask",
+      effective: "ask",
+      adminCeiling: "always",
+      limitedByAdmin: false,
+    });
+
+    const saved = await api("PATCH", "/api/config", { permissions: { policy: "always" } });
+    expect(saved.status).toBe(200);
+    expect(saved.body.permissions).toMatchObject({ requested: "always", effective: "always" });
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.permissions).toEqual({ policy: "always" });
+    expect(disk.permissions).not.toHaveProperty("adminCeiling");
+
+    const smuggled = await api("PATCH", "/api/config", {
+      permissions: { policy: "always", adminCeiling: "always" },
+    });
+    expect(smuggled.status).toBe(400);
+    await api("PATCH", "/api/config", { permissions: { policy: "ask" } });
+  });
+
   it("isolates Local VMs per bot by default and retains an explicit shared option", async () => {
     const first = (await api("POST", "/api/bots")).body.bot;
     const second = (await api("POST", "/api/bots")).body.bot;

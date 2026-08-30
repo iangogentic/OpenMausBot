@@ -3,7 +3,7 @@
 // is the stuff shared by every bot: who you are, your keys, and the
 // machine your bots can borrow.
 import { useEffect, useRef, useState } from "react";
-import { Coins, KeyRound, Monitor, Search, Smartphone, Terminal, User, X } from "lucide-react";
+import { Coins, KeyRound, Monitor, Search, ShieldCheck, Smartphone, Terminal, User, X } from "lucide-react";
 import { api, useStore, type AppSettingsSection, type ConfigStatus } from "@/state/store";
 import { analyticsAvailable, analyticsEnabled, setAnalyticsEnabled } from "@/lib/analytics";
 import { skillRecorderEnabled } from "@/lib/feature-flags";
@@ -30,6 +30,7 @@ const SECTIONS: Array<{
   { id: "engines", label: "Engines", icon: Terminal, keywords: ["models", "claude", "grok", "providers", "cli"] },
   { id: "companion", label: "Phone", icon: Smartphone, keywords: ["companion", "phone", "pair", "mobile"] },
   { id: "computer", label: "Local VM", icon: Monitor, keywords: ["vm", "virtual", "desktop"] },
+  { id: "security", label: "Security", icon: ShieldCheck, keywords: ["permissions", "always", "ask", "never", "approval"] },
   { id: "usage", label: "Usage", icon: Coins, keywords: ["tokens", "cost", "billing"] },
 ];
 
@@ -189,6 +190,63 @@ function ExperimentalFeaturesRow() {
           <span className={cnKnob(enabled)} />
         </button>
       </div>
+      {error ? <p role="alert" className="mt-2 text-[12px] text-danger">{error}</p> : null}
+    </Card>
+  );
+}
+
+function PermissionPolicySettings() {
+  const { state, dispatch } = useStore();
+  const status = state.config?.permissions;
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const choices = [
+    { id: "never" as const, label: "Never", copy: "Deny tool permission requests automatically." },
+    { id: "ask" as const, label: "Ask", copy: "Require a fresh decision for every tool permission." },
+    { id: "always" as const, label: "Always", copy: "Auto-approve routine tools, while guarded actions still stop and ask." },
+  ];
+  const select = async (policy: "never" | "ask" | "always") => {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const config: ConfigStatus = await api("/api/config", {
+        method: "PATCH",
+        body: JSON.stringify({ permissions: { policy } }),
+      });
+      dispatch({ type: "configStatus", config });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save the permission policy.");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Card
+      title="Tool permissions"
+      subtitle="This fleet-wide policy is enforced on the Razer server. Destructive, sensitive, unattended, and physical-computer actions are never silently widened by Always."
+    >
+      <div className="grid gap-2 sm:grid-cols-3">
+        {choices.map((choice) => (
+          <button
+            key={choice.id}
+            type="button"
+            disabled={saving || !status}
+            aria-pressed={status?.requested === choice.id}
+            onClick={() => void select(choice.id)}
+            className={cn(
+              "rounded-xl border p-3 text-left transition-colors disabled:cursor-wait disabled:opacity-50",
+              status?.requested === choice.id ? "border-accent bg-accent/10" : "border-hairline/40 bg-inset hover:bg-control",
+            )}
+          >
+            <span className="block text-[13px] font-semibold text-ink">{choice.label}</span>
+            <span className="mt-1 block text-[11px] leading-relaxed text-ink-secondary">{choice.copy}</span>
+          </button>
+        ))}
+      </div>
+      {status?.limitedByAdmin ? (
+        <p className="mt-2 text-[12px] text-warning">The deployment ceiling limits this to {status.effective}.</p>
+      ) : null}
       {error ? <p role="alert" className="mt-2 text-[12px] text-danger">{error}</p> : null}
     </Card>
   );
@@ -427,6 +485,8 @@ export function SettingsModal() {
             {section === "companion" && <CompanionSection profileEmail={state.config?.profile?.email} />}
 
             {section === "computer" && <LocalComputerSection />}
+
+            {section === "security" && <PermissionPolicySettings />}
 
             {section === "usage" && <UsageSection />}
           </div>

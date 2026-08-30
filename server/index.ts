@@ -20,6 +20,12 @@ import {
 
 import { approvalKey, autoVerdict } from "./auto-approve.ts";
 import {
+  parsePermissionPolicy,
+  permissionPolicyStatus,
+  resolvePermission,
+  resolvePermissionPolicy,
+} from "./permission-policy.ts";
+import {
   COMPUTER_OPERATOR_HOST_ID,
   COMPUTER_OPERATOR_MODEL_ID,
   canonicalComputerOperatorModel,
@@ -3180,11 +3186,30 @@ bus.subscribe((event: RuntimeEvent) => {
       const asker = bot ?? (speaker ? store.bot(speaker.botId) : undefined);
       const pendingInstanceId = event.providerInstanceId ?? asker?.modelSelection.instanceId ?? "";
       const unattended = permission && asker && event.requestId ? isUnattended(asker.id) : false;
+      const permissionState = currentPermissionPolicy();
       const verdict = permission && asker && event.requestId
-        ? autoVerdict(asker, event.tool, event.summary, { unattended, scope: event.approvalScope })
+        ? autoVerdict(
+            permissionState.effective === "always" ? { ...asker, autoApprove: true } : asker,
+            event.tool,
+            event.summary,
+            { unattended, scope: event.approvalScope },
+          )
         : null;
-      if (verdict?.approve && asker && event.requestId) {
-        const settled = verdict.approve;
+      const policyResolution = verdict
+        ? resolvePermission(permissionState, verdict, {
+            unattended,
+            physicalComputer: event.approvalScope === "local-computer",
+          })
+        : null;
+      if (
+        policyResolution &&
+        (policyResolution.decision === "auto" || policyResolution.decision === "deny") &&
+        asker && event.requestId
+      ) {
+        const automaticBehavior = policyResolution.decision === "auto" ? "allow" : "deny";
+        const settled = policyResolution.decision === "auto"
+          ? policyResolution.autoApproval
+          : "denied by the fleet permission policy";
         const instance = event.providerInstanceId
           ? registry.get(event.providerInstanceId)
           : registry.get(asker.modelSelection.instanceId);
@@ -3212,7 +3237,7 @@ bus.subscribe((event: RuntimeEvent) => {
             ) throw new Error("the ask is no longer owned by this turn");
             const outcome = await TURN_EXTERNAL_OPERATIONS.run(
               eventTurn,
-              () => instance.adapter.respondToRequest(event.threadId, requestId, { behavior: "allow" }),
+              () => instance.adapter.respondToRequest(event.threadId, requestId, { behavior: automaticBehavior }),
             );
             if (outcome === "unavailable") throw new Error("the ask is no longer open");
             const current = pendingProviderRequest(event.threadId, requestId);
@@ -3220,7 +3245,7 @@ bus.subscribe((event: RuntimeEvent) => {
             pushMessage({
               role: "bot",
               kind: "activity",
-              tool: { name: `${settled}: ${summary.slice(0, 120)}`, ok: true },
+              tool: { name: `${settled}: ${summary.slice(0, 120)}`, ok: automaticBehavior === "allow" },
             });
             // logged under the same discipline as the chip: only once the
             // provider has actually taken the answer, so the audit log
@@ -3232,17 +3257,29 @@ bus.subscribe((event: RuntimeEvent) => {
               botName: asker.name,
               tool,
               summary,
-              decision: "auto-approved",
-              source: verdict.source,
-              rule: verdict.rule,
+              decision: automaticBehavior === "allow" ? "auto-approved" : "policy-denied",
+              source: automaticBehavior === "allow" ? "policy-always" : "policy-never",
+              rule: verdict?.rule,
             });
           } catch {
             if (
               pendingProviderRequest(event.threadId, requestId) !== pending ||
               !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
             ) return;
-            // couldn't answer it for them — hand it back to the human
-            // rather than leaving the bot waiting on nobody
+            if (automaticBehavior === "deny") {
+              // Never must not degrade into an approval card. If the engine
+              // cannot receive the denial, stop its turn so the guarded
+              // request cannot remain live behind a misleading UI state.
+              void instance?.adapter.interruptTurn(event.threadId).catch(() => {});
+              pushMessage({
+                role: "bot",
+                kind: "activity",
+                tool: { name: "Permission denied; the provider could not acknowledge the denial, so the turn was stopped.", ok: false },
+              });
+              return;
+            }
+            // couldn't auto-approve it — hand it back to the human rather
+            // than leaving the bot waiting on nobody
             const card = pushMessage({
               role: "bot",
               kind: "options",
@@ -3267,7 +3304,7 @@ bus.subscribe((event: RuntimeEvent) => {
               summary,
               decision: "card-shown",
               source: "auto-fallback",
-              rule: verdict.rule,
+              rule: verdict?.rule,
             });
           }
         })();
@@ -3294,9 +3331,13 @@ bus.subscribe((event: RuntimeEvent) => {
             : undefined,
           // in auto mode a card can only mean the guard stopped it — say so
           held:
-            permission && asker?.autoApprove
-              ? "This looked destructive, so auto mode stopped to ask."
-              : undefined,
+            permission && permissionState.effective === "ask"
+              ? "Fleet policy requires a fresh decision."
+              : permission && permissionState.effective === "always"
+                ? "Always stopped because this action is guarded."
+                : permission && asker?.autoApprove
+                  ? "This looked destructive, so auto mode stopped to ask."
+                  : undefined,
           approvalScope: event.approvalScope,
         },
       });
@@ -3324,7 +3365,13 @@ bus.subscribe((event: RuntimeEvent) => {
         tool: event.tool,
         summary: event.summary,
         decision: "card-shown",
-        source: !permission ? "question" : verdict ? verdict.source : "no-grant",
+        source: !permission
+          ? "question"
+          : policyResolution?.reason === "policy-ask"
+            ? "policy-ask"
+            : verdict
+              ? verdict.source
+              : "no-grant",
         rule: verdict?.rule,
         unattended: unattended || undefined,
       });
@@ -5583,6 +5630,7 @@ async function perBotLocalVmCountForModeChange(): Promise<number | null> {
 }
 
 function configStatus() {
+  const permissionState = currentPermissionPolicy();
   return {
     xai: { configured: Boolean(cfg.xai?.key) },
     composio: {
@@ -5604,7 +5652,16 @@ function configStatus() {
       maxInstances: localVmMaxInstances(cfg),
     },
     features: { skillRecorder: skillRecorderEnabled(cfg) },
+    permissions: permissionPolicyStatus(permissionState),
   };
+}
+
+function currentPermissionPolicy() {
+  const rawCeiling = process.env.OPENMAUSBOT_PERMISSION_POLICY_CEILING;
+  const adminCeiling = rawCeiling === undefined
+    ? "always"
+    : parsePermissionPolicy(rawCeiling) ?? "never";
+  return resolvePermissionPolicy(cfg.permissions?.policy ?? "ask", adminCeiling);
 }
 
 /** Platform metadata travels with engine rows so a remote Mac controller
@@ -9741,7 +9798,8 @@ const server = createServer(async (req, res) => {
           key !== "vps" &&
           key !== "rooms" &&
           key !== "localVm" &&
-          key !== "features",
+          key !== "features" &&
+          key !== "permissions",
       );
       if (reloadKeys.length > 0) await reloadProviders();
       const status = configStatus();

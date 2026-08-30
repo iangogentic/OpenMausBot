@@ -272,11 +272,17 @@ export interface ConfigStatus {
   profile?: { name: string; email: string };
   /** Experimental features are opt-in and default off when absent. */
   features?: { skillRecorder: boolean };
+  permissions?: {
+    requested: "never" | "ask" | "always";
+    effective: "never" | "ask" | "always";
+    adminCeiling: "never" | "ask" | "always";
+    limitedByAdmin: boolean;
+  };
 }
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features"
+  "xai" | "composio" | "box" | "vps" | "rooms" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "features" | "permissions"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -292,6 +298,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     imageGen: frame.imageGen,
     profile: frame.profile,
     features: frame.features,
+    permissions: frame.permissions,
   };
 }
 
@@ -350,6 +357,7 @@ export type AppSettingsSection =
   | "engines"
   | "companion"
   | "computer"
+  | "security"
   | "usage";
 
 export interface AppState {

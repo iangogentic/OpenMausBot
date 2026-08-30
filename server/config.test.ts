@@ -94,6 +94,16 @@ describe("configuration boundaries", () => {
     );
   });
 
+  it("persists only the three exact fleet permission policies", () => {
+    for (const policy of ["never", "ask", "always"] as const) {
+      expect(parseConfigPatch({ permissions: { policy } })).toEqual({ permissions: { policy } });
+      expect(parseStoredConfig({ permissions: { policy } })).toEqual({ permissions: { policy } });
+    }
+    for (const policy of ["allow", "Always", "", null, 1]) {
+      expect(() => parseConfigPatch({ permissions: { policy } })).toThrow("permissions.policy");
+    }
+  });
+
   it.each([0, 1.5, 5, "2", null])("rejects an invalid per-bot VM limit: %j", (maxInstances) => {
     expect(() => parseConfigPatch({ localVm: { maxInstances } })).toThrow("localVm.maxInstances");
   });
