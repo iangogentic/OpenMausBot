@@ -28,6 +28,32 @@ export const LOCAL_VM_MAX_TOOL_CALLS = 2_048;
 export const LOCAL_VM_GENERATION_POLL_MS = 2_000;
 export const LOCAL_VM_MCP_RESPONSE_TIMEOUT_MS = 180_000;
 
+/** Cua Driver's low-level action tools report only metadata. Attach the
+ * resulting pixels in the broker so a vision model receives one atomic
+ * act-and-observe result instead of spending another inference on a separate
+ * get_desktop_state call. Read-only inspection tools already return their own
+ * state and must not trigger redundant captures. */
+export const LOCAL_VM_ACT_AND_OBSERVE_TOOLS = new Set([
+  "bring_to_front",
+  "browser_click",
+  "browser_fill",
+  "browser_navigate",
+  "click",
+  "double_click",
+  "drag",
+  "hotkey",
+  "launch_app",
+  "press_key",
+  "right_click",
+  "scroll",
+  "type_text",
+]);
+
+export interface LocalVmActionScreenshot {
+  readonly data: string;
+  readonly mimeType: "image/png" | "image/jpeg" | "image/webp";
+}
+
 export interface LocalVmMcpAuthority {
   readonly capabilityToken: string;
   readonly botId: string;
@@ -143,6 +169,9 @@ export function attachLocalVmMcpBroker(options: {
   endAction: (actionId: string) => boolean | Promise<boolean>;
   quarantine: () => void | Promise<void>;
   requestHelp: (reason: string) => Promise<{ text: string; isError?: boolean }>;
+  /** Trusted server-side capture performed while the action ticket remains
+   * held. Failures leave the original action result intact. */
+  captureAfterAction?: (toolName: string) => Promise<LocalVmActionScreenshot | null>;
   signal?: AbortSignal;
   spawnDriver?: (authority: LocalVmMcpAuthority) => DriverChild;
   terminateDriver?: (child: ChildProcess) => Promise<void>;
@@ -164,6 +193,7 @@ export function attachLocalVmMcpBroker(options: {
   let pendingDriverBytes = 0;
   const pendingDriver: Buffer[] = [];
   const pendingActions = new Map<string, string>();
+  const pendingActionTools = new Map<string, string>();
   const pendingToolsList = new Set<string>();
   const pendingPassthrough = new Set<string>();
   const responseTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -319,7 +349,7 @@ export function attachLocalVmMcpBroker(options: {
       if (!(await claimToolCall())) return { allowed: false, reason: "unavailable" };
       return options.beginAction();
     },
-    actionForwarded: (requestId, actionId) => {
+    actionForwarded: (requestId, actionId, toolName) => {
       if (closed) {
         void Promise.resolve(options.endAction(actionId)).then((ended) => {
           if (!ended) return quarantineSafely();
@@ -327,6 +357,7 @@ export function attachLocalVmMcpBroker(options: {
         return;
       }
       pendingActions.set(requestId, actionId);
+      pendingActionTools.set(requestId, toolName);
       armResponseDeadline(requestId);
     },
     actionAbandoned: async (actionId) => {
@@ -422,19 +453,50 @@ export function attachLocalVmMcpBroker(options: {
       const id = typeof frame?.id === "string" || typeof frame?.id === "number"
         ? `${typeof frame.id}:${String(frame.id)}`
         : null;
+      let responseLine = line;
       if (id && ("result" in (frame ?? {}) || "error" in (frame ?? {}))) {
         clearResponseDeadline(id);
         pendingPassthrough.delete(id);
         const actionId = pendingActions.get(id);
         if (actionId) {
+          const toolName = pendingActionTools.get(id) ?? "";
+          if (
+            !("error" in (frame ?? {})) &&
+            LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName) &&
+            options.captureAfterAction
+          ) {
+            try {
+              const screenshot = await options.captureAfterAction(toolName);
+              const result = frame?.result;
+              if (screenshot && result && typeof result === "object" && !Array.isArray(result)) {
+                const content = Array.isArray((result as Record<string, unknown>).content)
+                  ? [...((result as Record<string, unknown>).content as unknown[])]
+                  : [];
+                if (!content.some((item) => (
+                  item && typeof item === "object" && (item as Record<string, unknown>).type === "image"
+                ))) {
+                  content.push({ type: "image", data: screenshot.data, mimeType: screenshot.mimeType });
+                  responseLine = JSON.stringify({
+                    ...frame,
+                    result: { ...(result as Record<string, unknown>), content },
+                  });
+                }
+              }
+            } catch {
+              // The action already completed. Preserve its authoritative
+              // result and let the model request a fresh screenshot if the
+              // best-effort observation failed.
+            }
+          }
           if (!(await options.endAction(actionId))) {
             finish("Local VM control did not acknowledge the completed action", true);
             return;
           }
           pendingActions.delete(id);
+          pendingActionTools.delete(id);
         }
       }
-      const response = augmentToolsListResponse(line, pendingToolsList);
+      const response = augmentToolsListResponse(responseLine, pendingToolsList);
       if (id && ("result" in (frame ?? {}) || "error" in (frame ?? {}))) pendingToolsList.delete(id);
       emitBroker(response);
     });

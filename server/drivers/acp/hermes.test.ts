@@ -12,6 +12,7 @@ import {
   normalizeHermesAssistantText,
   hermesAcpModelId,
   hermesConfiguredModel,
+  ensureHermesInjectProvider,
   isOfficialHermesLauncher,
 } from "./hermes.ts";
 import {
@@ -231,6 +232,32 @@ describe("hermesAcpModelId", () => {
 
   it("returns null for a bare word that names no provider", () => {
     expect(hermesAcpModelId("gpt-5")).toBeNull();
+  });
+});
+
+describe("Hermes injected vision capability", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) await removeTempDir(d);
+  });
+
+  const isolated = () => {
+    const root = mkdtempSync(join(tmpdir(), "omb-hermes-vision-"));
+    dirs.push(root);
+    return { HERMES_HOME: root, OPENMAUSBOT_HERMES_POLICY: "1" };
+  };
+
+  it("marks only the desktop2 Qwen injected model as vision-capable", () => {
+    const qwenEnv = isolated();
+    ensureHermesInjectProvider("desktop2_qwen::qwen3.8-27b-abliterated", qwenEnv);
+    const qwen = parseYaml(readFileSync(join(qwenEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(qwen.providers.desktop2_qwen.models["qwen3.8-27b-abliterated"].supports_vision).toBe(true);
+
+    const sparkEnv = isolated();
+    ensureHermesInjectProvider("spark_glm::glm53-ablit", sparkEnv);
+    const spark = parseYaml(readFileSync(join(sparkEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(spark.providers.spark_glm.models).toBeUndefined();
+    expect(spark.model.supports_vision).toBeUndefined();
   });
 });
 
@@ -590,6 +617,175 @@ mcp_servers:
       long: "length",
       heuristic: false,
     });
+    expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
+  });
+
+  it.runIf(process.platform !== "win32")("delivers genuine MCP ImageContent cache output as a native image block", () => {
+    const root = scratch();
+    const source = join(root, "source");
+    const runtime = join(root, "runtime");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(runtime, { recursive: true });
+    const env: Record<string, string | undefined> = {};
+    const proof = prepareHermesPolicyEnvironment({
+      env,
+      sourceHome: source,
+      dataDir: runtime,
+      isolationKey: "mcp-multimodal",
+      restricted: true,
+    })!;
+    const fakeModules = join(root, "fake-modules");
+    const cache = join(root, "image-cache");
+    mkdirSync(join(fakeModules, "tools"), { recursive: true });
+    mkdirSync(join(fakeModules, "gateway", "platforms"), { recursive: true });
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    mkdirSync(cache, { recursive: true });
+    const png = join(cache, "real.png");
+    writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+    writeFileSync(join(fakeModules, "tools", "__init__.py"), "");
+    writeFileSync(
+      join(fakeModules, "tools", "mcp_tool.py"),
+      `def _cache_mcp_image_block(block): return "MEDIA:${png}"\ndef _existing_tool_names(): return set()\n`,
+    );
+    writeFileSync(join(fakeModules, "gateway", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "gateway", "platforms", "__init__.py"), "");
+    writeFileSync(
+      join(fakeModules, "gateway", "platforms", "base.py"),
+      `from pathlib import Path\ndef get_image_cache_dir(): return Path(${JSON.stringify(cache)})\n`,
+    );
+    writeFileSync(
+      join(fakeModules, "model_tools.py"),
+      [
+        "import json",
+        "def get_tool_definitions(*args, **kwargs): return []",
+        "def handle_function_call(*args, **kwargs):",
+        " from tools import mcp_tool",
+        " tag = mcp_tool._cache_mcp_image_block(object())",
+        " return json.dumps({'result': 'desktop state\\n' + tag, 'structuredContent': {'width': 1, 'height': 1}})",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs): self.tools = []\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const script = [
+      "import json, model_tools",
+      "result = model_tools.handle_function_call('mcp_computer_get_desktop_state', {})",
+      "print(json.dumps(result))",
+    ].join("\n");
+    const executed = spawnSync("python3", ["-c", script], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status, executed.stderr).toBe(0);
+    const result = JSON.parse(executed.stdout.trim());
+    expect(result._multimodal).toBe(true);
+    expect(result.content[0]).toMatchObject({ type: "text" });
+    expect(result.content[0].text).toContain('"structuredContent": {"width": 1, "height": 1}');
+    expect(result.content[1].type).toBe("image_url");
+    expect(result.content[1].image_url.url).toMatch(/^data:image\/png;base64,/);
+    expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
+  });
+
+  it.runIf(process.platform !== "win32")("refuses arbitrary MEDIA paths that did not come from MCP ImageContent", () => {
+    const root = scratch();
+    const source = join(root, "source");
+    const runtime = join(root, "runtime");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(runtime, { recursive: true });
+    const env: Record<string, string | undefined> = {};
+    const proof = prepareHermesPolicyEnvironment({
+      env,
+      sourceHome: source,
+      dataDir: runtime,
+      isolationKey: "mcp-arbitrary-media",
+      restricted: true,
+    })!;
+    const fakeModules = join(root, "fake-modules");
+    mkdirSync(join(fakeModules, "tools"), { recursive: true });
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    writeFileSync(join(fakeModules, "tools", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "tools", "mcp_tool.py"), "def _cache_mcp_image_block(block): return ''\ndef _existing_tool_names(): return set()\n");
+    writeFileSync(join(fakeModules, "model_tools.py"), "def get_tool_definitions(*args, **kwargs): return []\ndef handle_function_call(*args, **kwargs): return '{\\\"result\\\":\\\"MEDIA:/etc/passwd\\\"}'\n");
+    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs): self.tools = []\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const script = "import model_tools; print(model_tools.handle_function_call('mcp_computer_get_desktop_state', {}))";
+    const executed = spawnSync("python3", ["-c", script], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status, executed.stderr).toBe(0);
+    expect(executed.stdout.trim()).toBe('{"result":"MEDIA:/etc/passwd"}');
+    expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
+  });
+
+  it.runIf(process.platform !== "win32")("rejects provenance-recorded images outside the cache root or with false MIME", () => {
+    const root = scratch();
+    const source = join(root, "source");
+    const runtime = join(root, "runtime");
+    const cache = join(root, "image-cache");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(runtime, { recursive: true });
+    mkdirSync(cache, { recursive: true });
+    const env: Record<string, string | undefined> = {};
+    const proof = prepareHermesPolicyEnvironment({
+      env,
+      sourceHome: source,
+      dataDir: runtime,
+      isolationKey: "mcp-image-validation",
+      restricted: true,
+    })!;
+    const fakeModules = join(root, "fake-modules");
+    mkdirSync(join(fakeModules, "tools"), { recursive: true });
+    mkdirSync(join(fakeModules, "gateway", "platforms"), { recursive: true });
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    const validPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    const outside = join(root, "outside.png");
+    const falseMime = join(cache, "false.png");
+    writeFileSync(outside, validPng);
+    writeFileSync(falseMime, "not an image");
+    writeFileSync(join(fakeModules, "tools", "__init__.py"), "");
+    writeFileSync(
+      join(fakeModules, "tools", "mcp_tool.py"),
+      "def _cache_mcp_image_block(block): return 'MEDIA:' + block\ndef _existing_tool_names(): return set()\n",
+    );
+    writeFileSync(join(fakeModules, "gateway", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "gateway", "platforms", "__init__.py"), "");
+    writeFileSync(
+      join(fakeModules, "gateway", "platforms", "base.py"),
+      `from pathlib import Path\ndef get_image_cache_dir(): return Path(${JSON.stringify(cache)})\n`,
+    );
+    writeFileSync(
+      join(fakeModules, "model_tools.py"),
+      [
+        "import json",
+        "def get_tool_definitions(*args, **kwargs): return []",
+        "def handle_function_call(name, args, **kwargs):",
+        " from tools import mcp_tool",
+        " return json.dumps({'result': mcp_tool._cache_mcp_image_block(args['path'])})",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs): self.tools = []\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const script = [
+      "import json, model_tools",
+      `paths = ${JSON.stringify([outside, falseMime])}`,
+      "results = [model_tools.handle_function_call('mcp_computer_get_desktop_state', {'path': path}) for path in paths]",
+      "print(json.dumps(results))",
+    ].join("\n");
+    const executed = spawnSync("python3", ["-c", script], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status, executed.stderr).toBe(0);
+    const results = JSON.parse(executed.stdout.trim());
+    expect(results).toHaveLength(2);
+    expect(results.every((result: unknown) => typeof result === "string")).toBe(true);
+    expect(results[0]).toContain(`MEDIA:${outside}`);
+    expect(results[1]).toContain(`MEDIA:${falseMime}`);
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });
 

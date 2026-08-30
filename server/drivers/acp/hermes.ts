@@ -117,6 +117,34 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
     // native `length` reason and Hermes' bounded continuation path.
     ...(hostId === "spark_glm" ? { max_tokens: 4_096 } : {}),
   };
+  // The desktop2 Qwen endpoint accepts OpenAI-compatible image content in
+  // tool messages. Hermes cannot infer that capability for a private model
+  // absent from models.dev, and otherwise replaces every screenshot with a
+  // text-only fallback. Scope the declaration to this exact injected route;
+  // Spark GLM remains deliberately text-only.
+  if (hostId === "desktop2_qwen") {
+    const providers = config.providers && typeof config.providers === "object" && !Array.isArray(config.providers)
+      ? { ...(config.providers as Record<string, unknown>) }
+      : {};
+    const existingProvider = providers[hostId];
+    const provider = existingProvider && typeof existingProvider === "object" && !Array.isArray(existingProvider)
+      ? { ...(existingProvider as Record<string, unknown>) }
+      : {};
+    const existingModels = provider.models;
+    const models = existingModels && typeof existingModels === "object" && !Array.isArray(existingModels)
+      ? { ...(existingModels as Record<string, unknown>) }
+      : {};
+    const existingModel = models[model];
+    models[model] = {
+      ...(existingModel && typeof existingModel === "object" && !Array.isArray(existingModel)
+        ? existingModel as Record<string, unknown>
+        : {}),
+      supports_vision: true,
+    };
+    provider.models = models;
+    providers[hostId] = provider;
+    config.providers = providers;
+  }
   return stringifyYaml(config);
 }
 

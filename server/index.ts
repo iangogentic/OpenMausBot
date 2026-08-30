@@ -9737,6 +9737,16 @@ server.on("upgrade", (req, socket, head) => {
               text: "Computer control authority is unavailable, so nobody can be paged safely right now.",
               isError: true,
             }),
+        captureAfterAction: async () => {
+          if (!stillAuthorized()) return null;
+          const image = await containerComputerScreenshot(undefined, undefined, target);
+          const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(image);
+          if (!match) return null;
+          return {
+            mimeType: match[1] as "image/png" | "image/jpeg" | "image/webp",
+            data: match[2]!,
+          };
+        },
       });
       const connections = LOCAL_VM_MCP_CONNECTIONS.get(capability.token) ?? new Set();
       connections.add(broker);

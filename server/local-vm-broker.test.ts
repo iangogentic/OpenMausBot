@@ -162,6 +162,53 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     expect(await processGone(pid)).toBe(true);
   });
 
+  it("returns the resulting screen with a visual action in one act-observe response", async () => {
+    const socket = new FakeSocket();
+    const captureAfterAction = vi.fn(async (toolName: string) => {
+      expect(toolName).toBe("click");
+      return { data: "aW1hZ2U=", mimeType: "image/png" as const };
+    });
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { captureAfterAction }));
+
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 81,
+      method: "tools/call",
+      params: { name: "click", arguments: { x: 10, y: 20 } },
+    }) + "\n");
+
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+    const response = JSON.parse(socket.sent.map((value) => value.toString()).join("").trim());
+    expect(response.result.content).toContainEqual({
+      type: "image",
+      data: "aW1hZ2U=",
+      mimeType: "image/png",
+    });
+    expect(captureAfterAction).toHaveBeenCalledOnce();
+
+    handle.close("act-observe test complete");
+    await handle.closed;
+  });
+
+  it("does not add redundant captures to read-only computer inspection", async () => {
+    const socket = new FakeSocket();
+    const captureAfterAction = vi.fn(async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { captureAfterAction }));
+
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 82,
+      method: "tools/call",
+      params: { name: "get_desktop_state", arguments: {} },
+    }) + "\n");
+
+    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+    expect(captureAfterAction).not.toHaveBeenCalled();
+
+    handle.close("read-only observation test complete");
+    await handle.closed;
+  });
+
   it("rejects a stale/replaced VM generation before a tool byte reaches Cua", async () => {
     const socket = new FakeSocket();
     let checks = 0;

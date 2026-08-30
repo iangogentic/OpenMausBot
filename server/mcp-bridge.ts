@@ -251,7 +251,7 @@ export function createGateInterceptor(options: {
   beginAction: () => Promise<ActionPermit>;
   forward: (line: string) => void;
   refuse: (line: string) => void;
-  actionForwarded?: (requestId: string, actionId: string) => void;
+  actionForwarded?: (requestId: string, actionId: string, toolName: string) => void;
   toolsListRequested?: (requestId: string) => void;
   /** Track any other request forwarded to the driver (for example
    * initialize), so its id cannot be reused by a tools/call before the first
@@ -369,7 +369,11 @@ export function createGateInterceptor(options: {
         return;
       }
       if (permit.allowed) {
-        options.actionForwarded?.(requestId, permit.actionId);
+        options.actionForwarded?.(
+          requestId,
+          permit.actionId,
+          typeof frame.params?.name === "string" ? frame.params.name : "",
+        );
         options.forward(line);
         return;
       }

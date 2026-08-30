@@ -67,8 +67,13 @@ const POLICY_FILENAME = "sitecustomize.py";
 // localhost/private URLs, which would become a host-network escape.
 export const HERMES_POLICY_PYTHON = String.raw`"""OpenMaus Hermes ACP containment. Installed and verified per turn."""
 import json
+import base64
+import mimetypes
 import os
+import stat
 import sys
+import threading
+import time
 import traceback
 
 _ACTIVE = os.environ.get("OPENMAUSBOT_HERMES_POLICY") == "1"
@@ -103,6 +108,122 @@ _DENIED_MCP_PREFIXES = (
     "mcp_ian_brain_creds_",
     "mcp_ian_brain_mcp_ian_brain_creds_",
 )
+_MCP_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+_MCP_IMAGE_PROVENANCE_TTL_SECONDS = 60
+_MCP_IMAGE_PROVENANCE_LIMIT = 128
+_MCP_IMAGE_PROVENANCE = {}
+_MCP_IMAGE_PROVENANCE_LOCK = threading.Lock()
+
+
+def _remember_mcp_image_media_tag(media_tag):
+    """Remember only paths emitted by Hermes' real MCP ImageContent cache."""
+    if not isinstance(media_tag, str) or not media_tag.startswith("MEDIA:"):
+        return media_tag
+    path = media_tag[len("MEDIA:"):].strip()
+    if not path:
+        return media_tag
+    now = time.monotonic()
+    with _MCP_IMAGE_PROVENANCE_LOCK:
+        expired = [
+            candidate for candidate, created in _MCP_IMAGE_PROVENANCE.items()
+            if now - created > _MCP_IMAGE_PROVENANCE_TTL_SECONDS
+        ]
+        for candidate in expired:
+            _MCP_IMAGE_PROVENANCE.pop(candidate, None)
+        while len(_MCP_IMAGE_PROVENANCE) >= _MCP_IMAGE_PROVENANCE_LIMIT:
+            oldest = min(_MCP_IMAGE_PROVENANCE, key=_MCP_IMAGE_PROVENANCE.get)
+            _MCP_IMAGE_PROVENANCE.pop(oldest, None)
+        _MCP_IMAGE_PROVENANCE[path] = now
+    return media_tag
+
+
+def _consume_mcp_image_provenance(path):
+    now = time.monotonic()
+    with _MCP_IMAGE_PROVENANCE_LOCK:
+        created = _MCP_IMAGE_PROVENANCE.pop(path, None)
+    return created is not None and now - created <= _MCP_IMAGE_PROVENANCE_TTL_SECONDS
+
+
+def _image_mime_from_magic(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"BM"):
+        return "image/bmp"
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _validated_mcp_image_data_url(path):
+    """Load one provenance-bound cache image without following symlinks."""
+    if not _consume_mcp_image_provenance(path):
+        return None
+    try:
+        from gateway.platforms.base import get_image_cache_dir
+        cache_root = os.path.realpath(str(get_image_cache_dir()))
+        candidate = os.path.realpath(path)
+        if os.path.commonpath((cache_root, candidate)) != cache_root:
+            return None
+        if os.path.islink(path):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            if info.st_size <= 0 or info.st_size > _MCP_IMAGE_MAX_BYTES:
+                return None
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                data = stream.read(_MCP_IMAGE_MAX_BYTES + 1)
+            if len(data) != info.st_size:
+                return None
+        finally:
+            os.close(fd)
+        magic_mime = _image_mime_from_magic(data)
+        extension_mime = mimetypes.guess_type(candidate)[0]
+        if magic_mime is None:
+            return None
+        if extension_mime == "image/jpg":
+            extension_mime = "image/jpeg"
+        if extension_mime != magic_mime:
+            return None
+        encoded = base64.b64encode(data).decode("ascii")
+        return "data:" + magic_mime + ";base64," + encoded
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _promote_mcp_images_to_multimodal(result):
+    """Turn trusted MCP cache tags into Hermes' native vision envelope."""
+    if not isinstance(result, str) or "MEDIA:" not in result:
+        return result
+    try:
+        parsed = json.loads(result)
+        if isinstance(parsed, dict) and "error" in parsed:
+            return result
+    except (TypeError, ValueError):
+        pass
+    with _MCP_IMAGE_PROVENANCE_LOCK:
+        candidates = list(_MCP_IMAGE_PROVENANCE)
+    image_parts = []
+    for path in candidates:
+        if "MEDIA:" + path not in result:
+            continue
+        data_url = _validated_mcp_image_data_url(path)
+        if data_url:
+            image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+    if not image_parts:
+        return result
+    return {
+        "_multimodal": True,
+        "content": [{"type": "text", "text": result}] + image_parts,
+        "text_summary": result,
+    }
 
 
 def _mcp_server_prefixes(server_name):
@@ -206,6 +327,25 @@ def _install():
 
     import model_tools
 
+    # Hermes currently flattens MCP ImageContent into a MEDIA:/cache/path
+    # string. That is suitable for chat attachment delivery but leaves the
+    # agent itself blind. Record the exact paths created by the upstream MCP
+    # image-cache helper, then promote only those paths at the common dispatch
+    # boundary. This also covers MCP handlers registered after startup and MCP
+    # calls reached through Tool Search, without trusting model/server supplied
+    # arbitrary MEDIA paths.
+    try:
+        from tools import mcp_tool as mcp_tool_module
+    except ImportError:
+        mcp_tool_module = None
+    if mcp_tool_module is not None:
+        original_cache_mcp_image = getattr(mcp_tool_module, "_cache_mcp_image_block", None)
+        if callable(original_cache_mcp_image):
+            def openmaus_cache_mcp_image(block):
+                return _remember_mcp_image_media_tag(original_cache_mcp_image(block))
+
+            mcp_tool_module._cache_mcp_image_block = openmaus_cache_mcp_image
+
     # Keep a compact everyday MCP rail visible while Hermes progressively
     # discloses the long tail. Pushing all 93 schemas at a 27B local model
     # caused valid function names to be confused; deferring every MCP tool
@@ -234,7 +374,9 @@ def _install():
             return json.dumps({
                 "error": "OpenMaus policy blocked a Hermes-native host tool; use the mounted MCP tools."
             })
-        return original_dispatch(function_name, *args, **kwargs)
+        return _promote_mcp_images_to_multimodal(
+            original_dispatch(function_name, *args, **kwargs)
+        )
 
     model_tools.get_tool_definitions = guarded_definitions
     model_tools.handle_function_call = guarded_dispatch
