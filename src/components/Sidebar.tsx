@@ -764,11 +764,18 @@ function BotListItem({
       }
     };
     const closeForViewportChange = () => setPreviewOpen(false);
+    const closeForEscape = (event: KeyboardEvent) => {
+      // Pointer hover does not move keyboard focus into the row, so the
+      // button's own handler cannot see Escape in the common mouse case.
+      if (event.key === "Escape") setPreviewOpen(false);
+    };
     document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", closeForEscape);
     window.addEventListener("resize", closeForViewportChange);
     window.addEventListener("scroll", closeForViewportChange, true);
     return () => {
       document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", closeForEscape);
       window.removeEventListener("resize", closeForViewportChange);
       window.removeEventListener("scroll", closeForViewportChange, true);
     };
