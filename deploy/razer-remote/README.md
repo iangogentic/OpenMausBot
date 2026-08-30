@@ -333,6 +333,9 @@ sudo install -o root -g root -m 0644 deploy/razer-remote/*.mount \
   /etc/systemd/system/
 sudo install -o root -g root -m 0644 deploy/razer-remote/openmaus-provider.slice \
   /etc/systemd/system/
+sudo install -o root -g root -m 0644 deploy/razer-remote/openmausbot.tmpfiles.conf \
+  /etc/tmpfiles.d/openmausbot.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/openmausbot.conf
 sudo systemctl daemon-reload
 sudo systemctl start openmaus-provider.slice openmaus-provider-network.service
 sudo /usr/local/libexec/openmaus-provider-slice-check --check

@@ -8,6 +8,8 @@ Requires=openmaus-provider-network.service
 After=openmaus-provider-network.service
 Requires=openmaus-provider.slice
 After=openmaus-provider.slice
+Requires=systemd-tmpfiles-setup.service
+After=systemd-tmpfiles-setup.service
 RequiresMountsFor=/var/lib/openmaus-provider/state /var/lib/openmausbot-workspaces /var/lib/openmausbot-vm-homes
 
 [Service]
@@ -21,10 +23,7 @@ UMask=0077
 WorkingDirectory=/var/lib/openmausbot
 StateDirectory=openmausbot
 StateDirectoryMode=0700
-# Both paths must exist before systemd constructs ReadWritePaths=. The
-# provider directory is tightened to its setgid runtime-group mode by the
-# root ExecStartPre immediately after namespace setup.
-RuntimeDirectory=openmausbot-private openmaus-provider
+RuntimeDirectory=openmausbot-private
 RuntimeDirectoryMode=0700
 ExecStartPre=+/usr/bin/install -d -o openmaus-server -g openmaus-runtime -m 2750 /run/openmaus-provider
 ExecStartPre=/usr/bin/test -x /usr/bin/bwrap
