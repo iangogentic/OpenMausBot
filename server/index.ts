@@ -27,6 +27,11 @@ import {
 } from "./permission-policy.ts";
 import { ProviderRequestSettlements } from "./provider-request-settlement.ts";
 import {
+  deliverProviderRequestWithDeadline,
+  timedOutRequestStillOwned,
+  type ProviderDeliveryResult,
+} from "./provider-request-delivery.ts";
+import {
   COMPUTER_OPERATOR_HOST_ID,
   COMPUTER_OPERATOR_MODEL_ID,
   canonicalComputerOperatorModel,
@@ -2450,26 +2455,16 @@ async function deliverProviderRequestResponse(
 ): Promise<{ outcome: RequestOutcome; timedOut: boolean }> {
   const instance = registry.get(pending.instanceId);
   if (!instance) return { outcome: "unavailable", timedOut: false };
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<{ outcome: RequestOutcome; timedOut: boolean }>((resolve) => {
-    timer = setTimeout(
-      () => resolve({ outcome: "unavailable", timedOut: true }),
-      PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS,
-    );
-    timer.unref?.();
-  });
-  const delivery = TURN_EXTERNAL_OPERATIONS.run(
-    pending.turn,
-    () => instance.adapter.respondToRequest(pending.threadId, pending.requestId, { behavior, message }),
-  ).then(
-    (outcome) => ({ outcome, timedOut: false }),
-    () => ({ outcome: "unavailable" as const, timedOut: false }),
-  );
-  try {
-    return await Promise.race([delivery, timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+  const result = await deliverProviderRequestWithDeadline(
+    () => TURN_EXTERNAL_OPERATIONS.run(
+      pending.turn,
+      () => instance.adapter.respondToRequest(pending.threadId, pending.requestId, { behavior, message }),
+    ),
+    PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS,
+  ).catch((): ProviderDeliveryResult<RequestOutcome> => ({ status: "returned", outcome: "unavailable" }));
+  return result.status === "timed-out"
+    ? { outcome: "unavailable", timedOut: true }
+    : { outcome: result.outcome, timedOut: false };
 }
 
 /** Deliver a person's answer to the engine that asked, and tell the truth
@@ -2536,6 +2531,7 @@ async function answerRequest(
     // old HTTP response must not write into it.
     const current = pendingProviderRequests.get(key);
     if (current && current !== pending) return "unavailable";
+    if (timedOut && current !== pending) return "unavailable";
     if (outcome !== "unavailable" && deliveredBehavior !== "answer") {
       appendDecision(DATA_DIR, {
         threadId,
@@ -2556,7 +2552,9 @@ async function answerRequest(
       if (pendingProviderRequests.get(key) === pending) pendingProviderRequests.delete(key);
       pendingProviderSettlements.delete(key, pending);
       settleUnavailable();
-      if (timedOut) void cancelExactTargetTurn(pending.turn).catch(() => {});
+      if (timedOutRequestStillOwned({ status: "timed-out" }, current === pending)) {
+        void cancelExactTargetTurn(pending.turn).catch(() => {});
+      }
     } else if (pendingProviderRequests.get(key) === pending) {
       // request.resolved normally arrives synchronously from the adapter, but
       // a lost provider event must not leave an accepted card actionable.
@@ -3420,9 +3418,6 @@ bus.subscribe((event: RuntimeEvent) => {
         (policyResolution.decision === "auto" || policyResolution.decision === "deny") &&
         asker && event.requestId
       ) {
-        const instance = event.providerInstanceId
-          ? registry.get(event.providerInstanceId)
-          : registry.get(asker.modelSelection.instanceId);
         const requestId = event.requestId;
         const { tool, summary } = event;
         const pending = installPendingProviderRequest({
@@ -3445,11 +3440,11 @@ bus.subscribe((event: RuntimeEvent) => {
           initialAutomaticBehavior,
           async () => {
             let automaticBehavior: "allow" | "deny" = initialAutomaticBehavior;
+            let deliveryTimedOut = false;
             let settled = policyResolution.decision === "auto"
               ? policyResolution.autoApproval
               : "denied by the fleet permission policy";
             try {
-              if (!instance) throw new Error("provider unavailable");
               if (
                 pendingProviderRequest(event.threadId, requestId) !== pending ||
                 !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
@@ -3466,13 +3461,18 @@ bus.subscribe((event: RuntimeEvent) => {
               settled = latestResolution.decision === "auto"
                 ? latestResolution.autoApproval
                 : "denied by the fleet permission policy";
-              const outcome = await TURN_EXTERNAL_OPERATIONS.run(
-                eventTurn,
-                () => instance.adapter.respondToRequest(event.threadId, requestId, { behavior: automaticBehavior }),
-              );
+              const delivered = await deliverProviderRequestResponse(pending, automaticBehavior);
+              deliveryTimedOut = delivered.timedOut;
+              const outcome = delivered.outcome;
               if (outcome === "unavailable") throw new Error("the ask is no longer open");
               const current = pendingProviderRequest(event.threadId, requestId);
               if (current && current !== pending) throw new Error("a newer ask reused this request id");
+              if (!INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)) return "unavailable";
+              if (current === pending) {
+                const key = providerRequestKey(event.threadId, requestId);
+                pendingProviderRequests.delete(key);
+                pendingProviderSettlements.delete(key, pending);
+              }
               pushMessage({
                 role: "bot",
                 kind: "activity",
@@ -3502,6 +3502,18 @@ bus.subscribe((event: RuntimeEvent) => {
                 pendingProviderRequest(event.threadId, requestId) !== pending ||
                 !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
               ) return "unavailable";
+              if (deliveryTimedOut) {
+                const key = providerRequestKey(event.threadId, requestId);
+                pendingProviderRequests.delete(key);
+                pendingProviderSettlements.delete(key, pending);
+                void cancelExactTargetTurn(eventTurn).catch(() => {});
+                pushMessage({
+                  role: "bot",
+                  kind: "activity",
+                  tool: { name: "The provider did not acknowledge the permission response, so exact-turn cancellation started.", ok: false },
+                });
+                return "unavailable";
+              }
               if (automaticBehavior === "deny") {
                 // Never must not degrade into an approval card. If the engine
                 // cannot receive the denial, stop its turn so the guarded

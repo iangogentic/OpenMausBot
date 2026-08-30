@@ -14,7 +14,7 @@ describe("fleet permission policy wiring", () => {
   it("runs every permission through the policy resolver before provider response", () => {
     expect(source).toContain("resolvePermission(permissionState, verdict");
     expect(source).toContain('const initialAutomaticBehavior: "allow" | "deny" = policyResolution.decision === "auto" ? "allow" : "deny"');
-    expect(source).toContain("respondToRequest(event.threadId, requestId, { behavior: automaticBehavior })");
+    expect(source).toContain("deliverProviderRequestResponse(pending, automaticBehavior)");
     expect(source).toContain('physicalComputer: event.approvalScope === "local-computer"');
   });
 
@@ -38,6 +38,9 @@ describe("fleet permission policy wiring", () => {
     expect(source).toContain("void cancelExactTargetTurn(pending.turn).catch(() => {})");
     expect(source).not.toMatch(/await settling\.promise[\s\S]{0,500}interruptTurn\(pending\.threadId\)/);
     expect(source).toContain("PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS");
+    expect(source).toContain("deliverProviderRequestResponse(pending, automaticBehavior)");
+    expect(source).toContain("if (timedOut && current !== pending) return \"unavailable\"");
+    expect(source).toContain("if (deliveryTimedOut)");
     expect(source).toContain("request.resolved normally arrives synchronously");
   });
 });
