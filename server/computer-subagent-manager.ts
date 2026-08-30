@@ -2,6 +2,9 @@ import { newId, type ModelSelection } from "./contracts.ts";
 
 /** The hard action ceiling for one computer-use child runtime. */
 export const MAX_COMPUTER_SUBAGENT_ACTIONS = 9;
+/** Recent released records are useful for diagnostics, but this always-on
+ * server must not retain one object for every computer delegation forever. */
+export const MAX_COMPUTER_SUBAGENT_HISTORY = 256;
 
 /** A parent identity is deliberately stronger than botId alone. A stale
  * completion from an older turn must never affect a newer turn of the same
@@ -314,6 +317,18 @@ export class ComputerSubagentManager {
     }
     record.leaseHeld = false;
     this.targetLeases.delete(record.targetKey);
+    this.pruneReleasedHistory();
+  }
+
+  private pruneReleasedHistory(): void {
+    let excess = this.records.size - MAX_COMPUTER_SUBAGENT_HISTORY;
+    if (excess <= 0) return;
+    for (const [childId, record] of this.records) {
+      if (excess <= 0) break;
+      if (record.leaseHeld || !COMPUTER_SUBAGENT_TERMINAL_STATUSES.has(record.status)) continue;
+      this.records.delete(childId);
+      excess -= 1;
+    }
   }
 
   private finish(handle: ComputerSubagentHandle, status: "completed" | "failed" | "unknown" | "aborted", error?: string): ComputerSubagentRecord {

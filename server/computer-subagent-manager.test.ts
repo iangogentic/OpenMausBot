@@ -7,6 +7,7 @@ import {
   ComputerSubagentStateError,
   ComputerSubagentTargetBusyError,
   MAX_COMPUTER_SUBAGENT_ACTIONS,
+  MAX_COMPUTER_SUBAGENT_HISTORY,
   type ComputerSubagentHandle,
   type ComputerSubagentParent,
 } from "./computer-subagent-manager.ts";
@@ -146,5 +147,30 @@ describe("ComputerSubagentManager", () => {
     manager.complete(handle);
     expect(manager.takeQueuedSteer(handle)).toBe("retry with keyboard navigation");
     manager.release(handle);
+  });
+
+  it("bounds released terminal history without pruning active or held records", () => {
+    const manager = new ComputerSubagentManager();
+    for (let index = 0; index < MAX_COMPUTER_SUBAGENT_HISTORY + 40; index += 1) {
+      const started = manager.start({
+        parent,
+        targetKey: `vm:${index}`,
+        targetGeneration: `generation-${index}`,
+        childId: `history-${index}`,
+      });
+      manager.markRunning(started.handle);
+      manager.complete(started.handle);
+      manager.release(started.handle);
+    }
+    const active = manager.start({
+      parent,
+      targetKey: "vm:active",
+      targetGeneration: "generation-active",
+      childId: "active-record",
+    });
+    expect(manager.list()).toHaveLength(MAX_COMPUTER_SUBAGENT_HISTORY + 1);
+    expect(manager.get("history-0")).toBeNull();
+    expect(manager.get(`history-${MAX_COMPUTER_SUBAGENT_HISTORY + 39}`)).not.toBeNull();
+    expect(manager.get(active.handle.childId)).toMatchObject({ status: "queued", leaseHeld: true });
   });
 });
