@@ -58,5 +58,29 @@ describe("downloadAttachment", () => {
   it("rejects declared and actual oversized responses", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([1]), { headers: { "content-length": String(DOCUMENT_MAX_BYTES + 1) } })));
     await expect(downloadAttachment("/safe/a.pdf")).rejects.toThrow(/25 MB/);
+
+    let cancelled = false;
+    const chunk = new Uint8Array(1024 * 1024);
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(chunk);
+      },
+      cancel() { cancelled = true; },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
+    await expect(downloadAttachment("/safe/streamed.pdf")).rejects.toThrow(/25 MB/);
+    expect(cancelled).toBe(true);
+  });
+
+  it("bounds oversized error responses instead of buffering them", async () => {
+    let cancelled = false;
+    const chunk = new Uint8Array(32 * 1024).fill(120);
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { controller.enqueue(chunk); },
+      cancel() { cancelled = true; },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 500 })));
+    await expect(downloadAttachment("/safe/error.pdf")).rejects.toThrow(/unavailable/);
+    expect(cancelled).toBe(true);
   });
 });

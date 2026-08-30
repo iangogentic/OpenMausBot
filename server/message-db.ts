@@ -315,9 +315,14 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     tool_name: string | null;
     from_name: string | null;
   }>;
-  return rows.map((row) => {
+  return rows.flatMap((row) => {
     const haystack = [visibleSearchText(row.text), row.tool_name, row.from_name].filter(Boolean).join("\n");
-    const hitAt = Math.max(0, haystack.toLowerCase().indexOf(needle));
+    const hitAt = haystack.toLowerCase().indexOf(needle);
+    // FTS5's trigram tokenizer treats punctuation as separators. A query that
+    // contains a private attachment directory can therefore match an indexed
+    // basename through one of its component tokens. Never return a row unless
+    // the exact user-visible query is present in the sanitized visible text.
+    if (hitAt < 0) return [];
     const start = Math.max(0, hitAt - 60);
     const end = Math.min(haystack.length, hitAt + needle.length + 90);
     const head = start > 0 ? "…" : "";
@@ -326,7 +331,7 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     // whitespace folding can shift the offset; find the match again inside
     const folded = needle.replace(/\s+/g, " ");
     const matchStart = snippet.toLowerCase().indexOf(folded);
-    return {
+    return [{
       threadId: row.thread_id,
       messageId: row.id,
       at: row.at,
@@ -337,7 +342,7 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
       // A defensive fallback must not mark arbitrary snippet text as the hit.
       matchLength: matchStart < 0 ? 0 : folded.length,
       ...(row.from_name ? { from: row.from_name } : {}),
-    };
+    }];
   });
 }
 

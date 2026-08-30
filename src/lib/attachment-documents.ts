@@ -10,6 +10,38 @@ export type DownloadedAttachment = {
   name: string;
 };
 
+const ATTACHMENT_ERROR_MAX_BYTES = 64 * 1024;
+
+async function readBoundedBody(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("This attachment response has no readable body.");
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("attachment response exceeded its bounded size").catch(() => {});
+        throw new Error(maxBytes === DOCUMENT_MAX_BYTES
+          ? "This attachment exceeds 25 MB."
+          : "This attachment error response was too large.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
 function decodeBase64UrlUtf8(value: string | null): string | null {
   if (!value || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
   try {
@@ -34,19 +66,24 @@ export async function downloadAttachment(path: string, signal?: AbortSignal): Pr
     signal,
   });
   if (!response.ok) {
-    // SAFETY: this is used only for an optional human-readable error; all
-    // missing or differently shaped JSON falls back to a constant message.
-    const detail = (await response.json().catch(() => null)) as { error?: string } | null;
+    const errorBytes = await readBoundedBody(response, ATTACHMENT_ERROR_MAX_BYTES).catch(() => new Uint8Array());
+    let detail: { error?: string } | null = null;
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(errorBytes)) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) detail = parsed as { error?: string };
+    } catch {}
     throw new Error(detail?.error || "This attachment is unavailable.");
   }
   const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > DOCUMENT_MAX_BYTES) throw new Error("This attachment exceeds 25 MB.");
-  const buffer = await response.arrayBuffer();
-  if (buffer.byteLength === 0) throw new Error("This attachment is empty.");
-  if (buffer.byteLength > DOCUMENT_MAX_BYTES) throw new Error("This attachment exceeds 25 MB.");
+  if (Number.isFinite(declared) && declared > DOCUMENT_MAX_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error("This attachment exceeds 25 MB.");
+  }
+  const bytes = await readBoundedBody(response, DOCUMENT_MAX_BYTES);
+  if (bytes.byteLength === 0) throw new Error("This attachment is empty.");
   const headerName = decodeBase64UrlUtf8(response.headers.get("x-openmausbot-file-name-b64"));
   const fallback = attachmentBasename(path);
-  return { bytes: new Uint8Array(buffer), name: safeAttachmentDisplayName(headerName || fallback) };
+  return { bytes, name: safeAttachmentDisplayName(headerName || fallback) };
 }
 
 export function validatePdf(bytes: Uint8Array): void {
