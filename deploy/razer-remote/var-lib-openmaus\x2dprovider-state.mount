@@ -1,6 +1,5 @@
 [Unit]
 Description=Bounded OpenMaus provider state
-After=local-fs.target
 Requires=openmaus-storage-preflight.service
 After=openmaus-storage-preflight.service
 Before=openmaus-storage-prepare.service
