@@ -164,17 +164,29 @@ export const COMPUTER_REQUEST_HELP_TOOL = {
 
 export const COMPUTER_BATCH_MAX_ACTIONS = 9;
 
+type ComputerBatchWindowTarget = {
+  pid?: number;
+  window_id?: number;
+  delivery_mode?: "background" | "foreground";
+};
+
 export type ComputerBatchAction =
-  | { name: "click"; arguments: { x: number; y: number; button?: "left" | "right"; count?: number } }
-  | { name: "type_text"; arguments: { text: string } }
-  | { name: "press_key"; arguments: { key: string } }
-  | { name: "hotkey"; arguments: { keys: string[] } }
-  | { name: "scroll"; arguments: { x: number; y: number; direction: "up" | "down"; amount?: number; by?: "line" | "pixel" } };
+  | { name: "click"; arguments: ComputerBatchWindowTarget & { x: number; y: number; button?: "left" | "right"; count?: number } }
+  | { name: "type_text"; arguments: ComputerBatchWindowTarget & { text: string } }
+  | { name: "press_key"; arguments: ComputerBatchWindowTarget & { key: string } }
+  | { name: "hotkey"; arguments: ComputerBatchWindowTarget & { keys: string[] } }
+  | { name: "scroll"; arguments: ComputerBatchWindowTarget & { x: number; y: number; direction: "up" | "down"; amount?: number; by?: "line" | "pixel" } };
+
+const BATCH_WINDOW_TARGET_SCHEMA = {
+  pid: { type: "integer", minimum: 1 },
+  window_id: { type: "integer", minimum: 1 },
+  delivery_mode: { type: "string", enum: ["background", "foreground"] },
+} as const;
 
 export const COMPUTER_BATCH_TOOL = {
   name: "computer_batch",
   description:
-    "Run up to nine predictable mechanical computer actions sequentially under one control ticket, then return one final screenshot. Stop before any step whose result must be inspected.",
+    "Run up to nine predictable mechanical computer actions sequentially under one control ticket, then return one final screenshot. Stop before any step whose result must be inspected. On Linux/X11, keyboard actions aimed at a known window should repeat its pid and window_id with delivery_mode='foreground'.",
   inputSchema: {
     type: "object",
     properties: {
@@ -184,11 +196,11 @@ export const COMPUTER_BATCH_TOOL = {
         maxItems: COMPUTER_BATCH_MAX_ACTIONS,
         items: {
           oneOf: [
-            { type: "object", properties: { name: { const: "click" }, arguments: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, button: { type: "string", enum: ["left", "right"] }, count: { type: "integer", minimum: 1, maximum: 2 } }, required: ["x", "y"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
-            { type: "object", properties: { name: { const: "type_text" }, arguments: { type: "object", properties: { text: { type: "string", minLength: 1, maxLength: 4096 } }, required: ["text"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
-            { type: "object", properties: { name: { const: "press_key" }, arguments: { type: "object", properties: { key: { type: "string", minLength: 1, maxLength: 64 } }, required: ["key"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
-            { type: "object", properties: { name: { const: "hotkey" }, arguments: { type: "object", properties: { keys: { type: "array", minItems: 2, maxItems: 4, items: { type: "string", minLength: 1, maxLength: 32 } } }, required: ["keys"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
-            { type: "object", properties: { name: { const: "scroll" }, arguments: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, direction: { type: "string", enum: ["up", "down"] }, amount: { type: "integer", minimum: 1, maximum: 20 }, by: { type: "string", enum: ["line", "pixel"] } }, required: ["x", "y", "direction"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "click" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, button: { type: "string", enum: ["left", "right"] }, count: { type: "integer", minimum: 1, maximum: 2 } }, required: ["x", "y"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "type_text" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, text: { type: "string", minLength: 1, maxLength: 4096 } }, required: ["text"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "press_key" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, key: { type: "string", minLength: 1, maxLength: 64, description: "Canonical key name such as enter, tab, or escape." } }, required: ["key"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "hotkey" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, keys: { type: "array", minItems: 2, maxItems: 4, items: { type: "string", minLength: 1, maxLength: 32 } } }, required: ["keys"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "scroll" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, direction: { type: "string", enum: ["up", "down"] }, amount: { type: "integer", minimum: 1, maximum: 20 }, by: { type: "string", enum: ["line", "pixel"] } }, required: ["x", "y", "direction"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
           ],
         },
       },
@@ -210,6 +222,22 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): 
   return Object.keys(value).every((key) => allowed.includes(key));
 }
 
+function validBatchWindowTarget(args: Record<string, unknown>): boolean {
+  const hasPid = args.pid !== undefined;
+  const hasWindow = args.window_id !== undefined;
+  return hasPid === hasWindow &&
+    (!hasPid || (Number.isInteger(args.pid) && Number(args.pid) > 0 && Number.isInteger(args.window_id) && Number(args.window_id) > 0)) &&
+    (args.delivery_mode === undefined || args.delivery_mode === "background" || args.delivery_mode === "foreground");
+}
+
+function batchWindowTarget(args: Record<string, unknown>): ComputerBatchWindowTarget {
+  return {
+    ...(args.pid !== undefined ? { pid: Number(args.pid) } : {}),
+    ...(args.window_id !== undefined ? { window_id: Number(args.window_id) } : {}),
+    ...(args.delivery_mode !== undefined ? { delivery_mode: args.delivery_mode as "background" | "foreground" } : {}),
+  };
+}
+
 /** Runtime validation mirrors COMPUTER_BATCH_TOOL and returns fresh objects so
  * no unreviewed provider fields can reach the driver. */
 export function validateComputerBatchArguments(value: unknown): BatchValidation {
@@ -227,33 +255,34 @@ export function validateComputerBatchArguments(value: unknown): BatchValidation 
     if (!action || !args || !exactKeys(action, ["name", "arguments"])) {
       return { ok: false, message: "computer_batch contains an invalid action object" };
     }
-    if (action.name === "click" && exactKeys(args, ["x", "y", "button", "count"]) &&
+    if (action.name === "click" && exactKeys(args, ["x", "y", "button", "count", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) &&
       typeof args.x === "number" && Number.isFinite(args.x) && args.x >= 0 && args.x <= 16384 &&
       typeof args.y === "number" && Number.isFinite(args.y) && args.y >= 0 && args.y <= 16384 &&
       (args.button === undefined || args.button === "left" || args.button === "right") &&
       (args.count === undefined || (Number.isInteger(args.count) && Number(args.count) >= 1 && Number(args.count) <= 2))) {
-      actions.push({ name: "click", arguments: { x: args.x, y: args.y, ...(args.button ? { button: args.button } : {}), ...(args.count !== undefined ? { count: Number(args.count) } : {}) } });
+      actions.push({ name: "click", arguments: { ...batchWindowTarget(args), x: args.x, y: args.y, ...(args.button ? { button: args.button } : {}), ...(args.count !== undefined ? { count: Number(args.count) } : {}) } });
       continue;
     }
-    if (action.name === "type_text" && exactKeys(args, ["text"]) && typeof args.text === "string" && args.text.length >= 1 && args.text.length <= 4096) {
-      actions.push({ name: "type_text", arguments: { text: args.text } });
+    if (action.name === "type_text" && exactKeys(args, ["text", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) && typeof args.text === "string" && args.text.length >= 1 && args.text.length <= 4096) {
+      actions.push({ name: "type_text", arguments: { ...batchWindowTarget(args), text: args.text } });
       continue;
     }
-    if (action.name === "press_key" && exactKeys(args, ["key"]) && typeof args.key === "string" && args.key.length >= 1 && args.key.length <= 64) {
-      actions.push({ name: "press_key", arguments: { key: args.key } });
+    if (action.name === "press_key" && exactKeys(args, ["key", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) && typeof args.key === "string" && args.key.length >= 1 && args.key.length <= 64) {
+      const key = args.key.toLowerCase() === "return" ? "enter" : args.key;
+      actions.push({ name: "press_key", arguments: { ...batchWindowTarget(args), key } });
       continue;
     }
-    if (action.name === "hotkey" && exactKeys(args, ["keys"]) && Array.isArray(args.keys) && args.keys.length >= 2 && args.keys.length <= 4 && args.keys.every((key) => typeof key === "string" && key.length >= 1 && key.length <= 32)) {
-      actions.push({ name: "hotkey", arguments: { keys: [...args.keys] as string[] } });
+    if (action.name === "hotkey" && exactKeys(args, ["keys", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) && Array.isArray(args.keys) && args.keys.length >= 2 && args.keys.length <= 4 && args.keys.every((key) => typeof key === "string" && key.length >= 1 && key.length <= 32)) {
+      actions.push({ name: "hotkey", arguments: { ...batchWindowTarget(args), keys: [...args.keys] as string[] } });
       continue;
     }
-    if (action.name === "scroll" && exactKeys(args, ["x", "y", "direction", "amount", "by"]) &&
+    if (action.name === "scroll" && exactKeys(args, ["x", "y", "direction", "amount", "by", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) &&
       typeof args.x === "number" && Number.isFinite(args.x) && args.x >= 0 && args.x <= 16384 &&
       typeof args.y === "number" && Number.isFinite(args.y) && args.y >= 0 && args.y <= 16384 &&
       (args.direction === "up" || args.direction === "down") &&
       (args.amount === undefined || (Number.isInteger(args.amount) && Number(args.amount) >= 1 && Number(args.amount) <= 20)) &&
       (args.by === undefined || args.by === "line" || args.by === "pixel")) {
-      actions.push({ name: "scroll", arguments: { x: args.x, y: args.y, direction: args.direction, ...(args.amount !== undefined ? { amount: Number(args.amount) } : {}), ...(args.by ? { by: args.by } : {}) } });
+      actions.push({ name: "scroll", arguments: { ...batchWindowTarget(args), x: args.x, y: args.y, direction: args.direction, ...(args.amount !== undefined ? { amount: Number(args.amount) } : {}), ...(args.by ? { by: args.by } : {}) } });
       continue;
     }
     return { ok: false, message: "computer_batch contains an unsupported action or invalid arguments" };

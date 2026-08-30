@@ -37,6 +37,20 @@ describe("computer_batch validation", () => {
       { name: "computer_exec", arguments: { command: "id" } },
     ] }).ok).toBe(false);
   });
+
+  it("round-trips exact foreground window targeting and normalizes Return", () => {
+    const validated = validateComputerBatchArguments({ actions: [
+      { name: "type_text", arguments: { text: "hello", pid: 3268, window_id: 99, delivery_mode: "foreground" } },
+      { name: "press_key", arguments: { key: "Return", pid: 3268, window_id: 99, delivery_mode: "foreground" } },
+    ] });
+    expect(validated).toEqual({ ok: true, actions: [
+      { name: "type_text", arguments: { text: "hello", pid: 3268, window_id: 99, delivery_mode: "foreground" } },
+      { name: "press_key", arguments: { key: "enter", pid: 3268, window_id: 99, delivery_mode: "foreground" } },
+    ] });
+    expect(validateComputerBatchArguments({ actions: [
+      { name: "type_text", arguments: { text: "unsafe ambiguous target", pid: 3268, delivery_mode: "foreground" } },
+    ] }).ok).toBe(false);
+  });
 });
 
 /** a probe whose answers the test scripts one call at a time */
