@@ -51,6 +51,7 @@ import {
   containerComputerAction,
   containerComputerExists,
   containerComputerMcp,
+  containerComputerAgentScreenshot,
   containerComputerScreenshot,
   containerComputerStatus,
   currentContainerComputerGeneration,
@@ -217,6 +218,7 @@ import {
   LOCAL_VM_MCP_PATH,
   LocalVmMcpAdmissions,
   attachLocalVmMcpBroker,
+  localVmPostActionSettleMs,
   type LocalVmMcpAuthority,
   type LocalVmMcpBrokerHandle,
 } from "./local-vm-broker.ts";
@@ -3812,8 +3814,8 @@ async function startTurn(
           persona +
           (computerKind === "vm"
             ? localVmMode(cfg) === "per-bot"
-              ? " You have your own isolated Cua sandbox: a Linux desktop in a container reserved for this bot. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully."
-              : " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state before acting, prefer accessibility targets over raw coordinates, and work carefully."
+              ? " You have your own isolated Cua sandbox: a Linux desktop in a container reserved for this bot. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged."
+              : " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged."
             : computerKind === "box" && instance.driverKind !== "boxAgent"
             ? " You have your own cloud computer. In Chrome, prefer browser_snapshot with browser_click/browser_fill for semantic, trusted actions; use screenshot/click/type_text for visual or non-browser UI, open_url for navigation, and computer_exec for Linux tasks. Every action already returns the resulting screen, so don't follow it with screenshot; batch predictable pixel actions with computer_batch."
             : computerKind === "vps"
@@ -9737,9 +9739,11 @@ server.on("upgrade", (req, socket, head) => {
               text: "Computer control authority is unavailable, so nobody can be paged safely right now.",
               isError: true,
             }),
-        captureAfterAction: async () => {
+        captureAfterAction: async (toolName) => {
           if (!stillAuthorized()) return null;
-          const image = await containerComputerScreenshot(undefined, undefined, target);
+          await new Promise((resolve) => setTimeout(resolve, localVmPostActionSettleMs(toolName)));
+          if (!stillAuthorized()) return null;
+          const image = await containerComputerAgentScreenshot(undefined, undefined, target);
           const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/.exec(image);
           if (!match) return null;
           return {

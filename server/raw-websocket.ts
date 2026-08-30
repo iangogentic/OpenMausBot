@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 
-export const WEBSOCKET_MAX_MESSAGE_BYTES = 1024 * 1024;
+export const WEBSOCKET_MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 export type RawWebSocketMessage = { readonly binary: boolean; readonly data: Buffer };

@@ -1724,13 +1724,25 @@ export async function containerComputerScreenshot(
   platform: NodeJS.Platform = process.platform,
   target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
 ): Promise<string> {
-  return serializeScreenshot(target.key, () => captureContainerComputerScreenshot(runner, platform, target));
+  return serializeScreenshot(target.key, () => captureContainerComputerScreenshot(runner, platform, target, false));
+}
+
+/** A model-facing screenshot must fit in one bounded MCP/WebSocket frame.
+ * Preserve the normal PNG preview for people, but convert agent observations
+ * inside the VM to a stripped JPEG and fail closed if it still exceeds 400KB. */
+export async function containerComputerAgentScreenshot(
+  runner: CommandRunner = sh,
+  platform: NodeJS.Platform = process.platform,
+  target: LocalVmTarget = SHARED_LOCAL_VM_TARGET,
+): Promise<string> {
+  return serializeScreenshot(target.key, () => captureContainerComputerScreenshot(runner, platform, target, true));
 }
 
 async function captureContainerComputerScreenshot(
   runner: CommandRunner,
   platform: NodeJS.Platform,
   target: LocalVmTarget,
+  agentOptimized: boolean,
 ): Promise<string> {
   const cacheable = runner === sh && platform === process.platform;
   const now = Date.now();
@@ -1745,7 +1757,7 @@ async function captureContainerComputerScreenshot(
   }
   if (cacheable) screenshotStatusCache.set(target.key, { status, expiresAt: now + SCREENSHOT_STATUS_TTL_MS });
   try {
-    const screenshot = "/tmp/openmausbot-preview.png";
+    let screenshot = "/tmp/openmausbot-preview.png";
     await runner(
       status.runtime,
       cuaExecArgs([
@@ -1759,6 +1771,21 @@ async function captureContainerComputerScreenshot(
       ], { container: target.containerName }),
       30_000,
     );
+    if (agentOptimized) {
+      const optimized = "/tmp/openmausbot-agent.jpg";
+      await runner(
+        status.runtime,
+        [
+          "exec",
+          target.containerName,
+          "sh",
+          "-lc",
+          'raw=/tmp/openmausbot-preview.png; out=/tmp/openmausbot-agent.jpg; command -v convert >/dev/null 2>&1 || exit 69; convert "$raw" -resize "1024x768>" -strip -quality 72 "$out" || exit 70; bytes=$(wc -c < "$out"); if [ "$bytes" -gt 400000 ]; then convert "$raw" -resize "800x600>" -strip -quality 55 "$out" || exit 71; fi; test "$(wc -c < "$out")" -le 400000',
+        ],
+        30_000,
+      );
+      screenshot = optimized;
+    }
     const { stdout } = await runner(
       status.runtime,
       ["exec", target.containerName, "base64", "-w0", screenshot],

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 
 import { augmentedPath } from "./env-path.ts";
 import {
@@ -36,18 +37,37 @@ export const LOCAL_VM_MCP_RESPONSE_TIMEOUT_MS = 180_000;
 export const LOCAL_VM_ACT_AND_OBSERVE_TOOLS = new Set([
   "bring_to_front",
   "browser_click",
-  "browser_fill",
+  "browser_dialog",
   "browser_navigate",
+  "browser_pointer",
+  "browser_set_input_files",
+  "browser_type",
   "click",
   "double_click",
   "drag",
   "hotkey",
+  "invoke_menu",
+  "kill_app",
   "launch_app",
+  "mouse_button_down",
+  "mouse_button_up",
+  "mouse_drag",
+  "page",
+  "parallel_mouse_drag",
   "press_key",
   "right_click",
   "scroll",
+  "set_value",
+  "set_window_frame",
   "type_text",
 ]);
+
+export function localVmPostActionSettleMs(toolName: string): number {
+  if (toolName === "launch_app" || toolName === "kill_app") return 800;
+  if (toolName === "browser_navigate" || toolName === "page") return 600;
+  if (toolName.startsWith("browser_") || toolName === "invoke_menu") return 400;
+  return 250;
+}
 
 export interface LocalVmActionScreenshot {
   readonly data: string;
@@ -188,6 +208,7 @@ export function attachLocalVmMcpBroker(options: {
   let driverInputEnded = false;
   let generationChecking = false;
   let toolCalls = 0;
+  let lastDeliveredFrameHash: string | null = null;
   let inputFrames = 0;
   let outputFrames = 0;
   let pendingDriverBytes = 0;
@@ -475,11 +496,24 @@ export function attachLocalVmMcpBroker(options: {
                 if (!content.some((item) => (
                   item && typeof item === "object" && (item as Record<string, unknown>).type === "image"
                 ))) {
-                  content.push({
-                    type: "text",
-                    text: `Fresh post-action screen attached for ${toolName}. Inspect this image before requesting another desktop capture.`,
-                  });
-                  content.push({ type: "image", data: screenshot.data, mimeType: screenshot.mimeType });
+                  const frameHash = createHash("sha256")
+                    .update(screenshot.mimeType)
+                    .update("\0")
+                    .update(screenshot.data)
+                    .digest("hex");
+                  if (frameHash === lastDeliveredFrameHash) {
+                    content.push({
+                      type: "text",
+                      text: `Post-action screen for ${toolName} is unchanged (sha256=${frameHash}). Do not repeat the action; use the current screen or finish.`,
+                    });
+                  } else {
+                    content.push({
+                      type: "text",
+                      text: `Fresh post-action screen attached for ${toolName} (sha256=${frameHash}). Inspect this image before requesting another desktop capture.`,
+                    });
+                    content.push({ type: "image", data: screenshot.data, mimeType: screenshot.mimeType });
+                    lastDeliveredFrameHash = frameHash;
+                  }
                   responseLine = JSON.stringify({
                     ...frame,
                     result: { ...(result as Record<string, unknown>), content },
@@ -501,6 +535,19 @@ export function attachLocalVmMcpBroker(options: {
         }
       }
       const response = augmentToolsListResponse(responseLine, pendingToolsList);
+      try {
+        const delivered = JSON.parse(response) as { result?: { content?: unknown[] } };
+        for (const item of delivered.result?.content ?? []) {
+          if (!item || typeof item !== "object") continue;
+          const image = item as { type?: unknown; data?: unknown; mimeType?: unknown };
+          if (image.type !== "image" || typeof image.data !== "string" || typeof image.mimeType !== "string") continue;
+          lastDeliveredFrameHash = createHash("sha256")
+            .update(image.mimeType)
+            .update("\0")
+            .update(image.data)
+            .digest("hex");
+        }
+      } catch {}
       if (id && ("result" in (frame ?? {}) || "error" in (frame ?? {}))) pendingToolsList.delete(id);
       emitBroker(response);
     });

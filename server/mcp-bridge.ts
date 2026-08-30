@@ -165,9 +165,12 @@ export const COMPUTER_REQUEST_HELP_TOOL = {
 /** Collect a byte stream into complete newline-terminated lines. MCP's
  * stdio transport is one JSON-RPC frame per line, so line boundaries are
  * the only safe place to inspect — or inject — anything. */
-export const MCP_MAX_LINE_BYTES = 1024 * 1024;
+// A 1280x900 high-entropy CUA screenshot can exceed 1 MiB once base64 and
+// JSON framing are included. Keep the bridge bounded, but large enough for
+// one legitimate uncompressed observation from the driver.
+export const MCP_MAX_LINE_BYTES = 4 * 1024 * 1024;
 export const MCP_MAX_PENDING_FRAMES = 64;
-export const MCP_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+export const MCP_MAX_PENDING_BYTES = 16 * 1024 * 1024;
 export const MCP_BATCH_UNSUPPORTED_PLAIN =
   "JSON-RPC batches are not supported for computer control. Send one request at a time.";
 

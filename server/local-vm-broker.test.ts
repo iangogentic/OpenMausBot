@@ -2,9 +2,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  LOCAL_VM_ACT_AND_OBSERVE_TOOLS,
   LOCAL_VM_MAX_MCP_FRAMES,
   LocalVmMcpAdmissions,
   attachLocalVmMcpBroker,
+  localVmPostActionSettleMs,
   type LocalVmMcpAuthority,
 } from "./local-vm-broker.ts";
 import {
@@ -134,6 +136,18 @@ describe("Local VM MCP admission", () => {
   });
 });
 
+describe("Local VM visual action policy", () => {
+  it("matches the reviewed Cua mutation names and repaint classes", () => {
+    expect(LOCAL_VM_ACT_AND_OBSERVE_TOOLS).toContain("browser_type");
+    expect(LOCAL_VM_ACT_AND_OBSERVE_TOOLS).not.toContain("browser_fill");
+    expect(LOCAL_VM_ACT_AND_OBSERVE_TOOLS).toContain("set_window_frame");
+    expect(LOCAL_VM_ACT_AND_OBSERVE_TOOLS).toContain("browser_set_input_files");
+    expect(localVmPostActionSettleMs("click")).toBe(250);
+    expect(localVmPostActionSettleMs("browser_navigate")).toBe(600);
+    expect(localVmPostActionSettleMs("launch_app")).toBe(800);
+  });
+});
+
 describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () => {
   it("gates an exact action, correlates its result, and reaps the runtime process group", async () => {
     const socket = new FakeSocket();
@@ -181,7 +195,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     const response = JSON.parse(socket.sent.map((value) => value.toString()).join("").trim());
     expect(response.result.content).toContainEqual({
       type: "text",
-      text: "Fresh post-action screen attached for click. Inspect this image before requesting another desktop capture.",
+      text: "Fresh post-action screen attached for click (sha256=8ee314812d71b74b906d8a49d5119930806da86b4ead9bed83c5a12bccf08c91). Inspect this image before requesting another desktop capture.",
     });
     expect(response.result.content).toContainEqual({
       type: "image",
@@ -191,6 +205,37 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     expect(captureAfterAction).toHaveBeenCalledOnce();
 
     handle.close("act-observe test complete");
+    await handle.closed;
+  });
+
+  it("does not resend byte-identical post-action pixels", async () => {
+    const socket = new FakeSocket();
+    const captureAfterAction = vi.fn(async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction,
+      beginAction: vi.fn()
+        .mockReturnValueOnce({ allowed: true as const, actionId: "action-1" })
+        .mockReturnValueOnce({ allowed: true as const, actionId: "action-2" }),
+    }));
+
+    for (const id of [91, 92]) {
+      socket.receive(JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "click", arguments: { x: 10, y: 20 } },
+      }) + "\n");
+      await vi.waitFor(() => expect(socket.sent.length).toBe(id - 90));
+    }
+    const responses = socket.sent.map((value) => JSON.parse(value.toString().trim()));
+    expect(responses[0].result.content.filter((item: { type?: string }) => item.type === "image")).toHaveLength(1);
+    expect(responses[1].result.content.filter((item: { type?: string }) => item.type === "image")).toHaveLength(0);
+    expect(responses[1].result.content).toContainEqual({
+      type: "text",
+      text: "Post-action screen for click is unchanged (sha256=8ee314812d71b74b906d8a49d5119930806da86b4ead9bed83c5a12bccf08c91). Do not repeat the action; use the current screen or finish.",
+    });
+
+    handle.close("dedupe test complete");
     await handle.closed;
   });
 
