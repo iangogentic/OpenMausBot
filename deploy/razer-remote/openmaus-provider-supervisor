@@ -389,13 +389,21 @@ def validate_runtime_tree(path: str, server_uid: int, runtime_gid: int) -> None:
         if info.st_mode & 0o007:
             raise RuntimeError("provider runtime inode is accessible to unrelated users")
         if stat.S_ISDIR(info.st_mode):
-            if info.st_mode & 0o050 != 0o050:
-                raise RuntimeError("provider runtime directory is not runtime-group traversable")
+            # Most runtime artifacts are shared read-only through the runtime
+            # group. A server-private 0700 tree is stricter and is also valid:
+            # PID 1 opens it as root, then this supervisor transfers only that
+            # exact tree to the provider UID for the duration of one turn.
+            if info.st_mode & 0o700 != 0o700:
+                raise RuntimeError("provider runtime directory is not server-accessible")
+            if info.st_mode & 0o070 not in (0, 0o050):
+                raise RuntimeError("provider runtime directory has unsafe group access")
             with os.scandir(current) as entries:
                 pending.extend(entry.path for entry in entries)
         elif stat.S_ISREG(info.st_mode):
-            if info.st_nlink != 1 or info.st_mode & 0o040 != 0o040:
-                raise RuntimeError("provider runtime file is not a unique runtime-group file")
+            if info.st_nlink != 1 or info.st_mode & 0o400 != 0o400:
+                raise RuntimeError("provider runtime file is not a unique server-readable file")
+            if info.st_mode & 0o070 not in (0, 0o040, 0o060):
+                raise RuntimeError("provider runtime file has unsafe group access")
         elif stat.S_ISSOCK(info.st_mode):
             if info.st_mode & 0o060 != 0o060:
                 raise RuntimeError("provider runtime socket is not runtime-group accessible")

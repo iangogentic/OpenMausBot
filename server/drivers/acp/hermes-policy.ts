@@ -594,12 +594,30 @@ export function prepareHermesPolicyEnvironment(input: {
   copyPrivate(join(input.sourceHome, "auth.json"), join(home, "auth.json"), providerWritableMode, directoryMode);
 
   const digest = createHash("sha256").update(input.isolationKey).digest("hex").slice(0, 32);
+  const policyRoot = input.sharedAcrossUid ? join(input.dataDir, "hermes-policy") : home;
+  if (input.sharedAcrossUid) {
+    // Bubblewrap dereferences inherited O_PATH descriptors through
+    // /proc/self/fd after switching to the provider UID. Give the runtime
+    // group traversal (but not listing) access to this one parent. Each
+    // server-owned bot leaf remains 0700 until the privileged supervisor
+    // temporarily transfers that exact tree to the provider for its turn.
+    mkdirSync(policyRoot, { recursive: true, mode: 0o710 });
+    chmodSync(policyRoot, 0o710);
+  }
   const policyDir = input.sharedAcrossUid
-    ? join(input.dataDir, "hermes-policy", digest)
+    ? join(policyRoot, digest)
     : join(home, "openmaus-policy");
-  mkdirSync(policyDir, { recursive: true, mode: policyDirectoryMode });
-  chmodSync(policyDir, policyDirectoryMode);
-  writePrivate(join(policyDir, POLICY_FILENAME), HERMES_POLICY_PYTHON, policyFileMode, policyDirectoryMode);
+  const isolatedPolicyDirectoryMode = input.sharedAcrossUid ? 0o700 : policyDirectoryMode;
+  const isolatedPolicyFileMode = input.sharedAcrossUid ? 0o600 : policyFileMode;
+  const isolatedProviderWritableMode = input.sharedAcrossUid ? 0o600 : providerWritableMode;
+  mkdirSync(policyDir, { recursive: true, mode: isolatedPolicyDirectoryMode });
+  chmodSync(policyDir, isolatedPolicyDirectoryMode);
+  writePrivate(
+    join(policyDir, POLICY_FILENAME),
+    HERMES_POLICY_PYTHON,
+    isolatedPolicyFileMode,
+    isolatedPolicyDirectoryMode,
+  );
 
   input.env.HERMES_HOME = home;
   const nonce = randomBytes(24).toString("hex");
@@ -607,7 +625,7 @@ export function prepareHermesPolicyEnvironment(input: {
   if (existsSync(proofPath)) unlinkSync(proofPath);
   // The provider may write this one nonce-bound file but cannot create,
   // replace, or alter the policy module in the surrounding directory.
-  writePrivate(proofPath, "", providerWritableMode, policyDirectoryMode);
+  writePrivate(proofPath, "", isolatedProviderWritableMode, isolatedPolicyDirectoryMode);
   input.env.PYTHONPATH = policyDir;
   input.env.OPENMAUSBOT_HERMES_POLICY = "1";
   input.env.OPENMAUSBOT_HERMES_RESTRICT_NATIVE = input.restricted ? "1" : "0";

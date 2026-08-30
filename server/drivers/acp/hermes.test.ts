@@ -1,6 +1,6 @@
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { parse as parseYaml } from "yaml";
 
@@ -425,9 +425,10 @@ mcp_servers:
     expect(statSync(join(env.HERMES_HOME!, "auth.json")).mode & 0o777).toBe(0o660);
     expect(env.PYTHONPATH).toContain(join("hermes-policy", ""));
     expect(env.PYTHONPATH).not.toContain(join("hermes-bots", ""));
-    expect(statSync(env.PYTHONPATH!).mode & 0o777).toBe(0o750);
-    expect(statSync(join(env.PYTHONPATH!, "sitecustomize.py")).mode & 0o777).toBe(0o640);
-    expect(statSync(proof.path).mode & 0o777).toBe(0o660);
+    expect(statSync(dirname(env.PYTHONPATH!)).mode & 0o777).toBe(0o710);
+    expect(statSync(env.PYTHONPATH!).mode & 0o777).toBe(0o700);
+    expect(statSync(join(env.PYTHONPATH!, "sitecustomize.py")).mode & 0o777).toBe(0o600);
+    expect(statSync(proof.path).mode & 0o777).toBe(0o600);
     writeFileSync(proof.path, JSON.stringify({ version: 1, nonce: proof.nonce }));
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });
