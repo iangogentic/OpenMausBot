@@ -74,6 +74,9 @@ describe("internal integration capabilities", () => {
     expect(internalCapabilityAllows("ian-brain", { method: "PUT", path: "/api/internal/ian-brain/mcp" })).toBe(false);
     expect(internalCapabilityAllows("local-vm", { method: "GET", path: "/api/internal/local-vm-computer/mcp" })).toBe(true);
     expect(internalCapabilityAllows("local-vm", { method: "GET", path: "/api/internal/physical-computer/mcp" })).toBe(false);
+    expect(internalCapabilityAllows("computer-operator", { method: "POST", path: "/api/internal/computer-operator" })).toBe(true);
+    expect(internalCapabilityAllows("computer-operator", { method: "GET", path: "/api/internal/computer-operator" })).toBe(false);
+    expect(internalCapabilityAllows("computer-operator", { method: "POST", path: "/api/internal/local-vm-computer/mcp" })).toBe(false);
     expect(internalCapabilityAllows("model", { method: "GET", path: "/api/internal/model-relay" })).toBe(true);
     expect(internalCapabilityAllows("model", { method: "POST", path: "/api/internal/model-relay" })).toBe(true);
     expect(internalCapabilityAllows("model", { method: "POST", path: "/api/internal/box" })).toBe(false);

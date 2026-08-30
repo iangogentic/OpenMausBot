@@ -7,6 +7,7 @@ export type InternalCapabilityKind =
   | "ian-brain"
   | "physical"
   | "local-vm"
+  | "computer-operator"
   | "model";
 
 /** Optional immutable resource binding for a scoped service broker. The
@@ -103,6 +104,7 @@ const ROUTES = {
   ]),
   physical: new Set(["GET /api/internal/physical-computer/mcp"]),
   "local-vm": new Set(["GET /api/internal/local-vm-computer/mcp"]),
+  "computer-operator": new Set(["POST /api/internal/computer-operator"]),
   model: new Set([
     "GET /api/internal/model-relay",
     "POST /api/internal/model-relay",
