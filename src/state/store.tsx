@@ -16,6 +16,7 @@ import {
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
+import type { ComputerChildMonitor } from "../../shared/computer-child-monitor";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
 import { currentCall } from "@/lib/call";
@@ -384,6 +385,8 @@ export interface AppState {
    * (the bot's hands are refused server-side); helpReason = the bot's open
    * plea for the person to take over */
   computerControl: Record<string, { held: boolean; helpReason: string | null }>;
+  /** Authority-free delegated visual-operator lifecycle snapshots. */
+  computerChildren: Record<string, ComputerChildMonitor>;
   /** a search hit to scroll to once its thread is on screen; nonce lets the
    * same message be focused twice in a row */
   focusMessage: { threadId: string; messageId: string; nonce: number; consumed: boolean } | null;
@@ -421,6 +424,7 @@ export type Action =
       bots: Bot[];
       groups: Group[];
       computerControl: Record<string, { held: boolean; helpReason: string | null }>;
+      computerChildren: ComputerChildMonitor[];
     }
   | { type: "showRoutines" }
   | { type: "showTeamMap" }
@@ -498,6 +502,7 @@ export type Action =
     }
   | { type: "provisioning"; botId: string; on: boolean }
   | { type: "computerControl"; botId: string; held: boolean; helpReason: string | null }
+  | { type: "computerChild"; monitor: ComputerChildMonitor }
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
@@ -599,6 +604,7 @@ export function reducer(state: AppState, action: Action): AppState {
         bots: action.bots,
         groups: action.groups,
         computerControl: action.computerControl,
+        computerChildren: Object.fromEntries(action.computerChildren.map((monitor) => [monitor.childId, monitor])),
         selectedId,
       };
     }
@@ -904,6 +910,14 @@ export function reducer(state: AppState, action: Action): AppState {
           [action.botId]: { held: action.held, helpReason: action.helpReason },
         },
       };
+    case "computerChild":
+      return {
+        ...state,
+        computerChildren: {
+          ...state.computerChildren,
+          [action.monitor.childId]: action.monitor,
+        },
+      };
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
     case "setComputerAuto":
@@ -1140,6 +1154,7 @@ export const initialState: AppState = {
   screens: {},
   provisioning: {},
   computerControl: {},
+  computerChildren: {},
   focusMessage: null,
   connected: false,
   error: null,
@@ -1608,12 +1623,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const loadAll = () =>
       Promise.all([
         api("/api/bots")
-          .then(({ bots, groups, computerControl }) =>
+          .then(({ bots, groups, computerControl, computerChildren }) =>
             alive && rawDispatch({
               type: "hydrate",
               bots,
               groups: groups ?? [],
               computerControl: computerControl ?? {},
+              computerChildren: computerChildren ?? [],
             }))
           .catch(() => {}),
         api("/api/instances")
@@ -1832,6 +1848,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             held: frame.held === true,
             helpReason: typeof frame.helpReason === "string" ? frame.helpReason : null,
           });
+          break;
+        case "computer-child":
+          rawDispatch({ type: "computerChild", monitor: frame.monitor });
           break;
         case "bot.deleted":
           botPatchQueue.cancel(frame.botId);

@@ -179,6 +179,7 @@ import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { ComputerSubagentManager, type ComputerSubagentHandle, type ComputerSubagentParent } from "./computer-subagent-manager.ts";
+import type { ComputerChildMonitor } from "../shared/computer-child-monitor.ts";
 import {
   ComputerSubagentRuntime,
   MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES,
@@ -1292,6 +1293,28 @@ const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
 });
 
 const COMPUTER_SUBAGENT_MANAGER = new ComputerSubagentManager();
+const COMPUTER_CHILD_MONITORS = new Map<string, ComputerChildMonitor>();
+const COMPUTER_CHILD_MONITOR_LIMIT = 128;
+
+function computerChildMonitors(): ComputerChildMonitor[] {
+  return [...COMPUTER_CHILD_MONITORS.values()].sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function retainComputerChildMonitor(monitor: ComputerChildMonitor): void {
+  COMPUTER_CHILD_MONITORS.set(monitor.childId, Object.freeze({
+    ...monitor,
+    parent: Object.freeze({ ...monitor.parent }),
+  }));
+  if (COMPUTER_CHILD_MONITORS.size <= COMPUTER_CHILD_MONITOR_LIMIT) return;
+  const terminal = computerChildMonitors().filter((candidate) =>
+    candidate.status === "completed" || candidate.status === "failed" ||
+    candidate.status === "aborted" || candidate.status === "unknown"
+  );
+  while (COMPUTER_CHILD_MONITORS.size > COMPUTER_CHILD_MONITOR_LIMIT && terminal.length) {
+    COMPUTER_CHILD_MONITORS.delete(terminal.shift()!.childId);
+  }
+}
+
 const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
   manager: COMPUTER_SUBAGENT_MANAGER,
   provider: COMPUTER_OPERATOR_PROVIDER,
@@ -1411,6 +1434,10 @@ const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
   isParentCurrent: isComputerOperatorParentCurrent,
   quarantineChild: async (childId) => closeComputerOperatorChildTarget(childId, "computer operator quarantined"),
   onComplete: async () => undefined,
+  onMonitorChange: (monitor) => {
+    retainComputerChildMonitor(monitor);
+    broadcast({ kind: "computer-child", monitor });
+  },
 });
 
 type BoxBrokerPromptAction = {
@@ -7288,6 +7315,7 @@ const server = createServer(async (req, res) => {
             return [bot.id, { held: snapshot.held, helpReason: snapshot.helpReason }];
           }),
         ),
+        computerChildren: computerChildMonitors(),
       });
     }
 

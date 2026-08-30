@@ -35,6 +35,7 @@ import { LinuxLocalControl } from "./LinuxLocalControl";
 import { MacLocalControl } from "./MacLocalControl";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import { ComputerSessionStrip } from "./ComputerSessionStrip";
+import { ComputerChildMonitorStrip } from "./ComputerChildMonitorStrip";
 import {
   autoSelectsLocalComputer,
   instanceSupportsLocalComputer,
@@ -1437,6 +1438,12 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         selectedBotId={bot.id}
         dispatch={dispatch}
         variant="panel"
+      />
+
+      <ComputerChildMonitorStrip
+        monitors={state.computerChildren}
+        botId={bot.id}
+        threadId={bot.threadId}
       />
 
       {panelView === "android" && androidConnected ? (
