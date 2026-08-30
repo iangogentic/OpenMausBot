@@ -31,25 +31,29 @@ OpenMaus status in this ledger is deliberately split:
 
 ## Current checkout and deployment boundary
 
-The audited implementation revision is `036f581` (`Scope attachment previews to
-exact conversations`) on `feat/grokbot-remote-client`, 48 commits ahead of
-`origin/feat/grokbot-remote-client` and 109 commits ahead of `upstream/main`.
-The only working-tree change during this statement was this ledger. The complete
-`pnpm test` gate passed: 267 Vitest files, broker tests, Electron-node tests, and
-the packaged-server smoke test. `pnpm typecheck` passed and `pnpm audit --prod`
-reported no known vulnerabilities.
+The audited and deployed implementation revision is `3ffbe4a` (`Drain timed out
+provider responses safely`) on `feat/grokbot-remote-client`, 76 commits ahead of
+`origin/feat/grokbot-remote-client` and 137 commits ahead of `upstream/main`
+before this ledger update. The complete `pnpm test` gate passed on that exact
+revision: 277 Vitest files / 2,900 passing tests (21 platform skips), seven
+broker tests, 133 passing Electron-node tests (one Windows-only skip), and the
+packaged-server smoke test. `pnpm typecheck` and the production
+UI/server/companion builds passed.
 The fork history identifies the material additions: hardened Razer deployment
 (`3692be8`), physical Windows and Mac bridges, desktop2 Qwen, Spark GLM, Hermes,
 Ian Brain, remote clients, and the recent Hermes visual-loop work. These are Ian
 fork additions; they are not upstream OpenMaus behavior. The exact commit list
 is available with `git log upstream/main..HEAD`.
 
-Razer deployment is live-proven for the previously installed hardened computer
-path, but revision `036f581` is not called deployed until its immutable release
-cutover is completed. Commit `d6048b3` was installed at
-`/opt/openmausbot/releases/d6048b3f2732c3a6575d314386261dd1df3f58a7`; the
-server, companion, and four activation sockets were active after restart. A
-real Hermes Qwen turn then selected the topmost terminal and executed one
+Revision `3ffbe4a8602b12ade814b5636a883d2712f94524` is installed at
+`/opt/openmausbot/releases/3ffbe4a8602b12ade814b5636a883d2712f94524` with the
+previous release retained as rollback. The atomic `current` symlink, server,
+companion, and four Unix sockets were verified after cutover and a second
+restart. The authenticated Mac app proved requested/effective policy `always`
+survived restart. `/api/bots?screens=off` returned zero inline screenshot
+pixels while explicit screens-on hydration retained the one expected
+425,748-byte base64 frame. A prior real Hermes Qwen turn selected the topmost
+terminal and executed one
 strict two-action batch (`type_text`, `press_key enter`) with the exact PID,
 window ID, and foreground delivery mode. The returned tool result carried a
 final-screen hash, the agent reported the visible postcondition, and an
@@ -81,22 +85,18 @@ multi-session switcher is mounted inside that panel at
 `src/lib/computer-preview.test.ts`, `src/lib/computer-control-handback.test.ts`,
 and `src/components/ComputerSessionStrip.test.ts`.
 
-**Boundary.** OpenMaus's switcher derives sessions from bot/screen/control state;
-the source does not yet establish Grok's per-running-subagent monitor identity,
-VNC lifecycle, or transcript-linked handoff. Chat sessions and the execution
-timeline were intentionally removed from the chat canvas by `4423af9`; controls
-now belong in `ComputerPanel`.
+**Boundary.** OpenMaus now gives delegated computer children server-owned
+monitor IDs, bounded generation-fenced frames/cursors, pause/resume handoff, and
+selected-target takeover. Chat sessions and the execution timeline were
+intentionally removed from the chat canvas by `4423af9`; controls belong in
+`ComputerPanel`. It still does not reproduce Grok's private VNC/account service.
 
-**Status:** The panel, collapse behavior, preview generation checks, takeover,
-and per-bot VM selection are built + source-tested. The older deployed revision
-has live keyboard/final-frame proof, but the current rendered panel still needs
-post-deployment browser QA. Shared child/subagent monitor selection remains an
-**architecture parity** gap. Likely change points:
-`ComputerSessionStrip.tsx`, `ComputerPanel.tsx`, `src/state/store.tsx`, and
-server computer target/event state. Acceptance: start two concurrent computer-use
-subagents, prove distinct monitor/session IDs and frames, select each exact
-target, reject stale generation, and take/hand back control on the selected
-monitor only.
+**Status:** Built + source-tested. Post-deployment Mac UI QA live-proved sidebar
+collapse, 320→368 px drag resize and reload persistence, panel collapse/reopen,
+the real 1232×800 physical-Mac preview, takeover changing the selected session
+to `Control held`, and hand-back releasing it. The UI was restored to 320 px
+with the panel closed and no held lease. Two simultaneous delegated child turns
+with distinct live frames remain a separate acceptance lane.
 
 ### 2. Hermes, Qwen/GLM vision, and Cua routing
 
@@ -150,10 +150,12 @@ rejects stale refs, and fail-closes malformed HTTP(S) state in
 visual observation. Focused tests cover navigation, fill/upload, stale refs,
 secret redaction, and failed actions.
 
-**Status:** Built + source-tested. Remaining work is live post-deployment browser
-QA and WebAuthn/passkey relay. WebAuthn is an **architecture parity** gap because
-it crosses browser, user-presence, and credential trust boundaries; it must not
-be approximated by exposing credentials to the model.
+**Status:** Built + source-tested. Remaining work is live semantic-browser QA.
+The WebAuthn/passkey code is only source-tested scaffolding: protocol validation,
+a relay manager, and a development Chrome extension exist, but no authenticated
+server route, native broker executable, signed/managed extension deployment,
+controller authenticator, consent/PIN UI, or physical-key proof exists. It is
+not a working feature and remains an **architecture parity** gap.
 
 ### 4. Bots, sidebar, search, and groups
 
@@ -174,10 +176,10 @@ mounts `SidebarBotPreview.tsx` for pointer and keyboard previews with latest
 message, status, pin, draft, and safe attachment names. Message search uses a
 durable SQLite FTS5 trigram index, updates on edit/delete/reopen, searches safe
 visible fields, and never indexes private directories or attachment capability
-IDs. Hover preview and indexed exact-message search are therefore built +
-source-tested. Remaining product gaps are a richer action command palette,
-durable sidebar section reorder/resize/bulk operations, and a parent/child
-conversation outline.
+IDs. Hover preview, indexed exact-message search, modal command-palette
+isolation, and durable resizable/collapsible sidebar density are built +
+source-tested; resize/collapse persistence is also live-proven. Remaining
+product gaps are bulk sidebar operations and a parent/child conversation outline.
 
 Grok's shared-room reconstruction additionally shows external invite links,
 pending approval, and adding/removing owned agents
@@ -259,9 +261,13 @@ reset/update, security key, local-tool permissions, and auto-review
 `panels.tsx:92-210`). OpenMaus base settings are built/source-tested. The
 reconstruction-added Router/Docker experiments and synthetic unavailable
 1Password entry are not reliable evidence of official shipped requirements.
-Computer reset/update, security-key relay, global permission policy, and
-adaptive auto-review are genuine **product parity** gaps where user-visible and
-**architecture/undocumented** gaps where a private account service is inferred.
+Global Always/Ask/Never policy is built, source-tested, adversarially reviewed,
+and live-proven across restart. It serializes provider delivery, bounds hung
+responses, fences Never by exact turn generation, and preserves restrictive
+policy during failed saves. Computer reset/update, a deployable security-key
+relay, and adaptive auto-review remain genuine **product parity** gaps where
+user-visible and **architecture/undocumented** gaps where a private account
+service is inferred.
 Likely files: `SettingsModal.tsx`,
 `EnginesSettings.tsx`, `UsageSection.tsx`, `ModelPicker.tsx`, and routing APIs.
 Acceptance: selecting a route changes the actual provider/model/tools/MCP,
@@ -313,18 +319,16 @@ rendered App route and its backend lifecycle.
 
 ## Priority order
 
-1. **P0 — Deploy and live acceptance:** cut an immutable Razer release, verify
-   rollback, exercise the rendered computer panel, two per-bot VMs, semantic
-   browser actions, attachment preview isolation, and a fresh unknown-pixel
-   Hermes/Qwen turn.
-2. **P0 — True child monitors and cursor telemetry:** give each running computer
-   child its own monitor/frame/handoff identity and child-scoped cursor overlay.
+1. **P0 — Finish live acceptance:** run two concurrent per-bot delegated
+   computer turns, semantic browser actions, attachment preview isolation, and
+   a fresh unknown-pixel Hermes/Qwen turn on the deployed immutable release.
+2. **P0 — Child monitor live proof:** source implementation exists; prove two
+   simultaneous child IDs, frames/cursors, selected takeover, and resume.
 3. **P0 — WebAuthn/passkey relay:** preserve user presence and credential
    isolation across the remote browser boundary.
-4. **P1 — Product shell depth:** richer command palette, durable sidebar
-   organization, parent/child outline, structured references, Mermaid/math,
-   media viewer, complete action audit/export, scoped memory controls, and a
-   global Always/Ask/Never policy with a non-bypassable team ceiling.
+4. **P1 — Product shell depth:** bulk sidebar organization, parent/child outline,
+   structured references, Mermaid/math, media viewer, complete action
+   audit/export, and scoped memory controls.
 5. **P1 — Routine listeners and approvals:** add connector events only with
    dedupe, auth, expiry, and confirmation semantics.
 6. **P2 — Skills marketplace, full-duplex voice, terminal pane, and richer cards:**
