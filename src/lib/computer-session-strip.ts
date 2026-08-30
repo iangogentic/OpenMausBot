@@ -100,7 +100,11 @@ export function computerSessionStatus(session: ComputerSession): string {
     session.held ? "Control held" : null,
     session.busy ? "Working" : null,
     !session.held && !session.busy && session.recentScreen ? "Recent screen" : null,
-    !session.held && !session.busy && !session.recentScreen ? "Selected" : null,
+    !session.held && !session.busy && !session.recentScreen
+      ? session.selected
+        ? "Selected"
+        : "Idle"
+      : null,
   ].filter((state): state is string => Boolean(state));
   return states.join(" · ");
 }

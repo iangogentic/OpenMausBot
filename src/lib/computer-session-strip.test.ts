@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   COMPUTER_SESSION_DIRECT_LIMIT,
+  computerSessionStatus,
   computerSessionThumbnailSrc,
   deriveComputerSessions,
   nextComputerSessionFocusIndex,
@@ -99,6 +100,19 @@ describe("computer session derivation", () => {
 });
 
 describe("computer session navigation", () => {
+  it("labels only the selected idle session as selected", () => {
+    const selected = deriveComputerSessions({
+      bots: [bot("selected"), bot("peer")],
+      screens: {},
+      computerControl: {},
+      selectedBotId: "selected",
+      now,
+    });
+
+    expect(computerSessionStatus(selected[0])).toBe("Selected");
+    expect(computerSessionStatus(selected[1])).toBe("Idle");
+  });
+
   it("dispatches select before opening the panel and never emits a lease action", () => {
     const dispatch = vi.fn();
     openComputerSession(dispatch, "bot-b");
