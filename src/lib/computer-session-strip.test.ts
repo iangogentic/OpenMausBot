@@ -55,7 +55,10 @@ describe("computer session derivation", () => {
     });
 
     expect(sessions.map((session) => session.bot.id)).toEqual(["selected", "held", "working", "recent"]);
-    for (const session of sessions) expect(session.screen).toBe(screens[session.bot.id as keyof typeof screens]);
+    for (const session of sessions) {
+      // SAFETY: every session id in this fixture is a declared key of screens.
+      expect(session.screen).toBe(screens[session.bot.id as keyof typeof screens]);
+    }
     expect(sessions).toHaveLength(COMPUTER_SESSION_DIRECT_LIMIT);
   });
 

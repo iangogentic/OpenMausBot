@@ -71,6 +71,19 @@ export function readComputerLease(
   }
 }
 
+/**
+ * Resolve the proof that belongs to one visible bot and this exact renderer.
+ * ComputerPanel stays mounted while the user switches between bot sessions,
+ * so carrying its previous `leaseToken` state forward would make the new
+ * panel look owned by the wrong session (or hide a lease this renderer really
+ * owns). Keep this derivation shared by initial render and the bot-switch
+ * fence.
+ */
+export function computerPanelLeaseToken(botId: string, ownerId: string): string | null {
+  const lease = readComputerLease(botId);
+  return lease?.ownerId === ownerId ? lease.leaseToken : null;
+}
+
 export function writeComputerLease(
   botId: string,
   lease: StoredComputerLease,

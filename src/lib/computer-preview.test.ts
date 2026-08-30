@@ -5,6 +5,7 @@ import {
   historicalFrameMatchesPreviewTarget,
   newestPreviewFrame,
   previewFreshness,
+  selectComputerPanelPreview,
 } from "./computer-preview";
 
 describe("computer preview", () => {
@@ -35,5 +36,13 @@ describe("computer preview", () => {
     expect(historicalFrameMatchesPreviewTarget(prior, "box:ada", "turn-a")).toBe(true);
     expect(historicalFrameMatchesPreviewTarget(prior, "box:ada", "turn-b")).toBe(false);
     expect(historicalFrameMatchesPreviewTarget(prior, "box:grace", null)).toBe(false);
+  });
+
+  it("never substitutes another destination's pixels for the selected computer", () => {
+    const frames = { vm: "vm-pixels", physical: "mac-pixels", cloud: "cloud-pixels" };
+    expect(selectComputerPanelPreview({ surface: "vm", ...frames })).toBe("vm-pixels");
+    expect(selectComputerPanelPreview({ surface: "physical", ...frames })).toBe("mac-pixels");
+    expect(selectComputerPanelPreview({ surface: "cloud", ...frames })).toBe("cloud-pixels");
+    expect(selectComputerPanelPreview({ surface: "none", ...frames })).toBeNull();
   });
 });

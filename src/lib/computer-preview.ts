@@ -7,6 +7,23 @@ export interface TargetedPreviewFrame {
   targetGeneration: string;
 }
 
+export type ComputerPanelPreviewSurface = "vm" | "physical" | "cloud" | "none";
+
+/** Keep each panel destination attached to its own capture lane. In
+ * particular, a Local VM must never fall through to a cloud/SSE frame from a
+ * previous session just because that frame arrived more recently. */
+export function selectComputerPanelPreview<T>(input: {
+  surface: ComputerPanelPreviewSurface;
+  vm: T | null;
+  physical: T | null;
+  cloud: T | null;
+}): T | null {
+  if (input.surface === "vm") return input.vm;
+  if (input.surface === "physical") return input.physical;
+  if (input.surface === "cloud") return input.cloud;
+  return null;
+}
+
 /** Live SSE is authoritative only for the exact computer and dispatch the
  * panel most recently resolved from the server. */
 export function frameMatchesPreviewTarget(

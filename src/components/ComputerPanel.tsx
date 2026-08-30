@@ -49,7 +49,12 @@ import {
   historicalFrameMatchesPreviewTarget,
   newestPreviewFrame,
   previewFreshness,
+  selectComputerPanelPreview,
 } from "@/lib/computer-preview";
+import {
+  collapseComputerPanel,
+  escapeClosesComputerPanel,
+} from "@/lib/computer-panel-navigation";
 import { resolveDesktopViewerUrl } from "@/lib/desktop-viewer-url";
 import {
   browserDesktopViewerIsOpen,
@@ -66,6 +71,7 @@ import {
   computerControlSnapshotSchema,
   computerControlTakeSchema,
   computerControlOwnerId,
+  computerPanelLeaseToken,
   computerReleaseFailureIsTerminal,
   computerScreenshotSchema,
   computerViewerJoinSchema,
@@ -203,10 +209,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const [controlTargetKey, setControlTargetKey] = useState<string | null>(null);
   const [controlTargetGeneration, setControlTargetGeneration] = useState<string | null>(null);
   const ownerId = useRef(computerControlOwnerId()).current;
-  const [leaseToken, setLeaseToken] = useState(() => {
-    const lease = readComputerLease(bot.id);
-    return lease?.ownerId === ownerId ? lease.leaseToken : null;
-  });
+  const [leaseToken, setLeaseToken] = useState(() => computerPanelLeaseToken(bot.id, ownerId));
   const [electronViewerOpen, setElectronViewerOpen] = useState(false);
   const [browserViewerOpen, setBrowserViewerOpen] = useState(() => browserDesktopViewerIsOpen(bot.id));
   const [handbackPending, setHandbackPending] = useState(() => computerHandbackInProgress(bot.id));
@@ -237,11 +240,23 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     localSelectable,
   });
 
-  useEffect(() => () => {
+  // The panel intentionally stays mounted when a session tile selects another
+  // bot. Fence any in-flight take/join from the old bot immediately and reset
+  // transient UI state; otherwise the old continuation could open the wrong
+  // desktop, or leave the new bot's controls permanently disabled as "join".
+  useEffect(() => {
     desktopOperationGeneration.current += 1;
     desktopOperationAbort.current?.abort();
     desktopOperationAbort.current = null;
-  }, []);
+    setPending(null);
+    setControlPending(false);
+    setLeaseToken(computerPanelLeaseToken(bot.id, ownerId));
+    return () => {
+      desktopOperationGeneration.current += 1;
+      desktopOperationAbort.current?.abort();
+      desktopOperationAbort.current = null;
+    };
+  }, [bot.id, ownerId]);
 
   useEffect(() => {
     const query = window.matchMedia("(max-width: 767px)");
@@ -709,14 +724,18 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     ? { png: lastScreenMessage.png!, mime: lastScreenMessage.mime ?? "image/png", at: 0 }
     : null;
   const cloudFrame = newestPreviewFrame([live, polledFrame]) ?? historicalFrame;
-  const frameSrc =
-    phase === "vm"
-      ? vmFrame?.src ?? null
+  const frameSrc = selectComputerPanelPreview({
+    surface: phase === "vm"
+      ? "vm"
       : phase === "local" && !isLinux
-      ? localFrame
-      : phase === "ready" || phase === "starting"
-        ? cloudFrame && `data:${cloudFrame.mime};base64,${cloudFrame.png}`
-        : null;
+        ? "physical"
+        : phase === "ready" || phase === "starting"
+          ? "cloud"
+          : "none",
+    vm: vmFrame?.src ?? null,
+    physical: localFrame,
+    cloud: cloudFrame && `data:${cloudFrame.mime};base64,${cloudFrame.png}`,
+  });
   const frameAt = phase === "vm" ? vmFrame?.at ?? null : cloudFrame?.at ?? null;
   const freshness = previewFreshness(frameAt, previewNow, Boolean(bot.busy || viewerOpen));
   useEffect(() => {
@@ -1273,7 +1292,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   } satisfies Record<Exclude<Phase, "ready" | "local" | "vm">, string>;
 
   const closePanel = () => {
-    dispatch({ type: "toggleComputer", open: false });
+    collapseComputerPanel(dispatch);
     window.requestAnimationFrame(() => {
       document.querySelector<HTMLButtonElement>("[data-computer-toggle]")?.focus();
     });
@@ -1281,8 +1300,12 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
-      if (creatingRoutine || localAutoWarning !== null) return;
+      if (!escapeClosesComputerPanel({
+        key: event.key,
+        defaultPrevented: event.defaultPrevented,
+        routineEditorOpen: creatingRoutine,
+        warningOpen: localAutoWarning !== null,
+      })) return;
       event.preventDefault();
       closePanel();
     };

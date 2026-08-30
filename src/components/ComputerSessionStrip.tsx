@@ -117,6 +117,7 @@ export function ComputerSessionStrip({
     if (!overflowOpen) return;
     const focus = window.requestAnimationFrame(() => menuRefs.current[menuFocusIndex.current]?.focus());
     const closeOutside = (event: PointerEvent) => {
+      // SAFETY: DOM PointerEvent targets dispatched by document are Nodes.
       if (!rootRef.current?.contains(event.target as Node)) setOverflowOpen(false);
     };
     document.addEventListener("pointerdown", closeOutside);
