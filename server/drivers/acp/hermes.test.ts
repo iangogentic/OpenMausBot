@@ -224,6 +224,9 @@ model:
 providers:
   desktop2:
     base_url: http://127.0.0.1:9999/v1
+tool_loop_guardrails:
+  warnings_enabled: false
+  hard_stop_enabled: false
 agent:
   max_turns: 42
   system_prompt: shared host identity
@@ -256,6 +259,20 @@ memory:
       [...new Set(["tts", ...HERMES_DISABLED_NATIVE_TOOLSETS])].sort(),
     );
     expect(parsed.agent.system_prompt).toBeUndefined();
+    expect(parsed.tool_loop_guardrails).toEqual({
+      warnings_enabled: true,
+      hard_stop_enabled: true,
+      warn_after: {
+        exact_failure: 2,
+        same_tool_failure: 3,
+        idempotent_no_progress: 2,
+      },
+      hard_stop_after: {
+        exact_failure: 5,
+        same_tool_failure: 8,
+        idempotent_no_progress: 5,
+      },
+    });
     expect(parsed.host_files).toBeUndefined();
     expect(parsed.plugins).toBeUndefined();
     expect(parsed.terminal).toBeUndefined();
@@ -311,6 +328,8 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toContain('_RESTRICT_NATIVE = os.environ.get("OPENMAUSBOT_HERMES_RESTRICT_NATIVE") == "1"');
     expect(HERMES_POLICY_PYTHON).toMatch(/def _filter_definitions[\s\S]*if _allowed_tool\(name\)/);
     expect(HERMES_POLICY_PYTHON).toMatch(/def guarded_dispatch[\s\S]*if not _allowed_tool\(function_name\)/);
+    expect(HERMES_POLICY_PYTHON).toContain('name.startswith("mcp_")');
+    expect(HERMES_POLICY_PYTHON).toContain("guard._is_idempotent = lambda name");
   });
 
   it("recognizes the canonical Hermes MCP names for both mounted integrations", () => {

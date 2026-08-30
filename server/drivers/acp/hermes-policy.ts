@@ -165,6 +165,18 @@ def _install():
             for item in self.tools
             if _allowed_tool(item.get("function", {}).get("name"))
         }
+        # Upstream Hermes only applies its successful-result no-progress
+        # circuit breaker to a short built-in read-tool allowlist. Scoped MCP
+        # tools otherwise can repeat forever (including a mutating computer
+        # action) even when the exact call keeps returning the exact result.
+        # Changed results reset the counter; identical results use Hermes'
+        # native bounded warning/halt path configured below.
+        guard = getattr(self, "_tool_guardrails", None)
+        if _RESTRICT_NATIVE and guard is not None:
+            original_is_idempotent = guard._is_idempotent
+            guard._is_idempotent = lambda name: (
+                isinstance(name, str) and name.startswith("mcp_")
+            ) or original_is_idempotent(name)
         return result
 
     run_agent.AIAgent.__init__ = guarded_agent_init
@@ -297,11 +309,28 @@ export function sanitizeHermesConfig(
     "prompt_caching",
     "smart_model_routing",
     "streaming",
-    "tool_loop_guardrails",
     "tool_output",
     "max_concurrent_sessions",
     "logging",
   ]);
+
+  // Hosted turns must remain bounded even when the shared Hermes profile
+  // disabled its optional circuit breaker. The policy shim extends successful
+  // no-progress tracking to the scoped MCP catalog at runtime.
+  safe.tool_loop_guardrails = {
+    warnings_enabled: true,
+    hard_stop_enabled: true,
+    warn_after: {
+      exact_failure: 2,
+      same_tool_failure: 3,
+      idempotent_no_progress: 2,
+    },
+    hard_stop_after: {
+      exact_failure: 5,
+      same_tool_failure: 8,
+      idempotent_no_progress: 5,
+    },
+  };
 
   const sourceAgent = object(source.agent) ?? {};
   const agent = pick(sourceAgent, [
