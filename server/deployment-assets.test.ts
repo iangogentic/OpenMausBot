@@ -20,6 +20,10 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(leaf).toContain('f".retired-{key}-{uuid.uuid4().hex}"');
     expect(setup).toContain('if sys.argv[1] == "--check-mounted"');
     expect(setup).toContain("storage mount ownership or mode drifted");
+    const prepareService = asset("openmaus-storage-prepare.service");
+    expect(prepareService).toContain(
+      "CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_FSETID CAP_DAC_OVERRIDE CAP_SYS_ADMIN",
+    );
   });
 
   it("installs and requires the exact firewall, private-net, and aggregate-slice checks", () => {

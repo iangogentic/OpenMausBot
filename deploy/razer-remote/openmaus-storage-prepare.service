@@ -17,7 +17,11 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/openmaus-provider/state /var/lib/openmausbot-workspaces /var/lib/openmausbot-vm-homes
-CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+# CAP_FSETID is required when restoring the setgid bit on the workspace
+# filesystem root. Without it, chmod(3770) silently lands as 1770 because the
+# service is not a member of openmaus-workspace, and the leaf helper correctly
+# refuses the drift after a cold boot.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_FSETID CAP_DAC_OVERRIDE CAP_SYS_ADMIN
 AmbientCapabilities=
 LockPersonality=yes
 RestrictSUIDSGID=no
