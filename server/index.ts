@@ -3384,9 +3384,16 @@ async function startTurn(
   // rewound: the OTHER instances' cursors are left alone (a rewind wipes
   // them all), and "fresh" is decided by who ran the last turn, not by
   // whether we hold a cursor — see engineIsFresh.
+  // Hermes cannot restore a named custom-provider ACP session before
+  // session/set_model reattaches this turn's short-lived relay capability.
+  // Start injected Hermes turns fresh and replay the bounded visible branch
+  // in text: continuity survives, but a revoked relay token never becomes a
+  // persistent credential or an unrecoverable native-session dependency.
+  const hermesInjectedFresh = instance.driverKind === "hermesAgent" && Boolean(decodeInjectId(model));
   const fresh =
-    !rewound &&
-    engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
+    hermesInjectedFresh ||
+    (!rewound &&
+      engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript }));
   const { turnText, resume } = buildTurnContext({
     text: promptWithReply(text, opts?.replyTo, cfg.profile?.name?.trim() || "User"),
     transcript,
