@@ -59,6 +59,13 @@ export interface ComputerSubagentRuntimeOptions {
    * launch, interrupt, or cleanup promise is wedged. */
   quarantineChild: (childId: string, parent: ComputerSubagentParent) => void | Promise<void>;
   onComplete: (completion: ComputerSubagentCompletion) => void | Promise<void>;
+  /** Publish the runtime-verified terminal pixels before the terminal monitor
+   * transition. Failures are telemetry-only and never change task outcome. */
+  onFinalScreenshot?: (input: {
+    childId: string;
+    parent: ComputerSubagentParent;
+    screenshot: ComputerSubagentFinalScreenshot;
+  }) => void | Promise<void>;
   /** Receives authority-free snapshots after each runtime lifecycle change.
    * Listener failures are isolated from the child runtime. */
   onMonitorChange?: ComputerChildMonitorListener;
@@ -121,6 +128,7 @@ export class ComputerSubagentRuntime {
   private readonly isParentCurrent: ComputerSubagentRuntimeOptions["isParentCurrent"];
   private readonly quarantineChild: ComputerSubagentRuntimeOptions["quarantineChild"];
   private readonly onComplete: ComputerSubagentRuntimeOptions["onComplete"];
+  private readonly onFinalScreenshot?: ComputerSubagentRuntimeOptions["onFinalScreenshot"];
   private readonly onMonitorChange?: ComputerChildMonitorListener;
   private readonly operationTimeoutMs: number;
   private readonly abortGraceMs: number;
@@ -131,6 +139,7 @@ export class ComputerSubagentRuntime {
     this.manager = options.manager; this.provider = options.provider; this.acquireTarget = options.acquireTarget;
     this.releaseTarget = options.releaseTarget; this.captureFinalScreenshot = options.captureFinalScreenshot;
     this.isParentCurrent = options.isParentCurrent; this.quarantineChild = options.quarantineChild; this.onComplete = options.onComplete;
+    this.onFinalScreenshot = options.onFinalScreenshot;
     this.onMonitorChange = options.onMonitorChange;
     this.operationTimeoutMs = this.validTimeout(options.operationTimeoutMs ?? DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS, "operationTimeoutMs");
     this.abortGraceMs = this.validTimeout(options.abortGraceMs ?? DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS, "abortGraceMs");
@@ -487,6 +496,13 @@ export class ComputerSubagentRuntime {
         }), this.operationTimeoutMs);
         if (!captured.ok) throw new Error(captured.error ?? captured.reason);
         finalScreenshot = validateScreenshot(captured.value);
+        if (this.onFinalScreenshot) {
+          await this.bounded(Promise.resolve().then(() => this.onFinalScreenshot!({
+            childId: execution.handle.childId,
+            parent: cloneParent(execution.input.parent),
+            screenshot: finalScreenshot!,
+          })).catch(() => undefined), this.cleanupTimeoutMs);
+        }
       } catch (captureError) {
         status = execution.abortController.signal.aborted ? "aborted" : "failed";
         error = execution.abortController.signal.aborted

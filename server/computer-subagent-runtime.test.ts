@@ -115,6 +115,11 @@ function harness(overrides: {
         childId: completion.childId,
       });
     },
+    onFinalScreenshot: ({ childId, screenshot: final }) => {
+      events.push("final-frame");
+      expect(childId).toBeTruthy();
+      expect(final).toEqual(screenshot);
+    },
     onMonitorChange: (monitor) => { monitors.push(monitor); },
   });
   return { manager, launched, children, completions, screenshots, acquired, released, events, monitors, runtime };
@@ -264,7 +269,7 @@ describe("ComputerSubagentRuntime", () => {
     await settle(h.children[0]!, { status: "completed", output: "saved" });
     await handle.done;
     expect(h.screenshots).toEqual(["child-qwen"]);
-    expect(h.events).toEqual(["screenshot", "complete"]);
+    expect(h.events).toEqual(["screenshot", "final-frame", "complete"]);
     expect(h.completions).toEqual([{ status: "completed", finalScreenshotCaptured: true, childId: "child-qwen" }]);
     expect((await handle.done)?.finalScreenshot).toEqual(screenshot);
     expect(h.acquired).toEqual(["child-qwen"]);

@@ -1575,6 +1575,15 @@ const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
   },
   isParentCurrent: isComputerOperatorParentCurrent,
   quarantineChild: async (childId) => closeComputerOperatorChildTarget(childId, "computer operator quarantined"),
+  onFinalScreenshot: ({ childId, screenshot }) => {
+    const mime = screenshot.mimeType;
+    const data = screenshot.dataBase64;
+    publishComputerChildFrame(childId, {
+      mime,
+      data,
+      hash: createHash("sha256").update(mime).update("\0").update(data).digest("hex"),
+    });
+  },
   onComplete: async () => undefined,
   onMonitorChange: (monitor) => {
     retainComputerChildMonitor(monitor);
