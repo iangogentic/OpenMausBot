@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "OpenMaus Security Key Proxy",
+  "description": "Managed WebAuthn proxy for attended OpenMaus remote-computer sessions.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "115",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAss7x7Z1kGdFB9PrMbP87cl++him2HnxiQ8KZZ9/WJqrxVI2xm8+cj8YYOGJAKDIGL5KLfuqdR6JXkGVBsE85f4GcsRUEl5qKzMSWWlt1v2DUwhXBR+WMZHlgLeDcymdSDgrU+rsWxHdkdI0FEeD+SkwwwZNzy7a6qHvlFvGzdxvis8RfVL0x9ndjziekkDU2wLbB2n3GEezThXlCVCGJ7ak7eBogScRIkbjrp5IuoZ5rJDD/9fpC42wvib7kjWgrcBefo9WQOKoIPA+SALzBLOUpw3M0rpYpYZJ0tJ2roJEkDDCi2BwyG7AaVBW4CSDPBhPR8AOw4NVsuZQi39q9jwIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "webAuthenticationProxy"
+  ],
+  "background": {
+    "service_worker": "src/service-worker.js",
+    "type": "module"
+  }
+}

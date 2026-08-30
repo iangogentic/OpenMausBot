@@ -1,0 +1,9 @@
+{
+  "name": "com.openmausbot.security_key_proxy",
+  "description": "OpenMaus attended security-key relay broker",
+  "path": "__REPLACE_WITH_ABSOLUTE_LOCALLY_MANAGED_BROKER_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://iaopmdekcnajdahgiacemakfgdlihime/"
+  ]
+}
