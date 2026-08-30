@@ -405,6 +405,59 @@ def _install():
             for item in self.tools
             if _allowed_tool(item.get("function", {}).get("name"))
         }
+        # Hermes' no-progress guardrail predates native multimodal tool
+        # results: it type-annotates and hashes a string, while the executor
+        # now passes the entire {_multimodal: true, ...} dict. Let the native
+        # guardrail inspect the stable text summary, then copy any warning it
+        # appends back into the envelope without dropping its image parts.
+        original_append_guardrail = getattr(
+            self, "_append_guardrail_observation", None
+        )
+        if callable(original_append_guardrail):
+            def openmaus_append_guardrail(
+                tool_name, function_args, function_result, *, failed
+            ):
+                if not (
+                    isinstance(function_result, dict)
+                    and function_result.get("_multimodal") is True
+                ):
+                    return original_append_guardrail(
+                        tool_name, function_args, function_result, failed=failed
+                    )
+                summary = function_result.get("text_summary")
+                if not isinstance(summary, str):
+                    summary = ""
+                    for part in function_result.get("content") or []:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = part.get("text")
+                            if isinstance(text, str):
+                                summary = text
+                                break
+                guarded_summary = original_append_guardrail(
+                    tool_name, function_args, summary, failed=failed
+                )
+                if guarded_summary == summary:
+                    return function_result
+                promoted = dict(function_result)
+                promoted["text_summary"] = guarded_summary
+                content = []
+                replaced_text = False
+                for part in function_result.get("content") or []:
+                    if (
+                        not replaced_text
+                        and isinstance(part, dict)
+                        and part.get("type") == "text"
+                    ):
+                        content.append({**part, "text": guarded_summary})
+                        replaced_text = True
+                    else:
+                        content.append(part)
+                if not replaced_text:
+                    content.insert(0, {"type": "text", "text": guarded_summary})
+                promoted["content"] = content
+                return promoted
+
+            self._append_guardrail_observation = openmaus_append_guardrail
         if _SPARK_IMPLICIT_THINK and hasattr(self, "_get_transport"):
             # This Spark endpoint has repeatedly labelled short, complete
             # post-tool answers as length (and Hermes' GLM heuristic also

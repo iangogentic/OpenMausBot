@@ -665,12 +665,22 @@ mcp_servers:
         "",
       ].join("\n"),
     );
-    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs): self.tools = []\n");
+    writeFileSync(
+      join(fakeModules, "run_agent.py"),
+      [
+        "class AIAgent:",
+        " def __init__(self, *args, **kwargs): self.tools = []",
+        " def _append_guardrail_observation(self, name, args, result, *, failed): return result + '\\n[guarded]'",
+        "",
+      ].join("\n"),
+    );
     writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
     writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
     const script = [
       "import json, model_tools",
       "result = model_tools.handle_function_call('mcp_computer_get_desktop_state', {})",
+      "from run_agent import AIAgent",
+      "result = AIAgent()._append_guardrail_observation('mcp_computer_get_desktop_state', {}, result, failed=False)",
       "print(json.dumps(result))",
     ].join("\n");
     const executed = spawnSync("python3", ["-c", script], {
@@ -681,9 +691,11 @@ mcp_servers:
     const result = JSON.parse(executed.stdout.trim());
     expect(result._multimodal).toBe(true);
     expect(result.content[0]).toMatchObject({ type: "text" });
+    expect(result.content[0].text).toContain("[guarded]");
     expect(result.content[0].text).toContain('"structuredContent": {"width": 1, "height": 1}');
     expect(result.content[1].type).toBe("image_url");
     expect(result.content[1].image_url.url).toMatch(/^data:image\/png;base64,/);
+    expect(result.text_summary).toContain("[guarded]");
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });
 
