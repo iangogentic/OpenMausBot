@@ -373,6 +373,9 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toContain("tool_search_module._core_tool_names = guarded_core_tool_names");
     expect(HERMES_POLICY_PYTHON).toContain('code="openmaus_search_loop_halt"');
     expect(HERMES_POLICY_PYTHON).toContain("HermesACPAgent.set_session_model = guarded_set_session_model");
+    expect(HERMES_POLICY_PYTHON).toContain("for attempt in range(11)");
+    expect(HERMES_POLICY_PYTHON).toContain("pending_servers = retry_servers or list(mcp_servers or [])");
+    expect(HERMES_POLICY_PYTHON).toContain("await asyncio.sleep(2)");
   });
 
   it("recognizes the canonical Hermes MCP names for both mounted integrations", () => {

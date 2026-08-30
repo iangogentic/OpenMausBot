@@ -39,9 +39,6 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(service).toContain("Requires=openmaus-provider.slice");
     expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-network --check");
     expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-slice-check --check");
-    expect(service).toContain(
-      "ExecStartPre=/usr/bin/curl --silent --show-error --connect-timeout 2 --max-time 5 --output /dev/null http://127.0.0.1:15050/mcp",
-    );
     expect(ianBrainTunnel).toContain("-o ConnectionAttempts=1");
     expect(ianBrainTunnel).toContain("-o ConnectTimeout=10");
     expect(service.match(/^ExecStartPre=\+\/usr\/bin\/btrfs qgroup show --raw /gm)).toHaveLength(3);

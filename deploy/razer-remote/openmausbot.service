@@ -44,11 +44,6 @@ ExecStartPre=+/usr/bin/btrfs qgroup show --raw /var/lib/openmaus-provider/state
 ExecStartPre=+/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-workspaces
 ExecStartPre=+/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-vm-homes
 ExecStartPre=+/usr/local/libexec/openmaus-provider-slice-check --check
-# Every configured bot receives the dedicated Ian Brain capability. During a
-# cold boot the user-owned SSH tunnel can lag network-online/Tailscale by a few
-# seconds. Refuse to publish the harness until the local tunnel endpoint is
-# actually accepting HTTP; Restart=on-failure retries this bounded probe.
-ExecStartPre=/usr/bin/curl --silent --show-error --connect-timeout 2 --max-time 5 --output /dev/null http://127.0.0.1:15050/mcp
 ExecStartPre=/usr/bin/rm -f /run/openmausbot-private/harness.sock /run/openmausbot-private/webhook.sock
 Environment="PATH=/opt/openmaus-provider/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="HOME=/var/lib/openmausbot"

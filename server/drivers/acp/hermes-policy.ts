@@ -362,41 +362,66 @@ def _install():
         # the ACP-provided descriptors on the state object so the exact same
         # scoped servers can be registered on the replacement agent below.
         state._openmaus_mcp_servers = list(mcp_servers or [])
-        await original_register_mcp(self, state, mcp_servers)
-        # Hermes may collapse the model-facing MCP catalog into its native
-        # tool_search schema. Prove required servers against the authoritative
-        # connected registry, not that compressed snapshot.
-        from tools.mcp_tool import _existing_tool_names
-        registered_names = set(_existing_tool_names())
-        raw = guarded_definitions(
-            enabled_toolsets=getattr(state.agent, "enabled_toolsets", None),
-            disabled_toolsets=getattr(state.agent, "disabled_toolsets", None),
-            quiet_mode=True,
-            skip_tool_search_assembly=True,
-        )
-        names = {
-            item.get("function", {}).get("name")
-            for item in raw
-            if isinstance(item, dict)
-        }
-        names.update(registered_names)
-        unexpected = sorted(name for name in names if not _allowed_tool(name))
-        if unexpected:
-            raise RuntimeError("OpenMaus Hermes policy catalog contained forbidden tools")
         required = {
             item.strip() for item in
             os.environ.get("OPENMAUSBOT_HERMES_REQUIRED_MCP", "").split(",")
             if item.strip()
         }
-        for server_name in sorted(required):
-            if not _has_mcp_server_tool(names, server_name):
+        pending_servers = list(mcp_servers or [])
+        # The desktop2 SSH tunnel is user-owned and can trail Tailscale during
+        # a cold boot. Stock Hermes swallows a failed registration, so retry
+        # only the still-missing required descriptor. The exact-turn broker
+        # token remains active while we wait; forbidden tools still fail on
+        # every attempt, and a truly unavailable dependency fails closed after
+        # a bounded 20 seconds rather than running without Ian Brain.
+        for attempt in range(11):
+            await original_register_mcp(self, state, pending_servers)
+            # Hermes may collapse the model-facing MCP catalog into its native
+            # tool_search schema. Prove required servers against the authoritative
+            # connected registry, not that compressed snapshot.
+            from tools.mcp_tool import _existing_tool_names
+            registered_names = set(_existing_tool_names())
+            raw = guarded_definitions(
+                enabled_toolsets=getattr(state.agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(state.agent, "disabled_toolsets", None),
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            names = {
+                item.get("function", {}).get("name")
+                for item in raw
+                if isinstance(item, dict)
+            }
+            names.update(registered_names)
+            unexpected = sorted(name for name in names if not _allowed_tool(name))
+            if unexpected:
+                raise RuntimeError("OpenMaus Hermes policy catalog contained forbidden tools")
+            missing = {
+                server_name for server_name in required
+                if not _has_mcp_server_tool(names, server_name)
+            }
+            if not missing:
+                break
+            if attempt == 10:
                 visible = ",".join(sorted(
                     name for name in registered_names if isinstance(name, str)
                 ))[:1000]
                 raise RuntimeError(
-                    "OpenMaus required MCP server '" + server_name
-                    + "' exposed no tools (registered: " + visible + ")"
+                    "OpenMaus required MCP server '" + sorted(missing)[0]
+                    + "' exposed no tools after cold-start retries (registered: "
+                    + visible + ")"
                 )
+            retry_servers = []
+            for descriptor in list(mcp_servers or []):
+                descriptor_name = (
+                    descriptor.get("name") if isinstance(descriptor, dict)
+                    else getattr(descriptor, "name", None)
+                )
+                if descriptor_name in missing:
+                    retry_servers.append(descriptor)
+            pending_servers = retry_servers or list(mcp_servers or [])
+            import asyncio
+            await asyncio.sleep(2)
 
     HermesACPAgent._register_session_mcp_servers = guarded_register_mcp
 
