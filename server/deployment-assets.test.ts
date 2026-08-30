@@ -35,8 +35,8 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-slice-check --check");
     expect(service.match(/^ExecStartPre=\+\/usr\/bin\/btrfs qgroup show --raw /gm)).toHaveLength(3);
     expect(service).toContain("ExecStartPre=+/usr/bin/install -d -o openmaus-server -g openmaus-runtime -m 2750 /run/openmaus-provider");
-    expect(service).toContain("RuntimeDirectory=openmausbot-private\n");
-    expect(service).not.toContain("RuntimeDirectory=openmausbot-private openmaus-provider");
+    expect(service).toContain("RuntimeDirectory=openmausbot-private openmaus-provider");
+    expect(service).toContain("RuntimeDirectoryMode=0700");
     expect(companionService).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK");
     expect(service).toContain("/usr/bin/slirp4netns");
     expect(service).toContain('Environment="OMB_PROVIDER_HARNESS_HOST=10.0.2.2"');
