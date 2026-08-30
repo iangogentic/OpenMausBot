@@ -426,6 +426,7 @@ mcp_servers:
     expect(statSync(join(env.HERMES_HOME!, "auth.json")).mode & 0o777).toBe(0o660);
     expect(env.PYTHONPATH).toContain(join("hermes-policy", ""));
     expect(env.PYTHONPATH).not.toContain(join("hermes-bots", ""));
+    expect(env.OPENMAUSBOT_HERMES_POLICY_SHARED).toBe("1");
     expect(statSync(dirname(env.PYTHONPATH!)).mode & 0o777).toBe(0o710);
     expect(statSync(env.PYTHONPATH!).mode & 0o777).toBe(0o700);
     expect(statSync(join(env.PYTHONPATH!, "sitecustomize.py")).mode & 0o777).toBe(0o600);

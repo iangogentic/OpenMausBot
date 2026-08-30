@@ -234,6 +234,14 @@ def _install():
             "restrict_native": _RESTRICT_NATIVE,
             "allowed_native": sorted(_ALLOWED_NATIVE),
         }, stream)
+    # The privileged cross-UID launcher temporarily owns this exact policy
+    # leaf while Hermes is alive. Restore group traversal/readability only on
+    # the nonce-bound proof after writing it so the server can verify the
+    # loaded policy before sending the prompt. The policy module itself stays
+    # mode 0600 and the directory remains non-listable to the runtime group.
+    if os.environ.get("OPENMAUSBOT_HERMES_POLICY_SHARED") == "1":
+        os.chmod(proof, 0o640)
+        os.chmod(os.path.dirname(proof), 0o710)
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -641,6 +649,8 @@ export function prepareHermesPolicyEnvironment(input: {
   input.env.OPENMAUSBOT_HERMES_RESTRICT_NATIVE = input.restricted ? "1" : "0";
   input.env.OPENMAUSBOT_HERMES_POLICY_NONCE = nonce;
   input.env.OPENMAUSBOT_HERMES_POLICY_PROOF = proofPath;
+  if (input.sharedAcrossUid) input.env.OPENMAUSBOT_HERMES_POLICY_SHARED = "1";
+  else delete input.env.OPENMAUSBOT_HERMES_POLICY_SHARED;
   const requiresIanBrain = Boolean(object(object(parseYaml(config))?.mcp_servers)?.ian_brain);
   input.env.OPENMAUSBOT_HERMES_REQUIRED_MCP = [
     ...((input.computerMounted ?? input.restricted) ? ["computer"] : []),
