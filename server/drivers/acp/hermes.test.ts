@@ -406,6 +406,27 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toContain("await asyncio.sleep(2)");
   });
 
+  it("pins only the audited native Cua semantic-browser contract", () => {
+    for (const name of [
+      "get_browser_state",
+      "browser_navigate",
+      "browser_click",
+      "browser_type",
+      "browser_set_input_files",
+    ]) {
+      expect(HERMES_POLICY_PYTHON).toContain(`"mcp_computer_${name}"`);
+    }
+    expect(HERMES_POLICY_PYTHON).not.toContain('"mcp_computer_browser_state"');
+    expect(HERMES_POLICY_PYTHON).not.toContain('"mcp_computer_browser_fill"');
+    expect(HERMES_POLICY_PYTHON).not.toContain('"mcp_computer_browser_upload"');
+    expect(HERMES_POLICY_PYTHON).toMatch(
+      /_VISUAL_OBSERVATION_TOOLS = frozenset\([\s\S]*"mcp_computer_get_browser_state"/,
+    );
+    expect(HERMES_POLICY_PYTHON).toMatch(
+      /_HIGH_RISK_REPEAT_TOOLS = frozenset\([\s\S]*"mcp_computer_browser_set_input_files"/,
+    );
+  });
+
   it("recognizes the canonical Hermes MCP names for both mounted integrations", () => {
     expect(hermesMcpToolMatchesServer("mcp__computer__computer_click", "computer")).toBe(true);
     expect(hermesMcpToolMatchesServer("mcp__ian_brain__wiki_search", "ian_brain")).toBe(true);

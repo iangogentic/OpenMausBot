@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { isAbsolute } from "node:path";
 
 import { augmentedPath } from "./env-path.ts";
 import {
@@ -13,7 +14,6 @@ import {
   createGateInterceptor,
   createLineSplitter,
   type GateInterceptor,
-  type ComputerBatchAction,
 } from "./mcp-bridge.ts";
 import { cuaExecArgs, CUA_SOCKET, type Runtime } from "./container-computer.ts";
 import type { ActionPermit } from "./control-client.ts";
@@ -35,6 +35,204 @@ export const LOCAL_VM_MCP_RESPONSE_TIMEOUT_MS = 180_000;
  * for JSON framing and the textual batch result. Production optimized frames
  * are normally below 400 KiB. */
 export const LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES = 3 * 1024 * 1024;
+/** Browser semantic text/structure is deliberately much smaller than the
+ * transport frame. A trusted post-action image has its own existing bound. */
+export const LOCAL_VM_BROWSER_RESULT_MAX_BYTES = 512 * 1024;
+
+const LOCAL_VM_BROWSER_REF = /^p[^:\s]{1,128}:\d{1,10}$/;
+const LOCAL_VM_BROWSER_NATIVE_TOOLS = new Set([
+  "get_browser_state",
+  "browser_navigate",
+  "browser_click",
+  "browser_type",
+  "browser_set_input_files",
+]);
+const LOCAL_VM_BROWSER_UNSUPPORTED_ALIASES = new Map([
+  ["browser_state", "get_browser_state"],
+  ["browser_fill", "browser_type with replace=true"],
+  ["browser_upload", "browser_set_input_files"],
+]);
+
+type BrowserSemanticRequest = {
+  readonly sequence: number;
+  readonly toolName: string;
+  readonly session: string;
+  readonly targetId?: string;
+  readonly tabId?: string;
+  readonly ref?: string;
+  readonly requestedUrl?: string;
+  readonly snapshot: boolean;
+};
+
+type BrowserSnapshot = {
+  readonly url: string;
+  readonly refs: ReadonlySet<string>;
+};
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function rpcRequestKey(id: unknown): string | null {
+  return typeof id === "string" || (typeof id === "number" && Number.isFinite(id))
+    ? `${typeof id}:${String(id)}`
+    : null;
+}
+
+function browserTabKey(session: string, targetId: string, tabId: string): string {
+  return `${session.length}:${session}${targetId.length}:${targetId}${tabId.length}:${tabId}`;
+}
+
+function exactHttpUrl(value: unknown): URL | null {
+  if (typeof value !== "string" || value.length < 1 || value.length > 8_192) return null;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizedUrl(value: string): string {
+  const parsed = exactHttpUrl(value);
+  if (!parsed) return "[REDACTED URL]";
+  parsed.username = "";
+  parsed.password = "";
+  if (parsed.search) parsed.search = "?[REDACTED]";
+  if (parsed.hash) parsed.hash = "#[REDACTED]";
+  return parsed.href;
+}
+
+function redactBrowserString(value: string, sensitive: ReadonlySet<string>): string {
+  let redacted = value.replace(/https?:\/\/[^\s"'<>]+/giu, (candidate) => sanitizedUrl(candidate));
+  redacted = redacted.replace(
+    /\b(password|passwd|token|api[_-]?key|secret|authorization|cookie)=([^&\s]+)/giu,
+    "$1=[REDACTED]",
+  );
+  for (const literal of sensitive) {
+    if (literal.length >= 3) redacted = redacted.split(literal).join("[REDACTED]");
+  }
+  return redacted;
+}
+
+function redactBrowserValue(value: unknown, sensitive: ReadonlySet<string>): unknown {
+  let visited = 0;
+  const visit = (candidate: unknown, key: string, depth: number): unknown => {
+    visited += 1;
+    if (visited > 50_000 || depth > 32) throw new Error("browser result exceeded structural bounds");
+    if (/password|passwd|token|api[_-]?key|secret|authorization|cookie/iu.test(key)) {
+      return "[REDACTED]";
+    }
+    if (typeof candidate === "string") return redactBrowserString(candidate, sensitive);
+    if (Array.isArray(candidate)) return candidate.map((item) => visit(item, "", depth + 1));
+    const object = record(candidate);
+    if (!object) return candidate;
+    return Object.fromEntries(Object.entries(object).map(([childKey, item]) => (
+      [childKey, visit(item, childKey, depth + 1)]
+    )));
+  };
+  return visit(value, "", 0);
+}
+
+function collectBrowserRefs(value: unknown): ReadonlySet<string> {
+  const refs = new Set<string>();
+  let visited = 0;
+  const visit = (candidate: unknown, depth: number, key = "") => {
+    visited += 1;
+    if (visited > 50_000 || depth > 32) throw new Error("browser state exceeded structural bounds");
+    if (typeof candidate === "string") {
+      if ((key === "ref" || key === "action_ref") && LOCAL_VM_BROWSER_REF.test(candidate)) {
+        refs.add(candidate);
+      }
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      for (const item of candidate) visit(item, depth + 1, key);
+      return;
+    }
+    const object = record(candidate);
+    if (!object) return;
+    for (const [childKey, item] of Object.entries(object)) visit(item, depth + 1, childKey);
+  };
+  visit(value, 0);
+  return refs;
+}
+
+function browserSnapshotFromResult(
+  result: unknown,
+  request: Pick<BrowserSemanticRequest, "targetId" | "tabId">,
+): BrowserSnapshot | null {
+  const resultRecord = record(result);
+  const structured = record(resultRecord?.structuredContent);
+  if (!browserToolResultValid(resultRecord) || !structured) return null;
+  if (typeof structured.status === "string" && structured.status !== "ok") return null;
+  if (structured.target_id !== request.targetId || structured.tab_id !== request.tabId) return null;
+  let url: unknown = structured.url ?? structured.live_url;
+  const tab = record(structured.tab);
+  if (url === undefined && tab !== null && tab.tab_id === request.tabId) url = tab.url;
+  if (url === undefined && Array.isArray(structured.tabs)) {
+    const matched = structured.tabs.map(record).find((item) => item?.tab_id === request.tabId);
+    url = matched?.url;
+  }
+  const parsed = exactHttpUrl(url);
+  if (!parsed) return null;
+  try {
+    return { url: parsed.href, refs: collectBrowserRefs(structured) };
+  } catch {
+    return null;
+  }
+}
+
+function browserToolResultValid(result: unknown): result is Record<string, unknown> {
+  const resultRecord = record(result);
+  if (!resultRecord || resultRecord.isError === true || !Array.isArray(resultRecord.content)) return false;
+  if (resultRecord.content.length < 1) return false;
+  return resultRecord.content.every((item) => {
+    const part = record(item);
+    if (!part) return false;
+    if (part.type === "text") return typeof part.text === "string";
+    if (part.type === "image") {
+      return typeof part.data === "string" && typeof part.mimeType === "string";
+    }
+    return false;
+  });
+}
+
+function browserBindingResultValid(result: unknown): boolean {
+  if (!browserToolResultValid(result)) return false;
+  const structured = record(result.structuredContent);
+  if (!structured || typeof structured.target_id !== "string" || !Array.isArray(structured.tabs)) return false;
+  return structured.tabs.length > 0 && structured.tabs.every((candidate) => {
+    const tab = record(candidate);
+    return tab !== null && typeof tab.tab_id === "string" && typeof tab.url === "string" && tab.url.length <= 8_192;
+  });
+}
+
+function validBrowserScreenshot(screenshot: LocalVmActionScreenshot | null): screenshot is LocalVmActionScreenshot {
+  if (!screenshot || screenshot.data.length > LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES) return false;
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(screenshot.data, "base64");
+  } catch {
+    return false;
+  }
+  if (screenshot.mimeType === "image/png") {
+    return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  }
+  if (screenshot.mimeType === "image/jpeg") return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  return bytes.length >= 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+    bytes.subarray(8, 12).toString("ascii") === "WEBP";
+}
+
+function browserFailure(id: unknown, message: string): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id: id ?? null,
+    result: { content: [{ type: "text", text: `FAILED: ${message}` }], isError: true },
+  });
+}
 
 /** Cua Driver's low-level action tools report only metadata. Attach the
  * resulting pixels in the broker so a vision model receives one atomic
@@ -233,6 +431,11 @@ export function attachLocalVmMcpBroker(options: {
   const pendingDriver: Buffer[] = [];
   const pendingActions = new Map<string, string>();
   const pendingActionTools = new Map<string, string>();
+  const stagedBrowserRequests = new Map<string, BrowserSemanticRequest>();
+  const pendingBrowserRequests = new Map<string, BrowserSemanticRequest>();
+  const browserSnapshots = new Map<string, { sequence: number; refs: ReadonlySet<string> }>();
+  const browserSensitiveLiterals = new Set<string>();
+  let browserRequestSequence = 0;
   const pendingToolsList = new Set<string>();
   const pendingPassthrough = new Set<string>();
   const pendingBatchDriverCalls = new Map<string, {
@@ -241,6 +444,7 @@ export function attachLocalVmMcpBroker(options: {
   }>();
   let activeBatchActionId: string | null = null;
   let batchDriverSequence = 0;
+  const internalCorrelationNonce = randomBytes(16).toString("hex");
   const responseTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let offBrokerDrain: () => void = () => {};
   let generationTimer: ReturnType<typeof setInterval> | null = null;
@@ -305,6 +509,10 @@ export function attachLocalVmMcpBroker(options: {
     responseTimers.clear();
     for (const pending of pendingBatchDriverCalls.values()) pending.reject(new Error(reason));
     pendingBatchDriverCalls.clear();
+    stagedBrowserRequests.clear();
+    pendingBrowserRequests.clear();
+    browserSnapshots.clear();
+    browserSensitiveLiterals.clear();
     options.signal?.removeEventListener("abort", onAbort);
     offBrokerDrain();
     options.broker.resumeInput();
@@ -417,8 +625,12 @@ export function attachLocalVmMcpBroker(options: {
     return true;
   };
 
-  const callBatchDriver = (action: ComputerBatchAction): Promise<Record<string, unknown>> => {
-    const internalId = `__openmaus_computer_batch_${++batchDriverSequence}`;
+  const callInternalDriver = (
+    toolName: string,
+    args: Record<string, unknown>,
+    purpose: "computer_batch" | "browser_verify",
+  ): Promise<Record<string, unknown>> => {
+    const internalId = `__openmaus_${purpose}_${internalCorrelationNonce}_${++batchDriverSequence}`;
     const requestKey = `string:${internalId}`;
     return new Promise((resolve, reject) => {
       pendingBatchDriverCalls.set(requestKey, { resolve, reject });
@@ -427,13 +639,158 @@ export function attachLocalVmMcpBroker(options: {
         jsonrpc: "2.0",
         id: internalId,
         method: "tools/call",
-        params: { name: action.name, arguments: action.arguments },
+        params: { name: toolName, arguments: args },
       }));
       if (!forwarded && pendingBatchDriverCalls.delete(requestKey)) {
         clearResponseDeadline(requestKey);
         reject(new Error("Local VM driver was unavailable"));
       }
     });
+  };
+
+  const rememberBrowserSensitive = (value: string) => {
+    if (value.length < 3 || value.length > 8_192) return;
+    if (!browserSensitiveLiterals.has(value) && browserSensitiveLiterals.size >= 128) {
+      const oldest = browserSensitiveLiterals.values().next().value;
+      if (typeof oldest === "string") browserSensitiveLiterals.delete(oldest);
+    }
+    browserSensitiveLiterals.add(value);
+  };
+
+  const inspectBrowserRequest = (line: string): { accepted: boolean; requestId?: string } => {
+    let frame: Record<string, unknown> | null = null;
+    try {
+      frame = record(JSON.parse(line));
+    } catch {
+      return { accepted: true };
+    }
+    if (!frame || frame.method !== "tools/call") return { accepted: true };
+    const params = record(frame.params);
+    const name = typeof params?.name === "string" ? params.name : "";
+    const replacement = LOCAL_VM_BROWSER_UNSUPPORTED_ALIASES.get(name);
+    if (replacement) {
+      emitBroker(browserFailure(frame.id, `${name} is not a Cua Driver tool; use ${replacement}.`));
+      return { accepted: false };
+    }
+    if (!LOCAL_VM_BROWSER_NATIVE_TOOLS.has(name)) return { accepted: true };
+    const requestId = rpcRequestKey(frame.id);
+    if (!requestId) {
+      emitBroker(browserFailure(frame.id, `${name} requires a valid JSON-RPC request id.`));
+      return { accepted: false };
+    }
+    if (
+      stagedBrowserRequests.has(requestId) || pendingBrowserRequests.has(requestId) ||
+      pendingActions.has(requestId) || pendingPassthrough.has(requestId) || pendingToolsList.has(requestId)
+    ) {
+      emitBroker(browserFailure(frame.id, "this JSON-RPC request id is already in flight."));
+      return { accepted: false };
+    }
+    const args = record(params?.arguments);
+    if (!args) {
+      emitBroker(browserFailure(frame.id, `${name} requires an object argument.`));
+      return { accepted: false };
+    }
+    const session = args.session === undefined ? "" : args.session;
+    if (typeof session !== "string" || session.length > 128) {
+      emitBroker(browserFailure(frame.id, `${name} received an invalid browser session.`));
+      return { accepted: false };
+    }
+    const sequence = ++browserRequestSequence;
+    if (name === "get_browser_state") {
+      const targetId = args.target_id;
+      const tabId = args.tab_id;
+      const snapshot = typeof targetId === "string" && typeof tabId === "string" &&
+        targetId.length > 0 && targetId.length <= 512 && tabId.length > 0 && tabId.length <= 512;
+      const bind = Number.isSafeInteger(args.pid) && (args.pid as number) > 0 &&
+        Number.isSafeInteger(args.window_id) && (args.window_id as number) > 0;
+      if (!snapshot && !bind) {
+        emitBroker(browserFailure(frame.id, "get_browser_state requires either exact pid/window_id binding or target_id/tab_id snapshot arguments."));
+        return { accepted: false };
+      }
+      const request: BrowserSemanticRequest = {
+        sequence,
+        toolName: name,
+        session,
+        ...(snapshot ? { targetId, tabId } : {}),
+        snapshot,
+      };
+      stagedBrowserRequests.set(requestId, request);
+      return { accepted: true, requestId };
+    }
+    const targetId = args.target_id;
+    const tabId = args.tab_id;
+    if (
+      typeof targetId !== "string" || targetId.length < 1 || targetId.length > 512 ||
+      typeof tabId !== "string" || tabId.length < 1 || tabId.length > 512
+    ) {
+      emitBroker(browserFailure(frame.id, `${name} requires exact target_id and tab_id arguments.`));
+      return { accepted: false };
+    }
+    const tabKey = browserTabKey(session, targetId, tabId);
+    let ref: string | undefined;
+    if (name === "browser_click") {
+      const hasRef = typeof args.ref === "string";
+      const hasCoordinates = Number.isFinite(args.x) && Number.isFinite(args.y);
+      if (hasRef === hasCoordinates) {
+        emitBroker(browserFailure(frame.id, "browser_click requires exactly one current ref or one finite x/y coordinate pair."));
+        return { accepted: false };
+      }
+      if (hasRef) ref = args.ref as string;
+    } else if (name === "browser_type") {
+      if (typeof args.ref !== "string" || typeof args.text !== "string" || args.text.length > 65_536) {
+        emitBroker(browserFailure(frame.id, "browser_type requires a bounded current ref and text; use replace=true for fill semantics."));
+        return { accepted: false };
+      }
+      ref = args.ref;
+      rememberBrowserSensitive(args.text);
+    } else if (name === "browser_set_input_files") {
+      if (
+        typeof args.ref !== "string" || !Array.isArray(args.files) || args.files.length < 1 ||
+        args.files.length > 32 || !args.files.every((file) => typeof file === "string" && isAbsolute(file))
+      ) {
+        emitBroker(browserFailure(frame.id, "browser_set_input_files requires a bounded current ref and 1-32 absolute file paths."));
+        return { accepted: false };
+      }
+      ref = args.ref;
+      for (const file of args.files) rememberBrowserSensitive(file as string);
+    }
+    if (ref !== undefined) {
+      const snapshot = browserSnapshots.get(tabKey);
+      if (!LOCAL_VM_BROWSER_REF.test(ref) || !snapshot?.refs.has(ref)) {
+        emitBroker(browserFailure(frame.id, `${name} refused an unknown or stale browser ref; call get_browser_state for this exact tab first.`));
+        return { accepted: false };
+      }
+    }
+    let requestedUrl: string | undefined;
+    if (name === "browser_navigate") {
+      const parsed = exactHttpUrl(args.url);
+      if (!parsed) {
+        emitBroker(browserFailure(frame.id, "browser_navigate accepts only a valid bounded http(s) URL."));
+        return { accepted: false };
+      }
+      requestedUrl = parsed.href;
+      if (parsed.username) rememberBrowserSensitive(parsed.username);
+      if (parsed.password) rememberBrowserSensitive(parsed.password);
+      for (const [key, value] of parsed.searchParams) {
+        rememberBrowserSensitive(key);
+        rememberBrowserSensitive(value);
+      }
+    }
+    // Cua invalidates refs on navigation/newer state, and any page mutation
+    // may itself navigate. Reserve the current snapshot when the request is
+    // admitted so a queued duplicate cannot reuse the same ref concurrently.
+    browserSnapshots.delete(tabKey);
+    stagedBrowserRequests.set(requestId, {
+      sequence,
+      toolName: name,
+      session,
+      targetId,
+      tabId,
+      ...(ref === undefined ? {} : { ref }),
+      ...(requestedUrl === undefined ? {} : { requestedUrl }),
+      snapshot: false,
+    });
+    return { accepted: true, requestId };
   };
 
   const gate: GateInterceptor = createGateInterceptor({
@@ -457,6 +814,21 @@ export function attachLocalVmMcpBroker(options: {
       }
       pendingActions.set(requestId, actionId);
       pendingActionTools.set(requestId, toolName);
+      const browserRequest = stagedBrowserRequests.get(requestId);
+      if (browserRequest) {
+        stagedBrowserRequests.delete(requestId);
+        pendingBrowserRequests.set(requestId, browserRequest);
+        if (
+          browserRequest.toolName === "get_browser_state" && browserRequest.snapshot &&
+          browserRequest.targetId && browserRequest.tabId
+        ) {
+          browserSnapshots.delete(browserTabKey(
+            browserRequest.session,
+            browserRequest.targetId,
+            browserRequest.tabId,
+          ));
+        }
+      }
       armResponseDeadline(requestId);
     },
     actionAbandoned: async (actionId) => {
@@ -484,6 +856,11 @@ export function attachLocalVmMcpBroker(options: {
         return;
       }
       pendingPassthrough.add(requestId);
+      const browserRequest = stagedBrowserRequests.get(requestId);
+      if (browserRequest) {
+        stagedBrowserRequests.delete(requestId);
+        pendingBrowserRequests.set(requestId, browserRequest);
+      }
       armResponseDeadline(requestId);
     },
     requestHelp: async (reason) => await claimToolCall()
@@ -518,7 +895,7 @@ export function attachLocalVmMcpBroker(options: {
           if (!(await claimToolCall())) {
             return { content: [{ type: "text", text: `The computer batch stopped safely after ${completed} actions because its authority expired.` }], isError: true };
           }
-          const response = await callBatchDriver(action);
+          const response = await callInternalDriver(action.name, action.arguments, "computer_batch");
           const nestedResult = response.result;
           const nestedRecord = nestedResult !== null && typeof nestedResult === "object" && !Array.isArray(nestedResult)
             ? nestedResult as Record<string, unknown>
@@ -589,7 +966,14 @@ export function attachLocalVmMcpBroker(options: {
       finish("Local VM MCP frame quota exceeded", pendingActions.size > 0);
       return false;
     }
-    return gate(line);
+    const inspected = inspectBrowserRequest(line);
+    if (!inspected.accepted) return true;
+    const accepted = gate(line);
+    if (accepted && inspected.requestId) {
+      const requestId = inspected.requestId;
+      void gate.drain().finally(() => stagedBrowserRequests.delete(requestId));
+    }
+    return accepted;
   }, {
     maxLineBytes: MCP_MAX_LINE_BYTES,
     onOverflow: () => finish("Local VM MCP request frame exceeded its limit", pendingActions.size > 0),
@@ -607,6 +991,20 @@ export function attachLocalVmMcpBroker(options: {
       finish("Local VM MCP response frame quota exceeded", pendingActions.size > 0);
       return false;
     }
+    // Internal verification is awaited by the currently serialized outbound
+    // task. Resolve its exact private id before enqueueing, otherwise the
+    // response would sit behind the task that is waiting for it.
+    try {
+      const immediate = record(JSON.parse(line));
+      const immediateId = rpcRequestKey(immediate?.id);
+      const internal = immediateId ? pendingBatchDriverCalls.get(immediateId) : undefined;
+      if (internal && immediate && ("result" in immediate || "error" in immediate)) {
+        clearResponseDeadline(immediateId!);
+        pendingBatchDriverCalls.delete(immediateId!);
+        internal.resolve(immediate);
+        return true;
+      }
+    } catch {}
     const lineBytes = Buffer.byteLength(line) + 1;
     if (
       lineBytes > MCP_MAX_PENDING_BYTES ||
@@ -658,6 +1056,7 @@ export function attachLocalVmMcpBroker(options: {
         const actionId = pendingActions.get(id);
         if (actionId) {
           const toolName = pendingActionTools.get(id) ?? "";
+          const browserRequest = pendingBrowserRequests.get(id);
           const ordinaryResult = frame?.result;
           const ordinaryDriverError = "error" in (frame ?? {});
           const ordinaryResultValid = !ordinaryDriverError && (
@@ -678,7 +1077,108 @@ export function attachLocalVmMcpBroker(options: {
               },
             });
           }
-          if (
+          if (browserRequest) {
+            let failure: string | null = null;
+            let observedRefs: ReadonlySet<string> | null = null;
+            if (ordinaryDriverError || !browserToolResultValid(ordinaryResult)) {
+              failure = `${toolName} returned a malformed or failed Cua Driver result; its postcondition is unproven.`;
+            } else if (toolName === "get_browser_state") {
+              if (browserRequest.snapshot) {
+                const snapshot = browserSnapshotFromResult(ordinaryResult, browserRequest);
+                if (!snapshot || !browserRequest.targetId || !browserRequest.tabId) {
+                  failure = "get_browser_state returned malformed or non-http(s) tab state.";
+                } else {
+                  observedRefs = snapshot.refs;
+                }
+              } else if (!browserBindingResultValid(ordinaryResult)) {
+                failure = "get_browser_state returned malformed browser binding state.";
+              }
+            } else if (browserRequest.targetId && browserRequest.tabId) {
+              const key = browserTabKey(browserRequest.session, browserRequest.targetId, browserRequest.tabId);
+              const currentSnapshot = browserSnapshots.get(key);
+              if (currentSnapshot && currentSnapshot.sequence <= browserRequest.sequence) {
+                browserSnapshots.delete(key);
+              }
+              if (toolName === "browser_navigate") {
+                const verifyArgs: Record<string, unknown> = {
+                  target_id: browserRequest.targetId,
+                  tab_id: browserRequest.tabId,
+                  snapshot_format: "semantic_v2",
+                  include_screenshot: false,
+                  ...(browserRequest.session ? { session: browserRequest.session } : {}),
+                };
+                try {
+                  const verification = await callInternalDriver(
+                    "get_browser_state",
+                    verifyArgs,
+                    "browser_verify",
+                  );
+                  const snapshot = browserSnapshotFromResult(verification.result, browserRequest);
+                  if (!snapshot || snapshot.url !== browserRequest.requestedUrl) {
+                    failure = "browser_navigate did not prove the exact requested http(s) destination.";
+                  }
+                } catch {
+                  failure = "browser_navigate could not obtain trusted post-navigation state.";
+                }
+              }
+            }
+
+            let safeFrame: Record<string, unknown> | null = null;
+            try {
+              safeFrame = record(redactBrowserValue(frame, browserSensitiveLiterals));
+            } catch {
+              failure = `${toolName} returned browser state outside the broker's structural bound.`;
+            }
+            if (!safeFrame || Buffer.byteLength(JSON.stringify(safeFrame)) > LOCAL_VM_BROWSER_RESULT_MAX_BYTES) {
+              failure = `${toolName} returned browser state outside the broker's byte bound.`;
+            }
+            if (
+              !failure && observedRefs && browserRequest.targetId && browserRequest.tabId
+            ) {
+              browserSnapshots.set(
+                browserTabKey(browserRequest.session, browserRequest.targetId, browserRequest.tabId),
+                { sequence: browserRequest.sequence, refs: observedRefs },
+              );
+            }
+            if (failure) {
+              safeFrame = JSON.parse(browserFailure(frame?.id, failure)) as Record<string, unknown>;
+            }
+            if (!safeFrame) {
+              safeFrame = JSON.parse(browserFailure(
+                frame?.id,
+                `${toolName} produced no bounded browser result.`,
+              )) as Record<string, unknown>;
+            }
+
+            if (toolName !== "get_browser_state") {
+              let screenshot: LocalVmActionScreenshot | null = null;
+              try {
+                screenshot = await options.captureAfterAction?.(toolName) ?? null;
+              } catch {}
+              if (!validBrowserScreenshot(screenshot)) {
+                safeFrame = JSON.parse(browserFailure(
+                  frame?.id,
+                  `${toolName} has no bounded trusted post-action image; its visual postcondition is unproven.`,
+                )) as Record<string, unknown>;
+              } else {
+                const result = record(safeFrame.result);
+                const content = Array.isArray(result?.content) ? [...result.content] : [];
+                const frameHash = createHash("sha256")
+                  .update(screenshot.mimeType)
+                  .update("\0")
+                  .update(screenshot.data)
+                  .digest("hex");
+                content.push({
+                  type: "text",
+                  text: `Trusted post-action screen attached for ${toolName} (sha256=${frameHash}).`,
+                });
+                content.push({ type: "image", data: screenshot.data, mimeType: screenshot.mimeType });
+                safeFrame.result = { ...result, content };
+                lastDeliveredFrameHash = frameHash;
+              }
+            }
+            responseLine = JSON.stringify(safeFrame);
+          } else if (
             ordinaryResultValid &&
             LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName) &&
             options.captureAfterAction
@@ -740,6 +1240,7 @@ export function attachLocalVmMcpBroker(options: {
           }
           pendingActions.delete(id);
           pendingActionTools.delete(id);
+          pendingBrowserRequests.delete(id);
         }
       }
       const response = augmentToolsListResponse(

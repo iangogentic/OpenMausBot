@@ -97,6 +97,62 @@ function spawnResponder(script = responderScript): ChildProcessWithoutNullStream
   });
 }
 
+function semanticBrowserResponder(options: {
+  actualNavigateUrl?: string;
+  malformedState?: boolean;
+  malformedAction?: boolean;
+  extraText?: string;
+  oversizedState?: boolean;
+} = {}): string {
+  const config = JSON.stringify(options);
+  return String.raw`
+const readline = require("node:readline");
+const config = ${config};
+let currentUrl = "https://example.test/start";
+const send = (frame) => process.stdout.write(JSON.stringify(frame) + "\n");
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const frame = JSON.parse(line);
+  if (frame.method !== "tools/call") return send({ jsonrpc: "2.0", id: frame.id, result: {} });
+  const name = frame.params.name;
+  const args = frame.params.arguments || {};
+  if (name === "get_browser_state") {
+    if (config.malformedState) return send({ jsonrpc: "2.0", id: frame.id, result: { content: "invalid" } });
+    const padding = config.oversizedState ? "x".repeat(600000) : "";
+    return send({
+      jsonrpc: "2.0",
+      id: frame.id,
+      result: {
+        content: [{ type: "text", text: "browser state " + currentUrl + " " + (config.extraText || "") + padding }],
+        structuredContent: {
+          status: "ok",
+          target_id: args.target_id || "target-a",
+          tab_id: args.tab_id || "tab-a",
+          url: currentUrl,
+          snapshot_id: "snapshot-a",
+          elements: [
+            { ref: "p1:1", role: "button", name: "Continue" },
+            { ref: "p1:2", role: "textbox", name: "Email" },
+            { ref: "p1:3", role: "button", name: "Upload" },
+          ],
+        },
+      },
+    });
+  }
+  if (name === "browser_navigate") currentUrl = config.actualNavigateUrl || args.url;
+  if (config.malformedAction) return send({ jsonrpc: "2.0", id: frame.id, result: { content: [] } });
+  send({
+    jsonrpc: "2.0",
+    id: frame.id,
+    result: {
+      content: [{ type: "text", text: "action complete " + (config.extraText || "") }],
+      structuredContent: { status: "ok", echoed_url: currentUrl, files: args.files },
+    },
+  });
+});
+`;
+}
+
 function baseOptions(socket: FakeSocket, overrides: Record<string, unknown> = {}) {
   return {
     broker: socket as unknown as RawWebSocket,
@@ -180,6 +236,243 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     expect(beginAction).toHaveBeenCalledOnce();
     expect(endAction).toHaveBeenCalledExactlyOnceWith("direct-parent-ticket");
     handle.close("direct parent compatibility complete");
+    await handle.closed;
+  });
+
+  it("fails a wrong post-navigation URL, redacts credentials/query data, and still attaches trusted pixels", async () => {
+    const socket = new FakeSocket();
+    const secretUrl = "https://alice:password123@example.test/private?token=query-secret#fragment-secret";
+    const captureAfterAction = vi.fn(async () => ({ data: "iVBORw0KGgo=", mimeType: "image/png" as const }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction,
+      spawnDriver: () => spawnResponder(semanticBrowserResponder({
+        actualNavigateUrl: "https://example.test/wrong?token=driver-secret",
+        extraText: secretUrl,
+      })),
+    }));
+
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 201,
+      method: "tools/call",
+      params: {
+        name: "browser_navigate",
+        arguments: { target_id: "target-a", tab_id: "tab-a", url: secretUrl },
+      },
+    }) + "\n");
+
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    const raw = socket.sent[0]!.toString();
+    const response = JSON.parse(raw);
+    expect(response.result.isError).toBe(true);
+    expect(response.result.content).toContainEqual({ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" });
+    expect(raw).not.toContain("alice");
+    expect(raw).not.toContain("password123");
+    expect(raw).not.toContain("query-secret");
+    expect(raw).not.toContain("fragment-secret");
+    expect(raw).not.toContain("driver-secret");
+    expect(captureAfterAction).toHaveBeenCalledExactlyOnceWith("browser_navigate");
+
+    handle.close("wrong URL test complete");
+    await handle.closed;
+  });
+
+  it("reports navigation success only when trusted state proves the exact http(s) URL", async () => {
+    const socket = new FakeSocket();
+    const destination = "https://example.test/exact/path?view=compact";
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction: async () => ({ data: "iVBORw0KGgo=", mimeType: "image/png" as const }),
+      spawnDriver: () => spawnResponder(semanticBrowserResponder()),
+    }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 226,
+      method: "tools/call",
+      params: {
+        name: "browser_navigate",
+        arguments: { target_id: "target-a", tab_id: "tab-a", url: destination },
+      },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    const raw = socket.sent[0]!.toString();
+    const response = JSON.parse(raw);
+    expect(response.result.isError).toBeUndefined();
+    expect(response.result.content).toContainEqual({
+      type: "image",
+      data: "iVBORw0KGgo=",
+      mimeType: "image/png",
+    });
+    expect(raw).not.toContain("view=compact");
+    handle.close("exact URL test complete");
+    await handle.closed;
+  });
+
+  it("accepts only refs from the latest exact-tab state and makes them stale after a mutation", async () => {
+    const socket = new FakeSocket();
+    let actionSequence = 0;
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: `browser-${++actionSequence}` }));
+    const captureAfterAction = vi.fn(async () => ({ data: "iVBORw0KGgo=", mimeType: "image/png" as const }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      captureAfterAction,
+      spawnDriver: () => spawnResponder(semanticBrowserResponder({ extraText: "page text p9:9 is not an action ref" })),
+    }));
+    const send = (id: number, name: string, args: Record<string, unknown>) => socket.receive(JSON.stringify({
+      jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args },
+    }) + "\n");
+
+    send(202, "get_browser_state", { target_id: "target-a", tab_id: "tab-a", snapshot_format: "semantic_v2" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    expect(JSON.parse(socket.sent[0]!.toString()).result.isError).toBeUndefined();
+
+    send(220, "browser_click", { target_id: "target-a", tab_id: "tab-a", ref: "p9:9" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(2));
+    expect(JSON.parse(socket.sent[1]!.toString())).toMatchObject({ result: { isError: true } });
+    expect(beginAction).toHaveBeenCalledOnce();
+
+    send(203, "browser_click", { target_id: "target-a", tab_id: "tab-a", ref: "p1:1" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(3));
+    expect(JSON.parse(socket.sent[2]!.toString()).result.content)
+      .toContainEqual({ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" });
+
+    send(204, "browser_click", { target_id: "target-a", tab_id: "tab-a", ref: "p1:1" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(4));
+    expect(JSON.parse(socket.sent[3]!.toString())).toMatchObject({ result: { isError: true } });
+    expect(socket.sent[3]!.toString()).toContain("unknown or stale browser ref");
+    expect(beginAction).toHaveBeenCalledTimes(2);
+
+    send(205, "browser_type", { target_id: "target-a", tab_id: "tab-a", ref: "p9:9", text: "nope" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(5));
+    expect(JSON.parse(socket.sent[4]!.toString())).toMatchObject({ result: { isError: true } });
+    expect(beginAction).toHaveBeenCalledTimes(2);
+
+    send(221, "get_browser_state", { target_id: "target-a", tab_id: "tab-a" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(6));
+    send(222, "browser_click", { target_id: "target-a", tab_id: "tab-a", ref: "p1:1" });
+    send(223, "browser_click", { target_id: "target-a", tab_id: "tab-a", ref: "p1:1" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(8));
+    const raced = socket.sent.slice(6).map((item) => JSON.parse(item.toString()));
+    expect(raced.find((item) => item.id === 223)).toMatchObject({ result: { isError: true } });
+    expect(raced.find((item) => item.id === 222)?.result.isError).toBeUndefined();
+    expect(beginAction).toHaveBeenCalledTimes(4);
+
+    handle.close("browser ref test complete");
+    await handle.closed;
+  });
+
+  it("fails malformed browser state and action results instead of reporting success", async () => {
+    const malformedStateSocket = new FakeSocket();
+    const stateBegin = vi.fn(() => ({ allowed: true as const, actionId: "bad-state" }));
+    const stateHandle = attachLocalVmMcpBroker(baseOptions(malformedStateSocket, {
+      beginAction: stateBegin,
+      spawnDriver: () => spawnResponder(semanticBrowserResponder({ malformedState: true })),
+    }));
+    malformedStateSocket.receive(JSON.stringify({
+      jsonrpc: "2.0", id: 206, method: "tools/call",
+      params: { name: "get_browser_state", arguments: { target_id: "target-a", tab_id: "tab-a" } },
+    }) + "\n");
+    await vi.waitFor(() => expect(malformedStateSocket.sent.length).toBe(1));
+    expect(JSON.parse(malformedStateSocket.sent[0]!.toString())).toMatchObject({ result: { isError: true } });
+    malformedStateSocket.receive(JSON.stringify({
+      jsonrpc: "2.0", id: 207, method: "tools/call",
+      params: { name: "browser_click", arguments: { target_id: "target-a", tab_id: "tab-a", ref: "p1:1" } },
+    }) + "\n");
+    await vi.waitFor(() => expect(malformedStateSocket.sent.length).toBe(2));
+    expect(stateBegin).toHaveBeenCalledOnce();
+    stateHandle.close("malformed state test complete");
+    await stateHandle.closed;
+
+    const malformedActionSocket = new FakeSocket();
+    let actionId = 0;
+    const captureAfterAction = vi.fn(async () => ({ data: "iVBORw0KGgo=", mimeType: "image/png" as const }));
+    const actionHandle = attachLocalVmMcpBroker(baseOptions(malformedActionSocket, {
+      beginAction: () => ({ allowed: true as const, actionId: `malformed-${++actionId}` }),
+      captureAfterAction,
+      spawnDriver: () => spawnResponder(semanticBrowserResponder({ malformedAction: true })),
+    }));
+    malformedActionSocket.receive(JSON.stringify({
+      jsonrpc: "2.0", id: 208, method: "tools/call",
+      params: { name: "get_browser_state", arguments: { target_id: "target-a", tab_id: "tab-a" } },
+    }) + "\n");
+    await vi.waitFor(() => expect(malformedActionSocket.sent.length).toBe(1));
+    malformedActionSocket.receive(JSON.stringify({
+      jsonrpc: "2.0", id: 209, method: "tools/call",
+      params: { name: "browser_type", arguments: { target_id: "target-a", tab_id: "tab-a", ref: "p1:2", text: "credential-value", replace: true } },
+    }) + "\n");
+    await vi.waitFor(() => expect(malformedActionSocket.sent.length).toBe(2));
+    const malformedAction = JSON.parse(malformedActionSocket.sent[1]!.toString());
+    expect(malformedAction.result.isError).toBe(true);
+    expect(malformedAction.result.content).toContainEqual({ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" });
+    expect(malformedActionSocket.sent[1]!.toString()).not.toContain("credential-value");
+    actionHandle.close("malformed action test complete");
+    await actionHandle.closed;
+  });
+
+  it("redacts successful upload paths and fails a later mutation when trusted capture is absent", async () => {
+    const socket = new FakeSocket();
+    let actionId = 0;
+    const captureAfterAction = vi.fn()
+      .mockResolvedValueOnce({ data: "iVBORw0KGgo=", mimeType: "image/png" as const })
+      .mockResolvedValueOnce(null);
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction: () => ({ allowed: true as const, actionId: `capture-${++actionId}` }),
+      captureAfterAction,
+      spawnDriver: () => spawnResponder(semanticBrowserResponder()),
+    }));
+    const send = (id: number, name: string, args: Record<string, unknown>) => socket.receive(JSON.stringify({
+      jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args },
+    }) + "\n");
+    send(210, "get_browser_state", { target_id: "target-a", tab_id: "tab-a" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    send(211, "browser_set_input_files", {
+      target_id: "target-a", tab_id: "tab-a", ref: "p1:3", files: ["/tmp/private-upload-name.txt"],
+    });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(2));
+    const uploadRaw = socket.sent[1]!.toString();
+    expect(JSON.parse(uploadRaw).result.isError).toBeUndefined();
+    expect(uploadRaw).not.toContain("private-upload-name.txt");
+    expect(uploadRaw).toContain("[REDACTED]");
+
+    send(224, "get_browser_state", { target_id: "target-a", tab_id: "tab-a" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(3));
+    send(225, "browser_click", { target_id: "target-a", tab_id: "tab-a", ref: "p1:1" });
+    await vi.waitFor(() => expect(socket.sent.length).toBe(4));
+    const failureRaw = socket.sent[3]!.toString();
+    expect(JSON.parse(failureRaw)).toMatchObject({ result: { isError: true } });
+    expect(failureRaw).toContain("no bounded trusted post-action image");
+    expect(captureAfterAction).toHaveBeenNthCalledWith(1, "browser_set_input_files");
+    expect(captureAfterAction).toHaveBeenNthCalledWith(2, "browser_click");
+    handle.close("capture failure test complete");
+    await handle.closed;
+  });
+
+  it("bounds semantic state and explicitly rejects unsupported browser aliases", async () => {
+    const socket = new FakeSocket();
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "bounded" }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      spawnDriver: () => spawnResponder(semanticBrowserResponder({ oversizedState: true })),
+    }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0", id: 212, method: "tools/call",
+      params: { name: "get_browser_state", arguments: { target_id: "target-a", tab_id: "tab-a" } },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    expect(JSON.parse(socket.sent[0]!.toString())).toMatchObject({ result: { isError: true } });
+    expect(socket.sent[0]!.byteLength).toBeLessThan(10_000);
+
+    for (const [offset, name] of ["browser_state", "browser_fill", "browser_upload"].entries()) {
+      socket.receive(JSON.stringify({
+        jsonrpc: "2.0", id: 213 + offset, method: "tools/call", params: { name, arguments: {} },
+      }) + "\n");
+    }
+    await vi.waitFor(() => expect(socket.sent.length).toBe(4));
+    for (const response of socket.sent.slice(1)) {
+      expect(JSON.parse(response.toString())).toMatchObject({ result: { isError: true } });
+      expect(response.toString()).toContain("is not a Cua Driver tool");
+    }
+    expect(beginAction).toHaveBeenCalledOnce();
+    handle.close("bounded browser test complete");
     await handle.closed;
   });
 

@@ -98,6 +98,7 @@ _PINNED_MCP = frozenset({
     "mcp_computer_get_browser_state",
     "mcp_computer_browser_prepare", "mcp_computer_browser_navigate",
     "mcp_computer_browser_click", "mcp_computer_browser_type",
+    "mcp_computer_browser_set_input_files",
     # High-frequency, read-oriented Ian Brain entry points.
     "mcp_ian_brain_context_store_stats", "mcp_ian_brain_ian_context_brief",
     "mcp_ian_brain_projects_search", "mcp_ian_brain_memory_recall",
@@ -120,6 +121,7 @@ _GUARDRAIL_HOOK_INSTALLED = False
 
 _VISUAL_OBSERVATION_TOOLS = frozenset({
     "mcp_computer_get_desktop_state",
+    "mcp_computer_get_browser_state",
     "mcp_computer_screenshot",
     "mcp_computer_zoom",
 })
@@ -144,6 +146,7 @@ _MUTATING_COMPUTER_TOOLS = frozenset({
     "mcp_computer_stop_recording", "mcp_computer_type_text",
 })
 _HIGH_RISK_REPEAT_TOOLS = frozenset({
+    "mcp_computer_browser_set_input_files",
     "mcp_computer_browser_type",
     "mcp_computer_set_value",
     "mcp_computer_type_text",
