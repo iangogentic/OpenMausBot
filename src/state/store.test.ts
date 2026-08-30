@@ -47,6 +47,10 @@ describe("computer child monitor fold", () => {
       at: 2,
     };
     let state = reducer(initialState, {
+      type: "computerChild",
+      monitor: { ...childMonitor(0, "running"), childId: "child" },
+    });
+    state = reducer(state, {
       type: "computerChildFrame", childId: "child", seq: 2, at: 2, frame,
     });
     state = reducer(state, {
@@ -66,6 +70,65 @@ describe("computer child monitor fold", () => {
       cursor: { x: 99, y: 49, seq: 1, at: 4 },
     });
     expect(stale).toBe(state);
+  });
+
+  it("bounds delegated pixels to the server cap and rejects orphan telemetry", () => {
+    let state = initialState;
+    const frame = {
+      mime: "image/png" as const,
+      data: "aGVsbG8=",
+      hash: "a".repeat(64),
+      width: 100,
+      height: 50,
+      seq: 1,
+      at: 1,
+    };
+    for (let index = 0; index < 20; index += 1) {
+      state = reducer(state, { type: "computerChild", monitor: childMonitor(index, "running") });
+      state = reducer(state, {
+        type: "computerChildFrame",
+        childId: `child-${index}`,
+        seq: 1,
+        at: 1,
+        frame,
+      });
+    }
+    expect(Object.keys(state.computerChildVisuals)).toHaveLength(16);
+    expect(state.computerChildVisuals["child-0"]).toBeUndefined();
+    expect(state.computerChildVisuals["child-19"]?.frame).toEqual(frame);
+
+    const orphan = reducer(state, {
+      type: "computerChildFrame",
+      childId: "not-a-monitor",
+      seq: 1,
+      at: 1,
+      frame,
+    });
+    expect(orphan).toBe(state);
+  });
+
+  it("removes delegated pixels when bounded monitor history prunes their owner", () => {
+    let state = reducer(initialState, { type: "computerChild", monitor: childMonitor(0) });
+    state = reducer(state, {
+      type: "computerChildFrame",
+      childId: "child-0",
+      seq: 1,
+      at: 1,
+      frame: {
+        mime: "image/png",
+        data: "aGVsbG8=",
+        hash: "a".repeat(64),
+        width: 1,
+        height: 1,
+        seq: 1,
+        at: 1,
+      },
+    });
+    for (let index = 1; index <= 128; index += 1) {
+      state = reducer(state, { type: "computerChild", monitor: childMonitor(index) });
+    }
+    expect(state.computerChildren["child-0"]).toBeUndefined();
+    expect(state.computerChildVisuals["child-0"]).toBeUndefined();
   });
 });
 

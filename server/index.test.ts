@@ -3569,6 +3569,29 @@ describe("resumable event stream", () => {
     }
   });
 
+  it("forces paired-phone replay and hydration onto the pixel-free path", async () => {
+    const hydrated = await companionApi("GET", "/api/bots?messages=2&screens=on", undefined);
+    expect(hydrated.status).toBe(200);
+    expect(hydrated.body.computerChildVisuals ?? []).toSatisfy((visuals: any[]) =>
+      visuals.every((visual) => visual.frame === undefined),
+    );
+
+    const stream = await openSse(`${BASE}/api/events?screens=on`, {
+      ...UI_SESSION_HEADER,
+      "x-openmausbot-companion": "1",
+      "x-openmausbot-companion-device": "phone-pixel-test",
+    });
+    try {
+      expect((await stream.until((frame) => frame.kind === "hello")).resumed).toBe(false);
+      const { body } = await api("GET", "/api/bots");
+      await nudge(body.bots[0].id);
+      await stream.until((frame) => frame.kind === "bot");
+      expect(stream.frames.some((frame) => frame.kind === "screen" || frame.kind === "computer-child-frame")).toBe(false);
+    } finally {
+      stream.close();
+    }
+  });
+
   it("refuses a cursor it cannot honour instead of replaying the wrong run", async () => {
     for (const cursor of ["deadbeef:1", "not-a-cursor", "12345678:999999"]) {
       const stream = await openSse(`${BASE}/api/events?since=${encodeURIComponent(cursor)}`, UI_SESSION_HEADER);

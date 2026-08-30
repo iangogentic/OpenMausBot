@@ -275,6 +275,7 @@ import {
   writeModelRelayResponse,
   type ModelRelayAuthority,
 } from "./model-relay.ts";
+import { computerChildVisualsForWire } from "./computer-child-visual-wire.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
 const PROVIDER_HARNESS_HOST = process.env.OMB_PROVIDER_HARNESS_HOST?.trim() || "127.0.0.1";
@@ -7405,7 +7406,11 @@ const server = createServer(async (req, res) => {
       };
       client = {
         res,
-        screens: url.searchParams.get("screens") !== "off",
+        // A paired phone always gets the pixel-free stream, even if a buggy
+        // or hostile client explicitly asks for screens=on.
+        screens:
+          req.headers["x-openmausbot-companion"] !== "1" &&
+          url.searchParams.get("screens") !== "off",
         closed: false,
         cleanup,
       };
@@ -7464,6 +7469,9 @@ const server = createServer(async (req, res) => {
     if (method === "GET" && path === "/api/bots") {
       const limit = pageSize(url.searchParams.get("messages"));
       if (limit === null) return json(res, 400, { error: "messages must be a non-negative whole number" });
+      const includeScreens =
+        req.headers["x-openmausbot-companion"] !== "1" &&
+        url.searchParams.get("screens") !== "off";
       return json(res, 200, {
         bots: store.bots.map((bot) => ({ ...publicBot(bot), ...messagePage(bot.threadId, limit) })),
         groups: store.groups.map((g) => ({ ...g, ...messagePage(g.threadId, limit) })),
@@ -7474,7 +7482,7 @@ const server = createServer(async (req, res) => {
           }),
         ),
         computerChildren: computerChildMonitors(),
-        computerChildVisuals: [...COMPUTER_CHILD_VISUALS.values()],
+        computerChildVisuals: computerChildVisualsForWire(COMPUTER_CHILD_VISUALS.values(), includeScreens),
       });
     }
 

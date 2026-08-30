@@ -416,6 +416,7 @@ export interface AppState {
 
 const MAX_CONSUMED_QUEUE_IDS = 64;
 const MAX_COMPUTER_CHILD_MONITORS = 128;
+const MAX_COMPUTER_CHILD_VISUALS = 16;
 
 function upsertComputerChildMonitor(
   current: Record<string, ComputerChildMonitor>,
@@ -434,6 +435,19 @@ function upsertComputerChildMonitor(
     delete next[terminal[index]!.childId];
   }
   return next;
+}
+
+function retainedComputerChildVisuals(
+  current: Record<string, ComputerChildVisualState>,
+  knownChildren: Record<string, ComputerChildMonitor>,
+  next?: ComputerChildVisualState,
+): Record<string, ComputerChildVisualState> {
+  // Rebuild in insertion order so an updated child's telemetry becomes the
+  // newest entry, matching the server's bounded Map semantics.
+  const entries = Object.entries(current)
+    .filter(([childId]) => childId !== next?.childId && childId in knownChildren);
+  if (next && next.childId in knownChildren) entries.push([next.childId, next]);
+  return Object.fromEntries(entries.slice(-MAX_COMPUTER_CHILD_VISUALS));
 }
 
 function rememberConsumedQueueId(consumed: Record<string, true>, queueId: string): Record<string, true> {
@@ -631,13 +645,19 @@ export function reducer(state: AppState, action: Action): AppState {
       const known = (id: string) => action.bots.some((b) => b.id === id) || action.groups.some((g) => g.id === id);
       const selectedId =
         state.selectedId && known(state.selectedId) ? state.selectedId : (action.bots[0]?.id ?? "");
+      const computerChildren = Object.fromEntries(
+        action.computerChildren.map((monitor) => [monitor.childId, monitor]),
+      );
       return {
         ...state,
         bots: action.bots,
         groups: action.groups,
         computerControl: action.computerControl,
-        computerChildren: Object.fromEntries(action.computerChildren.map((monitor) => [monitor.childId, monitor])),
-        computerChildVisuals: Object.fromEntries(action.computerChildVisuals.map((visual) => [visual.childId, visual])),
+        computerChildren,
+        computerChildVisuals: retainedComputerChildVisuals(
+          Object.fromEntries(action.computerChildVisuals.map((visual) => [visual.childId, visual])),
+          computerChildren,
+        ),
         selectedId,
       };
     }
@@ -943,41 +963,52 @@ export function reducer(state: AppState, action: Action): AppState {
           [action.botId]: { held: action.held, helpReason: action.helpReason },
         },
       };
-    case "computerChild":
+    case "computerChild": {
+      const computerChildren = upsertComputerChildMonitor(state.computerChildren, action.monitor);
       return {
         ...state,
-        computerChildren: upsertComputerChildMonitor(state.computerChildren, action.monitor),
+        computerChildren,
+        // A terminal monitor pruned from bounded history no longer has an
+        // authorized UI owner. Drop its pixels in the same reducer step.
+        computerChildVisuals: retainedComputerChildVisuals(state.computerChildVisuals, computerChildren),
       };
+    }
     case "computerChildFrame": {
       const previous = state.computerChildVisuals[action.childId];
       if (previous && action.seq <= previous.lastSeq) return state;
+      if (!state.computerChildren[action.childId]) return state;
+      const next: ComputerChildVisualState = {
+        childId: action.childId,
+        lastSeq: action.seq,
+        ...(previous?.cursor ? { cursor: previous.cursor } : {}),
+        frame: action.frame,
+      };
       return {
         ...state,
-        computerChildVisuals: {
-          ...state.computerChildVisuals,
-          [action.childId]: {
-            childId: action.childId,
-            lastSeq: action.seq,
-            ...(previous?.cursor ? { cursor: previous.cursor } : {}),
-            frame: action.frame,
-          },
-        },
+        computerChildVisuals: retainedComputerChildVisuals(
+          state.computerChildVisuals,
+          state.computerChildren,
+          next,
+        ),
       };
     }
     case "computerChildCursor": {
       const previous = state.computerChildVisuals[action.childId];
       if (previous && action.seq <= previous.lastSeq) return state;
+      if (!state.computerChildren[action.childId]) return state;
+      const next: ComputerChildVisualState = {
+        childId: action.childId,
+        lastSeq: action.seq,
+        ...(previous?.frame ? { frame: previous.frame } : {}),
+        cursor: action.cursor,
+      };
       return {
         ...state,
-        computerChildVisuals: {
-          ...state.computerChildVisuals,
-          [action.childId]: {
-            childId: action.childId,
-            lastSeq: action.seq,
-            ...(previous?.frame ? { frame: previous.frame } : {}),
-            cursor: action.cursor,
-          },
-        },
+        computerChildVisuals: retainedComputerChildVisuals(
+          state.computerChildVisuals,
+          state.computerChildren,
+          next,
+        ),
       };
     }
     case "setModel":

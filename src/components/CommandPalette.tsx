@@ -16,6 +16,19 @@ type PaletteEntry =
   | { kind: "room"; group: Group }
   | { kind: "message"; hit: SearchHit };
 
+export function nextEnabledPaletteIndex(
+  enabled: readonly boolean[],
+  current: number,
+  direction: 1 | -1,
+): number {
+  if (!enabled.some(Boolean)) return 0;
+  for (let step = 1; step <= enabled.length; step += 1) {
+    const candidate = (current + direction * step + enabled.length) % enabled.length;
+    if (enabled[candidate]) return candidate;
+  }
+  return 0;
+}
+
 export function CommandPalette() {
   const { state, dispatch } = useStore();
   const [open, setOpen] = useState(false);
@@ -23,6 +36,7 @@ export function CommandPalette() {
   const [messageHits, setMessageHits] = useState<SearchHit[]>([]);
   const [cursor, setCursor] = useState(0);
   const selectedRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
   const wasOpen = useRef(false);
 
@@ -92,8 +106,6 @@ export function CommandPalette() {
     selectedRef.current?.scrollIntoView({ block: "nearest" });
   }, [cursor, messageHits]);
 
-  if (!open) return null;
-
   const bots = rankByName(state.bots.filter((b) => !b.hidden), q);
   const rooms = rankByName(state.groups, q);
   const commands = matchingAppCommands(appCommands(state), q);
@@ -105,7 +117,11 @@ export function CommandPalette() {
     ...(q ? messageHits.map((hit): PaletteEntry => ({ kind: "message", hit })) : []),
   ];
   // hits arriving or rows filtering away can strand the cursor past the end
-  const selected = entries.length ? Math.min(cursor, entries.length - 1) : 0;
+  const enabledEntries = entries.map((entry) => entry.kind !== "command" || entry.command.enabled);
+  const boundedCursor = entries.length ? Math.min(cursor, entries.length - 1) : 0;
+  const selected = enabledEntries[boundedCursor]
+    ? boundedCursor
+    : nextEnabledPaletteIndex(enabledEntries, boundedCursor, 1);
 
   const activate = async (entry: PaletteEntry) => {
     if (entry.kind === "command") {
@@ -124,24 +140,55 @@ export function CommandPalette() {
     setOpen(false);
   };
 
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      // shield the window listeners other modals hang their own Esc on
-      e.stopPropagation();
-      setOpen(false);
-    } else if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setCursor(entries.length ? (selected + 1) % entries.length : 0);
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setCursor(entries.length ? (selected - 1 + entries.length) % entries.length : 0);
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const entry = entries[selected];
-      if (entry) void activate(entry);
-    }
-  };
+  // Capture before App.tsx and other window-level shortcuts. Navigation is
+  // handled here (instead of a bubbling React handler) so app shortcuts can
+  // never act underneath the open modal.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      const modifier = event.metaKey || event.ctrlKey;
+      const chordK = modifier && event.key.toLowerCase() === "k" && !event.shiftKey && !event.altKey;
+      if (chordK || event.key === "Escape") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setOpen(false);
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        setCursor(nextEnabledPaletteIndex(enabledEntries, selected, event.key === "ArrowDown" ? 1 : -1));
+        return;
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const entry = entries[selected];
+        if (entry && enabledEntries[selected]) void activate(entry);
+        return;
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const focusable = [...(dialogRef.current?.querySelectorAll<HTMLElement>(
+          'input:not([disabled]), button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [])];
+        if (!focusable.length) return;
+        const current = focusable.indexOf(document.activeElement as HTMLElement);
+        const delta = event.shiftKey ? -1 : 1;
+        focusable[(current + delta + focusable.length) % focusable.length]?.focus();
+        return;
+      }
+      if (modifier) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, entries, enabledEntries, selected]);
+
+  if (!open) return null;
 
   // flat cursor across sections; each row needs its absolute index
   const botOffset = commands.length;
@@ -153,10 +200,12 @@ export function CommandPalette() {
       key={key}
       ref={index === selected ? selectedRef : undefined}
       onClick={onPick}
+      disabled={disabled}
+      tabIndex={disabled ? -1 : undefined}
       aria-disabled={disabled || undefined}
       // mousemove, not mouseenter: rows shifting under a resting pointer
       // (hits arriving) must not steal the keyboard selection
-      onMouseMove={() => setCursor(index)}
+      onMouseMove={() => !disabled && setCursor(index)}
       className={cn(
         "flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left",
         twoLine && "flex-col items-stretch gap-0.5",
@@ -172,9 +221,10 @@ export function CommandPalette() {
     <div
       className="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-6 pt-[14vh]"
       onMouseDown={(e) => e.target === e.currentTarget && setOpen(false)}
-      onKeyDown={onKeyDown}
+      data-command-palette-open="true"
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Command palette"
