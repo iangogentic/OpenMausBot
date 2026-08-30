@@ -1,5 +1,5 @@
 // SQLite message-store contract: per-mutation persistence, one-time legacy
-// import, deletion, and the LIKE search used by /api/search.
+// import, deletion, and the maintained full-text search used by /api/search.
 import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -141,6 +141,30 @@ describe("message-db", () => {
 
     // room attribution rides along
     expect(searchMessages("spoke")[0].from).toBe("Scout");
+  });
+
+  it("keeps the trigram index current across edits, deletes, and reopen recovery", () => {
+    insertMessage("indexed", msg("m1", "quarterly-report.xlsx is ready"));
+    expect(searchMessages("report.xlsx")).toMatchObject([{ threadId: "indexed", messageId: "m1" }]);
+
+    updateMessage("indexed", msg("m1", "renamed to board-pack.xlsx"));
+    expect(searchMessages("quarterly-report")).toEqual([]);
+    expect(searchMessages("board-pack")).toMatchObject([{ messageId: "m1" }]);
+
+    closeMessageDb();
+    expect(searchMessages("board-pack")).toMatchObject([{ messageId: "m1" }]);
+    deleteThread("indexed");
+    expect(searchMessages("board-pack")).toEqual([]);
+  });
+
+  it("indexes only user-visible fields rather than arbitrary private JSON", () => {
+    insertMessage("safe", {
+      ...msg("m1", "visible summary"),
+      tool: { name: "Connector sync", ok: true },
+      request: { kind: "secret", prompt: "password", response: "never-index-this-token" },
+    } as Message);
+    expect(searchMessages("connector sync")).toMatchObject([{ messageId: "m1" }]);
+    expect(searchMessages("never-index-this-token")).toEqual([]);
   });
 
   it("Store round-trips branching through the DB across a restart", () => {

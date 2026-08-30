@@ -50,8 +50,59 @@ function open(): DatabaseSync {
       thread_id TEXT PRIMARY KEY,
       active_leaf_id TEXT
     );
+    CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
+      thread_id UNINDEXED,
+      message_id UNINDEXED,
+      body,
+      tokenize='trigram'
+    );
   `);
+  // The index is derived state. Rebuild when upgrading an existing database
+  // or recovering from a crash between the transcript write and index write.
+  const messageCount = (db.prepare("SELECT count(*) AS count FROM messages").get() as { count: number }).count;
+  const searchCount = (db.prepare("SELECT count(*) AS count FROM message_search").get() as { count: number }).count;
+  if (messageCount !== searchCount) rebuildSearchIndex(db);
   return db;
+}
+
+function searchableRowText(text: string | null, json: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    parsed = null;
+  }
+  const message = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+  const tool = message?.tool && typeof message.tool === "object" ? message.tool as Record<string, unknown> : null;
+  const from = message?.from && typeof message.from === "object" ? message.from as Record<string, unknown> : null;
+  return [text, typeof tool?.name === "string" ? tool.name : null, typeof from?.name === "string" ? from.name : null]
+    .filter((part): part is string => Boolean(part))
+    .join("\n");
+}
+
+function rebuildSearchIndex(database: DatabaseSync): void {
+  const rows = database.prepare("SELECT thread_id, id, text, json FROM messages").all() as Array<{
+    thread_id: string;
+    id: string;
+    text: string | null;
+    json: string;
+  }>;
+  const insert = database.prepare("INSERT INTO message_search (thread_id, message_id, body) VALUES (?, ?, ?)");
+  database.exec("BEGIN");
+  try {
+    database.exec("DELETE FROM message_search");
+    for (const row of rows) insert.run(row.thread_id, row.id, searchableRowText(row.text, row.json));
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function indexMessage(database: DatabaseSync, threadId: string, message: Message): void {
+  database.prepare("DELETE FROM message_search WHERE thread_id = ? AND message_id = ?").run(threadId, message.id);
+  database.prepare("INSERT INTO message_search (thread_id, message_id, body) VALUES (?, ?, ?)")
+    .run(threadId, message.id, searchableRowText(message.text ?? null, JSON.stringify(message)));
 }
 
 /** The live handle — reopened when the file was removed out from under us
@@ -105,10 +156,13 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   const insert = db().prepare(
     "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
+  const index = db().prepare("INSERT INTO message_search (thread_id, message_id, body) VALUES (?, ?, ?)");
   db().exec("BEGIN");
   try {
     for (const message of messages) {
-      insert.run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+      const json = JSON.stringify(message);
+      insert.run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, json);
+      index.run(threadId, message.id, searchableRowText(message.text ?? null, json));
     }
     setActiveLeaf(threadId, activeLeafId);
     db().exec("COMMIT");
@@ -128,9 +182,11 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
 }
 
 export function insertMessage(threadId: string, message: Message): void {
-  db()
+  const database = db();
+  database
     .prepare("INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .run(threadId, message.id, message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message));
+  indexMessage(database, threadId, message);
 }
 
 /** Persist a new message and the branch head as one crash-safe mutation. */
@@ -148,9 +204,11 @@ export function appendMessage(threadId: string, message: Message): void {
 }
 
 export function updateMessage(threadId: string, message: Message): void {
-  db()
+  const database = db();
+  database
     .prepare("UPDATE messages SET at = ?, role = ?, kind = ?, text = ?, json = ? WHERE thread_id = ? AND id = ?")
     .run(message.at, message.role, message.kind, message.text ?? null, JSON.stringify(message), threadId, message.id);
+  indexMessage(database, threadId, message);
 }
 
 export function setActiveLeaf(threadId: string, leafId: string | null): void {
@@ -163,8 +221,17 @@ export function setActiveLeaf(threadId: string, leafId: string | null): void {
 }
 
 export function deleteThread(threadId: string): void {
-  db().prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
-  db().prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
+  const database = db();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
+    database.prepare("DELETE FROM message_search WHERE thread_id = ?").run(threadId);
+    database.prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 export interface SearchHit {
@@ -182,9 +249,9 @@ export interface SearchHit {
   from?: string;
 }
 
-/** Case-insensitive substring search over text messages, newest first.
- * A LIKE scan, deliberately: local transcripts are megabytes at most, a
- * scan is milliseconds, and it needs no FTS extension to exist. */
+/** Case-insensitive indexed substring search over visible transcript text,
+ * newest first. One- and two-character queries use a bounded LIKE fallback
+ * because FTS5's trigram tokenizer intentionally has no shorter tokens. */
 export function searchMessages(query: string, limit = 40, threadId?: string): SearchHit[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return [];
@@ -193,16 +260,25 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
   // text messages by their text; activity chips by the tool name — "which
   // bot ran that migration" is a tool-name question. The chip's name lives
   // in the row's json; a JSON1 extract keeps this one query.
-  const scope = threadId ? "thread_id = ? AND " : "";
-  const statement = db().prepare(
-    "SELECT thread_id, id, at, role, kind, text, json_extract(json, '$.tool.name') AS tool_name, json_extract(json, '$.from.name') AS from_name FROM messages " +
-      `WHERE ${scope}((kind = 'text' AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE '\\') ` +
-      "   OR (kind = 'activity' AND tool_name IS NOT NULL AND lower(tool_name) LIKE ? ESCAPE '\\')) " +
-      "ORDER BY at DESC LIMIT ?",
-  );
+  const database = db();
+  const shortQuery = [...needle].length < 3;
+  const scope = threadId ? "m.thread_id = ? AND " : "";
+  const statement = shortQuery
+    ? database.prepare(
+      "SELECT m.thread_id, m.id, m.at, m.role, m.kind, m.text, json_extract(m.json, '$.tool.name') AS tool_name, json_extract(m.json, '$.from.name') AS from_name " +
+        "FROM messages m " +
+        `WHERE ${scope}lower(coalesce(m.text, '') || char(10) || coalesce(tool_name, '') || char(10) || coalesce(from_name, '')) LIKE ? ESCAPE '\\' ` +
+        "ORDER BY m.at DESC LIMIT ?",
+    )
+    : database.prepare(
+      "SELECT m.thread_id, m.id, m.at, m.role, m.kind, m.text, json_extract(m.json, '$.tool.name') AS tool_name, json_extract(m.json, '$.from.name') AS from_name " +
+        "FROM message_search s JOIN messages m ON m.thread_id = s.thread_id AND m.id = s.message_id " +
+        `WHERE ${scope}s.body MATCH ? ORDER BY m.at DESC LIMIT ?`,
+    );
+  const ftsQuery = `"${needle.replace(/"/g, '""')}"`;
   const rows = (threadId
-    ? statement.all(threadId, pattern, pattern, limit)
-    : statement.all(pattern, pattern, limit)) as Array<{
+    ? statement.all(threadId, shortQuery ? pattern : ftsQuery, limit)
+    : statement.all(shortQuery ? pattern : ftsQuery, limit)) as Array<{
     thread_id: string;
     id: string;
     at: number;
@@ -213,7 +289,7 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     from_name: string | null;
   }>;
   return rows.map((row) => {
-    const haystack = row.kind === "activity" ? (row.tool_name ?? "") : (row.text ?? "");
+    const haystack = [row.text, row.tool_name, row.from_name].filter(Boolean).join("\n");
     const hitAt = Math.max(0, haystack.toLowerCase().indexOf(needle));
     const start = Math.max(0, hitAt - 60);
     const end = Math.min(haystack.length, hitAt + needle.length + 90);
