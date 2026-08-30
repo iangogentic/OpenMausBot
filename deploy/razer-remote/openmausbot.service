@@ -35,14 +35,14 @@ ExecStartPre=/usr/bin/test -x /usr/bin/setfacl
 ExecStartPre=/usr/bin/test -x /usr/bin/getfacl
 ExecStartPre=/usr/bin/test -x /usr/bin/btrfs
 ExecStartPre=/usr/bin/test -x /usr/local/libexec/openmaus-storage-leaf
-ExecStartPre=/usr/local/libexec/openmaus-provider-network --check
+ExecStartPre=+/usr/local/libexec/openmaus-provider-network --check
 ExecStartPre=/usr/bin/mountpoint -q /var/lib/openmaus-provider/state
 ExecStartPre=/usr/bin/mountpoint -q /var/lib/openmausbot-workspaces
 ExecStartPre=/usr/bin/mountpoint -q /var/lib/openmausbot-vm-homes
-ExecStartPre=/usr/bin/btrfs qgroup show --raw /var/lib/openmaus-provider/state
-ExecStartPre=/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-workspaces
-ExecStartPre=/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-vm-homes
-ExecStartPre=/usr/local/libexec/openmaus-provider-slice-check --check
+ExecStartPre=+/usr/bin/btrfs qgroup show --raw /var/lib/openmaus-provider/state
+ExecStartPre=+/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-workspaces
+ExecStartPre=+/usr/bin/btrfs qgroup show --raw /var/lib/openmausbot-vm-homes
+ExecStartPre=+/usr/local/libexec/openmaus-provider-slice-check --check
 ExecStartPre=/usr/bin/rm -f /run/openmausbot-private/harness.sock /run/openmausbot-private/webhook.sock
 Environment="PATH=/opt/openmaus-provider/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="HOME=/var/lib/openmausbot"

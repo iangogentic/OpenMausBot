@@ -30,8 +30,9 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(readme).toContain("/usr/local/libexec/openmaus-provider-slice-check");
     expect(service).toContain("Requires=openmaus-provider-network.service");
     expect(service).toContain("Requires=openmaus-provider.slice");
-    expect(service).toContain("/usr/local/libexec/openmaus-provider-network --check");
-    expect(service).toContain("/usr/local/libexec/openmaus-provider-slice-check --check");
+    expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-network --check");
+    expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-slice-check --check");
+    expect(service.match(/^ExecStartPre=\+\/usr\/bin\/btrfs qgroup show --raw /gm)).toHaveLength(3);
     expect(service).toContain("/usr/bin/slirp4netns");
     expect(service).toContain('Environment="OMB_PROVIDER_HARNESS_HOST=10.0.2.2"');
     expect(service).toContain('Environment="OMB_REQUIRE_LOCAL_VM_NETWORK_ISOLATION=1"');
