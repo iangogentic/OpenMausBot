@@ -11,6 +11,12 @@ import {
 } from "./mcp-bridge.ts";
 import type { ActionPermit } from "./control-client.ts";
 import type { RawWebSocket } from "./raw-websocket.ts";
+import type {
+  ComputerChildCursor,
+  ComputerChildCursorListener,
+  ComputerChildFrame,
+  ComputerChildFrameListener,
+} from "../shared/computer-child-monitor.ts";
 
 export const PHYSICAL_BRIDGE_PROTOCOL = 1;
 export const PHYSICAL_BRIDGE_ORIGIN = "openmausbot://desktop-main";
@@ -36,6 +42,17 @@ const PHYSICAL_ACT_AND_OBSERVE_TOOLS = new Set([
   "set_agent_cursor_location", "set_agent_cursor_visibility", "set_config", "set_value", "set_window_frame",
   "start_recording", "start_session", "stop_recording", "type_text",
 ]);
+
+const COMPUTER_CHILD_COORDINATE_MAX = 16_384;
+
+function computerChildCursor(value: unknown): ComputerChildCursor | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const args = value as Record<string, unknown>;
+  if (typeof args.x !== "number" || typeof args.y !== "number") return null;
+  if (!Number.isFinite(args.x) || !Number.isFinite(args.y)) return null;
+  if (args.x < 0 || args.x > COMPUTER_CHILD_COORDINATE_MAX || args.y < 0 || args.y > COMPUTER_CHILD_COORDINATE_MAX) return null;
+  return Object.freeze({ x: args.x, y: args.y });
+}
 
 type PhysicalPlatform = "darwin" | "win32";
 
@@ -629,6 +646,8 @@ export function attachPhysicalMcpBroker(options: {
   approvalGate: PhysicalApprovalGate;
   requireActionAccounting?: boolean;
   onActions?: (amount: number) => number;
+  onChildFrame?: ComputerChildFrameListener;
+  onChildCursor?: ComputerChildCursorListener;
 }): { close: (reason?: string) => void; closed: Promise<void> } | null {
   if (options.registry.current?.registrationId !== options.authority.registrationId) return null;
   let physical: PhysicalSession | null = null;
@@ -639,6 +658,7 @@ export function attachPhysicalMcpBroker(options: {
   const pending: Buffer[] = [];
   const pendingActions = new Map<string, string>();
   const stagedActionTools = new Map<string, string>();
+  const stagedActionCursors = new Map<string, ComputerChildCursor>();
   const pendingActionTools = new Map<string, string>();
   const pendingToolsList = new Set<string>();
   let outboundQueue: Promise<void> = Promise.resolve();
@@ -650,11 +670,24 @@ export function attachPhysicalMcpBroker(options: {
   let resolveClosed!: () => void;
   const closedPromise = new Promise<void>((resolve) => { resolveClosed = resolve; });
   const captureController = new AbortController();
+  const notifyChildFrame = (frame: ComputerChildFrame) => {
+    if (!options.onChildFrame) return;
+    queueMicrotask(() => {
+      try { void Promise.resolve(options.onChildFrame?.(frame)).catch(() => {}); } catch {}
+    });
+  };
+  const notifyChildCursor = (cursor: ComputerChildCursor | null) => {
+    if (!cursor || !options.onChildCursor) return;
+    queueMicrotask(() => {
+      try { void Promise.resolve(options.onChildCursor?.(cursor)).catch(() => {}); } catch {}
+    });
+  };
 
   const finish = (reason: string, quarantine: boolean) => {
     if (closed) return;
     closed = true;
     captureController.abort();
+    stagedActionCursors.clear();
     offBrokerDrain();
     offPhysicalDrain();
     physical?.resumeInput();
@@ -737,6 +770,10 @@ export function attachPhysicalMcpBroker(options: {
       const toolName = stagedActionTools.get(requestId);
       stagedActionTools.delete(requestId);
       if (toolName) pendingActionTools.set(requestId, toolName);
+      if (toolName && PHYSICAL_ACT_AND_OBSERVE_TOOLS.has(toolName)) {
+        notifyChildCursor(stagedActionCursors.get(requestId) ?? null);
+      }
+      stagedActionCursors.delete(requestId);
     },
     actionAbandoned: async (actionId) => {
       if (!(await options.endAction(actionId))) await options.quarantine();
@@ -759,12 +796,17 @@ export function attachPhysicalMcpBroker(options: {
       return;
     }
     try {
-      const frame = JSON.parse(line) as { id?: unknown; method?: unknown; params?: { name?: unknown } };
+      const frame = JSON.parse(line) as { id?: unknown; method?: unknown; params?: { name?: unknown; arguments?: unknown } };
       if (frame?.method === "tools/call" && typeof frame.params?.name === "string") {
         const id = typeof frame.id === "string" || typeof frame.id === "number"
           ? `${typeof frame.id}:${String(frame.id)}`
           : null;
-        if (id) stagedActionTools.set(id, frame.params.name);
+        if (id) {
+          stagedActionTools.set(id, frame.params.name);
+          const cursor = computerChildCursor(frame.params.arguments);
+          stagedActionCursors.delete(id);
+          if (cursor) stagedActionCursors.set(id, cursor);
+        }
       }
     } catch {}
     return gate(line);
@@ -815,6 +857,7 @@ export function attachPhysicalMcpBroker(options: {
               );
               const hash = createHash("sha256")
                 .update(screenshot.mimeType).update("\0").update(screenshot.dataBase64).digest("hex");
+              notifyChildFrame(Object.freeze({ mime: screenshot.mimeType, data: screenshot.dataBase64, hash }));
               const upstreamFailed = "error" in (frame ?? {});
               const result = frame?.result && typeof frame.result === "object" && !Array.isArray(frame.result)
                 ? frame.result as Record<string, unknown>

@@ -239,6 +239,50 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await handle.closed;
   });
 
+  it("publishes only bounded forwarded coordinates and trusted post-action child frames", async () => {
+    const socket = new FakeSocket();
+    const onChildCursor = vi.fn(() => { throw new Error("listener is isolated"); });
+    const onChildFrame = vi.fn(async () => { throw new Error("async listener is isolated"); });
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction: async () => ({ data: "iVBORw0KGgo=", mimeType: "image/png" as const }),
+      onChildCursor,
+      onChildFrame,
+    }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 101,
+      method: "tools/call",
+      params: { name: "click", arguments: { x: 640, y: 450, text: "must-not-leak", url: "https://secret.test", path: "/private" } },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    const response = JSON.parse(socket.sent[0]!.toString());
+    expect(response.result.isError).toBeUndefined();
+    expect(onChildCursor).toHaveBeenCalledExactlyOnceWith({ x: 640, y: 450 });
+    expect(onChildFrame).toHaveBeenCalledExactlyOnceWith({
+      mime: "image/png",
+      data: "iVBORw0KGgo=",
+      hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(JSON.stringify(onChildCursor.mock.calls)).not.toContain("must-not-leak");
+    handle.close("telemetry complete");
+    await handle.closed;
+  });
+
+  it("does not publish rejected or out-of-bound child coordinates", async () => {
+    const socket = new FakeSocket();
+    const onChildCursor = vi.fn();
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction: () => ({ allowed: false as const, reason: "human-control" as const }),
+      onChildCursor,
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 102, method: "tools/call", params: { name: "click", arguments: { x: 20, y: 30 } } }) + "\n");
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 103, method: "tools/call", params: { name: "click", arguments: { x: 99_999, y: 30 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(2));
+    expect(onChildCursor).not.toHaveBeenCalled();
+    handle.close("rejection complete");
+    await handle.closed;
+  });
+
   it("fails a wrong post-navigation URL, redacts credentials/query data, and still attaches trusted pixels", async () => {
     const socket = new FakeSocket();
     const secretUrl = "https://alice:password123@example.test/private?token=query-secret#fragment-secret";
@@ -482,9 +526,11 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     const beginAction = vi.fn(() => { accountingOrder.push("permit"); return { allowed: true as const, actionId: "batch-ticket" }; });
     const onActions = vi.fn((amount: number) => { accountingOrder.push(`account:${amount}`); return amount; });
     const endAction = vi.fn(() => true);
+    const onChildCursor = vi.fn();
+    const onChildFrame = vi.fn();
     const captureAfterAction = vi.fn(async (toolName: string) => {
       expect(toolName).toBe("press_key");
-      return { data: "aW1hZ2U=", mimeType: "image/png" as const };
+      return { data: "iVBORw0KGgo=", mimeType: "image/png" as const };
     });
     const handle = attachLocalVmMcpBroker(baseOptions(socket, {
       beginAction,
@@ -492,6 +538,8 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
       requireActionAccounting: true,
       endAction,
       captureAfterAction,
+      onChildCursor,
+      onChildFrame,
       maxToolCalls: 3,
     }));
     socket.receive(JSON.stringify({
@@ -518,8 +566,14 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     expect(captureAfterAction).toHaveBeenCalledOnce();
     expect(response.result.isError).toBeUndefined();
     expect(response.result.content.filter((item: { type?: string }) => item.type === "image")).toEqual([
-      { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+      { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
     ]);
+    expect(onChildCursor).toHaveBeenCalledExactlyOnceWith({ x: 10, y: 20 });
+    expect(onChildFrame).toHaveBeenCalledExactlyOnceWith({
+      mime: "image/png",
+      data: "iVBORw0KGgo=",
+      hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     expect(JSON.stringify(frames)).not.toContain("__openmaus_computer_batch_");
     handle.close("batch complete");
     await handle.closed;

@@ -24,6 +24,12 @@ import {
 } from "./local-vm-broker-protocol.ts";
 import type { RawWebSocket } from "./raw-websocket.ts";
 import { terminateCliTree } from "./procs.ts";
+import type {
+  ComputerChildCursor,
+  ComputerChildCursorListener,
+  ComputerChildFrame,
+  ComputerChildFrameListener,
+} from "../shared/computer-child-monitor.ts";
 
 export { LOCAL_VM_BROKER_ORIGIN, LOCAL_VM_MCP_PATH, LOCAL_VM_PROXY_MAX_BUFFERED_BYTES };
 
@@ -79,6 +85,16 @@ function rpcRequestKey(id: unknown): string | null {
   return typeof id === "string" || (typeof id === "number" && Number.isFinite(id))
     ? `${typeof id}:${String(id)}`
     : null;
+}
+
+const COMPUTER_CHILD_COORDINATE_MAX = 16_384;
+
+function computerChildCursor(value: unknown): ComputerChildCursor | null {
+  const args = record(value);
+  if (!args || typeof args.x !== "number" || typeof args.y !== "number") return null;
+  if (!Number.isFinite(args.x) || !Number.isFinite(args.y)) return null;
+  if (args.x < 0 || args.x > COMPUTER_CHILD_COORDINATE_MAX || args.y < 0 || args.y > COMPUTER_CHILD_COORDINATE_MAX) return null;
+  return Object.freeze({ x: args.x, y: args.y });
 }
 
 function browserTabKey(session: string, targetId: string, tabId: string): string {
@@ -404,6 +420,10 @@ export function attachLocalVmMcpBroker(options: {
   /** Trusted server-side capture performed while the action ticket remains
    * held. Failures leave the original action result intact. */
   captureAfterAction?: (toolName: string) => Promise<LocalVmActionScreenshot | null>;
+  /** Optional child-monitor sinks. They receive only authority-free telemetry
+   * and are never allowed to fail or delay the computer action path. */
+  onChildFrame?: ComputerChildFrameListener;
+  onChildCursor?: ComputerChildCursorListener;
   signal?: AbortSignal;
   spawnDriver?: (authority: LocalVmMcpAuthority) => DriverChild;
   terminateDriver?: (child: ChildProcess) => Promise<void>;
@@ -431,6 +451,7 @@ export function attachLocalVmMcpBroker(options: {
   const pendingDriver: Buffer[] = [];
   const pendingActions = new Map<string, string>();
   const pendingActionTools = new Map<string, string>();
+  const stagedActionCursors = new Map<string, ComputerChildCursor>();
   const stagedBrowserRequests = new Map<string, BrowserSemanticRequest>();
   const pendingBrowserRequests = new Map<string, BrowserSemanticRequest>();
   const browserSnapshots = new Map<string, { sequence: number; refs: ReadonlySet<string> }>();
@@ -444,6 +465,19 @@ export function attachLocalVmMcpBroker(options: {
   }>();
   let activeBatchActionId: string | null = null;
   let batchDriverSequence = 0;
+  const notifyChildFrame = (screenshot: LocalVmActionScreenshot, hash: string) => {
+    if (!options.onChildFrame || !validBrowserScreenshot(screenshot)) return;
+    const frame: ComputerChildFrame = Object.freeze({ mime: screenshot.mimeType, data: screenshot.data, hash });
+    queueMicrotask(() => {
+      try { void Promise.resolve(options.onChildFrame?.(frame)).catch(() => {}); } catch {}
+    });
+  };
+  const notifyChildCursor = (cursor: ComputerChildCursor | null) => {
+    if (!cursor || !options.onChildCursor) return;
+    queueMicrotask(() => {
+      try { void Promise.resolve(options.onChildCursor?.(cursor)).catch(() => {}); } catch {}
+    });
+  };
   const internalCorrelationNonce = randomBytes(16).toString("hex");
   const responseTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let offBrokerDrain: () => void = () => {};
@@ -510,6 +544,7 @@ export function attachLocalVmMcpBroker(options: {
     for (const pending of pendingBatchDriverCalls.values()) pending.reject(new Error(reason));
     pendingBatchDriverCalls.clear();
     stagedBrowserRequests.clear();
+    stagedActionCursors.clear();
     pendingBrowserRequests.clear();
     browserSnapshots.clear();
     browserSensitiveLiterals.clear();
@@ -814,6 +849,10 @@ export function attachLocalVmMcpBroker(options: {
       }
       pendingActions.set(requestId, actionId);
       pendingActionTools.set(requestId, toolName);
+      if (LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName)) {
+        notifyChildCursor(stagedActionCursors.get(requestId) ?? null);
+      }
+      stagedActionCursors.delete(requestId);
       const browserRequest = stagedBrowserRequests.get(requestId);
       if (browserRequest) {
         stagedBrowserRequests.delete(requestId);
@@ -908,6 +947,7 @@ export function attachLocalVmMcpBroker(options: {
           ) {
             return { content: [{ type: "text", text: `The computer batch stopped after ${completed} completed actions because action ${completed + 1} failed.` }], isError: true };
           }
+          notifyChildCursor(computerChildCursor(action.arguments));
           completed += 1;
         }
         const finalTool = actions.at(-1)?.name ?? "computer_batch";
@@ -934,6 +974,7 @@ export function attachLocalVmMcpBroker(options: {
             .update(screenshot.data)
             .digest("hex");
           lastDeliveredFrameHash = frameHash;
+          notifyChildFrame(screenshot, frameHash);
           result = {
             content: [
               { type: "text", text: `Completed ${completed} computer batch actions. Final screen attached (sha256=${frameHash}).` },
@@ -968,10 +1009,26 @@ export function attachLocalVmMcpBroker(options: {
     }
     const inspected = inspectBrowserRequest(line);
     if (!inspected.accepted) return true;
+    let stagedCursorRequestId: string | null = null;
+    try {
+      const frame = record(JSON.parse(line));
+      const params = record(frame?.params);
+      const requestId = frame?.method === "tools/call" ? rpcRequestKey(frame.id) : null;
+      const cursor = computerChildCursor(record(params?.arguments));
+      if (requestId) {
+        stagedActionCursors.delete(requestId);
+        if (cursor) stagedActionCursors.set(requestId, cursor);
+        stagedCursorRequestId = requestId;
+      }
+    } catch {}
     const accepted = gate(line);
     if (accepted && inspected.requestId) {
       const requestId = inspected.requestId;
       void gate.drain().finally(() => stagedBrowserRequests.delete(requestId));
+    }
+    if (stagedCursorRequestId) {
+      const requestId = stagedCursorRequestId;
+      void gate.drain().finally(() => stagedActionCursors.delete(requestId));
     }
     return accepted;
   }, {
@@ -1168,6 +1225,7 @@ export function attachLocalVmMcpBroker(options: {
                   .update("\0")
                   .update(screenshot.data)
                   .digest("hex");
+                notifyChildFrame(screenshot, frameHash);
                 content.push({
                   type: "text",
                   text: `Trusted post-action screen attached for ${toolName} (sha256=${frameHash}).`,
@@ -1190,14 +1248,15 @@ export function attachLocalVmMcpBroker(options: {
                 const content = Array.isArray((result as Record<string, unknown>).content)
                   ? [...((result as Record<string, unknown>).content as unknown[])]
                   : [];
+                const frameHash = createHash("sha256")
+                  .update(screenshot.mimeType)
+                  .update("\0")
+                  .update(screenshot.data)
+                  .digest("hex");
+                notifyChildFrame(screenshot, frameHash);
                 if (!content.some((item) => (
                   item && typeof item === "object" && (item as Record<string, unknown>).type === "image"
                 ))) {
-                  const frameHash = createHash("sha256")
-                    .update(screenshot.mimeType)
-                    .update("\0")
-                    .update(screenshot.data)
-                    .digest("hex");
                   if (frameHash === lastDeliveredFrameHash) {
                     content.push({
                       type: "text",

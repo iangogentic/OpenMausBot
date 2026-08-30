@@ -273,6 +273,8 @@ describe("physical MCP gate", () => {
     const device = attach(registry);
     const broker = new FakeSocket();
     const endAction = vi.fn(() => true);
+    const onChildCursor = vi.fn(() => { throw new Error("listener is isolated"); });
+    const onChildFrame = vi.fn(async () => { throw new Error("async listener is isolated"); });
     attachPhysicalMcpBroker({
       broker: broker as unknown as RawWebSocket,
       registry,
@@ -290,12 +292,14 @@ describe("physical MCP gate", () => {
       quarantine: vi.fn(),
       requestHelp: async () => ({ text: "done" }),
       approvalGate: permissiveApprovalGate(),
+      onChildCursor,
+      onChildFrame,
     });
     await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "open")).toBe(true));
     const open = device.frames().find((frame) => frame.type === "open")!;
     device.receive({ type: "approved", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
     device.receive({ type: "opened", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
-    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "click" } }) + "\n"), true);
+    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "click", arguments: { x: 321, y: 123, text: "private" } } }) + "\n"), true);
     await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "data")).toBe(true));
     device.receive({
       type: "data",
@@ -314,6 +318,13 @@ describe("physical MCP gate", () => {
       data: jpeg.toString("base64"),
     });
     await vi.waitFor(() => expect(endAction).toHaveBeenCalledWith("action-1"));
+    expect(onChildCursor).toHaveBeenCalledExactlyOnceWith({ x: 321, y: 123 });
+    expect(onChildFrame).toHaveBeenCalledExactlyOnceWith({
+      mime: "image/jpeg",
+      data: jpeg.toString("base64"),
+      hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(JSON.stringify(onChildCursor.mock.calls)).not.toContain("private");
     const reply = broker.sent.filter((entry) => entry.type === "binary").at(-1)!.data.toString();
     expect(reply).toContain('"type":"image"');
     expect(reply).toContain(jpeg.toString("base64"));
@@ -338,6 +349,7 @@ describe("physical MCP gate", () => {
     const device = attach(registry);
     const broker = new FakeSocket();
     const onActions = vi.fn(() => 1);
+    const onChildCursor = vi.fn();
     let permitted = false;
     const attached = attachPhysicalMcpBroker({
       broker: broker as unknown as RawWebSocket,
@@ -360,19 +372,24 @@ describe("physical MCP gate", () => {
       approvalGate: permissiveApprovalGate(),
       requireActionAccounting: true,
       onActions,
+      onChildCursor,
     })!;
     await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "open")).toBe(true));
     const open = device.frames().find((frame) => frame.type === "open")!;
     device.receive({ type: "approved", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
     device.receive({ type: "opened", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
-    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "click" } }) + "\n"), true);
+    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "click", arguments: { x: 7, y: 9 } } }) + "\n"), true);
     await vi.waitFor(() => expect(broker.sent.some((entry) => entry.data.includes(Buffer.from("taken control")))).toBe(true));
     expect(onActions).not.toHaveBeenCalled();
+    expect(onChildCursor).not.toHaveBeenCalled();
     expect(device.frames().filter((frame) => frame.type === "data")).toHaveLength(0);
     permitted = true;
-    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 22, method: "tools/call", params: { name: "click" } }) + "\n"), true);
+    // Reusing the refused id without coordinates must not publish the stale
+    // denied cursor that was staged for the first attempt.
+    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "click", arguments: {} } }) + "\n"), true);
     await vi.waitFor(() => expect(onActions).toHaveBeenCalledWith(1));
     expect(device.frames().filter((frame) => frame.type === "data")).toHaveLength(1);
+    expect(onChildCursor).not.toHaveBeenCalled();
     attached.close("test complete");
     await expect(attached.closed).resolves.toBeUndefined();
   });

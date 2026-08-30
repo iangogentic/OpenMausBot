@@ -32,3 +32,26 @@ export interface ComputerChildMonitor {
 
 /** A fresh snapshot is emitted after each lifecycle transition. */
 export type ComputerChildMonitorListener = (monitor: ComputerChildMonitor) => void;
+
+/** Authority-free pixels from the broker's existing trusted post-action
+ * capture. Identity and monotonic ordering are supplied by the owning child
+ * runtime, keeping this payload reusable across Local VM and physical lanes. */
+export interface ComputerChildFrame {
+  readonly mime: "image/png" | "image/jpeg" | "image/webp";
+  readonly data: string;
+  readonly hash: string;
+}
+
+/** The only action argument projected to the monitor surface. Coordinates
+ * are emitted only after the corresponding bounded action was authorized and
+ * forwarded; tool names and all other arguments remain private. */
+export interface ComputerChildCursor {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** Brokers enqueue listener invocations in accepted action order. The owning
+ * runtime can therefore assign one monotonic per-child sequence at callback
+ * entry without trusting a provider-supplied counter. */
+export type ComputerChildFrameListener = (frame: ComputerChildFrame) => void | Promise<void>;
+export type ComputerChildCursorListener = (cursor: ComputerChildCursor) => void | Promise<void>;
