@@ -1352,6 +1352,13 @@ const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
       adapter: instance.adapter,
       turn: {
         isolationKey: `computer-operator:${input.childId}`,
+        // The hardened remote supervisor accepts only its generated provider
+        // home or one exact managed workspace as cwd. Hidden children used to
+        // fall back to the service account home (/var/lib/openmausbot), so the
+        // supervisor rejected them before ACP initialize. Reuse the parent
+        // bot's already-confined workspace; Hermes' restricted operator policy
+        // still disables native shell/file/browser tools.
+        cwd: ensureWorkspace(input.parent.botId),
         system: `You are the dedicated visual computer operator. Complete only the delegated task on the attached ${capability.kind === "local-vm" ? "isolated Linux desktop" : "user-approved physical Mac or Windows computer"}. Inspect the current screen before acting, prefer accessibility targets over coordinates, verify focus before typing, and use small deliberate actions. Every mutation must be visually verified from its returned screen. Never claim success unless the final visible pixels prove the requested result. Stop for passwords, MFA, CAPTCHAs, purchases, destructive actions, or ambiguous targets and report the blocker. You have at most nine computer actions.`,
         integrations: {
           modelRelay: capability.modelRelay,

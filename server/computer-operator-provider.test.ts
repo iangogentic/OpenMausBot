@@ -115,6 +115,30 @@ describe("computer operator hidden provider child", () => {
     expect(childThread).toMatch(/^computer-operator-/);
   });
 
+  it("preserves the concrete provider failure instead of hiding it behind exit_before_result", async () => {
+    const fake = fakeAdapter((input, emit) => {
+      emit({
+        provider: "hermesAgent",
+        threadId: input.threadId,
+        turnId: input.turnId!,
+        type: "runtime.error",
+        message: "provider cwd was rejected",
+      });
+      emit({
+        provider: "hermesAgent",
+        threadId: input.threadId,
+        turnId: input.turnId!,
+        type: "turn.completed",
+        ok: false,
+        stopReason: "exit_before_result",
+        cost: null,
+      });
+    });
+    const child = await createComputerOperatorProviderRuntime({ prepare: async () => ({ adapter: fake.adapter }) })
+      .launch(launchInput);
+    await expect(child.completion).resolves.toEqual({ status: "failed", error: "provider cwd was rejected" });
+  });
+
   it("denies any provider permission request that escapes the trusted operator policy", async () => {
     const fake = fakeAdapter((input, emit) => {
       emit({

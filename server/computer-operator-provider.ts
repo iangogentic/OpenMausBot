@@ -61,6 +61,7 @@ export function createComputerOperatorProviderRuntime(
       const completion = deferred<ComputerSubagentProviderOutcome>();
       let settled = false;
       let unsubscribe: (() => void) | null = null;
+      let runtimeError: string | null = null;
 
       const settle = (outcome: ComputerSubagentProviderOutcome) => {
         if (settled) return;
@@ -85,6 +86,10 @@ export function createComputerOperatorProviderRuntime(
           output.append(event.text);
           return;
         }
+        if (event.type === "runtime.error") {
+          runtimeError = event.message;
+          return;
+        }
         if (event.type === "request.opened") {
           // Trusted ACP operators resolve exact computer calls internally.
           // Any request that still escapes that policy is denied immediately
@@ -99,12 +104,15 @@ export function createComputerOperatorProviderRuntime(
           else if (/(?:cancel|interrupt|stopp)/i.test(event.stopReason ?? "")) {
             settle({ status: "aborted", reason: event.stopReason ?? "computer operator was interrupted" });
           } else {
-            settle({ status: "failed", error: event.stopReason ?? "computer operator failed" });
+            settle({ status: "failed", error: runtimeError ?? event.stopReason ?? "computer operator failed" });
           }
           return;
         }
         if (event.type === "session.exited") {
-          settle({ status: "failed", error: "computer operator provider session exited before terminal completion" });
+          settle({
+            status: "failed",
+            error: runtimeError ?? "computer operator provider session exited before terminal completion",
+          });
         }
       });
 
