@@ -1046,7 +1046,7 @@ describe("ensureHermesInjectProvider", () => {
     });
   });
 
-  it("raises only Spark GLM's isolated output cap above Hermes' broken continuation ladder", () => {
+  it("keeps only Spark GLM's isolated response budget explicitly bounded", () => {
     const home = mkdtempSync(join(tmpdir(), "omb-hermes-spark-cap-"));
     scratchDirs.push(home);
     const spark = join(home, "spark");
@@ -1069,7 +1069,7 @@ describe("ensureHermesInjectProvider", () => {
     const qwenConfig = parseYaml(readFileSync(join(qwen, "config.yaml"), "utf8")) as {
       model: { max_tokens?: number };
     };
-    expect(sparkConfig.model.max_tokens).toBe(16_384);
+    expect(sparkConfig.model.max_tokens).toBe(4_096);
     expect(qwenConfig.model.max_tokens).toBeUndefined();
   });
 

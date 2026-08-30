@@ -109,14 +109,13 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
     ...modelConfig,
     default: model,
     provider: `custom:${hostId}`,
-    // The Spark GLM endpoint has been observed returning finish_reason=length
-    // at Hermes' 4K default after it already emitted a complete post-tool
-    // answer. Stock Hermes then injects its own continuation prompt, which
-    // makes this model narrate the recovery instructions into the visible
-    // answer. Keep the correction scoped to the exact affected host: 16K is
-    // above Hermes' 4K/8K/12K continuation ladder and avoids changing Qwen's
-    // latency or genuine long-answer behavior.
-    ...(hostId === "spark_glm" ? { max_tokens: 16_384 } : {}),
+    // Keep Spark on an explicit bounded response budget. The scoped transport
+    // policy below now fixes its false short post-tool `length` responses, so
+    // the old 16K workaround is both unnecessary and harmful: one pathological
+    // hidden-reasoning pass can otherwise hold a bot for many minutes before
+    // its first tool call. Genuine long or tool-call truncations retain their
+    // native `length` reason and Hermes' bounded continuation path.
+    ...(hostId === "spark_glm" ? { max_tokens: 4_096 } : {}),
   };
   return stringifyYaml(config);
 }
