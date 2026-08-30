@@ -73,6 +73,7 @@ posixOnly("Local VM provider relay", () => {
 
     expect(result).toEqual({ code: 0, stdout: input, stderr: "" });
     expect(seenHeaders).toMatchObject({
+      host: `127.0.0.1:${address.port}`,
       origin: LOCAL_VM_BROKER_ORIGIN,
       authorization: `Bearer ${capability}`,
     });

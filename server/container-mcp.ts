@@ -101,7 +101,11 @@ function flushQueued(): void {
 socket.once("connect", () => {
   socket.write(
     `GET ${LOCAL_VM_MCP_PATH} HTTP/1.1\r\n` +
-    `Host: ${url.hostname}:${url.port}\r\n` +
+    // The provider reaches the host through slirp's 10.0.2.2 gateway, but
+    // the trusted harness deliberately accepts this control plane only with
+    // a loopback Host authority. Connection destination and HTTP authority
+    // are therefore intentionally different inside the sandbox.
+    `Host: 127.0.0.1:${url.port}\r\n` +
     "Upgrade: websocket\r\n" +
     "Connection: Upgrade\r\n" +
     `Origin: ${LOCAL_VM_BROKER_ORIGIN}\r\n` +
