@@ -70,6 +70,8 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("consumeComputerOperatorTurn(context)");
     expect(source).toContain("Call delegate_computer exactly once");
     expect(source).toContain('privateWorkspace && instance.driverKind !== "hermesAgent"');
+    expect(source).toContain('workspace && instance.driverKind !== "hermesAgent"');
+    expect(source).toContain('includeRoot: Boolean(workspace) && instance.driverKind !== "hermesAgent"');
   });
 
   it("retires every deterministic hidden operator home with its bot", () => {

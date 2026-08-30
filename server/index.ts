@@ -5263,8 +5263,12 @@ async function runGroupMemberTurn(
   const roomSystem =
     system +
     sectionContextSystemPrompt(bot.section) +
-    (workspace ? `\n${memorySystemPrompt(bot.id).trim()}${skillsSystemPrompt(bot.id)}` : "") +
-    renderSkillInstructions(selectedSkills, { includeRoot: Boolean(workspace) }) +
+    (workspace && instance.driverKind !== "hermesAgent"
+      ? `\n${memorySystemPrompt(bot.id).trim()}${skillsSystemPrompt(bot.id)}`
+      : "") +
+    renderSkillInstructions(selectedSkills, {
+      includeRoot: Boolean(workspace) && instance.driverKind !== "hermesAgent",
+    }) +
     installedPlaybookInstructions(roomText, bot.playbooks);
 
   // run the turn and wait for it to settle, folding the reply text so a
