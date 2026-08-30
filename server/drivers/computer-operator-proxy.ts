@@ -29,7 +29,7 @@ const TOOL = {
 
 type Json = Record<string, unknown>;
 let failed = false;
-let activeCall: AbortController | null = null;
+let activeCall: { requestId: unknown; controller: AbortController } | null = null;
 
 function send(message: Json): void {
   if (failed) return;
@@ -45,7 +45,7 @@ function send(message: Json): void {
 function fail(error: unknown): void {
   if (failed) return;
   failed = true;
-  activeCall?.abort(error);
+  activeCall?.controller.abort(error);
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
   process.stdin.destroy();
   process.exitCode = 1;
@@ -55,11 +55,12 @@ const ok = (id: unknown, result: unknown) => send({ jsonrpc: "2.0", id, result }
 const rpcError = (id: unknown, code: number, message: string) =>
   send({ jsonrpc: "2.0", id, error: { code, message } });
 
-async function run(task: unknown): Promise<ReturnType<typeof normalizeComputerOperatorResult>> {
+async function run(requestId: unknown, task: unknown): Promise<ReturnType<typeof normalizeComputerOperatorResult>> {
   if (activeCall) throw new Error("the computer operator is already working for this parent turn");
   if (typeof task !== "string") throw new Error("task is required");
   const controller = new AbortController();
-  activeCall = controller;
+  const call = { requestId, controller };
+  activeCall = call;
   try {
     const response = await fetch(`${HARNESS}/api/internal/computer-operator`, {
       method: "POST",
@@ -82,7 +83,7 @@ async function run(task: unknown): Promise<ReturnType<typeof normalizeComputerOp
     }
     return normalizeComputerOperatorResult(parsed);
   } finally {
-    if (activeCall === controller) activeCall = null;
+    if (activeCall === call) activeCall = null;
   }
 }
 
@@ -101,7 +102,10 @@ async function handle(message: Json): Promise<void> {
   } else if (method === "notifications/initialized") {
     return;
   } else if (method === "notifications/cancelled") {
-    activeCall?.abort(new Error("computer operator call was cancelled by the parent provider"));
+    const cancelledId = params.requestId;
+    if (activeCall && (cancelledId === undefined || cancelledId === activeCall.requestId)) {
+      activeCall.controller.abort(new Error("computer operator call was cancelled by the parent provider"));
+    }
     return;
   } else if (method === "ping") {
     ok(id, {});
@@ -113,7 +117,7 @@ async function handle(message: Json): Promise<void> {
       ? params.arguments as Json
       : {};
     try {
-      const result = await run(args.task);
+      const result = await run(id, args.task);
       ok(id, {
         content: [
           { type: "text", text: result.text },
@@ -151,6 +155,6 @@ process.stdin.on("data", (chunk: Buffer) => {
   }
 });
 process.stdin.on("end", () => {
-  activeCall?.abort(new Error("computer operator parent disconnected"));
+  activeCall?.controller.abort(new Error("computer operator parent disconnected"));
   void Promise.allSettled([...inFlight]).then(() => { if (!failed) process.exitCode = 0; });
 });

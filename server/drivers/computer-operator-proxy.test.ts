@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const PROXY = join(dirname(fileURLToPath(import.meta.url)), "computer-operator-proxy.ts");
 const TOKEN = "operator-test-token";
-const image = Buffer.from("final pixels").toString("base64");
+const image = Buffer.from([0xff, 0xd8, 0x70, 0x78, 0xff, 0xd9]).toString("base64");
 let server: Server;
 let port = 0;
 let child: ChildProcess;
@@ -98,5 +98,22 @@ describe("computer operator MCP proxy", () => {
       { type: "text", text: "operator finished" },
       { type: "image", data: image, mimeType: "image/jpeg" },
     ]);
+  });
+
+  it("aborts the matching blocking HTTP request on MCP cancellation", async () => {
+    releaseResponse = null;
+    const requestId = nextId;
+    const call = rpc("tools/call", { name: "delegate_computer", arguments: { task: "wait here" } });
+    for (let attempt = 0; attempt < 50 && !releaseResponse; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    child.stdin!.write(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "notifications/cancelled",
+      params: { requestId },
+    }) + "\n");
+    const result = await call;
+    expect(result.result.isError).toBe(true);
+    expect(result.result.content[0].text).toMatch(/cancelled/i);
   });
 });

@@ -6,7 +6,7 @@ import {
   normalizeComputerOperatorResult,
 } from "./computer-operator-surface.ts";
 
-const pixel = Buffer.from("pixel").toString("base64");
+const pixel = Buffer.from([0xff, 0xd8, 0x70, 0x78, 0xff, 0xd9]).toString("base64");
 
 describe("computer operator surface", () => {
   it("blocks on the supplied lifecycle callback and returns final text plus screen", async () => {
@@ -44,6 +44,10 @@ describe("computer operator surface", () => {
       text: "done",
       image: { mimeType: "image/jpeg", data: "not base64" },
     })).toThrow(/invalid/);
+    expect(() => normalizeComputerOperatorResult({
+      text: "done",
+      image: { mimeType: "image/png", data: pixel },
+    })).toThrow(/do not match/);
   });
 
   it("does not invoke the executor after parent cancellation", async () => {

@@ -72,7 +72,13 @@ export function createComputerOperatorProviderRuntime(
       // Subscribe before sendTurn: a fast fake/API adapter may settle before
       // registration returns, and losing that event would retain the lease.
       unsubscribe = adapter.onEvent((event) => {
-        if (event.threadId !== threadId || event.turnId !== turnId) return;
+        if (event.threadId !== threadId) return;
+        // session.exited is session-scoped in some adapters and legitimately
+        // omits turnId. The hidden thread is unique to this one child, so it
+        // remains an exact correlation key. Every other event must carry the
+        // harness-allocated turn id.
+        if (event.type !== "session.exited" && event.turnId !== turnId) return;
+        if (event.type === "session.exited" && event.turnId && event.turnId !== turnId) return;
         if (event.type === "item.completed" && event.itemType === "assistant_text") {
           output.append(event.text);
           return;

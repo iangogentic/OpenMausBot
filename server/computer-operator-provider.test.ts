@@ -85,4 +85,18 @@ describe("computer operator hidden provider child", () => {
     await expect(child.waitForTerminal()).resolves.toBeUndefined();
     expect(fake.adapter.interruptTurn).toHaveBeenCalledWith(expect.stringMatching(/^computer-operator-/), "child-1");
   });
+
+  it("settles a session-scoped exit that omits turnId on the unique hidden thread", async () => {
+    let childThread = "";
+    const fake = fakeAdapter((input, emit) => {
+      childThread = input.threadId;
+      emit({ provider: "hermesAgent", threadId: input.threadId, type: "session.exited", reason: "process exited" });
+    });
+    const child = await createComputerOperatorProviderRuntime({ prepare: async () => ({ adapter: fake.adapter }) }).launch(launchInput);
+    await expect(child.completion).resolves.toEqual({
+      status: "failed",
+      error: "computer operator provider session exited before terminal completion",
+    });
+    expect(childThread).toMatch(/^computer-operator-/);
+  });
 });

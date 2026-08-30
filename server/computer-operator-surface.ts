@@ -53,6 +53,14 @@ function canonicalBase64(value: string): boolean {
   }
 }
 
+function matchesImageSignature(mimeType: ComputerOperatorImageMime, bytes: Buffer): boolean {
+  if (mimeType === "image/png") {
+    return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  }
+  if (mimeType === "image/jpeg") return bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes.at(-2) === 0xff && bytes.at(-1) === 0xd9;
+  return bytes.length >= 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+}
+
 function boundedImage(value: unknown): ComputerOperatorImage {
   const image = plainRecord(value);
   if (!image) throw new Error("computer operator image is invalid");
@@ -63,6 +71,9 @@ function boundedImage(value: unknown): ComputerOperatorImage {
   }
   if (typeof data !== "string" || data.length > COMPUTER_OPERATOR_IMAGE_MAX_BASE64_BYTES || !canonicalBase64(data)) {
     throw new Error("computer operator image is invalid or too large");
+  }
+  if (!matchesImageSignature(mimeType, Buffer.from(data, "base64"))) {
+    throw new Error("computer operator image bytes do not match its declared type");
   }
   return { mimeType, data };
 }
