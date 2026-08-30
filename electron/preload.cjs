@@ -73,6 +73,10 @@ contextBridge.exposeInMainWorld("ogb", {
   platform: process.platform,
   /** Whether this shell owns an embedded harness or controls an existing one. */
   connection: () => invokePrivileged("desktop:connection"),
+  selectedConversation: {
+    read: () => invokePrivileged("selection:read"),
+    write: (id) => invokePrivileged("selection:write", id),
+  },
   getCapabilities: () => invokePrivileged("desktop:capabilities"),
   onCapabilitiesChanged: (cb) => {
     const handler = (_event, capabilities) => cb(capabilities);

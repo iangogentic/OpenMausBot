@@ -31,7 +31,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { api, useStore, formatTime, visibleMessages, type Bot, type Group } from "@/state/store";
+import { api, createNavigationIntentId, useStore, formatTime, visibleMessages, type Bot, type Group } from "@/state/store";
 
 import { BotAvatar, InitialsAvatar } from "./Avatar";
 import { stateForBot } from "@/lib/mascot";
@@ -961,7 +961,7 @@ function ArchivedBotsPanel({
   onClose: () => void;
   onRestored: (message: string) => void;
 }) {
-  const { state, dispatch } = useStore();
+  const { dispatch } = useStore();
   const dialogRef = useRef<HTMLDivElement>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [restoringAll, setRestoringAll] = useState(false);
@@ -977,7 +977,8 @@ function ArchivedBotsPanel({
   }, [busyId, onClose, restoringAll]);
 
   const restore = async (bot: Bot) => {
-    const selectionEpoch = state.selectionEpoch;
+    const intentId = createNavigationIntentId();
+    dispatch({ type: "beginUserNavigation", intentId });
     setBusyId(bot.id);
     setError("");
     try {
@@ -986,7 +987,7 @@ function ArchivedBotsPanel({
         body: JSON.stringify({ hidden: false }),
       });
       dispatch({ type: "botPatched", bot: response.bot });
-      dispatch({ type: "selectIfUnchanged", id: bot.id, selectionEpoch });
+      dispatch({ type: "selectForIntent", id: bot.id, intentId });
       onRestored(`${bot.name} restored`);
       if (bots.length === 1) onClose();
     } catch (cause) {
@@ -997,7 +998,8 @@ function ArchivedBotsPanel({
   };
 
   const restoreAll = async () => {
-    const selectionEpoch = state.selectionEpoch;
+    const intentId = createNavigationIntentId();
+    dispatch({ type: "beginUserNavigation", intentId });
     setRestoringAll(true);
     setError("");
     try {
@@ -1011,7 +1013,7 @@ function ArchivedBotsPanel({
       );
       for (const response of responses) dispatch({ type: "botPatched", bot: response.bot });
       const first = bots[0];
-      if (first) dispatch({ type: "selectIfUnchanged", id: first.id, selectionEpoch });
+      if (first) dispatch({ type: "selectForIntent", id: first.id, intentId });
       onRestored(`${bots.length} ${bots.length === 1 ? "bot" : "bots"} restored`);
       onClose();
     } catch (cause) {
@@ -1208,7 +1210,8 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   };
 
   const undoTeamLoad = async (result: TeamImportResult) => {
-    const selectionEpoch = state.selectionEpoch;
+    const intentId = createNavigationIntentId();
+    dispatch({ type: "beginUserNavigation", intentId });
     setTeamFeedback(null);
     try {
       await Promise.all([
@@ -1255,7 +1258,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       );
       for (const response of restoredChiefs) dispatch({ type: "botPatched", bot: response.bot });
       const first = result.archived[0];
-      if (first) dispatch({ type: "selectIfUnchanged", id: first.id, selectionEpoch });
+      if (first) dispatch({ type: "selectForIntent", id: first.id, intentId });
       setTeamFeedback({ error: false, text: "Previous team restored" });
     } catch (cause) {
       setTeamFeedback({ error: true, text: cause instanceof Error ? cause.message : String(cause) });
@@ -1263,9 +1266,10 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   };
 
   const archiveBot = async (bot: Bot) => {
-    const selectionEpoch = state.selectionEpoch;
     const activeBots = state.bots.filter((candidate) => !candidate.hidden);
     if (bot.chiefOfStaff || activeBots.length <= 1) return;
+    const intentId = createNavigationIntentId();
+    dispatch({ type: "beginUserNavigation", intentId });
     setTeamFeedback(null);
     try {
       const response = await api(`/api/bots/${bot.id}`, {
@@ -1275,7 +1279,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       dispatch({ type: "botPatched", bot: response.bot });
       if (state.selectedId === bot.id) {
         const next = activeBots.find((candidate) => candidate.id !== bot.id);
-        if (next) dispatch({ type: "selectIfUnchanged", id: next.id, selectionEpoch });
+        if (next) dispatch({ type: "selectForIntent", id: next.id, intentId });
       }
       setTeamFeedback({
         error: false,
@@ -1288,7 +1292,8 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   };
 
   const undoBotArchive = async (bot: { id: string; name: string }) => {
-    const selectionEpoch = state.selectionEpoch;
+    const intentId = createNavigationIntentId();
+    dispatch({ type: "beginUserNavigation", intentId });
     setTeamFeedback(null);
     try {
       const response = await api(`/api/bots/${bot.id}`, {
@@ -1296,7 +1301,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
         body: JSON.stringify({ hidden: false }),
       });
       dispatch({ type: "botPatched", bot: response.bot });
-      dispatch({ type: "selectIfUnchanged", id: bot.id, selectionEpoch });
+      dispatch({ type: "selectForIntent", id: bot.id, intentId });
       setTeamFeedback({ error: false, text: `${bot.name} restored` });
     } catch (cause) {
       setTeamFeedback({ error: true, text: cause instanceof Error ? cause.message : String(cause) });

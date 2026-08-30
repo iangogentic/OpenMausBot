@@ -370,6 +370,12 @@ export interface AppState {
   selectedId: string;
   /** Monotonic fence for async workflows that intend to navigate on finish. */
   selectionEpoch: number;
+  /** True after at least one authoritative bots/groups snapshot, including an empty one. */
+  hasHydrated: boolean;
+  /** Restart selection received before the first authoritative snapshot. */
+  pendingPersistedSelectionId: string;
+  /** Latest user-started async navigation; only its completion may land. */
+  navigationIntentId: string;
   /** Forces one fresh snapshot after a stale snapshot preserved navigation. */
   hydrationRetryNonce: number;
   activeView: "chat" | "team-map" | "routines" | "skill-recorder";
@@ -422,6 +428,13 @@ export interface AppState {
 const MAX_CONSUMED_QUEUE_IDS = 64;
 const MAX_COMPUTER_CHILD_MONITORS = 128;
 const MAX_COMPUTER_CHILD_VISUALS = 16;
+let navigationIntentSequence = 0;
+
+/** Unique within this renderer lifetime; this is ordering, not authority. */
+export function createNavigationIntentId(): string {
+  navigationIntentSequence += 1;
+  return `nav-${Date.now()}-${navigationIntentSequence}`;
+}
 
 function upsertComputerChildMonitor(
   current: Record<string, ComputerChildMonitor>,
@@ -510,6 +523,9 @@ export type Action =
   | { type: "configStatus"; config: ConfigStatus }
   | { type: "select"; id: string }
   | { type: "selectIfUnchanged"; id: string; selectionEpoch: number }
+  | { type: "beginUserNavigation"; intentId: string }
+  | { type: "selectForIntent"; id: string; intentId: string }
+  | { type: "restoreSelection"; id: string; navigationIntentId: string }
   | { type: "send"; botId: string; text: string; replyToId?: string }
   | { type: "pendingQueued"; threadId: string; queueId: string; text: string }
   | { type: "consumePendingQueued"; threadId: string; queueId: string }
@@ -664,6 +680,8 @@ function reduceAppState(state: AppState, action: Action): AppState {
         if (selectedBot && !bots.some((bot) => bot.id === selectedBot.id)) bots = [selectedBot, ...bots];
         if (selectedGroup && !groups.some((group) => group.id === selectedGroup.id)) groups = [selectedGroup, ...groups];
         selectedId = state.selectedId;
+      } else if (state.pendingPersistedSelectionId && known(state.pendingPersistedSelectionId)) {
+        selectedId = state.pendingPersistedSelectionId;
       }
       const computerChildren = Object.fromEntries(
         action.computerChildren.map((monitor) => [monitor.childId, monitor]),
@@ -679,6 +697,8 @@ function reduceAppState(state: AppState, action: Action): AppState {
           computerChildren,
         ),
         selectedId,
+        hasHydrated: true,
+        pendingPersistedSelectionId: "",
         hydrationRetryNonce: navigationChanged
           ? state.hydrationRetryNonce + 1
           : state.hydrationRetryNonce,
@@ -687,6 +707,8 @@ function reduceAppState(state: AppState, action: Action): AppState {
     case "showRoutines":
       return {
         ...state,
+        pendingPersistedSelectionId: "",
+        navigationIntentId: "",
         activeView: "routines",
         settingsOpen: false,
         computerOpen: false,
@@ -697,6 +719,8 @@ function reduceAppState(state: AppState, action: Action): AppState {
     case "showTeamMap":
       return {
         ...state,
+        pendingPersistedSelectionId: "",
+        navigationIntentId: "",
         activeView: "team-map",
         settingsOpen: false,
         computerOpen: false,
@@ -708,6 +732,8 @@ function reduceAppState(state: AppState, action: Action): AppState {
       if (!skillRecorderEnabled(state.config)) return state;
       return {
         ...state,
+        pendingPersistedSelectionId: "",
+        navigationIntentId: "",
         activeView: "skill-recorder",
         settingsOpen: false,
         computerOpen: false,
@@ -785,13 +811,15 @@ function reduceAppState(state: AppState, action: Action): AppState {
       if (state.groups.some((g) => g.id === action.id)) {
         return {
           ...state,
+          pendingPersistedSelectionId: "",
+          navigationIntentId: "",
           activeView: "chat",
           selectedId: action.id,
           groups: state.groups.map((g) => (g.id === action.id ? { ...g, unread: false } : g)),
         };
       }
       return updateBot(
-        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id }, action.id, "switch"),
+        withMascotMotion({ ...state, activeView: "chat", selectedId: action.id, pendingPersistedSelectionId: "", navigationIntentId: "" }, action.id, "switch"),
         action.id,
         (b) => ({ ...b, unread: false }),
       );
@@ -800,6 +828,20 @@ function reduceAppState(state: AppState, action: Action): AppState {
       return state.selectionEpoch === action.selectionEpoch
         ? reduceAppState(state, { type: "select", id: action.id })
         : state;
+    case "beginUserNavigation":
+      return { ...state, pendingPersistedSelectionId: "", navigationIntentId: action.intentId };
+    case "selectForIntent":
+      return state.navigationIntentId === action.intentId
+        ? reduceAppState(state, { type: "select", id: action.id })
+        : state;
+    case "restoreSelection": {
+      if (state.navigationIntentId !== action.navigationIntentId) return state;
+      if (!state.hasHydrated) return { ...state, pendingPersistedSelectionId: action.id };
+      const known = state.bots.some((bot) => bot.id === action.id) || state.groups.some((group) => group.id === action.id);
+      return known
+        ? reduceAppState(state, { type: "select", id: action.id })
+        : { ...state, pendingPersistedSelectionId: "" };
+    }
     // optimistic card settle; the server's message.patch confirms it later
     case "answerCard": {
       const bot = state.bots.find((candidate) => candidate.id === action.botId);
@@ -1308,8 +1350,11 @@ export const initialState: AppState = {
   groups: [],
   instances: [],
   config: null,
-  selectedId: readSelectedConversationId(),
+  selectedId: "",
   selectionEpoch: 0,
+  hasHydrated: false,
+  pendingPersistedSelectionId: readSelectedConversationId(),
+  navigationIntentId: "",
   hydrationRetryNonce: 0,
   activeView: "chat",
   routines: [],
@@ -1381,6 +1426,8 @@ const StoreContext = createContext<{
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [state, rawDispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state);
+  const userNavigationRevision = useRef(0);
+  const durableSelectionReady = useRef(!window.ogb?.selectedConversation);
   stateRef.current = state;
   // per-frame stream-delta batching (see the "runtime" SSE case); stream
   // state is intentionally OUTSIDE the reducer so token frames re-render
@@ -1452,8 +1499,39 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const computerScreensVisible = computerPanelVisible(state);
 
   useEffect(() => {
-    writeSelectedConversationId(state.selectedId);
-  }, [state.selectedId]);
+    if (state.hasHydrated) {
+      writeSelectedConversationId(state.selectedId);
+      if (durableSelectionReady.current) {
+        void window.ogb?.selectedConversation?.write(state.selectedId).catch(() => {});
+      }
+    }
+  }, [state.hasHydrated, state.selectedId]);
+
+  useEffect(() => {
+    const selection = window.ogb?.selectedConversation;
+    if (!selection) return;
+    let alive = true;
+    const revision = userNavigationRevision.current;
+    const navigationIntentId = stateRef.current.navigationIntentId;
+    void selection.read().then((id) => {
+      if (!alive) return;
+      durableSelectionReady.current = true;
+      const current = stateRef.current;
+      if (id && userNavigationRevision.current === revision) {
+        const known = current.bots.some((bot) => bot.id === id) || current.groups.some((group) => group.id === id);
+        if (!current.hasHydrated || known) {
+          rawDispatch({ type: "restoreSelection", id, navigationIntentId });
+          return;
+        }
+      }
+      void selection.write(current.selectedId).catch(() => {});
+    }).catch(() => {
+      durableSelectionReady.current = true;
+      const current = stateRef.current;
+      if (current.hasHydrated) void selection.write(current.selectedId).catch(() => {});
+    });
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     // StrictMode's dev probe runs this cleanup once against the same memoized
@@ -1477,6 +1555,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
 
     const wrapped: React.Dispatch<Action> = (action) => {
+      if (
+        action.type === "select" ||
+        action.type === "selectIfUnchanged" ||
+        action.type === "selectForIntent" ||
+        action.type === "beginUserNavigation" ||
+        action.type === "newBot" ||
+        action.type === "duplicateBot" ||
+        action.type === "createGroup" ||
+        action.type === "showRoutines" ||
+        action.type === "showTeamMap" ||
+        action.type === "showSkillRecorder"
+      ) userNavigationRevision.current += 1;
+      const implicitIntentId =
+        action.type === "newBot" || action.type === "duplicateBot" || action.type === "createGroup"
+          ? createNavigationIntentId()
+          : "";
       const botBeforeUpdate =
         action.type === "updateBot"
           ? stateRef.current.bots.find((candidate) => candidate.id === action.botId)
@@ -1503,7 +1597,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         api(`/api/bots/${action.botId}`, { method: "DELETE" }).catch(showError);
         return;
       }
-      rawDispatch(action);
+      if (implicitIntentId) rawDispatch({ type: "beginUserNavigation", intentId: implicitIntentId });
+      else rawDispatch(action);
       switch (action.type) {
         case "createRoutine":
           api("/api/routines", { method: "POST", body: JSON.stringify(action.input) }).catch(showError);
@@ -1629,17 +1724,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         }
         case "newBot": {
-          const selectionEpoch = stateRef.current.selectionEpoch;
           api("/api/bots", { method: "POST" })
             .then(({ bot }) => {
               rawDispatch({ type: "botAdded", bot });
-              rawDispatch({ type: "selectIfUnchanged", id: bot.id, selectionEpoch });
+              rawDispatch({ type: "selectForIntent", id: bot.id, intentId: implicitIntentId });
             })
             .catch(showError);
           break;
         }
         case "duplicateBot": {
-          const selectionEpoch = stateRef.current.selectionEpoch;
           const source = stateRef.current.bots.find((b) => b.id === action.botId);
           if (!source) break;
           const duplicateProfile = {
@@ -1664,7 +1757,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               }).then(({ bot: patched }) => {
                 const duplicate = { ...bot, ...patched, messages: bot.messages };
                 rawDispatch({ type: "botAdded", bot: duplicate });
-                rawDispatch({ type: "selectIfUnchanged", id: duplicate.id, selectionEpoch });
+                rawDispatch({ type: "selectForIntent", id: duplicate.id, intentId: implicitIntentId });
               }),
             )
             .catch(showError);
@@ -1686,14 +1779,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         }
         case "createGroup": {
-          const selectionEpoch = stateRef.current.selectionEpoch;
           api(`/api/groups`, {
             method: "POST",
             body: JSON.stringify({ memberIds: action.memberIds, name: action.name, section: action.section }),
           })
             .then(({ group }) => {
               rawDispatch({ type: "groupPatched", group });
-              rawDispatch({ type: "selectIfUnchanged", id: group.id, selectionEpoch });
+              rawDispatch({ type: "selectForIntent", id: group.id, intentId: implicitIntentId });
             })
             .catch(showError);
           break;

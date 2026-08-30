@@ -30,6 +30,7 @@ import {
 } from "./remote-client.mjs";
 import { startOwnedRemoteSshConnector } from "./remote-ssh-connector.mjs";
 import { watchRemoteServer } from "./remote-server-watch.mjs";
+import { readSelectedConversation, writeSelectedConversation } from "./selected-conversation.mjs";
 import { composePhysicalCapture, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
@@ -117,6 +118,7 @@ const REMOTE_SSH_CONNECTOR = REMOTE_DEPLOYMENT
 const REMOTE_SERVER_URL = REMOTE_SSH_CONNECTOR?.serverUrl ?? null;
 const REMOTE_COMPANION_URL = REMOTE_SSH_CONNECTOR?.companionUrl ?? null;
 const REMOTE_SERVER_NAME = REMOTE_DEPLOYMENT?.serverName ?? "Remote server";
+const SELECTED_CONVERSATION_FILE = path.join(app.getPath("userData"), "selected-conversation");
 if (REMOTE_DEPLOYMENT) removeLegacyBridgeSecrets(app.getPath("userData"));
 const UI_SESSION_TOKEN = REMOTE_DEPLOYMENT?.sessionToken
   ?? process.env.OMB_UI_SESSION_TOKEN?.trim()
@@ -124,6 +126,7 @@ const UI_SESSION_TOKEN = REMOTE_DEPLOYMENT?.sessionToken
 const COMPANION_CONTROL_SESSION_TOKEN = REMOTE_DEPLOYMENT?.companionSessionToken
   ?? randomBytes(32).toString("base64url");
 const UI_SESSION_TOKEN_SHA256 = createHash("sha256").update(UI_SESSION_TOKEN).digest("hex");
+
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
 // resolve to ::1 and paint a black window
 const DEV_URL = process.env.ELECTRON_START_URL ?? "http://127.0.0.1:5199";
@@ -1775,6 +1778,9 @@ registerPrivilegedIpcHandle("desktop:connection", () => ({
   mode: REMOTE_SERVER_URL ? "remote" : "local",
   serverUrl: rendererOrigin(),
 }));
+registerPrivilegedIpcHandle("selection:read", () => readSelectedConversation(SELECTED_CONVERSATION_FILE));
+registerPrivilegedIpcHandle("selection:write", (_event, value) =>
+  writeSelectedConversation(SELECTED_CONVERSATION_FILE, value));
 
 function desktopCapabilitiesForRenderer(localConnection) {
   const connection = { mode: REMOTE_SERVER_URL ? "remote" : "local" };

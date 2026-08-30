@@ -103,6 +103,11 @@ type SkillRecordingPayload = {
   interface Window {
     ogb?: {
       platform: NodeJS.Platform;
+      /** App-owned selected chat, stable across remote loopback port changes. */
+      selectedConversation?: {
+        read(): Promise<string>;
+        write(id: string): Promise<boolean>;
+      };
       getCapabilities(): Promise<DesktopCapabilities>;
       onCapabilitiesChanged(cb: (capabilities: DesktopCapabilities) => void): () => void;
       companionAccount?: {

@@ -279,6 +279,8 @@ test("every exposed preload action carries the isolated document token", async (
 
   const promises = [
     api.connection(),
+    api.selectedConversation.read(),
+    api.selectedConversation.write("bot-id"),
     api.getCapabilities(),
     api.companion.state(),
     api.companion.start(),

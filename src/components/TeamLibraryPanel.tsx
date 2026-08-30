@@ -2,7 +2,7 @@ import { track } from "@/lib/analytics";
 import { cn } from "@/lib/cn";
 import { teamImportPreview, type PendingTeamImport } from "@/lib/team-import";
 import type { Routine } from "@/lib/routines";
-import { api, useStore, type Bot, type Group } from "@/state/store";
+import { api, createNavigationIntentId, useStore, type Bot, type Group } from "@/state/store";
 import {
   ArrowLeft,
   BookOpen,
@@ -289,7 +289,8 @@ export function TeamLibraryPanel({
 
   const importTeam = async () => {
     if (!pending) return;
-    const selectionEpoch = state.selectionEpoch;
+    const intentId = createNavigationIntentId();
+    dispatch({ type: "beginUserNavigation", intentId });
     setImporting(true);
     setError("");
     try {
@@ -309,7 +310,7 @@ export function TeamLibraryPanel({
       for (const group of response.groups ?? []) dispatch({ type: "groupPatched", group });
       for (const routine of response.routines ?? []) dispatch({ type: "routinePatched", routine });
       const first = response.bots[0];
-      if (first) dispatch({ type: "selectIfUnchanged", id: first.id, selectionEpoch });
+      if (first) dispatch({ type: "selectForIntent", id: first.id, intentId });
       track("team_imported", { members: response.bots.length, source, mode: importMode });
       onImported({
         name: pending.name,
@@ -370,7 +371,8 @@ export function TeamLibraryPanel({
 
   const createProject = async () => {
     if (!scouted || creating) return;
-    const selectionEpoch = state.selectionEpoch;
+    const intentId = createNavigationIntentId();
+    dispatch({ type: "beginUserNavigation", intentId });
     setCreating(true);
     setError("");
     try {
@@ -403,7 +405,7 @@ export function TeamLibraryPanel({
       if (response.group) {
         // upsert now instead of waiting for the SSE frame, then land in the room
         dispatch({ type: "groupPatched", group: { ...response.group, messages: [] } });
-        dispatch({ type: "selectIfUnchanged", id: response.group.id, selectionEpoch });
+        dispatch({ type: "selectForIntent", id: response.group.id, intentId });
       }
       track("team_imported", { members: response.bots.length, source: "scout", mode: "project" });
       onImported({

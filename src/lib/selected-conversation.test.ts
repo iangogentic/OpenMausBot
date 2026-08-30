@@ -10,6 +10,7 @@ const values = new Map<string, string>();
 const fakeStorage = {
   getItem: vi.fn((key: string) => values.get(key) ?? null),
   setItem: vi.fn((key: string, value: string) => values.set(key, value)),
+  removeItem: vi.fn((key: string) => values.delete(key)),
 };
 
 describe("selected conversation persistence", () => {
@@ -29,16 +30,17 @@ describe("selected conversation persistence", () => {
     expect(readSelectedConversationId()).toBe("hermes");
   });
 
-  it("does not erase a saved selection during the empty startup state", () => {
+  it("clears a saved selection when no conversation remains", () => {
     values.set(SELECTED_CONVERSATION_KEY, "hermes");
     writeSelectedConversationId("");
-    expect(readSelectedConversationId()).toBe("hermes");
+    expect(readSelectedConversationId()).toBe("");
   });
 
   it("fails open when browser storage is unavailable", () => {
     vi.stubGlobal("window", { localStorage: {
       getItem: () => { throw new Error("denied"); },
       setItem: () => { throw new Error("denied"); },
+      removeItem: () => { throw new Error("denied"); },
     } });
     expect(readSelectedConversationId()).toBe("");
     expect(() => writeSelectedConversationId("hermes")).not.toThrow();

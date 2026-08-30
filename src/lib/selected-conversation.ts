@@ -18,9 +18,10 @@ export function readSelectedConversationId(): string {
 
 export function writeSelectedConversationId(id: string): void {
   const normalized = id.trim();
-  if (!normalized) return;
   try {
-    storage()?.setItem(SELECTED_CONVERSATION_KEY, normalized);
+    const target = storage();
+    if (normalized) target?.setItem(SELECTED_CONVERSATION_KEY, normalized);
+    else target?.removeItem(SELECTED_CONVERSATION_KEY);
   } catch {
     // Locked-down storage must not make navigation fail.
   }

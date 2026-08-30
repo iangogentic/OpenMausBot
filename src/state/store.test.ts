@@ -332,6 +332,143 @@ describe("main renderer screen transport", () => {
     expect(arrived.selectionEpoch).toBe(routines.selectionEpoch);
   });
 
+  it("restores the app-owned selection after a remote origin changes", () => {
+    const state = {
+      ...initialState,
+      hasHydrated: true,
+      bots: [{ id: "basil" } as Bot, { id: "hermes" } as Bot],
+      selectedId: "basil",
+    };
+    expect(reducer(state, { type: "restoreSelection", id: "hermes", navigationIntentId: "" }).selectedId).toBe("hermes");
+  });
+
+  it("holds a restart selection until the first authoritative snapshot", () => {
+    const pending = reducer({ ...initialState, pendingPersistedSelectionId: "" }, {
+      type: "restoreSelection",
+      id: "hermes",
+      navigationIntentId: "",
+    });
+    expect(pending.selectedId).toBe("");
+    expect(pending.pendingPersistedSelectionId).toBe("hermes");
+    const hydrated = reducer(pending, {
+      type: "hydrate",
+      bots: [{ id: "basil" } as Bot, { id: "hermes" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+    });
+    expect(hydrated.hasHydrated).toBe(true);
+    expect(hydrated.pendingPersistedSelectionId).toBe("");
+    expect(hydrated.selectedId).toBe("hermes");
+  });
+
+  it("rejects a deleted restart selection after an authoritative empty snapshot", () => {
+    const pending = reducer({ ...initialState, pendingPersistedSelectionId: "" }, {
+      type: "restoreSelection",
+      id: "deleted",
+      navigationIntentId: "",
+    });
+    const hydrated = reducer(pending, {
+      type: "hydrate",
+      bots: [],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+    });
+    expect(hydrated.hasHydrated).toBe(true);
+    expect(hydrated.selectedId).toBe("");
+    expect(hydrated.pendingPersistedSelectionId).toBe("");
+    expect(reducer(hydrated, { type: "restoreSelection", id: "deleted", navigationIntentId: "" }).selectedId).toBe("");
+  });
+
+  it("lets newer user navigation intent cancel a pending restart selection", () => {
+    const pending = reducer({ ...initialState, pendingPersistedSelectionId: "" }, {
+      type: "restoreSelection",
+      id: "hermes",
+      navigationIntentId: "",
+    });
+    const started = reducer(pending, { type: "beginUserNavigation", intentId: "newer" });
+    expect(started.pendingPersistedSelectionId).toBe("");
+    const hydrated = reducer(started, {
+      type: "hydrate",
+      bots: [{ id: "basil" } as Bot, { id: "hermes" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+    });
+    expect(hydrated.selectedId).toBe("basil");
+  });
+
+  it("lets a new-bot intent beat startup hydration and select its result", () => {
+    const pending = {
+      ...initialState,
+      selectedId: "",
+      pendingPersistedSelectionId: "hermes",
+    };
+    const started = reducer(pending, { type: "beginUserNavigation", intentId: "new-bot-intent" });
+    expect(started.pendingPersistedSelectionId).toBe("");
+    const hydrated = reducer(started, {
+      type: "hydrate",
+      bots: [{ id: "hermes" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+      selectionEpoch: started.selectionEpoch,
+    });
+    expect(hydrated.selectedId).toBe("hermes");
+    const arrived = reducer(hydrated, { type: "botAdded", bot: { id: "new-bot" } as Bot });
+    const selected = reducer(arrived, {
+      type: "selectForIntent",
+      id: "new-bot",
+      intentId: "new-bot-intent",
+    });
+    expect(selected.selectedId).toBe("new-bot");
+  });
+
+  it("makes the latest async navigation intent win regardless of response order", () => {
+    const base = {
+      ...initialState,
+      hasHydrated: true,
+      bots: [{ id: "basil" } as Bot, { id: "first" } as Bot, { id: "second" } as Bot],
+      selectedId: "basil",
+    };
+    const first = reducer(base, { type: "beginUserNavigation", intentId: "first-intent" });
+    const second = reducer(first, { type: "beginUserNavigation", intentId: "second-intent" });
+    const earlyFirstResponse = reducer(second, {
+      type: "selectForIntent",
+      id: "first",
+      intentId: "first-intent",
+    });
+    expect(earlyFirstResponse.selectedId).toBe("basil");
+    const laterSecondResponse = reducer(earlyFirstResponse, {
+      type: "selectForIntent",
+      id: "second",
+      intentId: "second-intent",
+    });
+    expect(laterSecondResponse.selectedId).toBe("second");
+  });
+
+  it("rejects an already-queued restart restore after newer user intent", () => {
+    const base = {
+      ...initialState,
+      hasHydrated: true,
+      bots: [{ id: "basil" } as Bot, { id: "hermes" } as Bot],
+      selectedId: "basil",
+    };
+    const started = reducer(base, { type: "beginUserNavigation", intentId: "user-intent" });
+    const staleRestore = reducer(started, {
+      type: "restoreSelection",
+      id: "hermes",
+      navigationIntentId: "",
+    });
+    expect(staleRestore.selectedId).toBe("basil");
+    expect(staleRestore.navigationIntentId).toBe("user-intent");
+  });
+
   it("uses explicit screen-off URLs while hidden and screen-on URLs while visible", () => {
     expect(screenTransportUrl("/api/events", false)).toBe("/api/events?screens=off");
     expect(screenTransportUrl("/api/bots", false)).toBe("/api/bots?screens=off");
