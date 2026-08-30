@@ -102,4 +102,28 @@ posixOnly("Local VM provider relay", () => {
     expect(result.code).toBe(2);
     expect(result.stderr).toMatch(/authority is unavailable/);
   });
+
+  it("accepts the provider namespace's private slirp gateway authority", async () => {
+    const result = await new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [fileURLToPath(new URL("./container-mcp.ts", import.meta.url))],
+        {
+          env: {
+            ...process.env,
+            NODE_NO_WARNINGS: "1",
+            OMB_LOCAL_VM_MCP_URL: `ws://10.0.2.2:1${LOCAL_VM_MCP_PATH}`,
+            OMB_LOCAL_VM_MCP_CAPABILITY: "g".repeat(43),
+          },
+          stdio: ["ignore", "ignore", "pipe"],
+        },
+      );
+      let stderr = "";
+      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code, stderr }));
+      setTimeout(() => child.kill("SIGTERM"), 250).unref();
+    });
+    expect(result.stderr).not.toMatch(/authority is unavailable/);
+  });
 });

@@ -28,7 +28,7 @@ function brokerUrl(value: string): URL | null {
     const parsed = new URL(value);
     const port = Number(parsed.port);
     return parsed.protocol === "ws:" &&
-      parsed.hostname === "127.0.0.1" &&
+      ["127.0.0.1", "10.0.2.2"].includes(parsed.hostname) &&
       parsed.username === "" &&
       parsed.password === "" &&
       /^\d{1,5}$/.test(parsed.port) &&
@@ -48,7 +48,7 @@ if (!url || !/^[A-Za-z0-9_-]{43}$/.test(capability)) {
   process.exit(2);
 }
 
-const socket = net.createConnection({ host: "127.0.0.1", port: Number(url.port) });
+const socket = net.createConnection({ host: url.hostname, port: Number(url.port) });
 socket.setNoDelay(true);
 const key = randomBytes(16).toString("base64");
 const expectedAccept = createHash("sha1")
@@ -101,7 +101,7 @@ function flushQueued(): void {
 socket.once("connect", () => {
   socket.write(
     `GET ${LOCAL_VM_MCP_PATH} HTTP/1.1\r\n` +
-    `Host: 127.0.0.1:${url.port}\r\n` +
+    `Host: ${url.hostname}:${url.port}\r\n` +
     "Upgrade: websocket\r\n" +
     "Connection: Upgrade\r\n" +
     `Origin: ${LOCAL_VM_BROKER_ORIGIN}\r\n` +

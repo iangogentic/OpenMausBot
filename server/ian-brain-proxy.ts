@@ -30,13 +30,13 @@ function checkedUpstream(value: string): string {
   const host = url.hostname.toLowerCase();
   if (
     url.protocol !== "http:" ||
-    !["127.0.0.1", "localhost", "::1"].includes(host) ||
+    !["127.0.0.1", "localhost", "::1", "10.0.2.2"].includes(host) ||
     url.username ||
     url.password ||
     url.search ||
     url.hash ||
     url.pathname !== "/api/internal/ian-brain/mcp"
-  ) throw new Error("Ian Brain MCP URL is outside the harness loopback boundary");
+  ) throw new Error("Ian Brain MCP URL is outside the private harness boundary");
   return url.toString();
 }
 

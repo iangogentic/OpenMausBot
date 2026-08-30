@@ -106,6 +106,17 @@ describe("Ian Brain stdio bridge", () => {
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     const [code] = await once(child, "exit") as [number];
     expect(code).not.toBe(0);
-    expect(Buffer.concat(stderr).toString("utf8")).toContain("outside the harness loopback boundary");
+    expect(Buffer.concat(stderr).toString("utf8")).toContain("outside the private harness boundary");
+  });
+
+  it("accepts the provider namespace's private slirp gateway authority", async () => {
+    const child = childFor("http://10.0.2.2:1/api/internal/ian-brain/mcp");
+    const stderr: Buffer[] = [];
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n`);
+    const [code] = await once(child, "exit") as [number];
+    const output = Buffer.concat(stderr).toString("utf8");
+    expect(code).toBeGreaterThanOrEqual(0);
+    expect(output).not.toContain("outside the private harness boundary");
   });
 });

@@ -94,16 +94,17 @@ On the current Razer, the known working source is Hermes Agent `0.17.0` at git
 revision `9f4c0b27c9c483b517d965651309630c51e6e481`, and it requires Python
 `>=3.11,<3.14`. Copy that exact clean source (excluding its old `venv`, `.venv`,
 and `.git`) to a versioned root-owned release, install a root-owned managed
-Python 3.11 plus the frozen `uv.lock` and the pinned `acp` extra
-(`agent-client-protocol==0.9.0`). Installing the base package alone leaves
-`hermes acp` present but unusable. Verify all of these before enabling the
-service:
+Python 3.11 plus the frozen `uv.lock` and both pinned extras: `acp`
+(`agent-client-protocol==0.9.0`) and `mcp` (`mcp==1.26.0`). Installing the
+base package alone leaves `hermes acp` present but unable to register any MCP
+server. A reproducible install uses `uv sync --frozen --no-dev --extra acp
+--extra mcp`. Verify all of these before enabling the service:
 
 ```bash
 sudo -u openmaus-server test -x /opt/openmaus-provider/bin/hermes
 sudo -u openmaus-server /opt/openmaus-provider/bin/hermes --version
 sudo -u openmaus-server /path/to/managed/python -c \
-  'import acp, importlib.metadata as m; assert m.version("agent-client-protocol") == "0.9.0"'
+  'import acp, mcp, importlib.metadata as x; assert x.version("agent-client-protocol") == "0.9.0"; assert x.version("mcp") == "1.26.0"'
 readlink -f /opt/openmaus-provider/bin/hermes
 head -n 1 "$(readlink -f /opt/openmaus-provider/bin/hermes)"
 # Neither resolved path nor shebang may contain /home/ian.
