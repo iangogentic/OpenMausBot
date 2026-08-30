@@ -238,7 +238,7 @@ describe("computer proxy (fake box)", () => {
       jsonrpc: "2.0",
       id: 4,
       method: "tools/call",
-      params: { name: "press_key", arguments: { keys: "Tab" } },
+      params: { name: "press_key", arguments: { keys: "Tab", pid: 42, window_id: 123, delivery_mode: "foreground" } },
     });
     const res = await waitFor(4);
     expect(res.result.content).toHaveLength(1);
@@ -253,7 +253,7 @@ describe("computer proxy (fake box)", () => {
       jsonrpc: "2.0",
       id: 5,
       method: "tools/call",
-      params: { name: "type_text", arguments: { text: "hello" } },
+      params: { name: "type_text", arguments: { text: "hello", pid: 42, window_id: 123, delivery_mode: "foreground" } },
     });
     const res = await waitFor(5);
     expect(commands.at(-1)).toMatch(/xdotool type --clearmodifiers --delay 8 -- .*hello/);
@@ -266,7 +266,7 @@ describe("computer proxy (fake box)", () => {
       jsonrpc: "2.0",
       id: 51,
       method: "tools/call",
-      params: { name: "type_text", arguments: { text: "--safe" } },
+      params: { name: "type_text", arguments: { text: "--safe", pid: 42, window_id: 123, delivery_mode: "foreground" } },
     });
     await waitFor(51);
     expect(commands.at(-1)).toMatch(/xdotool type --clearmodifiers --delay 8 -- .*--safe/);
@@ -283,9 +283,9 @@ describe("computer proxy (fake box)", () => {
         name: "computer_batch",
         arguments: {
           actions: [
-            { action: "click", x: 10, y: 20 },
-            { action: "type_text", text: "milind@example.com" },
-            { action: "press_key", keys: "Tab" },
+            { action: "click", x: 10, y: 20, pid: 42, window_id: 123, delivery_mode: "foreground" },
+            { action: "type_text", text: "milind@example.com", pid: 42, window_id: 123, delivery_mode: "foreground" },
+            { action: "press_key", keys: "Tab", pid: 42, window_id: 123, delivery_mode: "foreground" },
           ],
         },
       },
@@ -296,6 +296,9 @@ describe("computer proxy (fake box)", () => {
     expect(command).toMatch(/mousemove/);
     expect(command).toMatch(/xdotool type/);
     expect(command).toMatch(/xdotool key Tab/);
+    expect(command).toContain("xdotool getwindowpid 123");
+    expect(command).toContain('"window_id":123');
+    if (process.platform !== "win32") expect(spawnSync("/bin/bash", ["-n", "-c", command]).status).toBe(0);
     expect((command.match(/scrot/g) ?? []).length).toBe(1); // one capture
     expect(res.result.content[1]).toMatchObject({ type: "image" });
   });
@@ -306,6 +309,11 @@ describe("computer proxy (fake box)", () => {
     expect((await waitFor(63)).result.isError).toBe(true);
     rpc({ jsonrpc: "2.0", id: 64, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ action: "type_text", text: "wrong focus" }] } } });
     expect((await waitFor(64)).result.isError).toBe(true);
+    rpc({ jsonrpc: "2.0", id: 641, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [
+      { action: "click", x: 1, y: 1, pid: 42, window_id: 123, delivery_mode: "foreground" },
+      { action: "type_text", text: "wrong window", pid: 42, window_id: 124, delivery_mode: "foreground" },
+    ] } } });
+    expect((await waitFor(641)).result.isError).toBe(true);
     expect(commands.length).toBe(before);
   });
 
@@ -332,7 +340,10 @@ describe("computer proxy (fake box)", () => {
         jsonrpc: "2.0",
         id: 61,
         method: "tools/call",
-        params: { name: "computer_batch", arguments: { actions: [{ action: "click", x: 1, y: 1 }, { action: "press_key", keys: "Tab" }] } },
+        params: { name: "computer_batch", arguments: { actions: [
+          { action: "click", x: 1, y: 1, pid: 42, window_id: 123, delivery_mode: "foreground" },
+          { action: "press_key", keys: "Tab", pid: 42, window_id: 123, delivery_mode: "foreground" },
+        ] } },
       });
       const res = await waitFor(61);
       expect(res.result.isError).toBe(true);

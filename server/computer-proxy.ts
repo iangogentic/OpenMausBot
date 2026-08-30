@@ -672,12 +672,23 @@ const TOOLS = [
     },
   },
   {
+    name: "list_windows",
+    description: "List visible cloud-desktop windows with stable PID/window identity and stacking information. Use this before targeted keyboard work.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
     name: "type_text",
-    description: "Type text at the current focus and return the resulting screen.",
+    description: "Type text into one exact foreground window and return the resulting screen.",
     inputSchema: {
       type: "object",
-      properties: { text: { type: "string" }, ...OBSERVE_PROPS },
-      required: ["text"],
+      properties: {
+        text: { type: "string" },
+        pid: { type: "integer", minimum: 1 },
+        window_id: { type: "integer", minimum: 1 },
+        delivery_mode: { type: "string", enum: ["foreground"] },
+        ...OBSERVE_PROPS,
+      },
+      required: ["text", "pid", "window_id", "delivery_mode"],
     },
   },
   {
@@ -686,8 +697,14 @@ const TOOLS = [
       'Press a key or chord and return the resulting screen. xdotool syntax: "Return", "Tab", "ctrl+c", "alt+F4", "ctrl+shift+t".',
     inputSchema: {
       type: "object",
-      properties: { keys: { type: "string" }, ...OBSERVE_PROPS },
-      required: ["keys"],
+      properties: {
+        keys: { type: "string" },
+        pid: { type: "integer", minimum: 1 },
+        window_id: { type: "integer", minimum: 1 },
+        delivery_mode: { type: "string", enum: ["foreground"] },
+        ...OBSERVE_PROPS,
+      },
+      required: ["keys", "pid", "window_id", "delivery_mode"],
     },
   },
   {
@@ -728,6 +745,9 @@ const TOOLS = [
               direction: { type: "string", enum: ["up", "down"] },
               clicks: { type: "number" },
               ms: { type: "number", description: "wait: milliseconds, max 5000" },
+              pid: { type: "integer", minimum: 1 },
+              window_id: { type: "integer", minimum: 1 },
+              delivery_mode: { type: "string", enum: ["foreground"] },
             },
             required: ["action"],
             additionalProperties: false,
@@ -770,6 +790,28 @@ const shellQuote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 const settleOf = (args: any) => Math.min(Math.max(Number(args?.settle_ms) || SETTLE_MS, 0), 3000);
 const wantsFrame = (args: any) => args?.observe !== false;
 
+type ExactWindowTarget = { pid: number; windowId: number };
+
+function exactWindowTarget(value: any): ExactWindowTarget | null {
+  const pid = Number(value?.pid);
+  const windowId = Number(value?.window_id);
+  if (
+    !Number.isSafeInteger(pid) || pid < 1 ||
+    !Number.isSafeInteger(windowId) || windowId < 1 ||
+    value?.delivery_mode !== "foreground"
+  ) return null;
+  return { pid, windowId };
+}
+
+function exactX11Prefix(target: ExactWindowTarget): string {
+  return [
+    "command -v xdotool >/dev/null 2>&1",
+    `[ "$(xdotool getwindowpid ${target.windowId} 2>/dev/null)" = "${target.pid}" ]`,
+    `xdotool windowactivate --sync ${target.windowId}`,
+    `[ "$(xdotool getactivewindow 2>/dev/null)" = "${target.windowId}" ]`,
+  ].join(" && ");
+}
+
 /** One action → the shell that performs it (scaling clicks box-side). */
 function actionShell(a: any): string | { error: string } {
   const kind = String(a?.action ?? "");
@@ -781,29 +823,48 @@ function actionShell(a: any): string | { error: string } {
     const rep = a.double ? "--repeat 2 --delay 60 " : "";
     const button = a.button === "right" ? "right" : "left";
     const count = a.double ? 2 : 1;
-    const fallback = `xdotool mousemove $CX $CY click ${rep}${btn}`;
-    const args = `$(printf '{"x":%s,"y":%s,"button":"${button}","count":${count},"scope":"desktop","session":"${REMOTE_CUA_SESSION}"}' "$CX" "$CY")`;
+    const target = exactWindowTarget(a);
+    const fallback = `${target ? `${exactX11Prefix(target)} && ` : ""}xdotool mousemove $CX $CY click ${rep}${btn}`;
+    const targetJson = target
+      ? `,"pid":${target.pid},"window_id":${target.windowId},"delivery_mode":"foreground"`
+      : "";
+    const args = `$(printf '{"x":%s,"y":%s,"button":"${button}","count":${count},"scope":"desktop","session":"${REMOTE_CUA_SESSION}"${targetJson}}' "$CX" "$CY")`;
     return `${scaled("CX", x)}; ${scaled("CY", y)}; CUA_ARGS=${args}; ${cuaOrX11("click", '"$CUA_ARGS"', fallback)}`;
   }
   if (kind === "type_text") {
     const t = String(a.text ?? "");
     if (!t) return { error: "type_text needs text" };
-    const cuaArgs = shellQuote(JSON.stringify({ text: t, scope: "desktop", session: REMOTE_CUA_SESSION }));
-    return cuaOrX11("type_text", cuaArgs, `xdotool type --clearmodifiers --delay 8 -- ${shellQuote(t)}`);
+    const target = exactWindowTarget(a);
+    if (!target) return { error: "type_text requires exact pid, window_id, and delivery_mode foreground" };
+    const cuaArgs = shellQuote(JSON.stringify({
+      text: t,
+      pid: target.pid,
+      window_id: target.windowId,
+      delivery_mode: "foreground",
+      scope: "desktop",
+      session: REMOTE_CUA_SESSION,
+    }));
+    return cuaOrX11(
+      "type_text",
+      cuaArgs,
+      `${exactX11Prefix(target)} && xdotool type --clearmodifiers --delay 8 -- ${shellQuote(t)}`,
+    );
   }
   if (kind === "press_key") {
     const keys = String(a.keys ?? "").replace(/[^\w+]/g, "");
     if (!keys) return { error: "press_key needs keys" };
     const parts = keys.split("+").filter(Boolean);
     const tool = parts.length > 1 ? "hotkey" : "press_key";
+    const target = exactWindowTarget(a);
+    if (!target) return { error: "press_key requires exact pid, window_id, and delivery_mode foreground" };
     const cuaArgs = shellQuote(
       JSON.stringify(
         parts.length > 1
-          ? { keys: parts, scope: "desktop", session: REMOTE_CUA_SESSION }
-          : { key: parts[0]?.toLowerCase(), scope: "desktop", session: REMOTE_CUA_SESSION },
+          ? { keys: parts, pid: target.pid, window_id: target.windowId, delivery_mode: "foreground", scope: "desktop", session: REMOTE_CUA_SESSION }
+          : { key: parts[0]?.toLowerCase(), pid: target.pid, window_id: target.windowId, delivery_mode: "foreground", scope: "desktop", session: REMOTE_CUA_SESSION },
       ),
     );
-    return cuaOrX11(tool, cuaArgs, `xdotool key ${keys}`);
+    return cuaOrX11(tool, cuaArgs, `${exactX11Prefix(target)} && xdotool key ${keys}`);
   }
   if (kind === "scroll") {
     const clicks = Math.min(Math.max(Math.round(Number(a.clicks) || 3), 1), 20);
@@ -1110,6 +1171,19 @@ async function callWithPermit(id: unknown, name: string, args: any) {
     const overall = out.stdout.match(/"overall"\s*:\s*"(ok|degraded|failed)"/)?.[1] ?? "unknown";
     return text(id, `Cloud computer automation: Cua Driver ${REMOTE_CUA_VERSION} (${overall}).`);
   }
+  if (name === "list_windows") {
+    const command = [
+      ENV,
+      ensureRemoteCuaCommand(),
+      `if [ -x ${REMOTE_CUA_EXECUTABLE} ] && ${REMOTE_CUA_EXECUTABLE} status --socket ${REMOTE_CUA_SOCKET} >/dev/null 2>&1; then`,
+      `  env ${CUA_ENV} ${REMOTE_CUA_EXECUTABLE} call list_windows '{}' --socket ${REMOTE_CUA_SOCKET}`,
+      "elif command -v wmctrl >/dev/null 2>&1; then wmctrl -lpGx",
+      "else echo 'Exact window discovery is unavailable'; exit 1; fi",
+    ].join("\n");
+    const out = await runOnBox(command, 20_000);
+    if (out.exitCode !== 0) return text(id, "Exact cloud window discovery failed; keyboard actions are disabled until it recovers.", true);
+    return text(id, out.stdout.slice(0, 16_000) || "No visible windows were found.");
+  }
   if (name === "click") {
     const x = Math.round(Number(args.x));
     const y = Math.round(Number(args.y));
@@ -1120,12 +1194,16 @@ async function callWithPermit(id: unknown, name: string, args: any) {
   if (name === "type_text") {
     const t = String(args.text ?? "");
     if (!t) return text(id, "nothing to type", true);
-    return actAndObserve(id, [{ action: "type_text", text: t }], `typed ${t.length} chars`, args, 120_000);
+    const target = exactWindowTarget(args);
+    if (!target) return text(id, "type_text requires exact pid, window_id, and delivery_mode foreground", true);
+    return actAndObserve(id, [{ ...args, action: "type_text", text: t }], `typed ${t.length} chars`, args, 120_000);
   }
   if (name === "press_key") {
     const keys = String(args.keys ?? "").replace(/[^\w+]/g, "");
     if (!keys) return text(id, "press_key needs keys", true);
-    return actAndObserve(id, [{ action: "press_key", keys }], `pressed ${keys}`, args);
+    const target = exactWindowTarget(args);
+    if (!target) return text(id, "press_key requires exact pid, window_id, and delivery_mode foreground", true);
+    return actAndObserve(id, [{ ...args, action: "press_key", keys }], `pressed ${keys}`, args);
   }
   if (name === "scroll") {
     const clicks = Math.min(Math.max(Math.round(Number(args.clicks) || 3), 1), 20);
@@ -1136,11 +1214,18 @@ async function callWithPermit(id: unknown, name: string, args: any) {
     const actions = Array.isArray(args.actions) ? args.actions : [];
     if (!actions.length) return text(id, "computer_batch needs a non-empty actions array", true);
     if (actions.length > 9) return text(id, "computer_batch allows at most 9 actions; none were run", true);
-    let focusEstablished = false;
+    let focusTarget: ExactWindowTarget | null = null;
     for (const action of actions) {
-      if (action?.action === "click") focusEstablished = true;
-      if ((action?.action === "type_text" || action?.action === "press_key") && !focusEstablished) {
-        return text(id, "computer_batch keyboard actions require an earlier exact click in the same batch; none were run", true);
+      if (action?.action === "click") focusTarget = exactWindowTarget(action);
+      if (action?.action === "type_text" || action?.action === "press_key") {
+        const keyboardTarget = exactWindowTarget(action);
+        if (
+          !focusTarget || !keyboardTarget ||
+          focusTarget.pid !== keyboardTarget.pid ||
+          focusTarget.windowId !== keyboardTarget.windowId
+        ) {
+          return text(id, "computer_batch keyboard actions require an earlier click on the same exact pid/window_id with delivery_mode foreground; none were run", true);
+        }
       }
     }
     const summary = actions
