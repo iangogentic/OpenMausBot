@@ -55,8 +55,10 @@ describe("production computer operator wiring", () => {
   it("pauses the delegated child on the global target even when takeover comes through another bot", () => {
     expect(source).toContain("pauseComputerOperatorForHuman(resolvedTargetKey)");
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.markWaitingOnHuman(active.handle, active.parent)");
-    expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.resumeAfterHuman(active.handle, active.parent)");
+    expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.resumeAfterHuman(active.handle, active.parent, () =>");
     expect(source).toContain("activeComputerOperatorForTarget(event.targetKey)");
+    expect(source).toContain("activeComputerOperatorForTarget(targetKey) === active");
+    expect(source).toContain("!computerControl.targetReservedForHuman(targetKey)");
     expect(source).not.toContain("active.parent.botId !== botId");
   });
 

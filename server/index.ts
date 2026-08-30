@@ -1209,7 +1209,10 @@ async function resumeComputerOperatorAfterHuman(active: ActiveComputerOperator |
   if (!active) return;
   const record = COMPUTER_SUBAGENT_MANAGER.get(active.handle.childId);
   if (record?.status !== "waiting-on-human") return;
-  await COMPUTER_SUBAGENT_RUNTIME.resumeAfterHuman(active.handle, active.parent);
+  const targetKey = record.targetKey;
+  await COMPUTER_SUBAGENT_RUNTIME.resumeAfterHuman(active.handle, active.parent, () =>
+    activeComputerOperatorForTarget(targetKey) === active
+    && !computerControl.targetReservedForHuman(targetKey));
 }
 
 function computerOperatorTarget(context: ComputerOperatorTurnContext): { targetKey: string; targetGeneration: string } {
