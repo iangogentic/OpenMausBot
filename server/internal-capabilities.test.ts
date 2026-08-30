@@ -260,6 +260,50 @@ describe("internal integration capabilities", () => {
     })).toBe(currentBinding);
   });
 
+  it("namespaces parent and child mounts while revoking the complete turn", () => {
+    let sequence = 0;
+    const registry = new InternalCapabilityRegistry({ tokenFactory: () => `mount-${++sequence}` });
+    const common = {
+      kind: "local-vm" as const,
+      botId: "bot-a",
+      threadId: "thread-a",
+      depth: 0,
+      generation: "turn-a",
+      scope: { targetKey: "bot:target-a", resourceId: "a".repeat(64) },
+    };
+    const parentMount = registry.register({ ...common, mountId: "primary" });
+    const childMount = registry.register({ ...common, mountId: "computer-child:child-a" });
+
+    expect(registry.size).toBe(2);
+    expect(parentMount).toMatchObject({ mountId: "primary" });
+    expect(childMount).toMatchObject({ mountId: "computer-child:child-a" });
+    expect(registry.authorize(`Bearer ${parentMount.token}`, {
+      method: "GET",
+      path: "/api/internal/local-vm-computer/mcp",
+    })).toBe(parentMount);
+    expect(registry.authorize(`Bearer ${childMount.token}`, {
+      method: "GET",
+      path: "/api/internal/local-vm-computer/mcp",
+    })).toBe(childMount);
+
+    const replacementChild = registry.register({ ...common, mountId: "computer-child:child-a" });
+    expect(registry.size).toBe(2);
+    expect(registry.authorize(`Bearer ${childMount.token}`, {
+      method: "GET",
+      path: "/api/internal/local-vm-computer/mcp",
+    })).toBeNull();
+    expect(registry.authorize(`Bearer ${parentMount.token}`, {
+      method: "GET",
+      path: "/api/internal/local-vm-computer/mcp",
+    })).toBe(parentMount);
+    expect(registry.revokeTurn(common)).toBe(2);
+    expect(registry.authorize(`Bearer ${replacementChild.token}`, {
+      method: "GET",
+      path: "/api/internal/local-vm-computer/mcp",
+    })).toBeNull();
+    expect(registry.size).toBe(0);
+  });
+
   it("never reuses the old child's token while remounting", () => {
     const candidates = ["old-token", "old-token", "new-token"];
     const registry = new InternalCapabilityRegistry({ tokenFactory: () => candidates.shift() ?? "fallback" });

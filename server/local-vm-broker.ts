@@ -193,6 +193,10 @@ export function attachLocalVmMcpBroker(options: {
   stillAuthorized: () => boolean;
   verifyCurrentGeneration: () => boolean | Promise<boolean>;
   beginAction: () => ActionPermit | Promise<ActionPermit>;
+  /** Authoritative child-runtime budget hook. It is invoked only after a
+   * control ticket is acquired and before any mechanical action is reserved
+   * or forwarded. Omission or an exception denies the action. */
+  onActions?: (amount: number) => number;
   endAction: (actionId: string) => boolean | Promise<boolean>;
   quarantine: () => void | Promise<void>;
   requestHelp: (reason: string) => Promise<{ text: string; isError?: boolean }>;
@@ -325,6 +329,24 @@ export function attachLocalVmMcpBroker(options: {
     responseTimers.delete(requestId);
   };
 
+  const accountPermittedActions = async (
+    permit: Extract<ActionPermit, { allowed: true }>,
+    amount: number,
+  ): Promise<ActionPermit> => {
+    try {
+      if (!options.onActions) throw new Error("computer child action authority is unavailable");
+      options.onActions(amount);
+      return permit;
+    } catch {
+      const ended = await Promise.resolve(options.endAction(permit.actionId)).catch(() => false);
+      if (!ended) {
+        await quarantineSafely();
+        finish("Local VM action accounting failed and its control ticket could not be released", true);
+      }
+      return { allowed: false, reason: "unavailable" };
+    }
+  };
+
   const onAbort = () => finish("provider turn ended", pendingActions.size > 0);
   if (options.signal?.aborted) onAbort();
   else options.signal?.addEventListener("abort", onAbort, { once: true });
@@ -413,8 +435,10 @@ export function attachLocalVmMcpBroker(options: {
         return { allowed: false, reason: "unavailable" };
       }
       const permit = await options.beginAction();
-      if (permit.allowed && LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName)) computerActionsConsumed += 1;
-      return permit;
+      if (!permit.allowed || !LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName)) return permit;
+      const accounted = await accountPermittedActions(permit, 1);
+      if (accounted.allowed) computerActionsConsumed += 1;
+      return accounted;
     },
     actionForwarded: (requestId, actionId, toolName) => {
       if (closed) {
@@ -470,8 +494,12 @@ export function attachLocalVmMcpBroker(options: {
       if (!permit.allowed) {
         return { content: [{ type: "text", text: "Computer control is currently unavailable or held; no batch actions were run." }], isError: true };
       }
+      const accounted = await accountPermittedActions(permit, actions.length);
+      if (!accounted.allowed) {
+        return { content: [{ type: "text", text: "Computer action accounting is unavailable; no batch actions were run." }], isError: true };
+      }
       computerActionsConsumed += actions.length;
-      activeBatchActionId = permit.actionId;
+      activeBatchActionId = accounted.actionId;
       let completed = 0;
       let result: { content: Array<Record<string, unknown>>; isError?: boolean } = {
         content: [{ type: "text", text: "The computer batch could not complete safely." }],

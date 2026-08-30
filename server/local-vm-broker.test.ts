@@ -104,6 +104,7 @@ function baseOptions(socket: FakeSocket, overrides: Record<string, unknown> = {}
     stillAuthorized: () => true,
     verifyCurrentGeneration: () => true,
     beginAction: () => ({ allowed: true as const, actionId: "action-a" }),
+    onActions: () => 1,
     endAction: () => true,
     quarantine: vi.fn(),
     requestHelp: async () => ({ text: "done" }),
@@ -164,7 +165,9 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
 
   it("runs a validated batch sequentially under one ticket and returns only one final screen", async () => {
     const socket = new FakeSocket();
-    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "batch-ticket" }));
+    const accountingOrder: string[] = [];
+    const beginAction = vi.fn(() => { accountingOrder.push("permit"); return { allowed: true as const, actionId: "batch-ticket" }; });
+    const onActions = vi.fn((amount: number) => { accountingOrder.push(`account:${amount}`); return amount; });
     const endAction = vi.fn(() => true);
     const captureAfterAction = vi.fn(async (toolName: string) => {
       expect(toolName).toBe("press_key");
@@ -172,6 +175,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     });
     const handle = attachLocalVmMcpBroker(baseOptions(socket, {
       beginAction,
+      onActions,
       endAction,
       captureAfterAction,
       maxToolCalls: 3,
@@ -193,6 +197,8 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     const frames = socket.sent.map((bytes) => JSON.parse(bytes.toString()));
     const response = frames.find((frame) => frame.id === 101);
     expect(beginAction).toHaveBeenCalledOnce();
+    expect(onActions).toHaveBeenCalledWith(3);
+    expect(accountingOrder).toEqual(["permit", "account:3"]);
     expect(endAction).toHaveBeenCalledOnce();
     expect(endAction).toHaveBeenCalledWith("batch-ticket");
     expect(captureAfterAction).toHaveBeenCalledOnce();
@@ -202,6 +208,79 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     ]);
     expect(JSON.stringify(frames)).not.toContain("__openmaus_computer_batch_");
     handle.close("batch complete");
+    await handle.closed;
+  });
+
+  it("releases the permit and forwards no ordinary action when authoritative accounting fails", async () => {
+    const socket = new FakeSocket();
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "accounting-ticket" }));
+    const endAction = vi.fn(() => true);
+    const onActions = vi.fn(() => { throw new Error("child action budget exhausted"); });
+    const captureAfterAction = vi.fn(async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      endAction,
+      onActions,
+      captureAfterAction,
+    }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 104,
+      method: "tools/call",
+      params: { name: "click", arguments: { x: 10, y: 20 } },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    const response = JSON.parse(socket.sent[0]!.toString());
+    expect(response).toMatchObject({ id: 104, result: { isError: true } });
+    expect(beginAction).toHaveBeenCalledOnce();
+    expect(onActions).toHaveBeenCalledWith(1);
+    expect(endAction).toHaveBeenCalledExactlyOnceWith("accounting-ticket");
+    expect(captureAfterAction).not.toHaveBeenCalled();
+    handle.close("accounting rejection complete");
+    await handle.closed;
+  });
+
+  it("fails closed when no authoritative child action accountant is installed", async () => {
+    const socket = new FakeSocket();
+    const endAction = vi.fn(() => true);
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { onActions: undefined, endAction }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 106,
+      method: "tools/call",
+      params: { name: "click", arguments: { x: 1, y: 2 } },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    expect(JSON.parse(socket.sent[0]!.toString())).toMatchObject({ id: 106, result: { isError: true } });
+    expect(endAction).toHaveBeenCalledExactlyOnceWith("action-a");
+    handle.close("missing accounting rejection complete");
+    await handle.closed;
+  });
+
+  it("rejects a whole batch before reservation or forwarding when authoritative accounting fails", async () => {
+    const socket = new FakeSocket();
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: "batch-accounting-ticket" }));
+    const endAction = vi.fn(() => true);
+    const onActions = vi.fn(() => { throw new Error("child action budget exhausted"); });
+    const captureAfterAction = vi.fn(async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { beginAction, endAction, onActions, captureAfterAction }));
+    socket.receive(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 105,
+      method: "tools/call",
+      params: { name: "computer_batch", arguments: { actions: [
+        { name: "click", arguments: { x: 10, y: 20 } },
+        { name: "press_key", arguments: { key: "enter", pid: 1, window_id: 2, delivery_mode: "foreground" } },
+      ] } },
+    }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.length).toBe(1));
+    const response = JSON.parse(socket.sent[0]!.toString());
+    expect(response).toMatchObject({ id: 105, result: { isError: true } });
+    expect(response.result.content[0].text).toContain("accounting is unavailable");
+    expect(onActions).toHaveBeenCalledWith(2);
+    expect(endAction).toHaveBeenCalledExactlyOnceWith("batch-accounting-ticket");
+    expect(captureAfterAction).not.toHaveBeenCalled();
+    handle.close("batch accounting rejection complete");
     await handle.closed;
   });
 
@@ -540,7 +619,8 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
   it("does not add redundant captures to read-only computer inspection", async () => {
     const socket = new FakeSocket();
     const captureAfterAction = vi.fn(async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }));
-    const handle = attachLocalVmMcpBroker(baseOptions(socket, { captureAfterAction }));
+    const onActions = vi.fn(() => 1);
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, { captureAfterAction, onActions }));
 
     socket.receive(JSON.stringify({
       jsonrpc: "2.0",
@@ -551,6 +631,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
 
     await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
     expect(captureAfterAction).not.toHaveBeenCalled();
+    expect(onActions).not.toHaveBeenCalled();
 
     handle.close("read-only observation test complete");
     await handle.closed;
@@ -901,6 +982,7 @@ rl.on("line", (line) => {
         verifyCurrentGeneration: async () =>
           await currentContainerComputerGeneration("docker", target) === authority.vmGeneration,
         beginAction,
+        onActions: () => 1,
         endAction,
         quarantine: vi.fn(),
         requestHelp: async () => ({ text: "not needed" }),

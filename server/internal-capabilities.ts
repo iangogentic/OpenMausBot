@@ -23,6 +23,10 @@ export interface InternalCapabilityBinding {
   readonly threadId: string;
   readonly depth: number;
   readonly generation: string;
+  /** Names the MCP mount/child within one provider turn, allowing parent and
+   * dedicated children of the same kind to coexist. Absent only on legacy
+   * fixtures and interpreted as `primary`; new bindings always contain it. */
+  readonly mountId?: string;
   readonly token: string;
   readonly createdAtMs: number;
   readonly expiresAtMs: number;
@@ -40,6 +44,8 @@ export interface InternalCapabilityRegistration {
   threadId: string;
   depth: number;
   generation: string;
+  /** Defaults to the provider's primary mount for legacy callers. */
+  mountId?: string;
   ttlMs?: number;
   scope?: InternalCapabilityScope;
 }
@@ -174,6 +180,7 @@ export class InternalCapabilityRegistry {
     const botId = requiredIdentity(input.botId, "botId");
     const threadId = requiredIdentity(input.threadId, "threadId");
     const generation = requiredIdentity(input.generation, "generation");
+    const mountId = requiredIdentity(input.mountId ?? "primary", "mountId");
     if (!Number.isSafeInteger(input.depth) || input.depth < 0) {
       throw new Error("depth must be a non-negative safe integer");
     }
@@ -194,14 +201,16 @@ export class InternalCapabilityRegistry {
     }
     if (!token) throw new Error("could not allocate a unique internal capability token");
 
-    // Remounting one integration for the same dispatch invalidates its older
-    // child immediately. Agents and connectors remain separate capabilities.
+    // Remounting one integration namespace for the same dispatch invalidates
+    // only its older bearer. A parent and dedicated child of the same kind
+    // intentionally coexist under different mount ids.
     for (const [existingToken, binding] of this.bindings) {
       if (
         binding.kind === input.kind &&
         binding.botId === botId &&
         binding.threadId === threadId &&
-        binding.generation === generation
+        binding.generation === generation &&
+        (binding.mountId ?? "primary") === mountId
       ) {
         this.deleteBinding(existingToken);
       }
@@ -222,6 +231,7 @@ export class InternalCapabilityRegistry {
       threadId,
       depth: input.depth,
       generation,
+      mountId,
       token,
       createdAtMs,
       expiresAtMs: createdAtMs + ttlMs,
@@ -452,9 +462,10 @@ export class InternalCapabilityTurns {
     turn: InternalCapabilityTurn,
     depth: number,
     scope?: InternalCapabilityScope,
+    mountId = "primary",
   ): InternalCapabilityBinding {
     if (!this.matches(turn)) throw new Error("internal capability turn is no longer active");
-    return this.registry.register({ kind, ...turn, depth, ...(scope ? { scope } : {}) });
+    return this.registry.register({ kind, ...turn, depth, mountId, ...(scope ? { scope } : {}) });
   }
 
   authorize(
