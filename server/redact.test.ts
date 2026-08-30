@@ -24,6 +24,8 @@ describe("redactSecrets", () => {
             env: [
               { name: "OMB_AGENTS_CAPABILITY_TOKEN", value: "s3cret-agents-token-value" },
               { name: "OMB_CONNECTOR_CAPABILITY_TOKEN", value: "s3cret-connectors-token-value" },
+              { name: "OMB_LOCAL_VM_MCP_CAPABILITY", value: "local-vm-capability-value-123" },
+              { name: "OMB_PHYSICAL_MCP_CAPABILITY", value: "physical-capability-value-123" },
             ],
           },
           {
@@ -43,11 +45,15 @@ describe("redactSecrets", () => {
 
     expect(out).not.toContain("s3cret-agents-token-value");
     expect(out).not.toContain("s3cret-connectors-token-value");
+    expect(out).not.toContain("local-vm-capability-value-123");
+    expect(out).not.toContain("physical-capability-value-123");
     expect(out).not.toContain("box_live_abcdefghijklmnop");
     // shape survives: still the same method, servers, names and non-secret env
     expect(out).toContain("session/new");
     expect(out).toContain("OMB_AGENTS_CAPABILITY_TOKEN");
     expect(out).toContain("OMB_CONNECTOR_CAPABILITY_TOKEN");
+    expect(out).toContain("OMB_LOCAL_VM_MCP_CAPABILITY");
+    expect(out).toContain("OMB_PHYSICAL_MCP_CAPABILITY");
     expect(out).toContain("OGB_BOX_TOKEN");
     expect(out).toContain("box-9");
     expect(out).toContain("/app/agents-proxy.js");

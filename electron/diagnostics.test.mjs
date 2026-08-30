@@ -106,11 +106,13 @@ describe("buildDiagnosticsReport", () => {
         'config {"apiKey":"sk-proj-abcdefghijklmnop"}',
         "Authorization: Bearer abcdefghijklmnop",
         "password=hunter2000",
+        "OMB_LOCAL_VM_MCP_CAPABILITY=local-capability-value-123",
       ].join("\n"),
     });
     expect(report).not.toContain("sk-proj-abcdefghijklmnop");
     expect(report).not.toContain("abcdefghijklmnop");
     expect(report).not.toContain("hunter2000");
+    expect(report).not.toContain("local-capability-value-123");
     expect(report).toContain("«redacted");
   });
 
