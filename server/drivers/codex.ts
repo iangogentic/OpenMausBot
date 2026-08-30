@@ -160,6 +160,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         if (turn.integrations?.agents) {
           mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents);
         }
+        if (turn.integrations?.computerOperator) {
+          mountMcpServer(appServerArgs, env, "computer_operator", turn.integrations.computerOperator);
+        }
         if (turn.integrations?.ianBrain) {
           mountMcpServer(appServerArgs, env, "ian_brain", {
             command: process.execPath,
@@ -171,7 +174,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             },
           });
         }
-        if (turn.integrations?.computer) {
+        if (!turn.integrations?.computerOperator && turn.integrations?.computer) {
           const proxyEnv = computerProxyEnv(turn.integrations.computer);
           mountMcpServer(appServerArgs, env, "computer", {
             command: process.execPath,
@@ -187,7 +190,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
             },
           });
-        } else if (turn.integrations?.localComputer) {
+        } else if (!turn.integrations?.computerOperator && turn.integrations?.localComputer) {
           // The host daemon and isolated Local VM both arrive as a direct Cua
           // Driver stdio MCP server. Codex sees the same computer tool surface.
           mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
@@ -681,6 +684,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       capabilities: {
         sessionModelSwitch: "unsupported",
         computerMcp: true,
+        computerOperatorMcp: true,
         localComputerMcp: true,
         composioMcp: true,
         agentsMcp: true,

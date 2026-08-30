@@ -754,14 +754,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         mcpServers.composio = { ...turn.integrations.composio };
         allowed.push("mcp__composio");
       }
-      if (turn.integrations?.computer) {
+      if (turn.integrations?.computerOperator) {
+        mcpServers.computer_operator = { ...turn.integrations.computerOperator };
+        allowed.push("mcp__computer_operator");
+      }
+      if (!turn.integrations?.computerOperator && turn.integrations?.computer) {
         mcpServers.computer = {
           command: process.execPath,
           args: [PROXY_PATH],
           env: { ...NODE_ENV_FLAG, ...computerProxyEnv(turn.integrations.computer) },
         };
         allowed.push("mcp__computer");
-      } else if (turn.integrations?.localComputer) {
+      } else if (!turn.integrations?.computerOperator && turn.integrations?.localComputer) {
         const local = turn.integrations.localComputer;
         mcpServers.computer = {
           command: local.command,
@@ -1351,6 +1355,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           sessionModelSwitch: "in-session",
           agentsMcp: true,
           computerMcp: true,
+          computerOperatorMcp: true,
           composioMcp: true,
           phoneMcp: true,
           images: true,

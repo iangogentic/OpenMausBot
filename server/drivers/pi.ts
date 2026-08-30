@@ -61,13 +61,14 @@ export function piThinkingLevel(effort: EffortLevel): (typeof EFFORT_LEVELS)[num
 export function buildMcpServers(turn: SendTurnInput): Record<string, unknown> | null {
   const servers: Record<string, unknown> = {};
   if (turn.integrations?.composio) servers.composio = { ...turn.integrations.composio };
-  if (turn.integrations?.computer) {
+  if (turn.integrations?.computerOperator) servers.computer_operator = { ...turn.integrations.computerOperator };
+  if (!turn.integrations?.computerOperator && turn.integrations?.computer) {
     servers.computer = {
       command: process.execPath,
       args: [SPAWNED_PROXIES.computer],
       env: { ...NODE_ENV_FLAG, ...computerProxyEnv(turn.integrations.computer) },
     };
-  } else if (turn.integrations?.localComputer) {
+  } else if (!turn.integrations?.computerOperator && turn.integrations?.localComputer) {
     const local = turn.integrations.localComputer;
     servers.computer = {
       command: local.command,
@@ -740,6 +741,7 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           // pi-mcp-extension (pi core has no MCP client of its own).
           agentsMcp: true,
           computerMcp: true,
+          computerOperatorMcp: true,
           composioMcp: true,
           phoneMcp: true,
           // Host control (the user's real Mac) rides the pi-native permission

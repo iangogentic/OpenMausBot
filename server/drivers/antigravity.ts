@@ -204,6 +204,8 @@ const mcpConfigFileSchema = z.looseObject({
 export function antigravityComputerMcpServer(
   integrations: SendTurnInput["integrations"],
 ): AntigravityComputerMcpServer | null {
+  const operator = integrations?.computerOperator;
+  if (operator) return { command: operator.command, args: operator.args, env: { ...operator.env } };
   const computer = integrations?.computer;
   if (computer) {
     const proxyEnv = computerProxyEnv(computer);
@@ -763,6 +765,7 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
           // approval (see contracts.ts), which print mode cannot deliver in
           // any mode; that returns with the native ACP path (agy issue #31).
           computerMcp: config.fullAuto,
+          computerOperatorMcp: config.fullAuto,
         },
         sendTurn,
         interruptTurn: async (threadId) => {
