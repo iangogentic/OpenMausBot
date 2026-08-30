@@ -28,8 +28,8 @@ export type SafeViewerKind = "pdf" | "xlsx";
 
 /** Parser routing is based on both the inert filename and file signature,
  * never an attacker-controlled Content-Type header. ZIP is only a candidate
- * XLSX here; the renderer additionally validates its central directory and
- * SheetJS must parse the Office workbook structure in a disposable worker. */
+ * XLSX here; the renderer additionally validates its central directory and a
+ * bounded display-only OOXML parser runs in a disposable worker. */
 export function safeViewerKind(name: string, bytes: Uint8Array): SafeViewerKind | null {
   const lower = name.toLowerCase();
   if (lower.endsWith(".pdf") && bytes.length >= 5 && Buffer.from(bytes.subarray(0, 5)).equals(Buffer.from("%PDF-"))) {

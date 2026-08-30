@@ -31,7 +31,6 @@ export function ComposerAttachments({
   onRemove,
   onDisplayInChatBox,
   allowImages = true,
-  remote = false,
   notice,
   onNotice,
 }: {
@@ -40,8 +39,6 @@ export function ComposerAttachments({
   onRemove: (id: string) => void;
   onDisplayInChatBox: (attachment: PasteAttachment) => void;
   allowImages?: boolean;
-  /** The screen may be a Mac controller while the bot runs on Razer. */
-  remote?: boolean;
   notice: string | null;
   onNotice: (notice: string | null) => void;
 }) {
@@ -83,7 +80,7 @@ export function ComposerAttachments({
         allowImages,
         getPath: pathForFile,
         uploadImage: imageAttachmentFromFile,
-        uploadFile: remote ? fileAttachmentFromFile : undefined,
+        uploadFile: fileAttachmentFromFile,
       });
       if (!active) return;
       if (attachments.length) onAdd(attachments);
@@ -103,7 +100,7 @@ export function ComposerAttachments({
       window.removeEventListener("dragover", onOver);
       window.removeEventListener("drop", onDrop);
     };
-  }, [onAdd, allowImages, onNotice, remote]);
+  }, [onAdd, allowImages, onNotice]);
 
   return (
     <>
@@ -177,13 +174,12 @@ export function ComposerAttachments({
               <Chip key={a.id} label="FILE" title={a.name} onRemove={() => onRemove(a.id)}>
                 <button
                   type="button"
-                  disabled={!remote}
                   onClick={() => {
                     const extension = a.name.split(".").pop()?.toLowerCase();
                     setFilePreview({ path: a.path, name: a.name, preview: extension === "pdf" ? "pdf" : extension === "xlsx" ? "xlsx" : null });
                   }}
-                  className="flex h-[76px] w-full items-center gap-2 text-left disabled:cursor-default"
-                  aria-label={remote ? (/\.(pdf|xlsx)$/i.test(a.name) ? `Preview ${a.name}` : `Download ${a.name}`) : `Attached file ${a.name}`}
+                  className="flex h-[76px] w-full items-center gap-2 text-left"
+                  aria-label={/\.(pdf|xlsx)$/i.test(a.name) ? `Preview ${a.name}` : `Download ${a.name}`}
                 >
                   <FileIcon size={16} className="shrink-0 text-ink-secondary" />
                   <div className="min-w-0">

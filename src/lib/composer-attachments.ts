@@ -147,9 +147,9 @@ export function uploadFileNameHeader(name: string): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
 }
 
-/** Persist a non-image file in the harness-owned upload directory. This is
- * only used for remote desktop sessions; local mode deliberately keeps the
- * existing direct-file-path behavior. */
+/** Persist a non-image file in the harness-owned upload directory. Local and
+ * remote sessions use the same managed copy so transcripts never retain an
+ * arbitrary Finder path and in-app preview works identically in both modes. */
 export async function fileAttachmentFromFile(file: File): Promise<FileAttachment> {
   if (file.size <= 0) throw Object.assign(new Error(`${file.name || "file"} is empty`), { status: 400 });
   if (file.size > REMOTE_FILE_MAX_BYTES) {
@@ -373,8 +373,8 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     allowImages: boolean;
     getPath: (file: T) => string;
     uploadImage: (file: T) => Promise<Attachment | null>;
-    /** Present only for a remote server: binary files are transferred to the
-     * harness, never represented by a controller-local Finder path. */
+    /** When present, binary files are copied into the harness-owned store and
+     * never represented by a controller-local Finder path. */
     uploadFile?: (file: T) => Promise<FileAttachment>;
   },
 ): Promise<{ attachments: Attachment[]; notice: string | null }> {
@@ -398,7 +398,7 @@ export async function intakeFiles<T extends DroppedFile & { type: string }>(
     if (uploadFile) {
       // Small text stays in the message, so it remains visible and editable
       // without an otherwise needless server file. Binary and large text get
-      // a Razer-owned path the selected engine can actually open.
+      // a harness-owned path the selected engine can actually open.
       if (isInlineText(file) && file.size <= INLINE_DROP_LIMIT) {
         try {
           attachments.push(pasteAttachment(await file.text()));

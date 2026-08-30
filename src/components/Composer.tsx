@@ -297,7 +297,10 @@ export function Composer({
       allowImages: engineSupportsImages,
       getPath: pathForFile,
       uploadImage: imageAttachmentFromFile,
-      uploadFile: capabilities.connection?.mode === "remote" ? fileAttachmentFromFile : undefined,
+      // Always copy binary files into the harness-owned attachment store.
+      // This gives local and remote chats the same safe preview/download path
+      // and avoids persisting arbitrary Finder paths in transcripts.
+      uploadFile: fileAttachmentFromFile,
     });
     if (added.length) addAttachments(added);
     // Keep file-specific failures beside the attachments. A successful
@@ -492,7 +495,6 @@ export function Composer({
           onRemove={removeAttachment}
           onDisplayInChatBox={displayPasteInChatBox}
         allowImages={engineSupportsImages}
-        remote={capabilities.connection?.mode === "remote"}
           notice={attachmentNotice}
           onNotice={setAttachmentNotice}
         />
