@@ -15,7 +15,7 @@ import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import type { DecisionRow } from "./decision-log.ts";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
@@ -161,6 +161,11 @@ async function makePermissionBot(patch: Record<string, unknown>) {
   return current;
 }
 
+async function setPermissionPolicy(policy: "never" | "ask" | "always") {
+  const result = await api("PATCH", "/api/config", { permissions: { policy } });
+  expect(result.status).toBe(200);
+}
+
 posixOnly("authorization decisions are logged", () => {
   beforeAll(async () => {
     chmodSync(FAKE_CLI, 0o755);
@@ -209,10 +214,15 @@ posixOnly("authorization decisions are logged", () => {
     await removeTempDir(home);
   });
 
+  beforeEach(async () => {
+    await setPermissionPolicy("ask");
+  });
+
   it(
     "a rule-matched auto-approval writes a row naming the rule",
     async () => {
       const bot = await makePermissionBot({ name: "Granted", alwaysAllow: ["shell:echo"] });
+      await setPermissionPolicy("always");
       expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run it" })).status).toBe(202);
 
       const row = await waitForDecision((r) => r.decision === "auto-approved" && r.botId === bot.id);
@@ -224,6 +234,7 @@ posixOnly("authorization decisions are logged", () => {
       expect(row!.botName).toBe("Granted");
       expect(row!.threadId).toBeTruthy();
       expect(row!.requestId).toBeTruthy();
+      await setPermissionPolicy("ask");
     },
     60_000,
   );
@@ -240,7 +251,7 @@ posixOnly("authorization decisions are logged", () => {
 
       const shown = await waitForDecision((r) => r.decision === "card-shown" && r.requestId === requestId);
       expect(shown, "the card was shown but never logged").not.toBeNull();
-      expect(shown!.source).toBe("no-grant");
+      expect(shown!.source).toBe("policy-ask");
       expect(shown!.botId).toBe(bot.id);
       expect(shown!.tool).toBe("shell");
 
@@ -285,12 +296,41 @@ posixOnly("authorization decisions are logged", () => {
   );
 
   it(
+    "switching to Never settles an already-open permission before a stale Allow can run",
+    async () => {
+      const bot = await makePermissionBot({ name: "Policy fence" });
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "run it" })).status).toBe(202);
+      const card = await waitForBotCard(bot.id);
+      expect(card).not.toBeNull();
+      const requestId = card.card.requestId as string;
+
+      const never = await api("PATCH", "/api/config", { permissions: { policy: "never" } });
+      expect(never.status).toBe(200);
+      const denied = await waitForDecision((row) => row.requestId === requestId && row.decision === "policy-denied");
+      expect(denied).not.toBeNull();
+      expect(denied!.source).toBe("policy-never");
+
+      const staleAllow = await api("POST", `/api/bots/${bot.id}/respond`, {
+        requestId,
+        messageId: card.id,
+        behavior: "allow",
+      });
+      expect(staleAllow.status).toBe(200);
+      expect(staleAllow.body.outcome).toBe("unavailable");
+
+      await setPermissionPolicy("ask");
+    },
+    90_000,
+  );
+
+  it(
     "an unattended block writes the row that says a grant was withheld",
     async () => {
       // Auto mode on AND the exact key granted: an attended turn would sail
       // straight through, so the only thing carding this one is the
       // unattended block — which is precisely what the row must say.
       const bot = await makePermissionBot({ name: "Nightshift", autoApprove: true, alwaysAllow: ["shell:echo"] });
+      await setPermissionPolicy("always");
 
       const hook = await api("POST", "/api/webhooks", {
         name: "Nightly build",
@@ -318,6 +358,7 @@ posixOnly("authorization decisions are logged", () => {
       expect(row!.rule).toBe("shell:echo");
       expect(row!.unattended).toBe(true);
       expect(row!.botId).toBe(bot.id);
+      await setPermissionPolicy("ask");
     },
     90_000,
   );

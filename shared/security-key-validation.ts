@@ -2,6 +2,7 @@ import {
   SECURITY_KEY_RELAY_MAX_CLIENT_DATA_JSON_BYTES,
   SECURITY_KEY_RELAY_MAX_REQUEST_JSON_BYTES,
 } from "./security-key-relay.ts";
+import { getPublicSuffix } from "tldts";
 import { z } from "zod";
 
 /* oxlint-disable anti-slop/no-runtime-typeof -- canonicalJson discriminates an already Zod-validated recursive JSON domain union. */
@@ -24,14 +25,6 @@ const clientDataSchema = z.object({
   crossOrigin: z.boolean().optional(),
   topOrigin: z.string().optional(),
 }).passthrough();
-
-const HIGH_RISK_PUBLIC_SUFFIXES = new Set([
-  "com", "org", "net", "edu", "gov", "mil", "int", "io", "ai", "app", "dev", "xyz", "info", "biz", "me", "co",
-  "co.uk", "org.uk", "me.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "edu.au", "gov.au",
-  "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "co.nz", "net.nz", "org.nz", "ac.nz", "govt.nz",
-  "co.za", "org.za", "net.za", "gov.za", "com.br", "net.br", "org.br", "gov.br", "com.cn", "net.cn", "org.cn", "gov.cn",
-  "github.io", "gitlab.io", "pages.dev", "workers.dev", "appspot.com", "firebaseapp.com", "web.app", "vercel.app", "netlify.app",
-]);
 
 export function encodeBase64url(bytes: Uint8Array): string {
   let binary = "";
@@ -196,10 +189,9 @@ function isIpAddress(hostname: string): boolean {
 }
 
 function isConservativePublicSuffix(rpId: string): boolean {
-  if (HIGH_RISK_PUBLIC_SUFFIXES.has(rpId)) return true;
-  const labels = rpId.split(".");
-  if (labels.length < 2) return true;
-  const tld = labels.at(-1) ?? "";
-  const secondLevel = labels.at(-2) ?? "";
-  return labels.length === 2 && tld.length === 2 && new Set(["ac", "co", "com", "edu", "gov", "net", "org"]).has(secondLevel);
+  // WebAuthn uses the public-suffix boundary as a tenant boundary. Include
+  // the PSL private section as well as ICANN entries: hosts such as
+  // tenant.blogspot.com and project.github.io are separate security
+  // principals even though their shared suffix is privately operated.
+  return getPublicSuffix(rpId, { allowPrivateDomains: true }) === rpId;
 }

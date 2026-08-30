@@ -66,6 +66,8 @@ describe("security-key validation", () => {
     expect(() => validateRpIdForOrigin("com", "https://login.example.com")).toThrow();
     expect(() => validateRpIdForOrigin("co.uk", "https://login.example.co.uk")).toThrow();
     expect(() => validateRpIdForOrigin("github.io", "https://tenant.github.io")).toThrow();
+    expect(() => validateRpIdForOrigin("blogspot.com", "https://tenant.blogspot.com")).toThrow();
+    expect(() => validateRpIdForOrigin("pages.dev", "https://tenant.pages.dev")).toThrow();
     expect(() => validateRpIdForOrigin("0.0.1", "https://127.0.0.1")).toThrow();
   });
 

@@ -52,11 +52,12 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("reserveComputerOperator(ACTIVE_COMPUTER_OPERATORS, parentKey, () => {");
   });
 
-  it("pauses the exact delegated child for human takeover and resumes it on lease revocation", () => {
-    expect(source).toContain("pauseComputerOperatorForHuman(bot.id, resolvedTargetKey)");
+  it("pauses the delegated child on the global target even when takeover comes through another bot", () => {
+    expect(source).toContain("pauseComputerOperatorForHuman(resolvedTargetKey)");
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.markWaitingOnHuman(active.handle, active.parent)");
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.resumeAfterHuman(active.handle, active.parent)");
-    expect(source).toContain("activeComputerOperatorForTarget(event.botId, event.targetKey)");
+    expect(source).toContain("activeComputerOperatorForTarget(event.targetKey)");
+    expect(source).not.toContain("active.parent.botId !== botId");
   });
 
   it("publishes trusted child frames and cursors with server-owned ordering", () => {

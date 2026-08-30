@@ -371,6 +371,7 @@ const PEER_CALLS = new PeerCallLifecycle();
 // beside turn authority so routines and queued room work see it even during
 // early module startup.
 let providerConfigBusy = false;
+let permissionPolicyMutationFence: ReturnType<typeof resolvePermissionPolicy> | null = null;
 // Set before teardown snapshots. Every dispatch path checks this so an
 // already-accepted slow request cannot create work behind shutdown.
 let shutdownStarted = false;
@@ -1182,17 +1183,19 @@ const COMPUTER_OPERATOR_CONTEXTS = new Map<string, ComputerOperatorTurnContext>(
 const COMPUTER_OPERATOR_CHILD_TARGETS = new Map<string, ComputerOperatorTargetCapability>();
 const ACTIVE_COMPUTER_OPERATORS = new Map<string, ActiveComputerOperator>();
 
-function activeComputerOperatorForTarget(botId: string, targetKey: string): ActiveComputerOperator | null {
+function activeComputerOperatorForTarget(targetKey: string): ActiveComputerOperator | null {
   for (const active of ACTIVE_COMPUTER_OPERATORS.values()) {
-    if (active.parent.botId !== botId) continue;
     const record = COMPUTER_SUBAGENT_MANAGER.get(active.handle.childId);
     if (record?.targetKey === targetKey && record.leaseHeld) return active;
   }
   return null;
 }
 
-async function pauseComputerOperatorForHuman(botId: string, targetKey: string): Promise<ActiveComputerOperator | null> {
-  const active = activeComputerOperatorForTarget(botId, targetKey);
+async function pauseComputerOperatorForHuman(targetKey: string): Promise<ActiveComputerOperator | null> {
+  // A computer lease is global to the target, not to whichever bot panel the
+  // human used to reach it. Shared VM and physical-host targets can therefore
+  // be displayed by bot B while bot A owns the active visual child.
+  const active = activeComputerOperatorForTarget(targetKey);
   if (!active) return null;
   const record = COMPUTER_SUBAGENT_MANAGER.get(active.handle.childId);
   if (record?.status === "waiting-on-human") return active;
@@ -2399,6 +2402,7 @@ async function answerRequest(
   messageId: string,
   behavior: "allow" | "deny" | "answer",
   message?: string,
+  policyEnforced = false,
 ): Promise<RequestOutcome> {
   const key = providerRequestKey(threadId, requestId);
   const pending = pendingProviderRequests.get(key);
@@ -2433,12 +2437,19 @@ async function answerRequest(
     return "unavailable";
   }
   const instance = registry.get(pending.instanceId);
+  // A card can outlive the policy under which it was shown. Never is an
+  // execution-time authority boundary, so an old Allow click cannot cross a
+  // newly selected Never policy. Questions have no tool and remain answerable.
+  const policyForcedDeny = Boolean(
+    card.tool && (policyEnforced || (behavior === "allow" && currentPermissionPolicy().effective === "never")),
+  );
+  const deliveredBehavior = policyForcedDeny ? "deny" : behavior;
   let outcome: RequestOutcome = "unavailable";
   if (instance) {
     try {
       outcome = await TURN_EXTERNAL_OPERATIONS.run(
         pending.turn,
-        () => instance.adapter.respondToRequest(threadId, requestId, { behavior, message }),
+        () => instance.adapter.respondToRequest(threadId, requestId, { behavior: deliveredBehavior, message }),
       );
     } catch {
       outcome = "unavailable";
@@ -2454,7 +2465,7 @@ async function answerRequest(
   // old HTTP response must not write into it.
   const current = pendingProviderRequests.get(key);
   if (current && current !== pending) return "unavailable";
-  if (outcome !== "unavailable" && behavior !== "answer") {
+  if (outcome !== "unavailable" && deliveredBehavior !== "answer") {
     appendDecision(DATA_DIR, {
       threadId,
       requestId,
@@ -2462,8 +2473,12 @@ async function answerRequest(
       botName: pending.botName,
       tool: card?.tool,
       summary: card?.subtitle,
-      decision: behavior === "allow" ? "user-approved" : "user-denied",
-      source: "user",
+      decision: policyForcedDeny
+        ? "policy-denied"
+        : deliveredBehavior === "allow"
+          ? "user-approved"
+          : "user-denied",
+      source: policyForcedDeny ? "policy-never" : "user",
     });
   }
   if (outcome === "unavailable") {
@@ -2471,6 +2486,33 @@ async function answerRequest(
     settleUnavailable();
   }
   return outcome;
+}
+
+/** Settle every already-visible permission when Settings enters Never.
+ * Automatic answers without a card are interrupted: once an adapter call is
+ * in flight there is no portable provider-level retraction primitive, so the
+ * exact turn must stop rather than race a contradictory denial. */
+async function enforceNeverOnPendingPermissions(): Promise<void> {
+  for (const pending of [...pendingProviderRequests.values()]) {
+    if (!pending.messageId) {
+      const instance = registry.get(pending.instanceId);
+      await instance?.adapter.interruptTurn(pending.threadId).catch(() => {});
+      if (pendingProviderRequest(pending.threadId, pending.requestId) === pending) {
+        pendingProviderRequests.delete(providerRequestKey(pending.threadId, pending.requestId));
+      }
+      continue;
+    }
+    const card = store.messagesFor(pending.threadId).find((message) => message.id === pending.messageId)?.card;
+    if (!card?.tool || card.answered || card.dismissed) continue;
+    await answerRequest(
+      pending.threadId,
+      pending.requestId,
+      pending.messageId,
+      "deny",
+      undefined,
+      true,
+    );
+  }
 }
 
 /** Close every approval still open on a thread. Interrupting a turn kills the
@@ -3103,7 +3145,7 @@ computerControl.onRevoked((event) => {
   localVmViewerProxy.revokeBot(event.botId);
   if (event.targetKey.startsWith("vps:")) vps.closeVpsDesktopTunnel(event.botId);
   void resumeComputerOperatorAfterHuman(
-    activeComputerOperatorForTarget(event.botId, event.targetKey),
+    activeComputerOperatorForTarget(event.targetKey),
   ).catch(() => {});
 });
 
@@ -3279,10 +3321,6 @@ bus.subscribe((event: RuntimeEvent) => {
         (policyResolution.decision === "auto" || policyResolution.decision === "deny") &&
         asker && event.requestId
       ) {
-        const automaticBehavior = policyResolution.decision === "auto" ? "allow" : "deny";
-        const settled = policyResolution.decision === "auto"
-          ? policyResolution.autoApproval
-          : "denied by the fleet permission policy";
         const instance = event.providerInstanceId
           ? registry.get(event.providerInstanceId)
           : registry.get(asker.modelSelection.instanceId);
@@ -3302,12 +3340,28 @@ bus.subscribe((event: RuntimeEvent) => {
         // where the transcript says "approved" over a request nothing
         // answered — and if the provider is gone entirely, forever.
         void (async () => {
+          let automaticBehavior: "allow" | "deny" = policyResolution.decision === "auto" ? "allow" : "deny";
+          let settled = policyResolution.decision === "auto"
+            ? policyResolution.autoApproval
+            : "denied by the fleet permission policy";
           try {
             if (!instance) throw new Error("provider unavailable");
             if (
               pendingProviderRequest(event.threadId, requestId) !== pending ||
               !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
             ) throw new Error("the ask is no longer owned by this turn");
+            // Re-resolve at the last synchronous boundary before delivery.
+            // Settings can change after request.opened but before this task
+            // runs; a stale automatic Allow must never cross Ask or Never.
+            const latestResolution = resolvePermission(currentPermissionPolicy(), verdict!, {
+              unattended,
+              physicalComputer: event.approvalScope === "local-computer",
+            });
+            if (latestResolution.decision === "ask") throw new Error("permission policy now requires a human");
+            automaticBehavior = latestResolution.decision === "auto" ? "allow" : "deny";
+            settled = latestResolution.decision === "auto"
+              ? latestResolution.autoApproval
+              : "denied by the fleet permission policy";
             const outcome = await TURN_EXTERNAL_OPERATIONS.run(
               eventTurn,
               () => instance.adapter.respondToRequest(event.threadId, requestId, { behavior: automaticBehavior }),
@@ -3331,7 +3385,11 @@ bus.subscribe((event: RuntimeEvent) => {
               tool,
               summary,
               decision: automaticBehavior === "allow" ? "auto-approved" : "policy-denied",
-              source: automaticBehavior === "allow" ? "policy-always" : "policy-never",
+              // Preserve the narrow rule that actually authorized the call
+              // (remembered grant versus auto mode). The global Always mode
+              // is the ceiling that permitted that verdict, not a substitute
+              // for its more useful audit provenance.
+              source: automaticBehavior === "allow" ? verdict!.source : "policy-never",
               rule: verdict?.rule,
             });
           } catch {
@@ -5730,11 +5788,16 @@ function configStatus() {
 }
 
 function currentPermissionPolicy() {
+  if (permissionPolicyMutationFence) return permissionPolicyMutationFence;
+  return permissionPolicyForRequested(cfg.permissions?.policy ?? "ask");
+}
+
+function permissionPolicyForRequested(requested: "never" | "ask" | "always") {
   const rawCeiling = process.env.OPENMAUSBOT_PERMISSION_POLICY_CEILING;
   const adminCeiling = rawCeiling === undefined
     ? "always"
     : parsePermissionPolicy(rawCeiling) ?? "never";
-  return resolvePermissionPolicy(cfg.permissions?.policy ?? "ask", adminCeiling);
+  return resolvePermissionPolicy(requested, adminCeiling);
 }
 
 /** Platform metadata travels with engine rows so a remote Mac controller
@@ -9736,6 +9799,14 @@ const server = createServer(async (req, res) => {
         if (aliasError) return json(res, 409, { error: aliasError });
       }
       providerConfigBusy = true;
+      const previousPermissionPolicy = currentPermissionPolicy();
+      if (patch.permissions?.policy) {
+        // Publish the target authority before the first await. Permission
+        // delivery paths consult this fence, so a concurrently open card or
+        // queued automatic answer cannot use the old policy while Settings
+        // is being committed.
+        permissionPolicyMutationFence = permissionPolicyForRequested(patch.permissions.policy);
+      }
       const requestedComposioKey = patch.composio?.apiKey;
       const changingLocalVmMode = patch.localVm?.mode !== undefined && patch.localVm.mode !== localVmMode(cfg);
       const modeLifecycleClaims: Array<{ targetKey: string; lifecycleId: string }> = [];
@@ -9868,6 +9939,12 @@ const server = createServer(async (req, res) => {
         syncCredentialEnv(patch);
         Object.assign(cfg, loadConfig());
       }
+      if (
+        previousPermissionPolicy.effective !== "never" &&
+        currentPermissionPolicy().effective === "never"
+      ) {
+        await enforceNeverOnPendingPermissions();
+      }
       // Provider keys change the fleet. Profile, voice, VPS, and room timeout
       // changes do not rebuild it: no driver reads them, and they should not
       // interrupt in-flight turns.
@@ -9887,6 +9964,7 @@ const server = createServer(async (req, res) => {
       broadcast({ kind: "config", ...status });
       return json(res, 200, status);
       } finally {
+        permissionPolicyMutationFence = null;
         for (const claim of modeLifecycleClaims) {
           computerControl.endLifecycleMutation(claim.targetKey, claim.lifecycleId);
         }
@@ -10213,7 +10291,7 @@ const server = createServer(async (req, res) => {
           const expectedAuthorityVersion = takeAuthorityAfter!.version;
           let pausedOperator: ActiveComputerOperator | null = null;
           try {
-            pausedOperator = await pauseComputerOperatorForHuman(bot.id, resolvedTargetKey);
+            pausedOperator = await pauseComputerOperatorForHuman(resolvedTargetKey);
           } catch {
             return json(res, 409, { error: "the visual operator changed while control was being requested; refresh and try again" });
           }
