@@ -520,7 +520,10 @@ const support: AcpSupport = {
     const proof = turnPolicyProofs.get(turn.threadId);
     if (!proof) return [];
     return [
-      { path: dirname(proof.path) },
+      { path: proof.policyDir ?? dirname(proof.path) },
+      ...(proof.policyDir && proof.policyDir !== dirname(proof.path)
+        ? [{ path: dirname(proof.path) }]
+        : []),
       { path: proof.path, writable: true },
     ];
   },

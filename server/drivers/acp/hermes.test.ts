@@ -431,6 +431,8 @@ mcp_servers:
     expect(statSync(env.PYTHONPATH!).mode & 0o777).toBe(0o700);
     expect(statSync(join(env.PYTHONPATH!, "sitecustomize.py")).mode & 0o777).toBe(0o600);
     expect(statSync(proof.path).mode & 0o777).toBe(0o600);
+    expect(dirname(proof.path)).not.toBe(env.PYTHONPATH);
+    expect(statSync(dirname(proof.path)).mode & 0o777).toBe(0o710);
     writeFileSync(proof.path, JSON.stringify({ version: 1, nonce: proof.nonce }));
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });

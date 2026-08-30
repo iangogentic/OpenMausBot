@@ -234,14 +234,13 @@ def _install():
             "restrict_native": _RESTRICT_NATIVE,
             "allowed_native": sorted(_ALLOWED_NATIVE),
         }, stream)
-    # The privileged cross-UID launcher temporarily owns this exact policy
-    # leaf while Hermes is alive. Restore group traversal/readability only on
+    # The privileged cross-UID launcher temporarily owns this exact proof
+    # leaf while Hermes is alive. Restore group readability only on
     # the nonce-bound proof after writing it so the server can verify the
     # loaded policy before sending the prompt. The policy module itself stays
     # mode 0600 and the directory remains non-listable to the runtime group.
     if os.environ.get("OPENMAUSBOT_HERMES_POLICY_SHARED") == "1":
         os.chmod(proof, 0o640)
-        os.chmod(os.path.dirname(proof), 0o710)
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -478,6 +477,7 @@ export interface HermesPolicyProof {
   path: string;
   nonce: string;
   home: string;
+  policyDir?: string;
 }
 
 export interface ManagedHermesPythonTarget {
@@ -638,12 +638,27 @@ export function prepareHermesPolicyEnvironment(input: {
   );
 
   input.env.HERMES_HOME = home;
+  const proofDir = input.sharedAcrossUid
+    ? join(input.dataDir, "hermes-proof", digest)
+    : policyDir;
+  if (input.sharedAcrossUid) {
+    mkdirSync(dirname(proofDir), { recursive: true, mode: 0o710 });
+    chmodSync(dirname(proofDir), 0o710);
+    mkdirSync(proofDir, { recursive: true, mode: 0o710 });
+    chmodSync(proofDir, 0o710);
+  }
   const nonce = randomBytes(24).toString("hex");
-  const proofPath = join(policyDir, `proof-${nonce}.json`);
+  const proofPath = join(proofDir, `proof-${nonce}.json`);
   if (existsSync(proofPath)) unlinkSync(proofPath);
-  // The provider may write this one nonce-bound file but cannot create,
-  // replace, or alter the policy module in the surrounding directory.
-  writePrivate(proofPath, "", isolatedProviderWritableMode, isolatedPolicyDirectoryMode);
+  // The provider may write this one nonce-bound file but cannot create or
+  // replace a sibling. In cross-UID mode it lives outside the policy module
+  // directory so proof readability never makes the module traversable.
+  writePrivate(
+    proofPath,
+    "",
+    isolatedProviderWritableMode,
+    input.sharedAcrossUid ? 0o710 : isolatedPolicyDirectoryMode,
+  );
   input.env.PYTHONPATH = policyDir;
   input.env.OPENMAUSBOT_HERMES_POLICY = "1";
   input.env.OPENMAUSBOT_HERMES_RESTRICT_NATIVE = input.restricted ? "1" : "0";
@@ -666,7 +681,7 @@ export function prepareHermesPolicyEnvironment(input: {
   delete input.env.PYTHONHOME;
   delete input.env.PYTHONSTARTUP;
 
-  return { path: proofPath, nonce, home };
+  return { path: proofPath, nonce, home, policyDir };
 }
 
 /** The prompt is never sent unless the exact child process proved policy load. */
