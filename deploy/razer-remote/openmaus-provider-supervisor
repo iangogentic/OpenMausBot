@@ -480,6 +480,47 @@ def validate_persistent_home(
     return count, total_bytes
 
 
+def normalize_persistent_home_modes(
+    path: str,
+    provider_uid: int,
+    runtime_gid: int,
+    workspace_gid: int,
+) -> None:
+    """Restore owner-only modes after a provider's normal cache writes.
+
+    Some package caches preserve wheel-authored executable/world bits even
+    under umask 0077. The HOME root is already private and locked to this
+    exact bot, but reuse still normalizes every owned inode before validation.
+    Ownership, group, links, inode types and hard-link counts remain strict.
+    """
+    provider_gid = pwd.getpwuid(provider_uid).pw_gid
+    pending = [path]
+    count = 0
+    while pending:
+        current = pending.pop()
+        info = os.lstat(current)
+        count += 1
+        if count > MAX_PERSISTENT_HOME_NODES:
+            raise RuntimeError("provider persistent home has too many files")
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or info.st_uid != provider_uid
+            or info.st_gid not in (provider_gid, runtime_gid, workspace_gid)
+        ):
+            raise RuntimeError("provider persistent home cannot be normalized safely")
+        if stat.S_ISDIR(info.st_mode):
+            os.chmod(current, 0o700, follow_symlinks=False)
+            with os.scandir(current) as entries:
+                pending.extend(entry.path for entry in entries)
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                raise RuntimeError("provider persistent home contains a hard link")
+            owner_execute = stat.S_IMODE(info.st_mode) & 0o100
+            os.chmod(current, 0o600 | owner_execute, follow_symlinks=False)
+        else:
+            raise RuntimeError("provider persistent home contains an unsupported inode")
+
+
 def instance_state_usage(instance_state: str) -> tuple[int, int]:
     homes = 0
     total_bytes = 0
@@ -725,6 +766,7 @@ def prepare_persistent_home(
                 remove_initializing_tree(initializing)
                 raise
         validate_btrfs_home(path)
+        normalize_persistent_home_modes(path, provider_uid, runtime_gid, workspace_gid)
         validate_persistent_home(path, provider_uid, runtime_gid, workspace_gid)
         home_fd, _ = open_mount(path)
         return path, home_fd, lock_fd
@@ -1677,6 +1719,12 @@ def main() -> int:
                 )
                 try:
                     fcntl.flock(instance_lock_fd, fcntl.LOCK_EX)
+                    normalize_persistent_home_modes(
+                        sandbox["persistent_home"],
+                        account.pw_uid,
+                        runtime_gid,
+                        workspace_gid,
+                    )
                     validate_persistent_home(
                         sandbox["persistent_home"],
                         account.pw_uid,

@@ -476,6 +476,14 @@ try {
     '  fileMode: fs.statSync(target).mode & 0o777,',
     '  dirMode: fs.statSync(path.dirname(target)).mode & 0o777,',
     '}));',
+    '// Wheel/package caches may preserve public mode bits despite umask.',
+    '// The supervisor must normalize them before this HOME is reused.',
+    'const permissiveDir = path.join(process.env.HOME, ".cache", "mode-normalization");',
+    'fs.mkdirSync(permissiveDir, { recursive: true });',
+    'const permissiveFile = path.join(permissiveDir, "tool.py");',
+    'fs.writeFileSync(permissiveFile, "fixture");',
+    'fs.chmodSync(permissiveFile, 0o711);',
+    'fs.chmodSync(permissiveDir, 0o777);',
   ].join("\n"), { mode: 0o550 });
   writeFileSync(persistentReaderFile, [
     'const fs = require("node:fs");',
@@ -721,6 +729,12 @@ try {
     createdSubvolumes.add(stateHome);
     if (!existsSync(join(stateHome, persistence.relative))) {
       throw new Error(`${persistence.label} state was not durable after process exit`);
+    }
+    if (
+      (statSync(join(stateHome, ".cache", "mode-normalization", "tool.py")).mode & 0o777) !== 0o700 ||
+      (statSync(join(stateHome, ".cache", "mode-normalization")).mode & 0o777) !== 0o700
+    ) {
+      throw new Error(`${persistence.label} persistent HOME modes were not normalized after process exit`);
     }
 
     const secondManifest = join(secondScope, "launch.json");
