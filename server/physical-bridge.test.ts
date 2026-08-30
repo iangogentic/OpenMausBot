@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  PHYSICAL_CAPTURE_MAX_BYTES,
   PhysicalApprovalGate,
   PhysicalBridgeRegistry,
   attachPhysicalMcpBroker,
@@ -183,9 +184,108 @@ describe("outbound physical bridge registry", () => {
     expect(onData).toHaveBeenCalledOnce();
     expect(onData.mock.calls[0]![0]).toEqual(payload);
   });
+
+  it("captures one bounded screen under exact registration and executor authority", async () => {
+    const queue = [...ids];
+    const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });
+    const socket = attach(registry);
+    const registration = registry.current!;
+    const capture = registry.captureScreenshot(
+      registration.registrationId,
+      registration.executorGeneration,
+      new AbortController().signal,
+    );
+    const request = socket.frames().find((frame) => frame.type === "capture")!;
+    expect(request).toMatchObject({
+      registrationId: registration.registrationId,
+      executorGeneration: registration.executorGeneration,
+    });
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    socket.receive({
+      type: "capture-result",
+      captureId: request.captureId,
+      executorGeneration: registration.executorGeneration,
+      mimeType: "image/jpeg",
+      data: jpeg.toString("base64"),
+    });
+    await expect(capture).resolves.toEqual({ mimeType: "image/jpeg", dataBase64: jpeg.toString("base64") });
+    await expect(registry.captureScreenshot(
+      registration.registrationId,
+      "ffffffff-ffff-4fff-8fff-ffffffffffff",
+      new AbortController().signal,
+    )).rejects.toThrow(/authority is unavailable/);
+  });
+
+  it("rejects an authenticated screenshot that exceeds the decoded capture boundary", async () => {
+    const queue = [...ids];
+    const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });
+    const socket = attach(registry);
+    const registration = registry.current!;
+    const capture = registry.captureScreenshot(
+      registration.registrationId,
+      registration.executorGeneration,
+      new AbortController().signal,
+    );
+    const request = socket.frames().find((frame) => frame.type === "capture")!;
+    const oversized = Buffer.alloc(PHYSICAL_CAPTURE_MAX_BYTES + 1, 0x61);
+    oversized[0] = 0xff; oversized[1] = 0xd8; oversized[2] = 0xff;
+    oversized[oversized.length - 2] = 0xff; oversized[oversized.length - 1] = 0xd9;
+    socket.receive({
+      type: "capture-result",
+      captureId: request.captureId,
+      executorGeneration: registration.executorGeneration,
+      mimeType: "image/jpeg",
+      data: oversized.toString("base64"),
+    });
+    await expect(capture).rejects.toThrow();
+    expect(socket.open).toBe(false);
+  });
 });
 
 describe("physical MCP gate", () => {
+  it("accounts a child action before it can reach the physical computer and exposes close proof", async () => {
+    const queue = [...ids];
+    const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });
+    const device = attach(registry);
+    const broker = new FakeSocket();
+    const onActions = vi.fn(() => 1);
+    let permitted = false;
+    const attached = attachPhysicalMcpBroker({
+      broker: broker as unknown as RawWebSocket,
+      registry,
+      authority: {
+        capabilityToken: "a".repeat(43),
+        registrationId: registry.current!.registrationId,
+        botId: "bot-1",
+        targetKey: "physical:host",
+        bridgeId: "bridge-1",
+      },
+      stillAuthorized: () => true,
+      beginAction: () => permitted
+        ? { allowed: true, actionId: "accounted-action" }
+        : { allowed: false, reason: "human-control" },
+      endAction: () => true,
+      quarantine: vi.fn(),
+      requestHelp: async () => ({ text: "done" }),
+      approvalGate: permissiveApprovalGate(),
+      requireActionAccounting: true,
+      onActions,
+    })!;
+    await vi.waitFor(() => expect(device.frames().some((frame) => frame.type === "open")).toBe(true));
+    const open = device.frames().find((frame) => frame.type === "open")!;
+    device.receive({ type: "approved", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
+    device.receive({ type: "opened", sessionId: open.sessionId, executorGeneration: registry.current!.executorGeneration });
+    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "click" } }) + "\n"), true);
+    await vi.waitFor(() => expect(broker.sent.some((entry) => entry.data.includes(Buffer.from("taken control")))).toBe(true));
+    expect(onActions).not.toHaveBeenCalled();
+    expect(device.frames().filter((frame) => frame.type === "data")).toHaveLength(0);
+    permitted = true;
+    broker.receive(Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 22, method: "tools/call", params: { name: "click" } }) + "\n"), true);
+    await vi.waitFor(() => expect(onActions).toHaveBeenCalledWith(1));
+    expect(device.frames().filter((frame) => frame.type === "data")).toHaveLength(1);
+    attached.close("test complete");
+    await expect(attached.closed).resolves.toBeUndefined();
+  });
   it("closes on a fragmented unterminated provider frame before aggregate memory can exceed the cap", async () => {
     const queue = [...ids];
     const registry = new PhysicalBridgeRegistry({ idFactory: () => queue.shift()! });

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   COMPUTER_OPERATOR_IMAGE_MAX_BASE64_BYTES,
+  ComputerOperatorRequestError,
   executeComputerOperatorRequest,
   normalizeComputerOperatorResult,
 } from "./computer-operator-surface.ts";
@@ -56,5 +57,12 @@ describe("computer operator surface", () => {
     const execute = vi.fn();
     await expect(executeComputerOperatorRequest({ task: "click" }, controller.signal, execute)).rejects.toThrow("parent stopped");
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("classifies malformed provider requests as HTTP 400 input errors", async () => {
+    await expect(executeComputerOperatorRequest({}, new AbortController().signal, vi.fn())).rejects.toMatchObject({
+      constructor: ComputerOperatorRequestError,
+      status: 400,
+    });
   });
 });

@@ -316,14 +316,14 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         // Cloud boxes use the REST adapter; host and sandbox Cua connections
         // expose Cua Driver's official MCP server directly.
         const computer = turn.integrations?.computer;
-        if (computer) {
+        if (!computerOperator && computer) {
           servers.push({
             name: "computer",
             command: process.execPath,
             args: [COMPUTER_PROXY_PATH],
             env: acpEnv({ ELECTRON_RUN_AS_NODE: "1", ...computerProxyEnv(computer) }),
           });
-        } else if (turn.integrations?.localComputer) {
+        } else if (!computerOperator && turn.integrations?.localComputer) {
           const local = turn.integrations.localComputer;
           servers.push({
             name: "computer",

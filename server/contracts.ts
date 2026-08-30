@@ -219,7 +219,7 @@ export interface SendTurnInput {
       env: Record<string, string>;
       platform?: "darwin" | "linux" | "win32";
       generation?: string;
-      scope?: "local-computer";
+      scope?: "local-computer" | "trusted-computer-operator";
     };
     /** Dedicated computer operator. The parent provider receives only this
      * blocking MCP surface; exact target/model authority remains in the

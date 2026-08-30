@@ -838,6 +838,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         const runtime = createProviderTempDirectory("omb-mcp-");
         mcpConfigPath = writeProviderRuntimeFile(runtime, "mcp.json", JSON.stringify({ mcpServers }));
         args.push("--mcp-config", mcpConfigPath);
+        // A dedicated operator turn must not inherit user/global MCP servers
+        // (especially another computer tool) alongside its exact-turn proxy.
+        if (turn.integrations?.computerOperator) args.push("--strict-mcp-config");
         args.push("--allowedTools", allowed.join(","));
       }
 

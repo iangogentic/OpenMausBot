@@ -19,6 +19,7 @@ import {
   AntigravityDriver,
   antigravityComputerMcpServer,
   ensureAntigravityComputerMcp,
+  recoverAntigravityOperatorMcp,
   readAntigravityModelCatalog,
   STATIC_ANTIGRAVITY_MODELS,
 } from "./antigravity.ts";
@@ -312,6 +313,79 @@ describe("Antigravity computer MCP config", () => {
       expect(config.mcpServers[ANTIGRAVITY_COMPUTER_MCP_KEY].command).toBe("/opt/cua");
       expect(config.mcpServers["sqlite-helper"]).toEqual({ command: "sqlite-mcp-server", args: ["/db"] });
       expect(config.futureTopLevelKey).toEqual({ keep: true });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exclusively mounts the operator and restores the original config", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-operator-"));
+    try {
+      mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+      const original = `${JSON.stringify({ mcpServers: { computer: { command: "global-cua" }, helper: { command: "helper" } } }, null, 2)}\n`;
+      writeFileSync(configPath(home), original);
+      const operator = { command: process.execPath, args: ["computer-operator.js"], env: { TOKEN: "exact" } };
+      const restore = ensureAntigravityComputerMcp(operator, { HOME: home }, { exclusive: true });
+      expect(readConfig(home).mcpServers).toEqual({ [ANTIGRAVITY_COMPUTER_MCP_KEY]: operator });
+      restore();
+      expect(readFileSync(configPath(home), "utf8")).toBe(original);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers a crash-left exclusive mount byte-for-byte on the next start", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-crash-recovery-"));
+    try {
+      mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+      const original = '{\n  "mcpServers": { "computer": { "command": "global-cua" }, "helper": { "command": "helper" } },\n  "future": true\n}\n';
+      writeFileSync(configPath(home), original);
+      const operator = { command: process.execPath, args: ["operator.js"], env: { TOKEN: "exact" } };
+      ensureAntigravityComputerMcp(operator, { HOME: home }, { exclusive: true }); // simulate crash: no restore callback
+      const journal = join(home, ".gemini", "config", "mcp_config.openmausbot-operator-recovery.json");
+      expect(statSync(journal).mode & 0o777).toBe(0o600);
+      expect(recoverAntigravityOperatorMcp({ HOME: home })).toBe(true);
+      expect(readFileSync(configPath(home), "utf8")).toBe(original);
+      expect(existsSync(journal)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves concurrent valid edits while restoring hidden servers", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-concurrent-recovery-"));
+    try {
+      mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+      writeFileSync(configPath(home), JSON.stringify({ mcpServers: { helper: { command: "helper" } } }));
+      const operator = { command: process.execPath, args: ["operator.js"], env: { TOKEN: "exact" } };
+      ensureAntigravityComputerMcp(operator, { HOME: home }, { exclusive: true });
+      const current = readConfig(home);
+      current.mcpServers.concurrent = { command: "new-server" };
+      writeFileSync(configPath(home), JSON.stringify(current));
+      expect(recoverAntigravityOperatorMcp({ HOME: home })).toBe(true);
+      expect(readConfig(home).mcpServers).toEqual({
+        helper: { command: "helper" },
+        concurrent: { command: "new-server" },
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed and retains the journal when concurrent config is malformed", () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-agy-malformed-recovery-"));
+    try {
+      mkdirSync(join(home, ".gemini", "config"), { recursive: true });
+      writeFileSync(configPath(home), JSON.stringify({ mcpServers: { helper: { command: "helper" } } }));
+      ensureAntigravityComputerMcp(
+        { command: process.execPath, args: ["operator.js"], env: {} },
+        { HOME: home },
+        { exclusive: true },
+      );
+      writeFileSync(configPath(home), "{{ concurrent partial write");
+      expect(recoverAntigravityOperatorMcp({ HOME: home })).toBe(false);
+      expect(existsSync(join(home, ".gemini", "config", "mcp_config.openmausbot-operator-recovery.json"))).toBe(true);
+      expect(() => ensureAntigravityComputerMcp(null, { HOME: home })).toThrow(/could not be safely recovered/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

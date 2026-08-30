@@ -330,6 +330,30 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(seen.env.OGB_BOX_TOKEN).toBeUndefined();
   });
 
+  it("clears inherited MCP servers before mounting the dedicated operator", async () => {
+    await create();
+    const dump = join(scratch, "operator.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-operator",
+      text: "delegate",
+      integrations: {
+        computerOperator: {
+          command: process.execPath,
+          args: ["/tmp/computer-operator.js"],
+          env: { OMB_COMPUTER_OPERATOR_CAPABILITY_TOKEN: "operator-token" },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    const clearAt = seen.argv.indexOf("mcp_servers={}");
+    const operatorAt = seen.argv.findIndex((arg: string) => arg.includes("mcp_servers.computer_operator.command"));
+    expect(clearAt).toBeGreaterThan(-1);
+    expect(operatorAt).toBeGreaterThan(clearAt);
+    expect(seen.argv.join(" ")).not.toContain("mcp_servers.computer.command");
+  });
+
   it("sends the local provider when the picker id is custom-encoded", async () => {
     await create({ environment: { UNSLOTH_STUDIO_AUTH_TOKEN: "unsloth-secret" } });
     const dump = join(scratch, "dump.json");

@@ -6,7 +6,7 @@
 //
 // The fake CLI is a shebang script Windows cannot exec directly —
 // resolveCliSpawn turns it into `node <script>`, so these run everywhere.
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -181,6 +181,43 @@ describe("ACP decodeConfig", () => {
       }),
     ).rejects.toThrow(/interactive provider approvals/);
     await fullAuto.dispose();
+  });
+
+  it("allows a full-auto hidden operator only through its trusted scoped physical broker", async () => {
+    const fullAuto = await GrokAgentDriver.create({
+      instanceId: "grok-full-auto-operator",
+      displayName: "Grok Full Auto Operator",
+      environment: {},
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: true },
+    });
+    const events = recordEvents(fullAuto.adapter);
+    const dump = join(tmpdir(), `omb-acp-operator-${Date.now()}.json`);
+    process.env.FAKE_ACP_DUMP = dump;
+    try {
+      await fullAuto.adapter.sendTurn({
+        threadId: "t-full-auto-operator",
+        text: "inspect",
+        integrations: {
+          localComputer: {
+            command: "/cua-driver",
+            args: ["mcp"],
+            env: { OMB_PHYSICAL_MCP_CAPABILITY: "child-scoped" },
+            platform: "darwin",
+            generation: "executor-generation",
+            scope: "trusted-computer-operator",
+          },
+        },
+      });
+      await events.until((event) => event.type === "turn.completed");
+      const seen = JSON.parse(readFileSync(dump, "utf8"));
+      expect(seen.mcpServers).toContainEqual(expect.objectContaining({ name: "computer", command: "/cua-driver" }));
+    } finally {
+      events.stop();
+      await fullAuto.dispose();
+      rmSync(dump, { force: true });
+      delete process.env.FAKE_ACP_DUMP;
+    }
   });
 });
 

@@ -29,7 +29,7 @@ import {
   removeLegacyBridgeSecrets,
 } from "./remote-client.mjs";
 import { startOwnedRemoteSshConnector } from "./remote-ssh-connector.mjs";
-import { startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
+import { selectPhysicalCaptureSource, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
 import {
   ensureManagedComposioCredentials,
   managedComposioAccess,
@@ -2044,6 +2044,21 @@ app.whenReady().then(async () => {
       sessionToken: UI_SESSION_TOKEN,
       platform: process.platform,
       getConnection: () => cuaReady,
+      captureScreenshot: async ({ signal }) => {
+        if (signal.aborted) throw new Error("physical screenshot capture was cancelled");
+        const sources = await desktopCapturer.getSources({
+          types: ["screen"],
+          thumbnailSize: { width: 1280, height: 800 },
+        });
+        if (signal.aborted) throw new Error("physical screenshot capture was cancelled");
+        const activeDisplay = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+        const source = selectPhysicalCaptureSource(sources, activeDisplay?.id);
+        if (!source || source.thumbnail.isEmpty()) throw new Error("physical screen is unavailable");
+        let bytes = source.thumbnail.toJPEG(72);
+        if (bytes.byteLength > 512_000) bytes = source.thumbnail.resize({ width: 960 }).toJPEG(62);
+        if (bytes.byteLength <= 0 || bytes.byteLength > 512_000) throw new Error("physical screenshot is too large");
+        return { mimeType: "image/jpeg", dataBase64: bytes.toString("base64") };
+      },
       approveConnection: async ({ signal, botId, botLabel, taskLabel, sessionId }) => {
         const options = physicalApprovalDialogOptions({
           deviceName,

@@ -25,6 +25,8 @@ export const PHYSICAL_MAX_BUFFERED_BYTES = 1024 * 1024;
 // payload cap so valid screenshots are accepted without weakening the line
 // parser's 1 MiB memory boundary.
 export const PHYSICAL_MAX_ENVELOPE_BYTES = 2 * 1024 * 1024;
+export const PHYSICAL_CAPTURE_MAX_BYTES = 512_000;
+export const PHYSICAL_CAPTURE_TIMEOUT_MS = 20_000;
 
 type PhysicalPlatform = "darwin" | "win32";
 
@@ -62,8 +64,20 @@ type SessionRecord = {
 type RegistrationRecord = PhysicalRegistration & {
   readonly socket: RawWebSocket;
   readonly sessions: Map<string, SessionRecord>;
+  readonly captures: Map<string, CaptureRecord>;
   heartbeat: ReturnType<typeof setInterval> | null;
   lastSeenAt: number;
+};
+
+type PhysicalCapture = { mimeType: "image/png" | "image/jpeg"; dataBase64: string };
+type CaptureRecord = {
+  readonly captureId: string;
+  readonly executorGeneration: string;
+  readonly resolve: (capture: PhysicalCapture) => void;
+  readonly reject: (error: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
+  readonly signal: AbortSignal;
+  readonly onAbort: () => void;
 };
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
@@ -250,6 +264,48 @@ export class PhysicalBridgeRegistry {
     });
   }
 
+  captureScreenshot(
+    registrationId: string,
+    executorGeneration: string,
+    signal: AbortSignal,
+  ): Promise<PhysicalCapture> {
+    const record = this.currentRecord;
+    if (
+      !record ||
+      record.registrationId !== registrationId ||
+      record.executorGeneration !== executorGeneration ||
+      !record.socket.open ||
+      signal.aborted ||
+      record.captures.size > 0
+    ) return Promise.reject(new Error("physical screenshot authority is unavailable"));
+    const captureId = this.idFactory();
+    if (!validSessionId(captureId) || record.captures.has(captureId)) {
+      return Promise.reject(new Error("physical screenshot identity is unavailable"));
+    }
+    return new Promise<PhysicalCapture>((resolve, reject) => {
+      const finish = (error?: Error, capture?: PhysicalCapture) => {
+        const pending = record.captures.get(captureId);
+        if (!pending) return;
+        record.captures.delete(captureId);
+        clearTimeout(pending.timer);
+        pending.signal.removeEventListener("abort", pending.onAbort);
+        if (error) reject(error);
+        else resolve(capture!);
+      };
+      const onAbort = () => finish(new Error("physical screenshot capture was cancelled"));
+      const timer = setTimeout(() => finish(new Error("physical screenshot capture timed out")), PHYSICAL_CAPTURE_TIMEOUT_MS);
+      timer.unref?.();
+      record.captures.set(captureId, { captureId, executorGeneration, resolve, reject, timer, signal, onAbort });
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (!record.socket.sendText(JSON.stringify({
+        type: "capture",
+        captureId,
+        registrationId,
+        executorGeneration,
+      }))) finish(new Error("physical screenshot transport failed"));
+    });
+  }
+
   revokeRegistration(registrationId: string, reason = "physical registration revoked"): boolean {
     const record = this.currentRecord;
     if (!record || record.registrationId !== registrationId) return false;
@@ -277,6 +333,7 @@ export class PhysicalBridgeRegistry {
       executorGeneration,
       socket,
       sessions: new Map(),
+      captures: new Map(),
       heartbeat: null,
       lastSeenAt: this.now(),
     };
@@ -321,6 +378,51 @@ export class PhysicalBridgeRegistry {
         // capability scoped to the retired registration can survive.
         record.socket.close(1008, "CUA executor generation changed");
       }
+      return;
+    }
+    if (
+      exactKeys(frame, ["type", "captureId", "executorGeneration", "mimeType", "data"]) &&
+      frame.type === "capture-result" &&
+      validSessionId(frame.captureId)
+    ) {
+      const capture = record.captures.get(frame.captureId);
+      const data = decodeData(frame.data);
+      const png = Boolean(data && data.length >= 8 && data.subarray(0, 8).equals(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      ));
+      const jpeg = Boolean(data && data.length >= 4 && data[0] === 0xff && data[1] === 0xd8 && data.at(-2) === 0xff && data.at(-1) === 0xd9);
+      if (
+        !capture ||
+        capture.executorGeneration !== frame.executorGeneration ||
+        (frame.mimeType !== "image/png" && frame.mimeType !== "image/jpeg") ||
+        !data ||
+        data.byteLength <= 0 ||
+        data.byteLength > PHYSICAL_CAPTURE_MAX_BYTES ||
+        (frame.mimeType === "image/png" ? !png : !jpeg)
+      ) {
+        record.socket.close(1008, "invalid physical screenshot result");
+        return;
+      }
+      record.captures.delete(frame.captureId);
+      clearTimeout(capture.timer);
+      capture.signal.removeEventListener("abort", capture.onAbort);
+      capture.resolve({ mimeType: frame.mimeType, dataBase64: data.toString("base64") });
+      return;
+    }
+    if (
+      exactKeys(frame, ["type", "captureId", "executorGeneration"]) &&
+      frame.type === "capture-error" &&
+      validSessionId(frame.captureId)
+    ) {
+      const capture = record.captures.get(frame.captureId);
+      if (!capture || capture.executorGeneration !== frame.executorGeneration) {
+        record.socket.close(1008, "invalid physical screenshot failure");
+        return;
+      }
+      record.captures.delete(frame.captureId);
+      clearTimeout(capture.timer);
+      capture.signal.removeEventListener("abort", capture.onAbort);
+      capture.reject(new Error("physical screenshot capture failed"));
       return;
     }
     if (!validSessionId(frame.sessionId)) {
@@ -401,6 +503,12 @@ export class PhysicalBridgeRegistry {
     if (record.heartbeat) clearInterval(record.heartbeat);
     record.heartbeat = null;
     for (const session of [...record.sessions.values()]) this.closeSession(record, session, reason, false);
+    for (const capture of [...record.captures.values()]) {
+      clearTimeout(capture.timer);
+      capture.signal.removeEventListener("abort", capture.onAbort);
+      capture.reject(new Error(reason));
+    }
+    record.captures.clear();
     if (this.currentRecord === record) {
       this.currentRecord = null;
       this.emit(null);
@@ -498,7 +606,9 @@ export function attachPhysicalMcpBroker(options: {
   quarantine: () => void | Promise<void>;
   requestHelp: (reason: string) => Promise<{ text: string; isError?: boolean }>;
   approvalGate: PhysicalApprovalGate;
-}): { close: (reason?: string) => void } | null {
+  requireActionAccounting?: boolean;
+  onActions?: (amount: number) => number;
+}): { close: (reason?: string) => void; closed: Promise<void> } | null {
   if (options.registry.current?.registrationId !== options.authority.registrationId) return null;
   let physical: PhysicalSession | null = null;
   let approvalReference: string | null = null;
@@ -514,6 +624,8 @@ export function attachPhysicalMcpBroker(options: {
   let outboundFailed = false;
   let offBrokerDrain: () => void = () => {};
   let offPhysicalDrain: () => void = () => {};
+  let resolveClosed!: () => void;
+  const closedPromise = new Promise<void>((resolve) => { resolveClosed = resolve; });
 
   const finish = (reason: string, quarantine: boolean) => {
     if (closed) return;
@@ -533,6 +645,7 @@ export function attachPhysicalMcpBroker(options: {
     physical = null;
     if (quarantine && pendingActions.size) void options.quarantine();
     options.broker.close(1008, reason);
+    resolveClosed();
   };
 
   const emitBroker = (line: string) => {
@@ -579,9 +692,21 @@ export function attachPhysicalMcpBroker(options: {
     if (physical.backpressured) options.broker.pauseInput();
   };
   const gate: GateInterceptor = createGateInterceptor({
-    beginAction: async () => options.stillAuthorized()
-      ? await options.beginAction()
-      : { allowed: false, reason: "unavailable" },
+    beginAction: async () => {
+      if (!options.stillAuthorized()) return { allowed: false, reason: "unavailable" };
+      const permit = await options.beginAction();
+      if (!permit.allowed) return permit;
+      if (options.requireActionAccounting) {
+        try {
+          if (!options.onActions) throw new Error("computer child action authority is unavailable");
+          options.onActions(1);
+        } catch {
+          if (!(await options.endAction(permit.actionId))) await options.quarantine();
+          return { allowed: false, reason: "unavailable" };
+        }
+      }
+      return permit;
+    },
     actionForwarded: (requestId, actionId) => pendingActions.set(requestId, actionId),
     actionAbandoned: async (actionId) => {
       if (!(await options.endAction(actionId))) await options.quarantine();
@@ -725,7 +850,10 @@ export function attachPhysicalMcpBroker(options: {
       if (!physical?.backpressured) options.broker.resumeInput();
     });
   }).catch(() => finish("physical approval fence failed", false));
-  return Object.freeze({ close: (reason = "physical MCP authority revoked") => finish(reason, pendingActions.size > 0) });
+  return Object.freeze({
+    close: (reason = "physical MCP authority revoked") => finish(reason, pendingActions.size > 0),
+    closed: closedPromise,
+  });
 }
 
 export { COMPUTER_REQUEST_HELP_TOOL };

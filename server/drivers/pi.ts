@@ -343,7 +343,16 @@ export const PiDriver: ProviderDriver<PiConfig> = {
           throw err;
         }
       }
-      const childArgs = mcpServers ? [...PI_ARGS, "-e", SPAWNED_PROXIES.piMcpExtension] : PI_ARGS;
+      const childArgs = mcpServers
+        ? [
+            ...PI_ARGS,
+            // Explicit -e remains enabled, while user/global extensions (and
+            // any computer tools they register) cannot join an operator turn.
+            ...(turn.integrations?.computerOperator ? ["--no-extensions"] : []),
+            "-e",
+            SPAWNED_PROXIES.piMcpExtension,
+          ]
+        : PI_ARGS;
 
       // spawnCli can throw synchronously (unresolvable CLI); if it does, the
       // 0600 temp file with the box token / composio key / comms token must

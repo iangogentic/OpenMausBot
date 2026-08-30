@@ -566,6 +566,28 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(instance.adapter.capabilities.localComputerMcp).toBe(true);
   });
 
+  it("uses strict MCP config for a dedicated operator turn", async () => {
+    await create();
+    const dump = join(scratch, "operator-dump.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "t-operator",
+      text: "delegate",
+      integrations: {
+        computerOperator: {
+          command: process.execPath,
+          args: ["/tmp/computer-operator.js"],
+          env: { OMB_COMPUTER_OPERATOR_CAPABILITY_TOKEN: "operator-token" },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv).toContain("--strict-mcp-config");
+    expect(Object.keys(seen.mcpConfig.mcpServers)).toEqual(expect.arrayContaining(["computer_operator"]));
+    expect(seen.mcpConfig.mcpServers.computer).toBeUndefined();
+  });
+
   it("resumes with --resume when a cursor exists and reports that session id", async () => {
     await create();
     const dump = join(scratch, "dump.json");

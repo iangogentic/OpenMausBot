@@ -152,6 +152,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const env = childEnv();
         applyModelRelayEnvironment(env, turn.model, turn.integrations?.modelRelay);
         const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
+        // Clear the inherited Codex MCP table before mounting the sole scoped
+        // operator. Otherwise a user's global computer server can coexist.
+        if (turn.integrations?.computerOperator) appServerArgs.push("-c", "mcp_servers={}");
         const controlsHost = turn.integrations?.localComputer?.scope === "local-computer";
         const effectiveFullAuto = config.fullAuto && !controlsHost;
         if (turn.integrations?.composio) {

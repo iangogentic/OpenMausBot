@@ -11,8 +11,10 @@ describe("production computer operator wiring", () => {
   });
 
   it("fails closed onto the exact live desktop2 Qwen Hermes selection", () => {
-    expect(source).toContain('inject?.host !== "desktop2_qwen"');
-    expect(source).toContain('inject.model.toLowerCase() !== "qwen3.8-27b-abliterated"');
+    expect(source).toContain("canonicalComputerOperatorModel(inject.host, inject.model)");
+    expect(source).toContain("preflightComputerOperatorModel(");
+    expect(source).toContain("model: canonicalModel");
+    expect(source).toContain("input.model.model !== encodeInjectId(COMPUTER_OPERATOR_HOST_ID, COMPUTER_OPERATOR_MODEL_ID)");
     expect(source).toContain('instance.driverKind !== "hermesAgent"');
     expect(source).toContain('snapshot?.state !== "available"');
     expect(source).toContain("a live Hermes bot configured for the desktop2 Qwen model is required");
@@ -23,6 +25,8 @@ describe("production computer operator wiring", () => {
     expect(source).toContain('capabilityBinding?.kind !== "computer-operator"');
     expect(source).toContain("requireActionAccounting: Boolean(authority.computerSubagent)");
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount)");
+    expect(source).toContain("error instanceof ComputerOperatorRequestError || error instanceof SyntaxError");
+    expect(source).toContain("return json(res, 409, { error: \"the computer operator request was cancelled\" })");
   });
 
   it("fences final and preview images to the exact VM generation", () => {
@@ -30,6 +34,16 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("the Local VM generation changed before preview capture");
     expect(source).toContain('createHash("sha256").update(bytes).digest("hex")');
     expect(source).toContain("imageDimensions(bytes, mimeType)");
+  });
+
+  it("routes approved outbound Mac or Windows targets through the operator with exact executor fencing", () => {
+    expect(source).toContain("physicalComputerOperatorIntegration(");
+    expect(source).toContain('kind: "physical-outbound"');
+    expect(source).toContain("registration.executorGeneration !== context.executorGeneration");
+    expect(source).toContain("PHYSICAL_BRIDGES.captureScreenshot(");
+    expect(source).toContain("computer operator physical generation changed before final screenshot");
+    expect(source).toContain('scope: child ? "trusted-computer-operator" : "local-computer"');
+    expect(source).toMatch(/if \(instance\.adapter\.capabilities\.computerOperatorMcp === true\)[\s\S]*?integrations\.computerOperator = physicalComputerOperatorIntegration/);
   });
 
   it("cleans exact-turn contexts and aborts active children at turn finish", () => {

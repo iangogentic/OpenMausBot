@@ -24,7 +24,7 @@ export type LocalComputerConnection = {
   env: Record<string, string>;
   platform: "darwin" | "linux" | "win32";
   generation?: string;
-  scope: "local-computer";
+  scope: "local-computer" | "trusted-computer-operator";
 };
 
 type LegacyConnectionDescriptor = {

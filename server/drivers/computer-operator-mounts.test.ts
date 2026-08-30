@@ -39,4 +39,21 @@ describe("dedicated computer operator mounts", () => {
     expect(source).toContain(statement);
     expect(source).toContain("computerOperatorMcp:");
   });
+
+  it("gives the ACP operator strict precedence over direct computer mounts", () => {
+    const source = readFileSync(new URL("./acp/core.ts", import.meta.url), "utf8");
+    expect(source).toContain("if (!computerOperator && computer)");
+    expect(source).toContain("else if (!computerOperator && turn.integrations?.localComputer)");
+  });
+
+  it("isolates operator turns from provider-global MCP servers", () => {
+    const claude = readFileSync(new URL("./claude.ts", import.meta.url), "utf8");
+    const codex = readFileSync(new URL("./codex.ts", import.meta.url), "utf8");
+    const antigravity = readFileSync(new URL("./antigravity.ts", import.meta.url), "utf8");
+    expect(claude).toContain('if (turn.integrations?.computerOperator) args.push("--strict-mcp-config")');
+    expect(codex).toContain('appServerArgs.push("-c", "mcp_servers={}")');
+    const pi = readFileSync(new URL("./pi.ts", import.meta.url), "utf8");
+    expect(pi).toContain('turn.integrations?.computerOperator ? ["--no-extensions"] : []');
+    expect(antigravity).toContain('{ exclusive: Boolean(turn.integrations?.computerOperator) }');
+  });
 });

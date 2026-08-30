@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { Duplex, PassThrough, Writable } from "node:stream";
 import test from "node:test";
 
-import { ClientWebSocket, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
+import { ClientWebSocket, selectPhysicalCaptureSource, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
 import {
   PHYSICAL_BRIDGE_ORIGIN,
   PHYSICAL_BRIDGE_PATH,
@@ -15,6 +15,13 @@ import { acceptRawWebSocket } from "../server/raw-websocket.ts";
 
 const TOKEN = "app-session-" + "x".repeat(48);
 const GENERATION = "10000000-0000-4000-8000-000000000001";
+
+test("selects the display nearest the cursor with a primary-order fallback", () => {
+  const sources = [{ display_id: "1", name: "primary" }, { display_id: "2", name: "cursor display" }];
+  assert.equal(selectPhysicalCaptureSource(sources, 2), sources[1]);
+  assert.equal(selectPhysicalCaptureSource(sources, 999), sources[0]);
+  assert.equal(selectPhysicalCaptureSource([], 1), null);
+});
 
 test("Mac bridge WebSocket surfaces write backpressure instead of retaining an unbounded queue", () => {
   const socket = new Duplex({
@@ -132,6 +139,36 @@ const stderrFloodConnection = {
     flood();
   `],
 };
+
+test("returns a bounded screenshot only for the exact registered executor", async () => {
+  const remote = await fixture();
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const bridge = await startOutboundPhysicalBridge({
+    serverUrl: remote.serverUrl,
+    sessionToken: TOKEN,
+    platform: "darwin",
+    getConnection: async () => echoConnection,
+    approveConnection: async () => "once",
+    captureScreenshot: async ({ generation }) => {
+      assert.equal(generation, GENERATION);
+      return { mimeType: "image/jpeg", dataBase64: jpeg.toString("base64") };
+    },
+    reconnect: false,
+    log: {},
+  });
+  try {
+    const registration = await eventually(() => remote.registry.current);
+    const captured = await remote.registry.captureScreenshot(
+      registration.registrationId,
+      registration.executorGeneration,
+      new AbortController().signal,
+    );
+    assert.deepEqual(captured, { mimeType: "image/jpeg", dataBase64: jpeg.toString("base64") });
+  } finally {
+    await bridge.stop();
+    await remote.close();
+  }
+});
 
 test("authenticates outbound, permits a slow human decision, and relays MCP without a disk token", async () => {
   const remote = await fixture();

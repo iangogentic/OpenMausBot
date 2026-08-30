@@ -31,6 +31,10 @@ export interface ComputerOperatorSurfaceResponse {
   isError?: boolean;
 }
 
+export class ComputerOperatorRequestError extends Error {
+  readonly status = 400;
+}
+
 function plainRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const proto = Object.getPrototypeOf(value);
@@ -79,9 +83,13 @@ function boundedImage(value: unknown): ComputerOperatorImage {
 }
 
 export function computerOperatorTask(body: unknown): string {
-  const record = plainRecord(body);
-  if (!record || typeof record.task !== "string") throw new Error("task is required");
-  return boundedUtf8(record.task, COMPUTER_OPERATOR_TASK_MAX_BYTES, "task");
+  try {
+    const record = plainRecord(body);
+    if (!record || typeof record.task !== "string") throw new Error("task is required");
+    return boundedUtf8(record.task, COMPUTER_OPERATOR_TASK_MAX_BYTES, "task");
+  } catch (error) {
+    throw new ComputerOperatorRequestError(error instanceof Error ? error.message : "invalid computer operator request");
+  }
 }
 
 export function normalizeComputerOperatorResult(value: unknown): ComputerOperatorSurfaceResponse {

@@ -16,8 +16,16 @@ const APPROVAL_TIMEOUT_MS = 120_000;
 const CHILD_STOP_GRACE_MS = 1_000;
 const CHILD_KILL_REAP_MS = 1_000;
 const CHILD_INPUT_DRAIN_TIMEOUT_MS = 30_000;
+const CAPTURE_MAX_BYTES = 512_000;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const terminatingChildren = new WeakMap();
+
+/** Electron returns one source per display. Capture the display the user is
+ * actively pointing at, rather than whichever monitor happens to sort first. */
+export function selectPhysicalCaptureSource(sources, displayId) {
+  const wanted = String(displayId ?? "");
+  return sources.find((source) => String(source?.display_id ?? "") === wanted) ?? sources[0] ?? null;
+}
 
 function loopback(hostname) {
   const value = hostname.replace(/^\[|\]$/g, "").toLowerCase();
@@ -362,6 +370,7 @@ export async function startOutboundPhysicalBridge({
   platform = process.platform,
   getConnection,
   approveConnection,
+  captureScreenshot,
   spawnProcess = spawn,
   log = console,
   approvalTimeoutMs = APPROVAL_TIMEOUT_MS,
@@ -398,6 +407,7 @@ export async function startOutboundPhysicalBridge({
   let heartbeat = null;
   let connectAttempt = null;
   const childReaps = new Set();
+  const captures = new Set();
 
   const reapChild = (child) => {
     if (!child) return;
@@ -642,6 +652,52 @@ export async function startOutboundPhysicalBridge({
     }
   };
 
+  const handleCapture = async (frame) => {
+    if (
+      !registrationId ||
+      !exactKeys(frame, ["type", "captureId", "registrationId", "executorGeneration"]) ||
+      frame.registrationId !== registrationId ||
+      frame.executorGeneration !== generation ||
+      typeof frame.captureId !== "string" ||
+      !/^[0-9a-f-]{32,64}$/i.test(frame.captureId) ||
+      captures.size > 0 ||
+      typeof captureScreenshot !== "function"
+    ) {
+      transport?.close(1008, "invalid physical screenshot request");
+      return;
+    }
+    captures.add(frame.captureId);
+    try {
+      let connection;
+      try { connection = await getConnection(); } catch {}
+      if (!usableConnection(connection) || connection.generation !== generation || !transport?.open) {
+        send({ type: "capture-error", captureId: frame.captureId, executorGeneration: generation });
+        return;
+      }
+      const result = await captureScreenshot({ generation, platform, signal: stopController.signal });
+      const mimeType = result?.mimeType;
+      const data = result?.dataBase64;
+      if (
+        (mimeType !== "image/png" && mimeType !== "image/jpeg") ||
+        typeof data !== "string" ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
+      ) {
+        send({ type: "capture-error", captureId: frame.captureId, executorGeneration: generation });
+        return;
+      }
+      const bytes = Buffer.from(data, "base64");
+      if (bytes.byteLength <= 0 || bytes.byteLength > CAPTURE_MAX_BYTES || !transport?.open) {
+        send({ type: "capture-error", captureId: frame.captureId, executorGeneration: generation });
+        return;
+      }
+      send({ type: "capture-result", captureId: frame.captureId, executorGeneration: generation, mimeType, data });
+    } catch {
+      send({ type: "capture-error", captureId: frame.captureId, executorGeneration: generation });
+    } finally {
+      captures.delete(frame.captureId);
+    }
+  };
+
   const handleMessage = (message) => {
     if (message.binary) return transport?.close(1003, "bridge messages must be JSON");
     const frame = parseMessage(message.data);
@@ -657,6 +713,7 @@ export async function startOutboundPhysicalBridge({
     }
     if (frame.type === "open") { void handleOpen(frame); return; }
     if (frame.type === "spawn") { void handleSpawn(frame); return; }
+    if (frame.type === "capture") { void handleCapture(frame); return; }
     if (exactKeys(frame, ["type", "sessionId", "data"]) && frame.type === "data") {
       if (approvalFenceCount > 0) {
         // Fail closed if a buggy or compromised server delivers any physical

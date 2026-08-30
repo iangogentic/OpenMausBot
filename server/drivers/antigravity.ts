@@ -17,7 +17,7 @@
 // ensureAntigravityComputerMcp below. Full-auto instances only; the host
 // desktop stays off (no approval channel in print mode, ever).
 import { describeSpawnFailure, execCli, spawnCli, terminateCliTree } from "../procs.ts";
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -197,6 +197,83 @@ const mcpConfigFileSchema = z.looseObject({
   mcpServers: z.looseObject({}).optional(),
 });
 
+const ANTIGRAVITY_OPERATOR_RECOVERY_FILE = "mcp_config.openmausbot-operator-recovery.json";
+
+function atomicPrivateWrite(path: string, contents: string): void {
+  const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(temporary, contents, { mode: 0o600, flag: "wx" });
+  chmodSync(temporary, 0o600);
+  renameSync(temporary, path);
+}
+
+/** Recover an exclusive operator mount left by a hard process crash. Returns
+ * false only when concurrent/malformed bytes make a safe recovery impossible;
+ * callers then fail closed and retain the journal for manual/next-start repair. */
+export function recoverAntigravityOperatorMcp(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const directory = join(home, ".gemini", "config");
+  const path = join(directory, "mcp_config.json");
+  const journalPath = join(directory, ANTIGRAVITY_OPERATOR_RECOVERY_FILE);
+  if (!existsSync(journalPath)) return true;
+  let journal: { original: string | null; mounted: string };
+  try {
+    const raw = readFileSync(journalPath, "utf8");
+    const parsed = JSON.parse(raw) as { original?: unknown; mounted?: unknown };
+    if (!((typeof parsed.original === "string" || parsed.original === null) && typeof parsed.mounted === "string")) {
+      return false;
+    }
+    journal = { original: parsed.original, mounted: parsed.mounted };
+  } catch {
+    return false;
+  }
+  let current: string | null = null;
+  try { current = readFileSync(path, "utf8"); } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return false;
+  }
+  if (current === journal.mounted || current === null) {
+    if (journal.original === null) {
+      if (current !== null) unlinkSync(path);
+    } else {
+      atomicPrivateWrite(path, journal.original);
+    }
+    unlinkSync(journalPath);
+    return true;
+  }
+
+  // Preserve concurrent valid edits, restoring only servers hidden by our
+  // exclusive replacement and removing our own entry when it was not there.
+  try {
+    const currentParsed = mcpConfigFileSchema.safeParse(JSON.parse(current));
+    const originalParsed = journal.original === null
+      ? { success: true as const, data: {} as z.infer<typeof mcpConfigFileSchema> }
+      : mcpConfigFileSchema.safeParse(JSON.parse(journal.original));
+    const mountedParsed = mcpConfigFileSchema.safeParse(JSON.parse(journal.mounted));
+    if (!currentParsed.success || !originalParsed.success || !mountedParsed.success) return false;
+    const currentConfig = currentParsed.data;
+    const currentServers = { ...currentConfig.mcpServers };
+    const originalServers = originalParsed.data.mcpServers ?? {};
+    for (const [name, value] of Object.entries(originalServers)) {
+      if (!(name in currentServers)) currentServers[name] = value;
+    }
+    const mountedOperator = mountedParsed.data.mcpServers?.[ANTIGRAVITY_COMPUTER_MCP_KEY];
+    const currentOperator = currentServers[ANTIGRAVITY_COMPUTER_MCP_KEY];
+    if (ANTIGRAVITY_COMPUTER_MCP_KEY in originalServers) {
+      if (JSON.stringify(currentOperator) === JSON.stringify(mountedOperator)) {
+        currentServers[ANTIGRAVITY_COMPUTER_MCP_KEY] = originalServers[ANTIGRAVITY_COMPUTER_MCP_KEY];
+      }
+    } else if (JSON.stringify(currentOperator) === JSON.stringify(mountedOperator)) {
+      delete currentServers[ANTIGRAVITY_COMPUTER_MCP_KEY];
+    }
+    atomicPrivateWrite(path, `${JSON.stringify({ ...currentConfig, mcpServers: currentServers }, null, 2)}\n`);
+    unlinkSync(journalPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The computer MCP server for this turn, or null when the turn has none.
  * Cloud boxes go through OpenMausBot's REST-to-MCP adapter (the same spec
  * claude.ts and codex.ts build); Local VM and VPS connections arrive as a
@@ -236,9 +313,13 @@ export function antigravityComputerMcpServer(
 export function ensureAntigravityComputerMcp(
   server: AntigravityComputerMcpServer | null,
   env: Record<string, string | undefined> = process.env,
+  options: { exclusive?: boolean } = {},
 ): () => void {
   const home = env.HOME || env.USERPROFILE || homedir();
   const path = join(home, ".gemini", "config", "mcp_config.json");
+  if (!recoverAntigravityOperatorMcp(env)) {
+    throw new Error("an interrupted Antigravity operator MCP mount could not be safely recovered");
+  }
   const existed = existsSync(path);
   const original = existed ? readFileSync(path, "utf8") : null;
   let config: z.infer<typeof mcpConfigFileSchema> = {};
@@ -248,7 +329,11 @@ export function ensureAntigravityComputerMcp(
   } catch {
     // Missing or malformed user config — rebuild only what the mount needs.
   }
-  const servers = { ...config.mcpServers };
+  // Operator turns are capability-isolated: agy has no strict per-turn MCP
+  // flag, so under the module-wide lease we temporarily replace the table
+  // with the exact operator only. The byte-for-byte original is restored when
+  // the process exits in the normal (uncontended) case below.
+  const servers = options.exclusive ? {} : { ...config.mcpServers };
   // Nothing to remove and nothing to add: leave the user's file untouched
   // (don't create or reformat it on every computer-less turn).
   if (!server && !(ANTIGRAVITY_COMPUTER_MCP_KEY in servers)) return () => {};
@@ -262,6 +347,10 @@ export function ensureAntigravityComputerMcp(
   chmodSync(directory, 0o700);
   if (existed) chmodSync(path, 0o600);
   const mounted = `${JSON.stringify({ ...config, mcpServers: servers }, null, 2)}\n`;
+  const journalPath = join(directory, ANTIGRAVITY_OPERATOR_RECOVERY_FILE);
+  if (options.exclusive) {
+    atomicPrivateWrite(journalPath, `${JSON.stringify({ original, mounted })}\n`);
+  }
   writeFileSync(path, mounted, { mode: 0o600 });
   chmodSync(path, 0o600);
 
@@ -276,6 +365,12 @@ export function ensureAntigravityComputerMcp(
   return () => {
     if (restored) return;
     restored = true;
+    if (options.exclusive) {
+      if (!recoverAntigravityOperatorMcp(env)) {
+        throw new Error("Antigravity operator MCP recovery was unsafe; recovery journal retained");
+      }
+      return;
+    }
     let current: string;
     try {
       current = readFileSync(path, "utf8");
@@ -508,7 +603,11 @@ export const AntigravityDriver: ProviderDriver<AntigravityConfig> = {
       }
       let restoreMcp = () => {};
       try {
-        restoreMcp = ensureAntigravityComputerMcp(antigravityComputerMcpServer(turn.integrations), env);
+        restoreMcp = ensureAntigravityComputerMcp(
+          antigravityComputerMcpServer(turn.integrations),
+          env,
+          { exclusive: Boolean(turn.integrations?.computerOperator) },
+        );
       } catch (error) {
         releaseMcpLease();
         clearPending();
