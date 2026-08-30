@@ -5,10 +5,10 @@ import type { ComputerChildMonitor, ComputerChildMonitorListener } from "../shar
 
 export const MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES = 512_000;
 export const DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS = 30_000;
-export const DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 360_000;
+export const DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 350_000;
 export const DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS = 2_000;
 export const DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS = 10_000;
-export const MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 360_000;
+export const MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 350_000;
 
 export interface ComputerSubagentTargetSelection { targetKey: string; targetGeneration: string; boxId?: string }
 export interface ComputerSubagentCapabilityDescriptor extends ComputerSubagentTargetSelection { readonly opaqueCapability: unknown }
