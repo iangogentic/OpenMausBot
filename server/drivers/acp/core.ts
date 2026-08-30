@@ -57,6 +57,7 @@ import { augmentedPath } from "../../env-path.ts";
 const COMPUTER_PROXY_PATH = SPAWNED_PROXIES.computer;
 import { appendNative } from "../native.ts";
 import { SPAWNED_PROXIES } from "../../proxy-paths.ts";
+import { computerOperatorAcpServer } from "./computer-operator.ts";
 import { BoundedJsonLineDecoder } from "../bounded-json-lines.ts";
 
 export interface AcpConfig {
@@ -287,6 +288,8 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         if (agents) {
           servers.push({ name: "agents", command: agents.command, args: agents.args, env: acpEnv(agents.env) });
         }
+        const computerOperator = computerOperatorAcpServer(turn.integrations?.computerOperator);
+        if (computerOperator) servers.push(computerOperator);
         const composio = turn.integrations?.composio;
         if (composio) {
           servers.push({

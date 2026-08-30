@@ -57,6 +57,7 @@ const ENTRY_POINTS = [
   "connector-proxy.ts",
   "ian-brain-proxy.ts",
   "drivers/agents-proxy.ts",
+  "drivers/computer-operator-proxy.ts",
   "drivers/dweb-proxy.ts",
   "drivers/phone-proxy.ts",
 ];

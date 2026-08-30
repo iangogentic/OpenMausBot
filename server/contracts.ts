@@ -221,6 +221,14 @@ export interface SendTurnInput {
       generation?: string;
       scope?: "local-computer";
     };
+    /** Dedicated computer operator. The parent provider receives only this
+     * blocking MCP surface; exact target/model authority remains in the
+     * harness and is exercised by a lifecycle-managed child runtime. */
+    computerOperator?: {
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+    };
     /** Peer-agent comms: an MCP proxy (list_bots / ask_bot) that routes back
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */

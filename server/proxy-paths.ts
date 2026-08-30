@@ -41,6 +41,7 @@ export const SPAWNED_PROXIES = {
   gatedMcp: resolveProxy("gated-mcp"),
   physicalMcp: resolveProxy("physical-mcp-proxy"),
   agents: resolveProxy("drivers/agents-proxy"),
+  computerOperator: resolveProxy("drivers/computer-operator-proxy"),
   dweb: resolveProxy("drivers/dweb-proxy"),
   connectors: resolveProxy("connector-proxy"),
   ianBrain: resolveProxy("ian-brain-proxy"),
