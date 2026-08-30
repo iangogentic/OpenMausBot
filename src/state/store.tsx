@@ -370,6 +370,8 @@ export interface AppState {
   selectedId: string;
   /** Monotonic fence for async workflows that intend to navigate on finish. */
   selectionEpoch: number;
+  /** Forces one fresh snapshot after a stale snapshot preserved navigation. */
+  hydrationRetryNonce: number;
   activeView: "chat" | "team-map" | "routines" | "skill-recorder";
   routines: Routine[];
   routineRuns: RoutineRun[];
@@ -677,6 +679,9 @@ function reduceAppState(state: AppState, action: Action): AppState {
           computerChildren,
         ),
         selectedId,
+        hydrationRetryNonce: navigationChanged
+          ? state.hydrationRetryNonce + 1
+          : state.hydrationRetryNonce,
       };
     }
     case "showRoutines":
@@ -1305,6 +1310,7 @@ export const initialState: AppState = {
   config: null,
   selectedId: readSelectedConversationId(),
   selectionEpoch: 0,
+  hydrationRetryNonce: 0,
   activeView: "chat",
   routines: [],
   routineRuns: [],
@@ -2093,7 +2099,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       clearTimeout(hydrationFallback);
       es.close();
     };
-  }, [computerScreensVisible]);
+  }, [computerScreensVisible, state.hydrationRetryNonce]);
 
   // Re-probe the engines on demand. A CLI installed while the app is running
   // is invisible until something asks again — the setup screens expose this

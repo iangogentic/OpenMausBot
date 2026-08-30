@@ -286,6 +286,19 @@ describe("main renderer screen transport", () => {
     });
     expect(stale.selectedId).toBe("hermes");
     expect(stale.bots.some((bot) => bot.id === "hermes")).toBe(true);
+    expect(stale.hydrationRetryNonce).toBe(navigated.hydrationRetryNonce + 1);
+
+    const reconciled = reducer(stale, {
+      type: "hydrate",
+      bots: [{ id: "basil" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+      selectionEpoch: stale.selectionEpoch,
+    });
+    expect(reconciled.selectedId).toBe("basil");
+    expect(reconciled.bots.some((bot) => bot.id === "hermes")).toBe(false);
   });
 
   it("fences delayed chat navigation after moving to another app view", () => {
@@ -309,6 +322,14 @@ describe("main renderer screen transport", () => {
       selectionEpoch: epoch,
     });
     expect(room.selectedId).toBe("room");
+  });
+
+  it("keeps a later non-chat view when the first bot arrives", () => {
+    const routines = reducer({ ...initialState, selectedId: "", bots: [] }, { type: "showRoutines" });
+    const arrived = reducer(routines, { type: "botAdded", bot: { id: "first" } as Bot });
+    expect(arrived.selectedId).toBe("first");
+    expect(arrived.activeView).toBe("routines");
+    expect(arrived.selectionEpoch).toBe(routines.selectionEpoch);
   });
 
   it("uses explicit screen-off URLs while hidden and screen-on URLs while visible", () => {
