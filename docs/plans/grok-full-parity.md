@@ -18,8 +18,8 @@ server protocol or a production backend capability.
 OpenMaus status in this ledger is deliberately split:
 
 - **Built**: implementation exists in the checkout.
-- **Source-tested**: focused tests exist (tests were not all run during this
-  audit).
+- **Source-tested**: focused tests exist and the complete repository gate passed
+  on the implementation revision named below.
 - **Live-proven**: an actual current end-to-end host/model/device run is
   recorded. Historical commits, health checks, generated bundles, and gated
   tests that were not run do not qualify.
@@ -31,23 +31,38 @@ OpenMaus status in this ledger is deliberately split:
 
 ## Current checkout and deployment boundary
 
-At audit time the checkout is clean on `feat/grokbot-remote-client`, HEAD
-`bef5753` (`Move computer sessions into computer panel`), eight commits ahead of
-`origin/feat/grokbot-remote-client` and 69 commits ahead of `upstream/main`.
+The audited implementation revision is `036f581` (`Scope attachment previews to
+exact conversations`) on `feat/grokbot-remote-client`, 48 commits ahead of
+`origin/feat/grokbot-remote-client` and 109 commits ahead of `upstream/main`.
+The only working-tree change during this statement was this ledger. The complete
+`pnpm test` gate passed: 267 Vitest files, broker tests, Electron-node tests, and
+the packaged-server smoke test. `pnpm typecheck` passed and `pnpm audit --prod`
+reported no known vulnerabilities.
 The fork history identifies the material additions: hardened Razer deployment
 (`3692be8`), physical Windows and Mac bridges, desktop2 Qwen, Spark GLM, Hermes,
 Ian Brain, remote clients, and the recent Hermes visual-loop work. These are Ian
 fork additions; they are not upstream OpenMaus behavior. The exact commit list
 is available with `git log upstream/main..HEAD`.
 
-Razer deployment is extensively specified but not currently live-proven here:
-the deploy README separates server/provider/companion identities, gives Docker
-authority to the server, and uses pinned SSH plus opaque per-turn capabilities
-(`deploy/razer-remote/README.md:1-24,123-150,183-215,384-402`). The acceptance
-requirements demand real generations, isolated VMs, and real Hermes/Pi/Claude
-turns (`README.md:420-471`). The gated Cua test at
-`server/local-vm-broker.test.ts:580-606` requires
-`OMB_RAZER_LOCAL_VM_ACCEPTANCE=1`; it was not run for this audit.
+Razer deployment is live-proven for the previously installed hardened computer
+path, but revision `036f581` is not called deployed until its immutable release
+cutover is completed. Commit `d6048b3` was installed at
+`/opt/openmausbot/releases/d6048b3f2732c3a6575d314386261dd1df3f58a7`; the
+server, companion, and four activation sockets were active after restart. A
+real Hermes Qwen turn then selected the topmost terminal and executed one
+strict two-action batch (`type_text`, `press_key enter`) with the exact PID,
+window ID, and foreground delivery mode. The returned tool result carried a
+final-screen hash, the agent reported the visible postcondition, and an
+independent 1280x900 framebuffer pull visibly showed the executed command,
+`OPENMAUS-FINAL-7319`, and a fresh prompt. This proves the deployment, targeted
+keyboard delivery, final-capture path, and visible effect; a fresh-session
+unknown-pixel reading remains a separate vision acceptance gate. The deploy
+README separates server/provider/companion identities, gives Docker authority
+to the server, and uses pinned SSH plus opaque per-turn capabilities
+(`deploy/razer-remote/README.md:1-24,123-150,183-215,384-402`). Broader
+acceptance still demands real generations, isolated VMs, and real
+Hermes/Pi/Claude turns (`README.md:420-471`); the single Qwen proof above does
+not satisfy those remaining lanes by itself.
 
 ## Parity matrix
 
@@ -72,8 +87,11 @@ VNC lifecycle, or transcript-linked handoff. Chat sessions and the execution
 timeline were intentionally removed from the chat canvas by `4423af9`; controls
 now belong in `ComputerPanel`.
 
-**Status:** Built + source-tested; not live-proven. Shared-subagent monitor
-selection is **architecture parity**. Likely change points:
+**Status:** The panel, collapse behavior, preview generation checks, takeover,
+and per-bot VM selection are built + source-tested. The older deployed revision
+has live keyboard/final-frame proof, but the current rendered panel still needs
+post-deployment browser QA. Shared child/subagent monitor selection remains an
+**architecture parity** gap. Likely change points:
 `ComputerSessionStrip.tsx`, `ComputerPanel.tsx`, `src/state/store.tsx`, and
 server computer target/event state. Acceptance: start two concurrent computer-use
 subagents, prove distinct monitor/session IDs and frames, select each exact
@@ -108,11 +126,14 @@ fail-closed computer-hook requirements (`hermes-policy.ts:27,117-148,237-268,
 308-435,575-672,777-807`). Local VM post-action settle/capture is implemented
 at `server/local-vm-broker.ts:37,65,486-490` and `server/index.ts:9742-9745`.
 
-**Status:** Source-built and source-tested, including fake policy tests
-(`server/drivers/acp/hermes.test.ts:624-719,721-805`); not live-proven. Those
-tests prove the transform, not that a real Hermes ACP model receives pixels.
-The gap is **architecture parity** at the provider observation boundary, not a
-reason to route local Cua through Box. Likely future change points are
+**Status:** Source-built and source-tested, including policy tests
+(`server/drivers/acp/hermes.test.ts:624-719,721-805`). The exact desktop2
+Qwen3.8 27B abliterated W8A16 service, its seven shards plus MTP artifact, both
+RTX 3090s, direct inference, and the Razer tunnel inference were live-verified.
+OpenMaus model discovery and the Hermes default select that exact model. This
+proves the model route, not a fresh unknown-pixel visual turn. The remaining gap
+is **live acceptance** at the provider observation boundary, not a reason to
+route local Cua through Box. Likely future change points are
 `hermes-policy.ts`, `local-vm-broker.ts`, and `server/index.ts`. Acceptance must
 run the exact Razer VM Hermes turn: `get_desktop_state` -> mutating Cua action ->
 next inference, and independently prove Qwen receives pixels while Spark is
@@ -121,15 +142,18 @@ unscoped path is exposed.
 
 ### 3. Browser lane
 
-Box's computer proxy supplies semantic browser state, refs, navigation
-verification, redaction, and tests (`server/computer-proxy.ts:581-607,994-1077`,
-`server/computer-proxy.test.ts:300-466`). Local Cua exposes direct browser tools
-through the mounted MCP and Hermes policy allowlist, but no equivalent
-provider-neutral semantic browser adapter is established. This is **architecture
-parity** only if Grok's browser lane is required. Change points:
-`local-vm-broker.ts` and `hermes-policy.ts`. Acceptance: navigate, inspect state,
-click, fill, and upload with exact URL checks, credential/query redaction, and a
-fresh image after mutation.
+Both Box and native local-VM lanes now have semantic browser state and bounded
+refs. Box implements URL verification/redaction in `server/computer-proxy.ts`;
+the native broker maps `get_browser_state`, validates exact target/tab binding,
+rejects stale refs, and fail-closes malformed HTTP(S) state in
+`server/local-vm-broker.ts:699-822,1085-1153`. Hermes treats semantic state as a
+visual observation. Focused tests cover navigation, fill/upload, stale refs,
+secret redaction, and failed actions.
+
+**Status:** Built + source-tested. Remaining work is live post-deployment browser
+QA and WebAuthn/passkey relay. WebAuthn is an **architecture parity** gap because
+it crosses browser, user-presence, and credential trust boundaries; it must not
+be approximated by exposing credentials to the model.
 
 ### 4. Bots, sidebar, search, and groups
 
@@ -145,14 +169,15 @@ pins, replies, reactions, attachments, and cards (`src/components/GroupView.tsx:
 Grok's reconstructed sidebar adds hover/focus/outside/Escape preview composition
 with latest entry, attachment, status, and pinned state
 (`.../sidebar-agent-preview-content.tsx:63-193`) and its host has durable indexed
-content/roster search (`source/host/extensions/content-search/*`). OpenMaus has
-no production use of that hover compositor and its search is basic message LIKE
-search. Hover preview and indexed cross-content search are **product parity**
-gaps. Likely files: `Sidebar.tsx`, a new hover-preview component,
-`server/message-db.ts`, `CommandPalette.tsx`, and `SearchResults.tsx`. Acceptance:
-hover/focus/Escape/outside behavior with latest attachment/status; search across
-bots, groups, archived/hidden content, and attachments, landing on the exact
-message.
+content/roster search (`source/host/extensions/content-search/*`). OpenMaus now
+mounts `SidebarBotPreview.tsx` for pointer and keyboard previews with latest
+message, status, pin, draft, and safe attachment names. Message search uses a
+durable SQLite FTS5 trigram index, updates on edit/delete/reopen, searches safe
+visible fields, and never indexes private directories or attachment capability
+IDs. Hover preview and indexed exact-message search are therefore built +
+source-tested. Remaining product gaps are a richer action command palette,
+durable sidebar section reorder/resize/bulk operations, and a parent/child
+conversation outline.
 
 Grok's shared-room reconstruction additionally shows external invite links,
 pending approval, and adding/removing owned agents
@@ -164,17 +189,20 @@ from local groups.
 
 ### 5. Files and transcript content
 
-OpenMaus safely uploads/downloads workspace files (`server/index.ts:6733-6767`)
-and previews images with an in-app lightbox (`src/components/AttachmentPreview.tsx:1-20,68-124`).
-Non-image files are only FILE chips in `ComposerAttachments.tsx:156-187`; there
-is no PDF/XLSX viewer. Grok's recovered PDF viewer has PDF.js loading, page,
+OpenMaus safely uploads/downloads workspace files and previews images with an
+in-app lightbox. It now includes bounded PDF and XLSX viewers in
+`AttachmentFilePreview.tsx`: PDF load/page/text deadlines and cancellation,
+page/pixel/memory limits, safe XLSX ZIP/CRC/relationship validation, worker
+revalidation, multi-sheet navigation, bounded rows/cells/text, and accessible
+table semantics. Conversation uploads use opaque UUID capabilities scoped to an
+exact thread and, after send, an exact user message. Transcript paths are never
+authority; cross-thread, cross-message, wrong-ID, and symlink replay are tested.
+Grok's recovered PDF viewer has PDF.js loading, page,
 zoom, download, error, and 25 MB handling (`.../pdf-viewer.tsx:1-17,343-395`),
 while its spreadsheet viewer supports multiple sheets, rows, and download
-(`.../spreadsheet-viewer.tsx:1-20,150-179`). This is a **product parity** gap,
-not an upload gap. Likely additions: `PdfViewer.tsx`, `SpreadsheetViewer.tsx`,
-attachment dispatch, and a bounded byte route. Acceptance: MIME/size containment,
-25 MB PDF cap, page/zoom/download, multi-sheet XLSX rendering, and no arbitrary
-file read.
+(`.../spreadsheet-viewer.tsx:1-20,150-179`). **Status:** built + source-tested.
+Remaining content gaps are rich media viewing, Mermaid/math rendering, and
+structured MCP/PR/file references.
 
 ### 6. Skills, plugins, and teaching
 
@@ -228,10 +256,13 @@ Companion, Computer, and Usage plus per-bot settings
 recovered settings includes General, Router, Usage & Billing, Updates, computer
 reset/update, security key, local-tool permissions, and auto-review
 (`.../settings/overlay/view.tsx:10-24,49-119`, `computer-view.tsx:7-50`,
-`panels.tsx:92-210`). OpenMaus base settings are built/source-tested. Exact
-Router/update/reset/security-key/auto-review behavior is a **product parity**
-gap where user-visible and an **impossible/undocumented** gap where the private
-account protocol is inferred. Likely files: `SettingsModal.tsx`,
+`panels.tsx:92-210`). OpenMaus base settings are built/source-tested. The
+reconstruction-added Router/Docker experiments and synthetic unavailable
+1Password entry are not reliable evidence of official shipped requirements.
+Computer reset/update, security-key relay, global permission policy, and
+adaptive auto-review are genuine **product parity** gaps where user-visible and
+**architecture/undocumented** gaps where a private account service is inferred.
+Likely files: `SettingsModal.tsx`,
 `EnginesSettings.tsx`, `UsageSection.tsx`, `ModelPicker.tsx`, and routing APIs.
 Acceptance: selecting a route changes the actual provider/model/tools/MCP,
 settings persist across restart, usage is labeled non-authoritative, and secrets
@@ -241,15 +272,14 @@ never enter transcripts.
 
 OpenMaus has `ActivityRun.tsx`, `TaskPicker.tsx`, timeline tests, tool chips,
 approval/connector/secret cards, reactions, replies, and transcript attachments.
-Grok has richer async-task state and a dedicated read-only terminal output view
-(`.../agent-info/async-tasks/*`, `.../terminal/output/view.tsx:19-42`), plus
-listener/auto-review/connector transcript-card variants. Basic OpenMaus cards
-and task surfaces are built/source-tested. A dedicated terminal pane and exact
-Grok async/listener cards are **product parity** gaps; private transcript
-protocol details are **impossible/undocumented**. Likely additions are a
-`TerminalPanel`, run/event routing, and card adapters. Acceptance: streamed
-output, cancellation, bounded truncation, safe host authorization, and card
-action idempotency.
+Grok has richer async-task state. Its reconstructed terminal output leaf exists,
+but the audited parent route does not mount it; it is not evidence of a shipped
+terminal panel. The reconstruction also contains listener/auto-review/connector
+transcript-card variants. Basic OpenMaus cards and task surfaces are
+built/source-tested. Exact async/listener cards remain a **product parity** gap;
+private transcript protocol details are **impossible/undocumented**. A terminal
+pane is an optional OpenMaus enhancement, not a source-established Grok parity
+requirement.
 
 ### 11. Mobile and remote clients
 
@@ -283,23 +313,28 @@ rendered App route and its backend lifecycle.
 
 ## Priority order
 
-1. **P0 — Live Hermes/Cua proof:** run the gated Razer VM Qwen turn and prove
-   pixels cross the real ACP path after action; separately confirm Spark's
-   intentional text-only behavior and host-containment proof.
-2. **P0 — Computer UI wiring:** verify the new `ComputerPanel` session switcher
-   in the rendered app and add per-subagent monitor identity only if the product
-   requires Grok's semantics.
-3. **P1 — Browser/local observation contract:** add semantic local-browser state
-   only with the same lease, generation, redaction, and image trust boundaries.
-4. **P1 — Search and transcript attachments:** hover preview, indexed search, and
-   PDF/XLSX viewers are the clearest user-visible parity gaps.
+1. **P0 — Deploy and live acceptance:** cut an immutable Razer release, verify
+   rollback, exercise the rendered computer panel, two per-bot VMs, semantic
+   browser actions, attachment preview isolation, and a fresh unknown-pixel
+   Hermes/Qwen turn.
+2. **P0 — True child monitors and cursor telemetry:** give each running computer
+   child its own monitor/frame/handoff identity and child-scoped cursor overlay.
+3. **P0 — WebAuthn/passkey relay:** preserve user presence and credential
+   isolation across the remote browser boundary.
+4. **P1 — Product shell depth:** richer command palette, durable sidebar
+   organization, parent/child outline, structured references, Mermaid/math,
+   media viewer, complete action audit/export, scoped memory controls, and a
+   global Always/Ask/Never policy with a non-bypassable team ceiling.
 5. **P1 — Routine listeners and approvals:** add connector events only with
    dedupe, auth, expiry, and confirmation semantics.
 6. **P2 — Skills marketplace, full-duplex voice, terminal pane, and richer cards:**
    implement only where the private Grok contract is not being guessed.
-7. **P2 — Mobile live acceptance and undocumented account/hidden-chat/deep-link
-   surfaces:** preserve the current explicit boundaries until authoritative
-   contracts exist.
+7. **P2 — Hosted relay and mobile acceptance:** remove the Tailscale/SSH
+   requirement only by adding authenticated enrollment, TLS, revocation,
+   reconnect, rate limiting, and audit—not by exposing Razer directly.
+8. **P2 — Undocumented private services:** account/billing, cross-user shared
+   rooms, hosted cloud computers, and a cloud-code-agent substitute remain new
+   services, not renderer-only parity work.
 
 ## Acceptance rule
 
