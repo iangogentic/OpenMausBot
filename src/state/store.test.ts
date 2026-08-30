@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 import {
   botDeletionConfirmation,
@@ -260,6 +261,14 @@ describe("main renderer screen transport", () => {
       message: { id: "late", role: "bot", kind: "screen", png: "late-pixels", mime: "image/png", at: 2 },
     });
     expect(state.bots[0]?.messages.find((message) => message.id === "late")?.png).toBeUndefined();
+  });
+
+  it("keeps reconciliation pixel-free and drops queued frames on effect cleanup", () => {
+    const source = readFileSync(new URL("./store.tsx", import.meta.url), "utf8");
+    expect(source.match(/api\("\/api\/bots\?screens=off"/g)).toHaveLength(2);
+    expect(source).toContain("if (!alive) return;");
+    expect(source).toContain("pendingFrames.splice(0)");
+    expect(source).toContain('tasks?screens=${computerScreensVisible ? "on" : "off"}');
   });
 });
 

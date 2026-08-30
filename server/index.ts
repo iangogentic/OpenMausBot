@@ -2321,6 +2321,14 @@ function pixelFreeEventPayload(payload: Record<string, unknown>): Record<string,
   return project(payload) as Record<string, unknown>;
 }
 
+function eventPayloadContainsPixels(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(eventPayloadContainsPixels);
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (record.kind === "screen" && typeof record.png === "string") return true;
+  return Object.values(record).some(eventPayloadContainsPixels);
+}
+
 function disconnectSseClient(client: SseClient): void {
   if (client.closed) return;
   client.closed = true;
@@ -2368,9 +2376,13 @@ function broadcast(payload: Record<string, unknown>) {
   // Live desktop captures can each be hundreds of kilobytes and become stale
   // as soon as the next one arrives. Keep their sequence slots so resume-gap
   // detection stays honest, but never retain their base64 payloads.
-  const frameBytes = Buffer.byteLength(frame);
   const safeFrameBytes = Buffer.byteLength(safeFrame);
-  const replayFrame = kind === "screen" || kind === "computer-child-frame" || safeFrameBytes > REPLAY_MAX_BYTES ? null : safeFrame;
+  const replayFrame = kind === "screen"
+    || kind === "computer-child-frame"
+    || eventPayloadContainsPixels(payload)
+    || safeFrameBytes > REPLAY_MAX_BYTES
+    ? null
+    : safeFrame;
   replayBuffer.push({ seq, kind, frame: replayFrame });
   replayBytes += replayFrame ? safeFrameBytes : 0;
   while (replayBuffer.length > REPLAY_MAX || replayBytes > REPLAY_MAX_BYTES) {
@@ -2429,6 +2441,37 @@ function pendingProviderRequest(threadId: string, requestId: string): PendingPro
   return pendingProviderRequests.get(providerRequestKey(threadId, requestId)) ?? null;
 }
 
+const PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS = 10_000;
+
+async function deliverProviderRequestResponse(
+  pending: PendingProviderRequest,
+  behavior: "allow" | "deny" | "answer",
+  message?: string,
+): Promise<{ outcome: RequestOutcome; timedOut: boolean }> {
+  const instance = registry.get(pending.instanceId);
+  if (!instance) return { outcome: "unavailable", timedOut: false };
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<{ outcome: RequestOutcome; timedOut: boolean }>((resolve) => {
+    timer = setTimeout(
+      () => resolve({ outcome: "unavailable", timedOut: true }),
+      PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS,
+    );
+    timer.unref?.();
+  });
+  const delivery = TURN_EXTERNAL_OPERATIONS.run(
+    pending.turn,
+    () => instance.adapter.respondToRequest(pending.threadId, pending.requestId, { behavior, message }),
+  ).then(
+    (outcome) => ({ outcome, timedOut: false }),
+    () => ({ outcome: "unavailable" as const, timedOut: false }),
+  );
+  try {
+    return await Promise.race([delivery, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Deliver a person's answer to the engine that asked, and tell the truth
  * about what happened. `unavailable` — the turn ended, the ask timed out,
  * the engine has no asks — is fail-closed: the action was never run. The
@@ -2482,18 +2525,7 @@ async function answerRequest(
   );
   const deliveredBehavior = policyForcedDeny ? "deny" : behavior;
   return pendingProviderSettlements.settle(key, pending, deliveredBehavior, async () => {
-    const instance = registry.get(pending.instanceId);
-    let outcome: RequestOutcome = "unavailable";
-    if (instance) {
-      try {
-        outcome = await TURN_EXTERNAL_OPERATIONS.run(
-          pending.turn,
-          () => instance.adapter.respondToRequest(threadId, requestId, { behavior: deliveredBehavior, message }),
-        );
-      } catch {
-        outcome = "unavailable";
-      }
-    }
+    const { outcome, timedOut } = await deliverProviderRequestResponse(pending, deliveredBehavior, message);
     // The human's verdict, recorded only when it actually reached the engine:
     // `unavailable` means the action never ran, and a "user-approved" row
     // over a request nothing answered would be the audit log lying. A
@@ -2524,6 +2556,18 @@ async function answerRequest(
       if (pendingProviderRequests.get(key) === pending) pendingProviderRequests.delete(key);
       pendingProviderSettlements.delete(key, pending);
       settleUnavailable();
+      if (timedOut) void cancelExactTargetTurn(pending.turn).catch(() => {});
+    } else if (pendingProviderRequests.get(key) === pending) {
+      // request.resolved normally arrives synchronously from the adapter, but
+      // a lost provider event must not leave an accepted card actionable.
+      const existing = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
+      if (existing?.card && !existing.card.answered) {
+        store.patchMessage(threadId, messageId, {
+          card: { ...existing.card, answered: deliveredBehavior, dismissed: policyForcedDeny || undefined },
+        });
+      }
+      pendingProviderRequests.delete(key);
+      pendingProviderSettlements.delete(key, pending);
     }
     return outcome;
   });
@@ -3462,11 +3506,11 @@ bus.subscribe((event: RuntimeEvent) => {
                 // Never must not degrade into an approval card. If the engine
                 // cannot receive the denial, stop its turn so the guarded
                 // request cannot remain live behind a misleading UI state.
-                void instance?.adapter.interruptTurn(event.threadId).catch(() => {});
+                void cancelExactTargetTurn(eventTurn).catch(() => {});
                 pushMessage({
                   role: "bot",
                   kind: "activity",
-                  tool: { name: "Permission denied; the provider could not acknowledge the denial, so the turn was stopped.", ok: false },
+                  tool: { name: "Permission denied; the provider could not acknowledge the denial, so exact-turn cancellation started.", ok: false },
                 });
                 return "unavailable";
               }
@@ -7633,6 +7677,9 @@ const server = createServer(async (req, res) => {
       if (limit === null) return json(res, 400, { error: "limit must be a non-negative whole number" });
       const before = url.searchParams.get("before");
       const around = url.searchParams.get("around");
+      const includeScreens =
+        req.headers["x-openmausbot-companion"] !== "1" &&
+        url.searchParams.get("screens") !== "off";
       if (before && around) return json(res, 400, { error: "before and around cannot be combined" });
       if (around) {
         const window = messageWindow(threadId, around, limit ?? DEFAULT_PAGE);
@@ -7644,7 +7691,7 @@ const server = createServer(async (req, res) => {
       if (before && !store.messagesFor(threadId).some((msg) => msg.id === before)) {
         return json(res, 404, { error: "no such message" });
       }
-      return json(res, 200, messagePage(threadId, limit ?? DEFAULT_PAGE, before));
+      return json(res, 200, messagePage(threadId, limit ?? DEFAULT_PAGE, before, includeScreens));
     }
 
     // the pixels of one screen message, fetched only when something shows it
@@ -9499,9 +9546,12 @@ const server = createServer(async (req, res) => {
     // The bot record answers with its messages because switching tasks
     // changes which transcript is live, and a partial patch would leave
     // the client showing the previous task's conversation.
-    const botWithThread = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
+    const botWithThread = (
+      bot: NonNullable<ReturnType<typeof store.bot>>,
+      includeScreens = false,
+    ) => ({
       ...wireBot(bot),
-      messages: store.messagesFor(bot.threadId).map(slimMessage),
+      messages: store.messagesFor(bot.threadId).map(includeScreens ? (message) => message : slimMessage),
       activeLeafId: store.activeLeaf(bot.threadId),
       tasks: store.tasks(bot.id).map(wireTask),
     });
@@ -9519,8 +9569,9 @@ const server = createServer(async (req, res) => {
       }
       const task = store.createTask(bot.id, typeof body.title === "string" ? body.title : undefined);
       if (!task) return json(res, 500, { error: "couldn't create that task" });
-      const fresh = botWithThread(store.bot(bot.id)!);
-      broadcast({ kind: "bot", bot: fresh });
+      const includeScreens = req.headers["x-openmausbot-companion"] !== "1" && url.searchParams.get("screens") === "on";
+      const fresh = botWithThread(store.bot(bot.id)!, includeScreens);
+      broadcast({ kind: "bot", bot: botWithThread(store.bot(bot.id)!, true) });
       return json(res, 201, { bot: fresh, task: wireTask(task) });
     }
     m = path.match(/^\/api\/bots\/([\w-]+)\/tasks\/([\w-]+)$/);
@@ -9532,16 +9583,16 @@ const server = createServer(async (req, res) => {
       }
       const switched = store.switchTask(m[1], m[2]);
       if (!switched) return json(res, 404, { error: "no such task" });
-      const fresh = botWithThread(switched);
-      broadcast({ kind: "bot", bot: fresh });
+      const includeScreens = req.headers["x-openmausbot-companion"] !== "1" && url.searchParams.get("screens") === "on";
+      const fresh = botWithThread(switched, includeScreens);
+      broadcast({ kind: "bot", bot: botWithThread(switched, true) });
       return json(res, 200, { bot: fresh });
     }
     if (m && method === "PATCH") {
       const body = await readBody(req);
       const task = store.renameTask(m[1], m[2], String(body.title ?? ""));
       if (!task) return json(res, 404, { error: "no such task" });
-      const fresh = botWithThread(store.bot(m[1])!);
-      broadcast({ kind: "bot", bot: fresh });
+      broadcast({ kind: "bot", bot: botWithThread(store.bot(m[1])!, true) });
       return json(res, 200, { task: wireTask(task) });
     }
     if (m && method === "DELETE") {
@@ -9556,8 +9607,9 @@ const server = createServer(async (req, res) => {
       }
       const updated = store.deleteTask(m[1], m[2]);
       if (!updated) return json(res, 400, { error: "a bot keeps at least one task" });
-      const fresh = botWithThread(updated);
-      broadcast({ kind: "bot", bot: fresh });
+      const includeScreens = req.headers["x-openmausbot-companion"] !== "1" && url.searchParams.get("screens") === "on";
+      const fresh = botWithThread(updated, includeScreens);
+      broadcast({ kind: "bot", bot: botWithThread(updated, true) });
       return json(res, 200, { bot: fresh });
     }
 

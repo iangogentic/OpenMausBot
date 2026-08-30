@@ -1401,7 +1401,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           return result.bot;
         },
         reconcile: async (botId, signal) => {
-          const result: { bots: BotAnnouncement[] } = await api("/api/bots", { signal });
+          const result: { bots: BotAnnouncement[] } = await api("/api/bots?screens=off", { signal });
           return result.bots.find((candidate) => candidate.id === botId) ?? null;
         },
         onAuthoritative: (bot, optimisticOverlay) => {
@@ -1682,12 +1682,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         // tasks: the server answers with the bot AND the live transcript,
         // because switching changes which conversation is on screen
         case "newTask":
-          api(`/api/bots/${action.botId}/tasks`, { method: "POST", body: "{}" })
+          api(`/api/bots/${action.botId}/tasks?screens=${computerScreensVisible ? "on" : "off"}`, { method: "POST", body: "{}" })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
             .catch(showError);
           break;
         case "switchTask":
-          api(`/api/bots/${action.botId}/tasks/${action.threadId}`, { method: "POST" })
+          api(`/api/bots/${action.botId}/tasks/${action.threadId}?screens=${computerScreensVisible ? "on" : "off"}`, { method: "POST" })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
             .catch(showError);
           break;
@@ -1698,7 +1698,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           }).catch(showError);
           break;
         case "deleteTask":
-          api(`/api/bots/${action.botId}/tasks/${action.threadId}`, { method: "DELETE" })
+          api(`/api/bots/${action.botId}/tasks/${action.threadId}?screens=${computerScreensVisible ? "on" : "off"}`, { method: "DELETE" })
             .then((r: any) => r?.bot && dispatch({ type: "taskSwitched", bot: r.bot }))
             .catch(showError);
           break;
@@ -1737,7 +1737,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               // The captured bot is only the final fallback when even the
               // reconciliation read is unavailable.
               try {
-                const result: { bots: BotAnnouncement[] } = await api("/api/bots");
+                const result: { bots: BotAnnouncement[] } = await api("/api/bots?screens=off");
                 const authoritative = result.bots.find((candidate) => candidate.id === action.botId);
                 if (authoritative) {
                   rawDispatch({
@@ -1759,7 +1759,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
     };
     return wrapped;
-  }, [botPatchQueue]);
+  }, [botPatchQueue, computerScreensVisible]);
 
   // ── initial load + SSE fold ──────────────────────────────────────────
   useEffect(() => {
@@ -2021,6 +2021,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
     };
     es.onmessage = (raw) => {
+      if (!alive) return;
       let frame: any;
       try {
         frame = JSON.parse(raw.data);
@@ -2039,6 +2040,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
     return () => {
       alive = false;
+      pendingFrames.splice(0);
       clearTimeout(hydrationFallback);
       es.close();
     };

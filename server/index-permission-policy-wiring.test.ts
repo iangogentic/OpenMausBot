@@ -19,7 +19,7 @@ describe("fleet permission policy wiring", () => {
   });
 
   it("never degrades a failed policy denial into an approval card", () => {
-    expect(source).toMatch(/if \(automaticBehavior === "deny"\)[\s\S]*?interruptTurn\(event\.threadId\)[\s\S]*?return "unavailable";[\s\S]*?const card = pushMessage/);
+    expect(source).toMatch(/if \(automaticBehavior === "deny"\)[\s\S]*?cancelExactTargetTurn\(eventTurn\)[\s\S]*?return "unavailable";[\s\S]*?const card = pushMessage/);
     expect(source).toContain('decision: automaticBehavior === "allow" ? "auto-approved" : "policy-denied"');
   });
 
@@ -37,5 +37,7 @@ describe("fleet permission policy wiring", () => {
     expect(source).toContain("if (settling?.generation === pending)");
     expect(source).toContain("void cancelExactTargetTurn(pending.turn).catch(() => {})");
     expect(source).not.toMatch(/await settling\.promise[\s\S]{0,500}interruptTurn\(pending\.threadId\)/);
+    expect(source).toContain("PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS");
+    expect(source).toContain("request.resolved normally arrives synchronously");
   });
 });
