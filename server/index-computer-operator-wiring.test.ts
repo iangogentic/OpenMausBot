@@ -11,7 +11,8 @@ describe("production computer operator wiring", () => {
   });
 
   it("fails closed onto the exact live desktop2 Qwen Hermes selection", () => {
-    expect(source).toContain('decodeInjectId(selection.model)?.host !== "desktop2_qwen"');
+    expect(source).toContain('inject?.host !== "desktop2_qwen"');
+    expect(source).toContain('inject.model.toLowerCase() !== "qwen3.8-27b-abliterated"');
     expect(source).toContain('instance.driverKind !== "hermesAgent"');
     expect(source).toContain('snapshot?.state !== "available"');
     expect(source).toContain("a live Hermes bot configured for the desktop2 Qwen model is required");

@@ -1163,7 +1163,11 @@ async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSe
   const candidates = [preferred, ...store.bots.filter((bot) => bot.id !== parentBotId)].filter(Boolean);
   for (const candidate of candidates) {
     const selection = candidate!.modelSelection;
-    if (decodeInjectId(selection.model)?.host !== "desktop2_qwen") continue;
+    const inject = decodeInjectId(selection.model);
+    if (
+      inject?.host !== "desktop2_qwen" ||
+      inject.model.toLowerCase() !== "qwen3.8-27b-abliterated"
+    ) continue;
     const instance = registry.get(selection.instanceId);
     if (!instance || !instance.enabled || instance.driverKind !== "hermesAgent") continue;
     const snapshot = await instance.snapshot().catch(() => null);
@@ -1204,7 +1208,13 @@ const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
     const capability = input.target.opaqueCapability as ComputerOperatorTargetCapability;
     const inject = decodeInjectId(input.model.model);
     const instance = registry.get(input.model.instanceId);
-    if (!instance || !instance.enabled || instance.driverKind !== "hermesAgent" || inject?.host !== "desktop2_qwen") {
+    if (
+      !instance ||
+      !instance.enabled ||
+      instance.driverKind !== "hermesAgent" ||
+      inject?.host !== "desktop2_qwen" ||
+      inject.model.toLowerCase() !== "qwen3.8-27b-abliterated"
+    ) {
       throw new Error("computer operator model authority is unavailable");
     }
     const snapshot = await instance.snapshot();
