@@ -77,6 +77,25 @@ _ALLOWED_NATIVE = frozenset({
     "web_search", "todo",
     "tool_search", "tool_describe", "tool_call",
 })
+_PINNED_MCP = frozenset({
+    # Common computer perception and control must remain directly visible to
+    # local models; the complete catalog stays available through tool_search.
+    "mcp_computer_get_desktop_state", "mcp_computer_get_screen_size",
+    "mcp_computer_verify_state", "mcp_computer_list_apps",
+    "mcp_computer_list_windows", "mcp_computer_launch_app",
+    "mcp_computer_bring_to_front", "mcp_computer_click",
+    "mcp_computer_double_click", "mcp_computer_right_click",
+    "mcp_computer_drag", "mcp_computer_type_text",
+    "mcp_computer_press_key", "mcp_computer_hotkey",
+    "mcp_computer_scroll", "mcp_computer_get_browser_state",
+    "mcp_computer_browser_prepare", "mcp_computer_browser_navigate",
+    "mcp_computer_browser_click", "mcp_computer_browser_type",
+    # High-frequency, read-oriented Ian Brain entry points.
+    "mcp_ian_brain_context_store_stats", "mcp_ian_brain_ian_context_brief",
+    "mcp_ian_brain_projects_search", "mcp_ian_brain_memory_recall",
+    "mcp_ian_brain_files_search", "mcp_ian_brain_wiki_index",
+    "mcp_ian_brain_world_model_query", "mcp_ian_brain_work_item_list",
+})
 _DENIED_MCP_PREFIXES = (
     "mcp__ian_brain__creds_",
     "mcp__ian_brain__mcp_ian_brain_creds_",
@@ -124,6 +143,20 @@ def _filter_definitions(definitions):
 
 def _install():
     import model_tools
+
+    # Keep a compact everyday MCP rail visible while Hermes progressively
+    # discloses the long tail. Pushing all 93 schemas at a 27B local model
+    # caused valid function names to be confused; deferring every MCP tool
+    # caused requested computer tools to look absent. This split preserves
+    # both accuracy and complete reachability.
+    tool_search_module = sys.modules.get("tools.tool_search")
+    if _RESTRICT_NATIVE and tool_search_module is not None:
+        original_core_tool_names = tool_search_module._core_tool_names
+
+        def guarded_core_tool_names():
+            return frozenset(original_core_tool_names()) | _PINNED_MCP
+
+        tool_search_module._core_tool_names = guarded_core_tool_names
 
     original_definitions = model_tools.get_tool_definitions
     original_dispatch = model_tools.handle_function_call
@@ -353,12 +386,9 @@ export function sanitizeHermesConfig(
   safe.agent = agent;
 
   const toolSearch = object(object(source.tools)?.tool_search);
-  // The smaller local models used by hosted OpenMaus bots do not reliably
-  // discover an explicitly requested mounted tool after Hermes defers the MCP
-  // catalog behind tool_search. Directly expose the already policy-filtered
-  // catalog in restricted mode. This costs extra prompt tokens, but avoids a
-  // false "tool not mounted" response and makes computer control dependable.
-  if (restricted) safe.tools = { tool_search: { enabled: "off" } };
+  // Hosted local models receive a compact direct MCP rail from the policy
+  // shim and discover the remaining permitted tools through this bridge.
+  if (restricted) safe.tools = { tool_search: { enabled: "on" } };
   else if (toolSearch) safe.tools = { tool_search: toolSearch };
 
   const configuredMcps = object(source.mcp_servers);

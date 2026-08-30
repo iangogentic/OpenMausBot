@@ -276,7 +276,7 @@ memory:
         idempotent_no_progress: 5,
       },
     });
-    expect(parsed.tools).toEqual({ tool_search: { enabled: "off" } });
+    expect(parsed.tools).toEqual({ tool_search: { enabled: "on" } });
     expect(parsed.host_files).toBeUndefined();
     expect(parsed.plugins).toBeUndefined();
     expect(parsed.terminal).toBeUndefined();
@@ -334,6 +334,9 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toMatch(/def guarded_dispatch[\s\S]*if not _allowed_tool\(function_name\)/);
     expect(HERMES_POLICY_PYTHON).toContain('name.startswith("mcp_")');
     expect(HERMES_POLICY_PYTHON).toContain("guard._is_idempotent = lambda name");
+    expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_get_desktop_state"');
+    expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_context_store_stats"');
+    expect(HERMES_POLICY_PYTHON).toContain("tool_search_module._core_tool_names = guarded_core_tool_names");
   });
 
   it("recognizes the canonical Hermes MCP names for both mounted integrations", () => {
