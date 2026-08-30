@@ -744,7 +744,7 @@ function BotListItem({
   const { state, dispatch } = useStore();
   const [renaming, setRenaming] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
-  const [previewPosition, setPreviewPosition] = useState({ top: 8, left: 88 });
+  const [previewPosition, setPreviewPosition] = useState({ top: 8, left: 88, maxHeight: 320 });
   const selectRef = useRef<HTMLButtonElement>(null);
   const selected = state.activeView === "chat" && state.selectedId === bot.id;
   const mascotMotion = selected && state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
@@ -780,10 +780,8 @@ function BotListItem({
       const left = rect.right + 10 + width <= window.innerWidth
         ? rect.right + 10
         : Math.max(8, rect.left - width - 10);
-      setPreviewPosition({
-        left,
-        top: Math.max(8, Math.min(rect.top, window.innerHeight - 360)),
-      });
+      const top = Math.max(8, Math.min(rect.top, window.innerHeight - 120));
+      setPreviewPosition({ left, top, maxHeight: Math.max(104, window.innerHeight - top - 8) });
     }
     setPreviewOpen(true);
   };
@@ -925,7 +923,7 @@ function BotListItem({
       </button>}
       {previewOpen && createPortal(
         <div
-          className="pointer-events-none fixed z-50 animate-pop-in"
+          className="pointer-events-none fixed z-50 overflow-hidden animate-pop-in"
           style={previewPosition}
         >
           <SidebarBotPreview bot={bot} />
