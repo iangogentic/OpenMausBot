@@ -1,4 +1,5 @@
-import { read, utils, type CellObject, type WorkSheet } from "xlsx";
+import { unzipSync } from "fflate";
+import { Parser } from "saxen";
 
 export const XLSX_MAX_SHEETS = 20;
 export const XLSX_MAX_ROWS = 1_000;
@@ -7,62 +8,161 @@ export const XLSX_MAX_CELLS = 25_000;
 export const XLSX_MAX_CELL_CHARS = 10_000;
 export const XLSX_MAX_TEXT_CHARS = 2_000_000;
 
-export type WorkbookPreview = { sheets: Array<{ name: string; rows: string[][]; truncated: boolean }>; truncated: boolean };
+const XLSX_MAX_XML_BYTES = 32 * 1024 * 1024;
+const decoder = new TextDecoder("utf-8", { fatal: true });
 
-function visibleCell(sheet: WorkSheet, row: number, column: number): string {
-  // SAFETY: SheetJS WorkSheet indexes are documented as CellObject entries;
-  // missing coordinates are explicitly handled below.
-  const cell = sheet[utils.encode_cell({ r: row, c: column })] as CellObject | undefined;
-  if (!cell || cell.t === "z") return "";
-  const value = utils.format_cell({ ...cell, f: undefined, l: undefined, c: undefined, h: undefined });
-  return String(value).slice(0, XLSX_MAX_CELL_CHARS);
+export type WorkbookPreview = { sheets: Array<{ name: string; rows: string[][]; truncated: boolean }>; truncated: boolean };
+type Attributes = Record<string, string>;
+type SaxDecode = (value: string) => string;
+
+function localName(name: string): string { return name.slice(name.lastIndexOf(":") + 1); }
+
+function xmlText(bytes: Uint8Array, label: string): string {
+  if (bytes.byteLength > XLSX_MAX_XML_BYTES) throw new Error(`${label} exceeds the preview limit.`);
+  let value: string;
+  try { value = decoder.decode(bytes); } catch { throw new Error(`${label} is not valid UTF-8.`); }
+  if (/<!\s*(?:DOCTYPE|ENTITY)\b/i.test(value)) throw new Error(`${label} contains prohibited XML declarations.`);
+  return value;
 }
 
-/** Build a display-only, bounded representation. SheetJS never evaluates
- * formulas; formula source, hyperlinks, comments, HTML, VBA, and external
- * links are discarded before results cross the Worker boundary. */
-export function parseWorkbookPreview(buffer: ArrayBuffer): WorkbookPreview {
-  const workbook = read(buffer, {
-    type: "array",
-    dense: false,
-    bookVBA: false,
-    cellFormula: false,
-    cellHTML: false,
-    cellStyles: false,
-    cellNF: false,
-    WTF: false,
+function parseXml(xml: string, handlers: {
+  open?: (name: string, attributes: Attributes) => void;
+  close?: (name: string) => void;
+  text?: (value: string) => void;
+}): void {
+  const parser = new Parser();
+  let parseError: Error | null = null;
+  parser.on("openTag", (name: string, getAttributes: () => Attributes, decode: SaxDecode) => {
+    const attributes: Attributes = Object.create(null) as Attributes;
+    for (const [key, value] of Object.entries(getAttributes())) attributes[key] = decode(value);
+    handlers.open?.(localName(name), attributes);
   });
-  if (workbook.SheetNames.length === 0) throw new Error("This workbook has no worksheets.");
+  parser.on("closeTag", (name: string) => handlers.close?.(localName(name)));
+  parser.on("text", (value: string, decode: SaxDecode) => handlers.text?.(decode(value)));
+  parser.on("cdata", (value: string) => handlers.text?.(value));
+  parser.on("error", (error: Error) => { parseError = error; });
+  const returned = parser.parse(xml);
+  if (parseError) throw parseError;
+  if (returned instanceof Error) throw returned;
+}
+
+function relationshipTarget(target: string): string {
+  const normalized = target.replaceAll("\\", "/");
+  if (/^[a-z]+:/i.test(normalized) || normalized.startsWith("/") || normalized.split("/").includes("..")) {
+    throw new Error("This XLSX contains an unsafe relationship target.");
+  }
+  return normalized.startsWith("xl/") ? normalized : `xl/${normalized.replace(/^\.\//, "")}`;
+}
+
+function columnIndex(reference: string): number | null {
+  const match = /^([A-Za-z]{1,3})[1-9][0-9]*$/.exec(reference);
+  if (!match) return null;
+  let result = 0;
+  for (const character of match[1]!.toUpperCase()) result = result * 26 + character.charCodeAt(0) - 64;
+  return result - 1;
+}
+
+/** Parse a deliberately small, display-only subset of OOXML. Only workbook
+ * relationships, shared strings, and worksheet cell values are extracted.
+ * Dimensions, formulas, links, comments, macros, styles, and external
+ * relationships are never interpreted. */
+export function parseWorkbookPreview(buffer: ArrayBuffer): WorkbookPreview {
+  const bytes = new Uint8Array(buffer);
+  const allowed = /^(?:xl\/workbook\.xml|xl\/_rels\/workbook\.xml\.rels|xl\/sharedStrings\.xml|xl\/worksheets\/[^/]+\.xml)$/;
+  const archive = unzipSync(bytes, {
+    filter(file) {
+      if (file.name.startsWith("/") || file.name.includes("\\") || file.name.split("/").includes("..")) throw new Error("This XLSX contains an unsafe archive path.");
+      return allowed.test(file.name);
+    },
+  });
+  const workbookBytes = archive["xl/workbook.xml"];
+  const relationsBytes = archive["xl/_rels/workbook.xml.rels"];
+  if (!workbookBytes || !relationsBytes) throw new Error("This workbook is missing required metadata.");
+
+  const relationships = new Map<string, string>();
+  parseXml(xmlText(relationsBytes, "Workbook relationships"), {
+    open(name, attributes) {
+      if (name !== "Relationship") return;
+      if (attributes.TargetMode?.toLowerCase() === "external") throw new Error("External workbook relationships cannot be previewed.");
+      if (attributes.Id && attributes.Target) relationships.set(attributes.Id, relationshipTarget(attributes.Target));
+    },
+  });
+
+  const sheetRecords: Array<{ name: string; path: string }> = [];
+  parseXml(xmlText(workbookBytes, "Workbook metadata"), {
+    open(name, attributes) {
+      if (name !== "sheet" || sheetRecords.length >= XLSX_MAX_SHEETS + 1) return;
+      const id = attributes["r:id"] ?? attributes.id;
+      const path = id ? relationships.get(id) : undefined;
+      if (path) sheetRecords.push({ name: String(attributes.name || "Sheet").slice(0, 120), path });
+    },
+  });
+  if (sheetRecords.length === 0) throw new Error("This workbook has no worksheets.");
+
+  const sharedStrings: string[] = [];
+  const sharedBytes = archive["xl/sharedStrings.xml"];
+  if (sharedBytes) {
+    let inString = false;
+    let inText = false;
+    let current = "";
+    let sharedChars = 0;
+    parseXml(xmlText(sharedBytes, "Shared strings"), {
+      open(name) { if (name === "si") { inString = true; current = ""; } if (inString && name === "t") inText = true; },
+      close(name) {
+        if (name === "t") inText = false;
+        if (name === "si" && inString) {
+          sharedStrings.push(current.slice(0, XLSX_MAX_CELL_CHARS));
+          sharedChars += current.length;
+          if (sharedStrings.length > XLSX_MAX_CELLS || sharedChars > XLSX_MAX_TEXT_CHARS) throw new Error("Shared strings exceed the preview limit.");
+          inString = false;
+        }
+      },
+      text(value) { if (inString && inText) current += value.slice(0, XLSX_MAX_CELL_CHARS + 1 - current.length); },
+    });
+  }
+
   let remainingCells = XLSX_MAX_CELLS;
   let remainingText = XLSX_MAX_TEXT_CHARS;
-  let truncated = workbook.SheetNames.length > XLSX_MAX_SHEETS;
+  let truncated = sheetRecords.length > XLSX_MAX_SHEETS;
   const sheets: WorkbookPreview["sheets"] = [];
-  for (const rawName of workbook.SheetNames.slice(0, XLSX_MAX_SHEETS)) {
-    const sheet = workbook.Sheets[rawName];
-    if (!sheet) continue;
-    const range = sheet["!ref"] ? utils.decode_range(sheet["!ref"]!) : { s: { r: 0, c: 0 }, e: { r: -1, c: -1 } };
-    const rowCount = Math.max(0, range.e.r - range.s.r + 1);
-    const columnCount = Math.max(0, range.e.c - range.s.c + 1);
-    const allowedColumns = Math.min(columnCount, XLSX_MAX_COLUMNS);
-    const allowedRows = Math.min(rowCount, XLSX_MAX_ROWS, Math.floor(remainingCells / Math.max(1, allowedColumns)));
+  for (const record of sheetRecords.slice(0, XLSX_MAX_SHEETS)) {
+    const sheetBytes = archive[record.path];
+    if (!sheetBytes) continue;
     const rows: string[][] = [];
-    let contentTruncated = false;
-    for (let row = range.s.r; row < range.s.r + allowedRows; row += 1) {
-      const values: string[] = [];
-      for (let column = range.s.c; column < range.s.c + allowedColumns; column += 1) {
-        const rawValue = visibleCell(sheet, row, column);
-        const value = rawValue.slice(0, remainingText);
-        contentTruncated ||= value.length < rawValue.length;
-        remainingText -= value.length;
-        values.push(value);
-      }
-      rows.push(values);
-    }
-    remainingCells -= rows.length * allowedColumns;
-    const sheetTruncated = rowCount > allowedRows || columnCount > allowedColumns || contentTruncated;
+    let row: string[] | null = null;
+    let cellColumn: number | null = null;
+    let cellType = "n";
+    let cellText = "";
+    let collectingValue = false;
+    let sheetTruncated = false;
+    parseXml(xmlText(sheetBytes, `Worksheet ${record.name}`), {
+      open(name, attributes) {
+        if (name === "row") { row = rows.length < XLSX_MAX_ROWS && remainingCells > 0 ? [] : null; if (!row) sheetTruncated = true; }
+        else if (name === "c") { cellColumn = attributes.r ? columnIndex(attributes.r) : row?.length ?? null; cellType = attributes.t || "n"; cellText = ""; }
+        else if ((name === "v" || (name === "t" && cellType === "inlineStr")) && cellColumn !== null) collectingValue = true;
+      },
+      close(name) {
+        if (name === "v" || name === "t") collectingValue = false;
+        if (name === "c" && cellColumn !== null) {
+          if (row && cellColumn < XLSX_MAX_COLUMNS && remainingCells > 0) {
+            let value = cellText;
+            if (cellType === "s") { const index = Number.parseInt(cellText, 10); value = Number.isSafeInteger(index) && index >= 0 ? sharedStrings[index] ?? "" : ""; }
+            else if (cellType === "b") value = cellText === "1" ? "TRUE" : cellText === "0" ? "FALSE" : "";
+            value = String(value).slice(0, Math.min(XLSX_MAX_CELL_CHARS, remainingText));
+            while (row.length < cellColumn) row.push("");
+            row[cellColumn] = value;
+            remainingCells -= 1;
+            remainingText -= value.length;
+          } else if (cellColumn >= XLSX_MAX_COLUMNS || remainingCells <= 0) sheetTruncated = true;
+          cellColumn = null; collectingValue = false;
+        } else if (name === "row" && row) { rows.push(row); row = null; }
+      },
+      text(value) { if (collectingValue && cellText.length <= XLSX_MAX_CELL_CHARS) cellText += value.slice(0, XLSX_MAX_CELL_CHARS + 1 - cellText.length); },
+    });
     truncated ||= sheetTruncated;
-    sheets.push({ name: String(rawName).slice(0, 120), rows, truncated: sheetTruncated });
-    if (remainingCells <= 0) break;
+    sheets.push({ name: record.name, rows, truncated: sheetTruncated });
+    if (remainingCells <= 0 || remainingText <= 0) { truncated = true; break; }
   }
+  if (sheets.length === 0) throw new Error("This workbook has no readable worksheets.");
   return { sheets, truncated };
 }

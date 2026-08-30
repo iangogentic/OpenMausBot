@@ -7,6 +7,9 @@ import type { TranscriptFileAttachment } from "@/lib/composer-attachments";
 
 type WorkbookPreview = { sheets: Array<{ name: string; rows: string[][]; truncated: boolean }>; truncated: boolean };
 type PreviewWorker = Pick<Worker, "postMessage" | "terminate" | "onmessage" | "onerror">;
+const PDF_MAX_IMAGE_PIXELS = 16_000_000;
+const PDF_MAX_CANVAS_BYTES = 64 * 1024 * 1024;
+const PDF_MAX_PAGE_PIXELS = 16_000_000;
 
 function saveBytes(file: DownloadedAttachment) {
   const copied = new Uint8Array(file.bytes.byteLength);
@@ -36,7 +39,14 @@ function PdfPages({ file }: { file: DownloadedAttachment }) {
         const pdfjs = await import("pdfjs-dist");
         const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
         pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
-        task = pdfjs.getDocument({ data: file.bytes.slice(), isEvalSupported: false, useWorkerFetch: false });
+        task = pdfjs.getDocument({
+          data: file.bytes.slice(),
+          isEvalSupported: false,
+          useWorkerFetch: false,
+          stopAtErrors: true,
+          maxImageSize: PDF_MAX_IMAGE_PIXELS,
+          canvasMaxAreaInBytes: PDF_MAX_CANVAS_BYTES,
+        });
         loaded = await task.promise;
         if (alive) setDocument(loaded);
       } catch (reason) {
@@ -57,6 +67,9 @@ function PdfPages({ file }: { file: DownloadedAttachment }) {
     void document.getPage(page).then((pdfPage) => {
       if (cancelled || !canvasRef.current) return;
       const viewport = pdfPage.getViewport({ scale: zoom * Math.min(2, window.devicePixelRatio || 1) });
+      if (!Number.isFinite(viewport.width) || !Number.isFinite(viewport.height) || viewport.width <= 0 || viewport.height <= 0 || viewport.width * viewport.height > PDF_MAX_PAGE_PIXELS) {
+        throw new Error("This PDF page is too large to preview safely.");
+      }
       const canvas = canvasRef.current;
       const context = canvas.getContext("2d", { alpha: false });
       if (!context) throw new Error("Canvas rendering is unavailable.");
