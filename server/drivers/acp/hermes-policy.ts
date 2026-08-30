@@ -179,6 +179,11 @@ def _install():
 
     async def guarded_register_mcp(self, state, mcp_servers):
         await original_register_mcp(self, state, mcp_servers)
+        # Hermes may collapse the model-facing MCP catalog into its native
+        # tool_search schema. Prove required servers against the authoritative
+        # connected registry, not that compressed snapshot.
+        from tools.mcp_tool import _existing_tool_names
+        registered_names = set(_existing_tool_names())
         raw = guarded_definitions(
             enabled_toolsets=getattr(state.agent, "enabled_toolsets", None),
             disabled_toolsets=getattr(state.agent, "disabled_toolsets", None),
@@ -190,6 +195,7 @@ def _install():
             for item in raw
             if isinstance(item, dict)
         }
+        names.update(registered_names)
         unexpected = sorted(name for name in names if not _allowed_tool(name))
         if unexpected:
             raise RuntimeError("OpenMaus Hermes policy catalog contained forbidden tools")

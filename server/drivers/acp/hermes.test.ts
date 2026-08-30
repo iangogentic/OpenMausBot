@@ -319,6 +319,7 @@ mcp_servers:
     expect(hermesMcpToolMatchesServer("mcp_computer_computer_click", "computer")).toBe(true);
     expect(hermesMcpToolMatchesServer("mcp__computer_backup__computer_click", "computer")).toBe(false);
     expect(HERMES_POLICY_PYTHON).toContain('return ("mcp__" + safe_name + "__", "mcp_" + safe_name + "_")');
+    expect(HERMES_POLICY_PYTHON).toContain("registered_names = set(_existing_tool_names())");
   });
 
   it("loads the Ian Brain credential deny even without a mounted computer", () => {
