@@ -529,7 +529,7 @@ beforeAll(async () => {
     }
     const boxCredentialOk =
       req.headers.authorization === "Bearer box_good" || req.headers.authorization === "Bearer box_slow";
-    if (req.headers.authorization === "Bearer box_slow") {
+    if (req.headers.authorization === "Bearer box_slow" || req.headers.authorization === "Bearer box_slow_bad") {
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
     if (boxCredentialOk && failBoxInventory && req.method === "GET" && req.url === "/boxes") {
@@ -2578,6 +2578,25 @@ describe("harness HTTP API", () => {
       permissions: { policy: "always", adminCeiling: "always" },
     });
     expect(smuggled.status).toBe(400);
+    await api("PATCH", "/api/config", { permissions: { policy: "ask" } });
+  });
+
+  it("does not publish a permissive policy before a combined config save succeeds", async () => {
+    expect((await api("PATCH", "/api/config", { permissions: { policy: "never" } })).status).toBe(200);
+    const failedSave = api("PATCH", "/api/config", {
+      permissions: { policy: "always" },
+      box: { token: "box_slow_bad" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    const duringValidation = await api("GET", "/api/config");
+    expect(duringValidation.body.permissions).toMatchObject({ requested: "never", effective: "never" });
+    expect((await failedSave).status).toBe(400);
+
+    const afterFailure = await api("GET", "/api/config");
+    expect(afterFailure.body.permissions).toMatchObject({ requested: "never", effective: "never" });
+    const disk = JSON.parse(readFileSync(join(home, ".openmausbot", "config.json"), "utf8"));
+    expect(disk.permissions).toEqual({ policy: "never" });
     await api("PATCH", "/api/config", { permissions: { policy: "ask" } });
   });
 

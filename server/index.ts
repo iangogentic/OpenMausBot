@@ -25,6 +25,7 @@ import {
   resolvePermission,
   resolvePermissionPolicy,
 } from "./permission-policy.ts";
+import { ProviderRequestSettlements } from "./provider-request-settlement.ts";
 import {
   COMPUTER_OPERATOR_HOST_ID,
   COMPUTER_OPERATOR_MODEL_ID,
@@ -2369,6 +2370,12 @@ interface PendingProviderRequest {
   readonly botName?: string;
 }
 const pendingProviderRequests = new Map<string, PendingProviderRequest>();
+const pendingProviderSettlements = new ProviderRequestSettlements<
+  string,
+  PendingProviderRequest,
+  "allow" | "deny" | "answer",
+  RequestOutcome
+>();
 const providerRequestKey = (threadId: string, requestId: string) => `${threadId}:${requestId}`;
 
 function installPendingProviderRequest(input: PendingProviderRequest): PendingProviderRequest {
@@ -2382,6 +2389,7 @@ function installPendingProviderRequest(input: PendingProviderRequest): PendingPr
       });
     }
   }
+  if (previous && previous !== input) pendingProviderSettlements.delete(key);
   const pending = Object.freeze({ ...input });
   pendingProviderRequests.set(key, pending);
   return pending;
@@ -2436,56 +2444,59 @@ async function answerRequest(
     settleUnavailable();
     return "unavailable";
   }
-  const instance = registry.get(pending.instanceId);
-  // A card can outlive the policy under which it was shown. Never is an
-  // execution-time authority boundary, so an old Allow click cannot cross a
-  // newly selected Never policy. Questions have no tool and remain answerable.
+  // Resolve the policy before claiming settlement. The claim itself is
+  // synchronous, so a concurrent human response or Never transition joins
+  // this exact delivery instead of sending a second, contradictory frame.
   const policyForcedDeny = Boolean(
     card.tool && (policyEnforced || (behavior === "allow" && currentPermissionPolicy().effective === "never")),
   );
   const deliveredBehavior = policyForcedDeny ? "deny" : behavior;
-  let outcome: RequestOutcome = "unavailable";
-  if (instance) {
-    try {
-      outcome = await TURN_EXTERNAL_OPERATIONS.run(
-        pending.turn,
-        () => instance.adapter.respondToRequest(threadId, requestId, { behavior: deliveredBehavior, message }),
-      );
-    } catch {
-      outcome = "unavailable";
+  return pendingProviderSettlements.settle(key, pending, deliveredBehavior, async () => {
+    const instance = registry.get(pending.instanceId);
+    let outcome: RequestOutcome = "unavailable";
+    if (instance) {
+      try {
+        outcome = await TURN_EXTERNAL_OPERATIONS.run(
+          pending.turn,
+          () => instance.adapter.respondToRequest(threadId, requestId, { behavior: deliveredBehavior, message }),
+        );
+      } catch {
+        outcome = "unavailable";
+      }
     }
-  }
-  // The human's verdict, recorded only when it actually reached the engine:
-  // `unavailable` means the action never ran, and a "user-approved" row
-  // over a request nothing answered would be the audit log lying. A
-  // question's `answer` is conversation, not authorization, so it is not a
-  // decision either.
-  // request.resolved commonly consumes `pending` synchronously during the
-  // adapter call. A different entry means a successor reused requestId; the
-  // old HTTP response must not write into it.
-  const current = pendingProviderRequests.get(key);
-  if (current && current !== pending) return "unavailable";
-  if (outcome !== "unavailable" && deliveredBehavior !== "answer") {
-    appendDecision(DATA_DIR, {
-      threadId,
-      requestId,
-      botId: pending.botId,
-      botName: pending.botName,
-      tool: card?.tool,
-      summary: card?.subtitle,
-      decision: policyForcedDeny
-        ? "policy-denied"
-        : deliveredBehavior === "allow"
-          ? "user-approved"
-          : "user-denied",
-      source: policyForcedDeny ? "policy-never" : "user",
-    });
-  }
-  if (outcome === "unavailable") {
-    if (pendingProviderRequests.get(key) === pending) pendingProviderRequests.delete(key);
-    settleUnavailable();
-  }
-  return outcome;
+    // The human's verdict, recorded only when it actually reached the engine:
+    // `unavailable` means the action never ran, and a "user-approved" row
+    // over a request nothing answered would be the audit log lying. A
+    // question's `answer` is conversation, not authorization, so it is not a
+    // decision either.
+    // request.resolved commonly consumes `pending` synchronously during the
+    // adapter call. A different entry means a successor reused requestId; the
+    // old HTTP response must not write into it.
+    const current = pendingProviderRequests.get(key);
+    if (current && current !== pending) return "unavailable";
+    if (outcome !== "unavailable" && deliveredBehavior !== "answer") {
+      appendDecision(DATA_DIR, {
+        threadId,
+        requestId,
+        botId: pending.botId,
+        botName: pending.botName,
+        tool: card?.tool,
+        summary: card?.subtitle,
+        decision: policyForcedDeny
+          ? "policy-denied"
+          : deliveredBehavior === "allow"
+            ? "user-approved"
+            : "user-denied",
+        source: policyForcedDeny ? "policy-never" : "user",
+      });
+    }
+    if (outcome === "unavailable") {
+      if (pendingProviderRequests.get(key) === pending) pendingProviderRequests.delete(key);
+      pendingProviderSettlements.delete(key, pending);
+      settleUnavailable();
+    }
+    return outcome;
+  });
 }
 
 /** Settle every already-visible permission when Settings enters Never.
@@ -2494,11 +2505,24 @@ async function answerRequest(
  * exact turn must stop rather than race a contradictory denial. */
 async function enforceNeverOnPendingPermissions(): Promise<void> {
   for (const pending of [...pendingProviderRequests.values()]) {
+    const key = providerRequestKey(pending.threadId, pending.requestId);
+    const settling = pendingProviderSettlements.get(key);
+    if (settling?.generation === pending) {
+      await settling.promise.catch(() => "unavailable" as const);
+      // The first response owns the request. Never must not send a second
+      // denial after an in-flight Allow; stop the exact turn instead.
+      if (settling.behavior === "allow") {
+        const instance = registry.get(pending.instanceId);
+        await instance?.adapter.interruptTurn(pending.threadId).catch(() => {});
+      }
+      continue;
+    }
     if (!pending.messageId) {
       const instance = registry.get(pending.instanceId);
       await instance?.adapter.interruptTurn(pending.threadId).catch(() => {});
       if (pendingProviderRequest(pending.threadId, pending.requestId) === pending) {
         pendingProviderRequests.delete(providerRequestKey(pending.threadId, pending.requestId));
+        pendingProviderSettlements.delete(providerRequestKey(pending.threadId, pending.requestId));
       }
       continue;
     }
@@ -2529,6 +2553,7 @@ function closeOpenApprovals(threadId: string): void {
     store.patchMessage(threadId, message.id, { card: { ...card, answered: "unavailable", dismissed: true } });
     const key = providerRequestKey(threadId, card.requestId);
     if (pendingProviderRequests.get(key)?.messageId === message.id) pendingProviderRequests.delete(key);
+    pendingProviderSettlements.delete(key);
   }
 }
 
@@ -2544,6 +2569,7 @@ INTERNAL_CAPABILITY_TURNS.onFinished((turn) => {
       }
     }
     pendingProviderRequests.delete(key);
+    pendingProviderSettlements.delete(key);
   }
 });
 
@@ -3339,106 +3365,114 @@ bus.subscribe((event: RuntimeEvent) => {
         // Claiming approval first and correcting later means a moment
         // where the transcript says "approved" over a request nothing
         // answered — and if the provider is gone entirely, forever.
-        void (async () => {
-          let automaticBehavior: "allow" | "deny" = policyResolution.decision === "auto" ? "allow" : "deny";
-          let settled = policyResolution.decision === "auto"
-            ? policyResolution.autoApproval
-            : "denied by the fleet permission policy";
-          try {
-            if (!instance) throw new Error("provider unavailable");
-            if (
-              pendingProviderRequest(event.threadId, requestId) !== pending ||
-              !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
-            ) throw new Error("the ask is no longer owned by this turn");
-            // Re-resolve at the last synchronous boundary before delivery.
-            // Settings can change after request.opened but before this task
-            // runs; a stale automatic Allow must never cross Ask or Never.
-            const latestResolution = resolvePermission(currentPermissionPolicy(), verdict!, {
-              unattended,
-              physicalComputer: event.approvalScope === "local-computer",
-            });
-            if (latestResolution.decision === "ask") throw new Error("permission policy now requires a human");
-            automaticBehavior = latestResolution.decision === "auto" ? "allow" : "deny";
-            settled = latestResolution.decision === "auto"
-              ? latestResolution.autoApproval
+        const initialAutomaticBehavior: "allow" | "deny" = policyResolution.decision === "auto" ? "allow" : "deny";
+        void pendingProviderSettlements.settle(
+          providerRequestKey(event.threadId, requestId),
+          pending,
+          initialAutomaticBehavior,
+          async () => {
+            let automaticBehavior: "allow" | "deny" = initialAutomaticBehavior;
+            let settled = policyResolution.decision === "auto"
+              ? policyResolution.autoApproval
               : "denied by the fleet permission policy";
-            const outcome = await TURN_EXTERNAL_OPERATIONS.run(
-              eventTurn,
-              () => instance.adapter.respondToRequest(event.threadId, requestId, { behavior: automaticBehavior }),
-            );
-            if (outcome === "unavailable") throw new Error("the ask is no longer open");
-            const current = pendingProviderRequest(event.threadId, requestId);
-            if (current && current !== pending) throw new Error("a newer ask reused this request id");
-            pushMessage({
-              role: "bot",
-              kind: "activity",
-              tool: { name: `${settled}: ${summary.slice(0, 120)}`, ok: automaticBehavior === "allow" },
-            });
-            // logged under the same discipline as the chip: only once the
-            // provider has actually taken the answer, so the audit log
-            // never claims an approval nothing received
-            appendDecision(DATA_DIR, {
-              threadId: event.threadId,
-              requestId,
-              botId: asker.id,
-              botName: asker.name,
-              tool,
-              summary,
-              decision: automaticBehavior === "allow" ? "auto-approved" : "policy-denied",
-              // Preserve the narrow rule that actually authorized the call
-              // (remembered grant versus auto mode). The global Always mode
-              // is the ceiling that permitted that verdict, not a substitute
-              // for its more useful audit provenance.
-              source: automaticBehavior === "allow" ? verdict!.source : "policy-never",
-              rule: verdict?.rule,
-            });
-          } catch {
-            if (
-              pendingProviderRequest(event.threadId, requestId) !== pending ||
-              !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
-            ) return;
-            if (automaticBehavior === "deny") {
-              // Never must not degrade into an approval card. If the engine
-              // cannot receive the denial, stop its turn so the guarded
-              // request cannot remain live behind a misleading UI state.
-              void instance?.adapter.interruptTurn(event.threadId).catch(() => {});
+            try {
+              if (!instance) throw new Error("provider unavailable");
+              if (
+                pendingProviderRequest(event.threadId, requestId) !== pending ||
+                !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
+              ) throw new Error("the ask is no longer owned by this turn");
+              // Re-resolve at the last synchronous boundary before delivery.
+              // Settings can change after request.opened but before this task
+              // runs; a stale automatic Allow must never cross Ask or Never.
+              const latestResolution = resolvePermission(currentPermissionPolicy(), verdict!, {
+                unattended,
+                physicalComputer: event.approvalScope === "local-computer",
+              });
+              if (latestResolution.decision === "ask") throw new Error("permission policy now requires a human");
+              automaticBehavior = latestResolution.decision === "auto" ? "allow" : "deny";
+              settled = latestResolution.decision === "auto"
+                ? latestResolution.autoApproval
+                : "denied by the fleet permission policy";
+              const outcome = await TURN_EXTERNAL_OPERATIONS.run(
+                eventTurn,
+                () => instance.adapter.respondToRequest(event.threadId, requestId, { behavior: automaticBehavior }),
+              );
+              if (outcome === "unavailable") throw new Error("the ask is no longer open");
+              const current = pendingProviderRequest(event.threadId, requestId);
+              if (current && current !== pending) throw new Error("a newer ask reused this request id");
               pushMessage({
                 role: "bot",
                 kind: "activity",
-                tool: { name: "Permission denied; the provider could not acknowledge the denial, so the turn was stopped.", ok: false },
+                tool: { name: `${settled}: ${summary.slice(0, 120)}`, ok: automaticBehavior === "allow" },
               });
-              return;
-            }
-            // couldn't auto-approve it — hand it back to the human rather
-            // than leaving the bot waiting on nobody
-            const card = pushMessage({
-              role: "bot",
-              kind: "options",
-              card: {
-                title: "Approval needed",
-                subtitle: summary,
-                options: ["Allow", "Deny"],
+              // logged under the same discipline as the chip: only once the
+              // provider has actually taken the answer, so the audit log
+              // never claims an approval nothing received
+              appendDecision(DATA_DIR, {
+                threadId: event.threadId,
                 requestId,
+                botId: asker.id,
+                botName: asker.name,
                 tool,
-                allowKey: approvalKey(tool, summary, event.approvalScope),
-                held: "Auto mode couldn't answer this one.",
-                approvalScope: event.approvalScope,
-              },
-            });
-            installPendingProviderRequest({ ...pending, messageId: card.id });
-            appendDecision(DATA_DIR, {
-              threadId: event.threadId,
-              requestId,
-              botId: asker.id,
-              botName: asker.name,
-              tool,
-              summary,
-              decision: "card-shown",
-              source: "auto-fallback",
-              rule: verdict?.rule,
-            });
-          }
-        })();
+                summary,
+                decision: automaticBehavior === "allow" ? "auto-approved" : "policy-denied",
+                // Preserve the narrow rule that actually authorized the call
+                // (remembered grant versus auto mode). The global Always mode
+                // is the ceiling that permitted that verdict, not a substitute
+                // for its more useful audit provenance.
+                source: automaticBehavior === "allow" ? verdict!.source : "policy-never",
+                rule: verdict?.rule,
+              });
+              return outcome;
+            } catch {
+              if (
+                pendingProviderRequest(event.threadId, requestId) !== pending ||
+                !INTERNAL_CAPABILITY_TURNS.isActive(eventTurn)
+              ) return "unavailable";
+              if (automaticBehavior === "deny") {
+                // Never must not degrade into an approval card. If the engine
+                // cannot receive the denial, stop its turn so the guarded
+                // request cannot remain live behind a misleading UI state.
+                void instance?.adapter.interruptTurn(event.threadId).catch(() => {});
+                pushMessage({
+                  role: "bot",
+                  kind: "activity",
+                  tool: { name: "Permission denied; the provider could not acknowledge the denial, so the turn was stopped.", ok: false },
+                });
+                return "unavailable";
+              }
+              // couldn't auto-approve it — hand it back to the human rather
+              // than leaving the bot waiting on nobody
+              const card = pushMessage({
+                role: "bot",
+                kind: "options",
+                card: {
+                  title: "Approval needed",
+                  subtitle: summary,
+                  options: ["Allow", "Deny"],
+                  requestId,
+                  tool,
+                  allowKey: approvalKey(tool, summary, event.approvalScope),
+                  held: "Auto mode couldn't answer this one.",
+                  approvalScope: event.approvalScope,
+                },
+              });
+              installPendingProviderRequest({ ...pending, messageId: card.id });
+              appendDecision(DATA_DIR, {
+                threadId: event.threadId,
+                requestId,
+                botId: asker.id,
+                botName: asker.name,
+                tool,
+                summary,
+                decision: "card-shown",
+                source: "auto-fallback",
+                rule: verdict?.rule,
+              });
+              return "unavailable";
+            }
+          },
+        );
         break;
       }
       const message = pushMessage({
@@ -3531,7 +3565,9 @@ bus.subscribe((event: RuntimeEvent) => {
           });
         }
         if (event.requestId && pendingProviderRequest(event.threadId, event.requestId) === pending) {
-          pendingProviderRequests.delete(providerRequestKey(event.threadId, event.requestId));
+          const key = providerRequestKey(event.threadId, event.requestId);
+          pendingProviderRequests.delete(key);
+          pendingProviderSettlements.delete(key);
         }
       }
       break;
@@ -5798,6 +5834,14 @@ function permissionPolicyForRequested(requested: "never" | "ask" | "always") {
     ? "always"
     : parsePermissionPolicy(rawCeiling) ?? "never";
   return resolvePermissionPolicy(requested, adminCeiling);
+}
+
+function isMoreRestrictivePermissionPolicy(
+  next: ReturnType<typeof resolvePermissionPolicy>,
+  previous: ReturnType<typeof resolvePermissionPolicy>,
+): boolean {
+  const rank = { never: 0, ask: 1, always: 2 } as const;
+  return rank[next.effective] < rank[previous.effective];
 }
 
 /** Platform metadata travels with engine rows so a remote Mac controller
@@ -9801,11 +9845,14 @@ const server = createServer(async (req, res) => {
       providerConfigBusy = true;
       const previousPermissionPolicy = currentPermissionPolicy();
       if (patch.permissions?.policy) {
-        // Publish the target authority before the first await. Permission
-        // delivery paths consult this fence, so a concurrently open card or
-        // queued automatic answer cannot use the old policy while Settings
-        // is being committed.
-        permissionPolicyMutationFence = permissionPolicyForRequested(patch.permissions.policy);
+        const targetPermissionPolicy = permissionPolicyForRequested(patch.permissions.policy);
+        // A restrictive target fences delivery before the first await. A
+        // permissive target does not become authority until saveConfig and
+        // loadConfig both succeed, so a failed combined settings request can
+        // never transiently grant broader execution rights.
+        if (isMoreRestrictivePermissionPolicy(targetPermissionPolicy, previousPermissionPolicy)) {
+          permissionPolicyMutationFence = targetPermissionPolicy;
+        }
       }
       const requestedComposioKey = patch.composio?.apiKey;
       const changingLocalVmMode = patch.localVm?.mode !== undefined && patch.localVm.mode !== localVmMode(cfg);

@@ -13,20 +13,27 @@ describe("fleet permission policy wiring", () => {
 
   it("runs every permission through the policy resolver before provider response", () => {
     expect(source).toContain("resolvePermission(permissionState, verdict");
-    expect(source).toContain('let automaticBehavior: "allow" | "deny" = policyResolution.decision === "auto" ? "allow" : "deny"');
+    expect(source).toContain('const initialAutomaticBehavior: "allow" | "deny" = policyResolution.decision === "auto" ? "allow" : "deny"');
     expect(source).toContain("respondToRequest(event.threadId, requestId, { behavior: automaticBehavior })");
     expect(source).toContain('physicalComputer: event.approvalScope === "local-computer"');
   });
 
   it("never degrades a failed policy denial into an approval card", () => {
-    expect(source).toMatch(/if \(automaticBehavior === "deny"\)[\s\S]*?interruptTurn\(event\.threadId\)[\s\S]*?return;[\s\S]*?const card = pushMessage/);
+    expect(source).toMatch(/if \(automaticBehavior === "deny"\)[\s\S]*?interruptTurn\(event\.threadId\)[\s\S]*?return "unavailable";[\s\S]*?const card = pushMessage/);
     expect(source).toContain('decision: automaticBehavior === "allow" ? "auto-approved" : "policy-denied"');
   });
 
   it("fences policy mutation and rechecks authority at the delivery boundary", () => {
-    expect(source).toContain("permissionPolicyMutationFence = permissionPolicyForRequested(patch.permissions.policy)");
+    expect(source).toContain("isMoreRestrictivePermissionPolicy(targetPermissionPolicy, previousPermissionPolicy)");
+    expect(source).toContain("permissionPolicyMutationFence = targetPermissionPolicy");
     expect(source).toContain("const latestResolution = resolvePermission(currentPermissionPolicy(), verdict!");
     expect(source).toContain('behavior === "allow" && currentPermissionPolicy().effective === "never"');
     expect(source).toContain("await enforceNeverOnPendingPermissions()");
+  });
+
+  it("serializes every provider request generation before delivery", () => {
+    expect(source).toContain("pendingProviderSettlements.settle(key, pending, deliveredBehavior");
+    expect(source).toContain("pendingProviderSettlements.settle(");
+    expect(source).toContain("if (settling?.generation === pending)");
   });
 });
