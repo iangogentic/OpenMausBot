@@ -396,6 +396,7 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toMatch(/def guarded_dispatch[\s\S]*if not _allowed_tool\(function_name\)/);
     expect(HERMES_POLICY_PYTHON).toContain('name.startswith("mcp_")');
     expect(HERMES_POLICY_PYTHON).toContain("guard._is_idempotent = lambda name");
+    expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_operator_delegate_computer"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_get_desktop_state"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_context_store_stats"');
     expect(HERMES_POLICY_PYTHON).toContain("tool_search_module._core_tool_names = guarded_core_tool_names");

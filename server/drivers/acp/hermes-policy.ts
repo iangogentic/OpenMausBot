@@ -85,6 +85,11 @@ _ALLOWED_NATIVE = frozenset({
     "tool_search", "tool_describe", "tool_call",
 })
 _PINNED_MCP = frozenset({
+    # When the parent delegates visual work to a dedicated operator this is
+    # the only computer action it can take. Keep it in the compact rail so a
+    # local model can follow the system prompt directly instead of getting
+    # trapped searching the deferred catalog for delegate_computer.
+    "mcp_computer_operator_delegate_computer",
     # Common computer perception and control must remain directly visible to
     # local models; the complete catalog stays available through tool_search.
     "mcp_computer_get_desktop_state", "mcp_computer_get_screen_size",
