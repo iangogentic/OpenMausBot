@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   readSelectedConversationId,
@@ -17,6 +17,10 @@ describe("selected conversation persistence", () => {
     values.clear();
     vi.clearAllMocks();
     vi.stubGlobal("window", { localStorage: fakeStorage });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("restores the last non-empty conversation after a renderer reload", () => {
