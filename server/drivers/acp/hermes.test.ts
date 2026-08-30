@@ -249,10 +249,11 @@ describe("Hermes injected vision capability", () => {
     return { HERMES_HOME: root, OPENMAUSBOT_HERMES_POLICY: "1" };
   };
 
-  it("marks only the desktop2 Qwen injected model as vision-capable", () => {
+  it("marks only audited desktop2 Qwen aliases as vision-capable", () => {
     const qwenEnv = isolated();
     ensureHermesInjectProvider("desktop2_qwen::qwen3.8-27b-abliterated", qwenEnv);
     const qwen = parseYaml(readFileSync(join(qwenEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(qwen.model.supports_vision).toBe(true);
     expect(qwen.providers.desktop2_qwen.models["qwen3.8-27b-abliterated"].supports_vision).toBe(true);
 
     const sparkEnv = isolated();
@@ -260,6 +261,30 @@ describe("Hermes injected vision capability", () => {
     const spark = parseYaml(readFileSync(join(sparkEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
     expect(spark.providers.spark_glm.models).toBeUndefined();
     expect(spark.model.supports_vision).toBeUndefined();
+
+    const unknownEnv = isolated();
+    ensureHermesInjectProvider("desktop2_qwen::unknown-text-model", unknownEnv);
+    const unknown = parseYaml(readFileSync(join(unknownEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(unknown.model.supports_vision).toBeUndefined();
+    expect(unknown.providers.desktop2_qwen.models).toBeUndefined();
+  });
+
+  it("does not retain route-specific vision or token limits when one durable profile switches models", () => {
+    const env = isolated();
+    ensureHermesInjectProvider("desktop2_qwen::qwen-quality-canary", env);
+    let config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(config.model.supports_vision).toBe(true);
+    expect(config.model.max_tokens).toBeUndefined();
+
+    ensureHermesInjectProvider("spark_glm::glm53-ablit", env);
+    config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(config.model.supports_vision).toBeUndefined();
+    expect(config.model.max_tokens).toBe(4_096);
+
+    ensureHermesInjectProvider("desktop2_qwen::qwen3.8-27b", env);
+    config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(config.model.supports_vision).toBe(true);
+    expect(config.model.max_tokens).toBeUndefined();
   });
 });
 
@@ -401,6 +426,7 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toContain("guard._is_idempotent = lambda name");
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_operator_delegate_computer"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_get_desktop_state"');
+    expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_get_accessibility_tree", "mcp_computer_zoom"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_context_store_stats"');
     expect(HERMES_POLICY_PYTHON).toContain("tool_search_module._core_tool_names = guarded_core_tool_names");
     expect(HERMES_POLICY_PYTHON).toContain('code="openmaus_search_loop_halt"');

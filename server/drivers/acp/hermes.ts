@@ -105,6 +105,11 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
   const modelConfig = previous && typeof previous === "object" && !Array.isArray(previous)
     ? { ...(previous as Record<string, unknown>) }
     : {};
+  // These are active-route properties owned by OpenMaus policy. A Hermes HOME
+  // is durable and may later switch providers, so never inherit either value
+  // from the previous route.
+  delete modelConfig.max_tokens;
+  delete modelConfig.supports_vision;
   config.model = {
     ...modelConfig,
     default: model,
@@ -122,7 +127,18 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
   // absent from models.dev, and otherwise replaces every screenshot with a
   // text-only fallback. Scope the declaration to this exact injected route;
   // Spark GLM remains deliberately text-only.
-  if (hostId === "desktop2_qwen") {
+  const desktop2VisionModel = hostId === "desktop2_qwen" && new Set([
+    "qwen-quality-canary",
+    "qwen3.8-27b-abliterated",
+    "qwen3.8-27b",
+  ]).has(model.toLowerCase());
+  if (desktop2VisionModel) {
+    // Hermes normalizes `custom:desktop2_qwen` to the runtime provider
+    // `custom`, but its current per-provider capability lookup does not strip
+    // the configured prefix before indexing `providers`. Also set the
+    // documented active-model shortcut so screenshots reach Qwen today; keep
+    // the precise per-model declaration below for forward compatibility.
+    (config.model as Record<string, unknown>).supports_vision = true;
     const providers = config.providers && typeof config.providers === "object" && !Array.isArray(config.providers)
       ? { ...(config.providers as Record<string, unknown>) }
       : {};

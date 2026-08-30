@@ -94,6 +94,7 @@ _PINNED_MCP = frozenset({
     # Common computer perception and control must remain directly visible to
     # local models; the complete catalog stays available through tool_search.
     "mcp_computer_get_desktop_state", "mcp_computer_get_screen_size",
+    "mcp_computer_get_accessibility_tree", "mcp_computer_zoom",
     "mcp_computer_verify_state", "mcp_computer_list_apps",
     "mcp_computer_list_windows", "mcp_computer_launch_app",
     "mcp_computer_bring_to_front", "mcp_computer_click",
@@ -131,6 +132,7 @@ _VISUAL_OBSERVATION_TOOLS = frozenset({
     "mcp_computer_get_browser_state",
     "mcp_computer_screenshot",
     "mcp_computer_zoom",
+    "mcp_computer_get_accessibility_tree",
 })
 _MUTATING_COMPUTER_TOOLS = frozenset({
     "mcp_computer_bring_to_front", "mcp_computer_browser_click",

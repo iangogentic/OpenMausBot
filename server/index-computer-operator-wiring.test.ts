@@ -69,6 +69,8 @@ describe("production computer operator wiring", () => {
   it("allows one delegated outcome per parent turn and removes contradictory Hermes memory instructions", () => {
     expect(source).toContain("consumeComputerOperatorTurn(context)");
     expect(source).toContain("Call delegate_computer exactly once");
+    expect(source).toContain("use mcp_computer_zoom for a focused fresh observation");
+    expect(source).toContain("mcp_computer_get_accessibility_tree for native text");
     expect(source).toContain('privateWorkspace && instance.driverKind !== "hermesAgent"');
     expect(source).toContain('workspace && instance.driverKind !== "hermesAgent"');
     expect(source).toContain('includeRoot: Boolean(workspace) && instance.driverKind !== "hermesAgent"');
