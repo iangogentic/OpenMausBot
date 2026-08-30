@@ -71,6 +71,8 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("Call delegate_computer exactly once");
     expect(source).toContain("use mcp_computer_zoom for a focused fresh observation");
     expect(source).toContain("mcp_computer_get_accessibility_tree for native text");
+    expect(source).toContain("does not accept pid or window filters");
+    expect(source).toContain("As soon as the delegated outcome is proven, stop observing and report it");
     expect(source).toContain('privateWorkspace && instance.driverKind !== "hermesAgent"');
     expect(source).toContain('workspace && instance.driverKind !== "hermesAgent"');
     expect(source).toContain('includeRoot: Boolean(workspace) && instance.driverKind !== "hermesAgent"');
