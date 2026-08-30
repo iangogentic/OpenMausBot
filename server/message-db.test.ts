@@ -167,6 +167,18 @@ describe("message-db", () => {
     expect(searchMessages("never-index-this-token")).toEqual([]);
   });
 
+  it("indexes attachment basenames without exposing their private directories", () => {
+    insertMessage("paths", msg(
+      "m1",
+      'review this\n\n<attached-file path="/var/lib/openmausbot/uploaded-files/123e4567-e89b-12d3-a456-426614174000-quarterly-plan.xlsx" />',
+    ));
+    expect(searchMessages("var/lib/openmausbot")).toEqual([]);
+    const hit = searchMessages("quarterly-plan.xlsx")[0];
+    expect(hit).toMatchObject({ threadId: "paths", messageId: "m1" });
+    expect(hit.snippet).toContain("quarterly-plan.xlsx");
+    expect(hit.snippet).not.toContain("/var/lib");
+  });
+
   it("Store round-trips branching through the DB across a restart", () => {
     const store = new Store(selection);
     const bot = store.createBot();

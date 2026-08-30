@@ -50,7 +50,7 @@ function open(): DatabaseSync {
       thread_id TEXT PRIMARY KEY,
       active_leaf_id TEXT
     );
-    CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
+    CREATE VIRTUAL TABLE IF NOT EXISTS message_search_v2 USING fts5(
       thread_id UNINDEXED,
       message_id UNINDEXED,
       body,
@@ -60,8 +60,11 @@ function open(): DatabaseSync {
   // The index is derived state. Rebuild when upgrading an existing database
   // or recovering from a crash between the transcript write and index write.
   const messageCount = (db.prepare("SELECT count(*) AS count FROM messages").get() as { count: number }).count;
-  const searchCount = (db.prepare("SELECT count(*) AS count FROM message_search").get() as { count: number }).count;
+  const searchCount = (db.prepare("SELECT count(*) AS count FROM message_search_v2").get() as { count: number }).count;
   if (messageCount !== searchCount) rebuildSearchIndex(db);
+  // v1 indexed raw attachment tags, including private parent directories.
+  // Once the redacted index is durable, remove that derived legacy table.
+  db.exec("DROP TABLE IF EXISTS message_search");
   return db;
 }
 
@@ -75,9 +78,33 @@ function searchableRowText(text: string | null, json: string): string {
   const message = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
   const tool = message?.tool && typeof message.tool === "object" ? message.tool as Record<string, unknown> : null;
   const from = message?.from && typeof message.from === "object" ? message.from as Record<string, unknown> : null;
-  return [text, typeof tool?.name === "string" ? tool.name : null, typeof from?.name === "string" ? from.name : null]
+  return [visibleSearchText(text), typeof tool?.name === "string" ? tool.name : null, typeof from?.name === "string" ? from.name : null]
     .filter((part): part is string => Boolean(part))
     .join("\n");
+}
+
+/** Transcript attachment tags contain real Mac/Razer paths for the model.
+ * Search may index the useful basename, never the private parent directories. */
+function visibleSearchText(text: string | null): string | null {
+  if (!text) return text;
+  return text.replace(
+    /<attached-(?:image|file)\s+path="([^"]*)"\s*\/?>(?:\s*\n)?/g,
+    (_tag, encodedPath: string) => {
+      const encodedName = encodedPath.split(/[\\/]/).at(-1) ?? "";
+      const name = encodedName
+        .replaceAll("&#9;", " ")
+        .replaceAll("&#10;", " ")
+        .replaceAll("&#13;", " ")
+        .replaceAll("&quot;", '"')
+        .replaceAll("&lt;", "<")
+        .replaceAll("&gt;", ">")
+        .replaceAll("&amp;", "&")
+        .replace(/[\0-\x1f\x7f]/g, "")
+        .replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-/i, "")
+        .slice(0, 180);
+      return name ? `[attachment: ${name}]` : "[attachment]";
+    },
+  );
 }
 
 function rebuildSearchIndex(database: DatabaseSync): void {
@@ -87,10 +114,10 @@ function rebuildSearchIndex(database: DatabaseSync): void {
     text: string | null;
     json: string;
   }>;
-  const insert = database.prepare("INSERT INTO message_search (thread_id, message_id, body) VALUES (?, ?, ?)");
+  const insert = database.prepare("INSERT INTO message_search_v2 (thread_id, message_id, body) VALUES (?, ?, ?)");
   database.exec("BEGIN");
   try {
-    database.exec("DELETE FROM message_search");
+    database.exec("DELETE FROM message_search_v2");
     for (const row of rows) insert.run(row.thread_id, row.id, searchableRowText(row.text, row.json));
     database.exec("COMMIT");
   } catch (error) {
@@ -100,8 +127,8 @@ function rebuildSearchIndex(database: DatabaseSync): void {
 }
 
 function indexMessage(database: DatabaseSync, threadId: string, message: Message): void {
-  database.prepare("DELETE FROM message_search WHERE thread_id = ? AND message_id = ?").run(threadId, message.id);
-  database.prepare("INSERT INTO message_search (thread_id, message_id, body) VALUES (?, ?, ?)")
+  database.prepare("DELETE FROM message_search_v2 WHERE thread_id = ? AND message_id = ?").run(threadId, message.id);
+  database.prepare("INSERT INTO message_search_v2 (thread_id, message_id, body) VALUES (?, ?, ?)")
     .run(threadId, message.id, searchableRowText(message.text ?? null, JSON.stringify(message)));
 }
 
@@ -156,7 +183,7 @@ function importLegacy(threadId: string, legacyFile: string): ThreadRows {
   const insert = db().prepare(
     "INSERT OR REPLACE INTO messages (thread_id, id, at, role, kind, text, json) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
-  const index = db().prepare("INSERT INTO message_search (thread_id, message_id, body) VALUES (?, ?, ?)");
+  const index = db().prepare("INSERT INTO message_search_v2 (thread_id, message_id, body) VALUES (?, ?, ?)");
   db().exec("BEGIN");
   try {
     for (const message of messages) {
@@ -225,7 +252,7 @@ export function deleteThread(threadId: string): void {
   database.exec("BEGIN IMMEDIATE");
   try {
     database.prepare("DELETE FROM messages WHERE thread_id = ?").run(threadId);
-    database.prepare("DELETE FROM message_search WHERE thread_id = ?").run(threadId);
+    database.prepare("DELETE FROM message_search_v2 WHERE thread_id = ?").run(threadId);
     database.prepare("DELETE FROM thread_state WHERE thread_id = ?").run(threadId);
     database.exec("COMMIT");
   } catch (error) {
@@ -272,7 +299,7 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     )
     : database.prepare(
       "SELECT m.thread_id, m.id, m.at, m.role, m.kind, m.text, json_extract(m.json, '$.tool.name') AS tool_name, json_extract(m.json, '$.from.name') AS from_name " +
-        "FROM message_search s JOIN messages m ON m.thread_id = s.thread_id AND m.id = s.message_id " +
+        "FROM message_search_v2 s JOIN messages m ON m.thread_id = s.thread_id AND m.id = s.message_id " +
         `WHERE ${scope}s.body MATCH ? ORDER BY m.at DESC LIMIT ?`,
     );
   const ftsQuery = `"${needle.replace(/"/g, '""')}"`;
@@ -289,7 +316,7 @@ export function searchMessages(query: string, limit = 40, threadId?: string): Se
     from_name: string | null;
   }>;
   return rows.map((row) => {
-    const haystack = [row.text, row.tool_name, row.from_name].filter(Boolean).join("\n");
+    const haystack = [visibleSearchText(row.text), row.tool_name, row.from_name].filter(Boolean).join("\n");
     const hitAt = Math.max(0, haystack.toLowerCase().indexOf(needle));
     const start = Math.max(0, hitAt - 60);
     const end = Math.min(haystack.length, hitAt + needle.length + 90);
