@@ -639,7 +639,7 @@ function dismissOnboardingCard(state: AppState, botId: string): AppState {
   return quiz ? patchCard(state, botId, quiz.id, { dismissed: true }) : state;
 }
 
-export function reducer(state: AppState, action: Action): AppState {
+function reduceAppState(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "hydrate": {
       const known = (id: string) => action.bots.some((b) => b.id === id) || action.groups.some((g) => g.id === id);
@@ -1223,6 +1223,32 @@ export function reducer(state: AppState, action: Action): AppState {
   }
 }
 
+/**
+ * Screen pixels are useful only while the Computer panel is visible. Keep the
+ * privacy boundary in the reducer rather than relying on an effect cleanup:
+ * an in-flight hydration response or a final event from a closing stream then
+ * cannot put pixels or a cursor back into hidden application state.
+ */
+function withoutHiddenComputerPixels(state: AppState): AppState {
+  if (computerPanelVisible(state)) return state;
+  if (Object.keys(state.screens).length === 0 && Object.keys(state.computerChildVisuals).length === 0) {
+    return state;
+  }
+  return { ...state, screens: {}, computerChildVisuals: {} };
+}
+
+export function reducer(state: AppState, action: Action): AppState {
+  return withoutHiddenComputerPixels(reduceAppState(state, action));
+}
+
+/** Matches App's actual ComputerPanel mount condition, not just its toggle. */
+export function computerPanelVisible(
+  state: Pick<AppState, "computerOpen" | "selectedId" | "bots">,
+): boolean {
+  return state.computerOpen &&
+    state.bots.some((bot) => bot.id === state.selectedId);
+}
+
 /** Newest screen frames whose pixels stay in memory per thread. */
 const MAX_KEPT_SCREEN_FRAMES = 8;
 
@@ -1266,6 +1292,11 @@ export async function api(path: string, init?: RequestInit): Promise<any> {
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
   return body;
+}
+
+/** Exact main-renderer transport URL for the current Computer-panel state. */
+export function screenTransportUrl(path: "/api/bots" | "/api/events", screensEnabled: boolean): string {
+  return `${path}?screens=${screensEnabled ? "on" : "off"}`;
 }
 
 /** Per-frame stream state lives in its OWN context: token frames update only
@@ -1365,6 +1396,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }),
     [],
   );
+  const computerScreensVisible = computerPanelVisible(state);
 
   useEffect(() => {
     // StrictMode's dev probe runs this cleanup once against the same memoized
@@ -1716,7 +1748,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     let alive = true;
     const loadAll = () =>
       Promise.all([
-        api("/api/bots")
+        api(screenTransportUrl("/api/bots", computerScreensVisible))
           .then(({ bots, groups, computerControl, computerChildren, computerChildVisuals }) =>
             alive && rawDispatch({
               type: "hydrate",
@@ -1777,7 +1809,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // gap before that connection opened.
     const hydrationFallback = setTimeout(hydrate, 1_000);
 
-    const es = new EventSource("/api/events");
+    const es = new EventSource(screenTransportUrl("/api/events", computerScreensVisible));
     // The hydrate decision belongs to the hello frame, not to onopen: the
     // server replays what we missed when it can, and re-downloading every
     // transcript on a reconnect it already covered is pure waste.
@@ -1992,7 +2024,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       clearTimeout(hydrationFallback);
       es.close();
     };
-  }, []);
+  }, [computerScreensVisible]);
 
   // Re-probe the engines on demand. A CLI installed while the app is running
   // is invisible until something asks again — the setup screens expose this

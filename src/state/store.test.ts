@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   botDeletionConfirmation,
+  computerPanelVisible,
   configStatusFromFrame,
   initialState,
   openNotificationTarget,
   reducer,
+  screenTransportUrl,
   type Bot,
   type Message,
 } from "./store";
@@ -20,6 +22,15 @@ function childMonitor(index: number, status: ComputerChildMonitor["status"] = "c
     actionLimit: 9,
     leaseHeld: status === "running",
     createdAt: index,
+  };
+}
+
+function openComputerState() {
+  return {
+    ...initialState,
+    bots: [{ id: "bot" } as Bot],
+    selectedId: "bot",
+    computerOpen: true,
   };
 }
 
@@ -46,7 +57,7 @@ describe("computer child monitor fold", () => {
       seq: 2,
       at: 2,
     };
-    let state = reducer(initialState, {
+    let state = reducer(openComputerState(), {
       type: "computerChild",
       monitor: { ...childMonitor(0, "running"), childId: "child" },
     });
@@ -73,7 +84,7 @@ describe("computer child monitor fold", () => {
   });
 
   it("bounds delegated pixels to the server cap and rejects orphan telemetry", () => {
-    let state = initialState;
+    let state = openComputerState();
     const frame = {
       mime: "image/png" as const,
       data: "aGVsbG8=",
@@ -108,7 +119,10 @@ describe("computer child monitor fold", () => {
   });
 
   it("removes delegated pixels when bounded monitor history prunes their owner", () => {
-    let state = reducer(initialState, { type: "computerChild", monitor: childMonitor(0) });
+    let state = reducer(
+      openComputerState(),
+      { type: "computerChild", monitor: childMonitor(0) },
+    );
     state = reducer(state, {
       type: "computerChildFrame",
       childId: "child-0",
@@ -129,6 +143,97 @@ describe("computer child monitor fold", () => {
     }
     expect(state.computerChildren["child-0"]).toBeUndefined();
     expect(state.computerChildVisuals["child-0"]).toBeUndefined();
+  });
+
+  it("clears every retained pixel and cursor atomically when the Computer panel closes", () => {
+    const monitor = { ...childMonitor(0, "running"), childId: "child" };
+    const frame = {
+      mime: "image/png" as const,
+      data: "aGVsbG8=",
+      hash: "a".repeat(64),
+      width: 100,
+      height: 50,
+      seq: 1,
+      at: 1,
+    };
+    let state = reducer(openComputerState(), { type: "computerChild", monitor });
+    state = reducer(state, { type: "computerChildFrame", childId: "child", seq: 1, at: 1, frame });
+    state = reducer(state, {
+      type: "computerChildCursor",
+      childId: "child",
+      seq: 2,
+      at: 2,
+      cursor: { x: 25, y: 10, seq: 2, at: 2 },
+    });
+    state = reducer(state, {
+      type: "screenFrame",
+      botId: "bot",
+      png: "cGl4ZWxz",
+      mime: "image/png",
+      targetKey: "vm:bot",
+      targetGeneration: "generation",
+    });
+
+    state = reducer(state, { type: "toggleComputer", open: false });
+
+    expect(state.computerOpen).toBe(false);
+    expect(state.screens).toEqual({});
+    expect(state.computerChildVisuals).toEqual({});
+
+    // A final frame already queued by the closing EventSource is also denied.
+    const afterLateFrame = reducer(state, {
+      type: "computerChildFrame",
+      childId: "child",
+      seq: 3,
+      at: 3,
+      frame: { ...frame, seq: 3, at: 3 },
+    });
+    expect(afterLateFrame.computerChildVisuals).toEqual({});
+  });
+
+  it("accepts exact delegated visuals from screen-enabled hydration after reopening", () => {
+    const monitor = { ...childMonitor(0, "running"), childId: "child" };
+    const visual = {
+      childId: "child",
+      lastSeq: 8,
+      frame: {
+        mime: "image/png" as const,
+        data: "aGVsbG8=",
+        hash: "b".repeat(64),
+        width: 80,
+        height: 40,
+        seq: 7,
+        at: 7,
+      },
+      cursor: { x: 12, y: 9, seq: 8, at: 8 },
+    };
+    let state = reducer(initialState, { type: "toggleComputer", open: true });
+    state = reducer(state, {
+      type: "hydrate",
+      bots: [{ id: "bot" } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [monitor],
+      computerChildVisuals: [visual],
+    });
+
+    expect(state.computerChildVisuals.child).toEqual(visual);
+  });
+});
+
+describe("main renderer screen transport", () => {
+  it("uses explicit screen-off URLs while hidden and screen-on URLs while visible", () => {
+    expect(screenTransportUrl("/api/events", false)).toBe("/api/events?screens=off");
+    expect(screenTransportUrl("/api/bots", false)).toBe("/api/bots?screens=off");
+    expect(screenTransportUrl("/api/events", true)).toBe("/api/events?screens=on");
+    expect(screenTransportUrl("/api/bots", true)).toBe("/api/bots?screens=on");
+  });
+
+  it("gates on the panel's real mount condition, including selected-bot presence", () => {
+    const visible = openComputerState();
+    expect(computerPanelVisible(visible)).toBe(true);
+    expect(computerPanelVisible({ ...visible, selectedId: "room" })).toBe(false);
+    expect(computerPanelVisible({ ...visible, computerOpen: false })).toBe(false);
   });
 });
 
