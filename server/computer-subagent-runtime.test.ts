@@ -149,12 +149,16 @@ async function settle(child: FakeChild, outcome: ComputerSubagentProviderOutcome
 
 describe("ComputerSubagentRuntime", () => {
   it("keeps a full cleanup and callback margin below the parent Hermes MCP deadline", () => {
+    // Longest successful path: acquire + launch + provider execution, then
+    // terminal proof, two parent fences, final capture + publication,
+    // capability release, callback parent fence, and callback delivery.
     const worstCaseMs = (
       2 * DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS
       + DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS
-      + 6 * DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS
+      + DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS
+      + 7 * DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS
     );
-    expect(HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS - worstCaseMs).toBeGreaterThanOrEqual(60_000);
+    expect(HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS - worstCaseMs).toBeGreaterThanOrEqual(80_000);
   });
 
   it("publishes authority-free snapshots for queued, running, human handoff, terminal, and release", async () => {
