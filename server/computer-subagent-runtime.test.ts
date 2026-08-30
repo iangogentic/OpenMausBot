@@ -287,6 +287,28 @@ describe("ComputerSubagentRuntime", () => {
     expect(h.released).toEqual(["child-first", successor.childId]);
   });
 
+  it("rejects a concurrent steer instead of acknowledging and dropping its prompt", async () => {
+    const h = harness();
+    const first = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "first",
+      childId: "child-concurrent-steer",
+    });
+    await waitForChild(h.children);
+    const accepted = h.runtime.steer(first, "accepted correction");
+    expect(() => h.runtime.steer(first, "must not be dropped")).toThrow(/already steering/);
+    expect(h.manager.get(first.childId)?.pendingSteerCount).toBe(1);
+    h.children[0]!.completionControl.resolve({ status: "aborted", reason: "steer" });
+    h.children[0]!.cleanupControl.resolve();
+    const successor = await accepted;
+    await waitForChild(h.children, 1);
+    expect(h.launched.map((launch) => launch.prompt)).toEqual(["first", "accepted correction"]);
+    await settle(h.children[1]!, { status: "completed" });
+    await successor.done;
+  });
+
   it("keeps one logical steer done and one final callback across an adversarial predecessor race", async () => {
     const h = harness();
     const first = h.runtime.start({ parent, target, operatorModel: { instanceId: "qwen", model: "vision" }, prompt: "first", childId: "chain-first" });

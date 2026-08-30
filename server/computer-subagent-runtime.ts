@@ -148,7 +148,12 @@ export class ComputerSubagentRuntime {
   }
   steer(handle: ComputerSubagentHandle, prompt: string): Promise<ComputerSubagentRuntimeHandle> {
     const execution = this.execution(handle);
-    if (execution.steerPromise) return execution.steerPromise;
+    // Returning the existing promise would acknowledge a second prompt even
+    // though only the first queued prompt can seed the successor. Fail closed
+    // so the caller can retry against that successor instead of losing text.
+    if (execution.steerPromise) {
+      throw new ComputerSubagentStateError(handle.childId, "is already steering; retry after its successor starts");
+    }
     this.manager.queueSteer(handle, prompt);
     execution.steering = true; execution.interruptRequested = true;
     execution.abortController.abort();
