@@ -75,6 +75,7 @@ function harness(overrides: {
   quarantineChild?: () => void | Promise<void>;
   captureFinalScreenshot?: (signal: AbortSignal) => Promise<ComputerSubagentFinalScreenshot>;
   acquireTarget?: (childId: string) => Promise<ComputerSubagentCapabilityDescriptor>;
+  executionTimeoutMs?: number;
 } = {}) {
   const manager = new ComputerSubagentManager();
   const launched: ComputerSubagentProviderLaunchInput[] = [];
@@ -105,6 +106,7 @@ function harness(overrides: {
     isParentCurrent: overrides.isParentCurrent ?? (() => true),
     quarantineChild: overrides.quarantineChild ?? (async () => undefined),
     operationTimeoutMs: 500,
+    executionTimeoutMs: overrides.executionTimeoutMs ?? 500,
     abortGraceMs: 5,
     cleanupTimeoutMs: 50,
     onComplete: (completion) => {
@@ -293,6 +295,96 @@ describe("ComputerSubagentRuntime", () => {
     expect(h.manager.get(handle.childId)?.actionCount).toBe(9);
     await settle(h.children[0]!, { status: "completed" });
     await handle.done;
+  });
+
+  it("bounds provider execution, interrupts once, and releases only after terminal proof", async () => {
+    const h = harness({ executionTimeoutMs: 20 });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-execution-timeout",
+    });
+    const child = await waitForChild(h.children);
+    child.cleanupControl.resolve();
+    const completion = await handle.done;
+    expect(child.interrupted).toBe(true);
+    expect(completion).toMatchObject({
+      status: "failed",
+      error: "provider completion failed: timeout",
+      finalScreenshotCaptured: false,
+    });
+    expect(h.screenshots).toEqual([]);
+    expect(h.released).toEqual([handle.childId]);
+    expect(h.completions).toEqual([{
+      status: "failed",
+      finalScreenshotCaptured: false,
+      childId: handle.childId,
+    }]);
+    expect(h.manager.get(handle.childId)).toMatchObject({ status: "failed", leaseHeld: false });
+    child.completionControl.resolve({ status: "completed", output: "late" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(h.completions).toHaveLength(1);
+    expect(h.screenshots).toEqual([]);
+  });
+
+  it("rejects steer, human handoff, and actions after the execution deadline latches", async () => {
+    const h = harness({ executionTimeoutMs: 20 });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-timeout-fence",
+    });
+    const child = await waitForChild(h.children);
+    await vi.waitFor(() => expect(child.interrupted).toBe(true));
+    expect(() => h.runtime.accountActions(handle)).toThrow("not accepting computer actions");
+    expect(() => h.runtime.steer(handle, "late steer")).toThrow("already stopping");
+    await expect(h.runtime.markWaitingOnHuman(handle, parent)).rejects.toThrow("cannot change human handoff while stopping");
+    child.cleanupControl.resolve();
+    expect((await handle.done)?.status).toBe("failed");
+    expect(h.children).toHaveLength(1);
+  });
+
+  it("keeps a timed-out lease held when cleanup cannot be proven, then allows explicit recovery", async () => {
+    const h = harness({
+      executionTimeoutMs: 10,
+      quarantineChild: async () => { throw new Error("quarantine unavailable"); },
+    });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-timeout-unknown",
+    });
+    await waitForChild(h.children);
+    const completion = await handle.done;
+    expect(completion).toMatchObject({ status: "unknown", finalScreenshotCaptured: false });
+    expect(h.manager.get(handle.childId)).toMatchObject({ status: "unknown", leaseHeld: true });
+    expect(h.screenshots).toEqual([]);
+    await h.runtime.releaseAfterCleanup(handle);
+    expect(h.manager.get(handle.childId)?.leaseHeld).toBe(false);
+  });
+
+  it("clears the execution deadline after normal completion", async () => {
+    const h = harness({ executionTimeoutMs: 200 });
+    const handle = h.runtime.start({
+      parent,
+      target,
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "work",
+      childId: "child-before-timeout",
+    });
+    const child = await waitForChild(h.children);
+    await settle(child, { status: "completed", output: "done" });
+    expect((await handle.done)?.status).toBe("completed");
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    expect(child.interrupted).toBe(false);
+    expect(h.completions).toHaveLength(1);
+    expect(h.screenshots).toEqual([handle.childId]);
   });
 
   it("waits for terminal cleanup before releasing the lease on abort", async () => {

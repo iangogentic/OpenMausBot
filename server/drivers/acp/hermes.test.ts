@@ -740,6 +740,56 @@ mcp_servers:
     expect(() => verifyHermesPolicyProof(proof)).not.toThrow();
   });
 
+  it.runIf(process.platform !== "win32")("keeps the parent computer-operator MCP wait above the hidden execution deadline", () => {
+    const root = scratch();
+    const source = join(root, "source");
+    const runtime = join(root, "runtime");
+    const fakeModules = join(root, "fake-modules");
+    mkdirSync(source, { recursive: true });
+    mkdirSync(runtime, { recursive: true });
+    mkdirSync(join(fakeModules, "tools"), { recursive: true });
+    mkdirSync(join(fakeModules, "acp_adapter"), { recursive: true });
+    const env: Record<string, string | undefined> = {};
+    prepareHermesPolicyEnvironment({
+      env,
+      sourceHome: source,
+      dataDir: runtime,
+      isolationKey: "operator-mcp-timeout",
+      restricted: true,
+      computerMounted: true,
+    });
+    writeFileSync(join(fakeModules, "tools", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "tools", "mcp_tool.py"), [
+      "captured = {}",
+      "def register_mcp_servers(config):",
+      " global captured",
+      " captured = config",
+      " return config",
+      "def _cache_mcp_image_block(block): return 'MEDIA:' + block",
+      "def _existing_tool_names(): return set()",
+      "",
+    ].join("\n"));
+    writeFileSync(join(fakeModules, "model_tools.py"), "def get_tool_definitions(*args, **kwargs): return []\ndef handle_function_call(*args, **kwargs): return '{}'\n");
+    writeFileSync(join(fakeModules, "run_agent.py"), "class AIAgent:\n def __init__(self, *args, **kwargs): self.tools = []\n def _append_guardrail_observation(self, name, args, result, *, failed): return result\n");
+    writeFileSync(join(fakeModules, "acp_adapter", "__init__.py"), "");
+    writeFileSync(join(fakeModules, "acp_adapter", "server.py"), "class HermesACPAgent:\n async def _register_session_mcp_servers(self, state, servers): pass\n");
+    const script = [
+      "import json",
+      "from tools import mcp_tool",
+      "mcp_tool.register_mcp_servers({'computer_operator': {'command': 'proxy'}, 'computer': {'command': 'cua'}})",
+      "print(json.dumps(mcp_tool.captured, sort_keys=True))",
+    ].join("\n");
+    const executed = spawnSync("python3", ["-c", script], {
+      env: { ...process.env, ...env, PYTHONPATH: `${env.PYTHONPATH}:${fakeModules}` },
+      encoding: "utf8",
+    });
+    expect(executed.status, executed.stderr).toBe(0);
+    expect(JSON.parse(executed.stdout.trim())).toEqual({
+      computer: { command: "cua" },
+      computer_operator: { command: "proxy", timeout: 600 },
+    });
+  });
+
   it.runIf(process.platform !== "win32")("bounds visual-only loops and identical computer mutations", () => {
     const root = scratch();
     const source = join(root, "source");

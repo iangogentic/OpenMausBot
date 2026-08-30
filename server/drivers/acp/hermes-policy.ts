@@ -121,6 +121,7 @@ _MCP_IMAGE_PROVENANCE_TTL_SECONDS = 60
 _MCP_IMAGE_PROVENANCE_LIMIT = 128
 _MCP_IMAGE_PROVENANCE = {}
 _MCP_IMAGE_PROVENANCE_LOCK = threading.Lock()
+_COMPUTER_OPERATOR_MCP_TIMEOUT_SECONDS = 600
 _IMAGE_CACHE_HOOK_INSTALLED = False
 _GUARDRAIL_HOOK_INSTALLED = False
 
@@ -392,6 +393,25 @@ def _install():
     except ImportError:
         mcp_tool_module = None
     if mcp_tool_module is not None:
+        original_register_mcp_servers = getattr(mcp_tool_module, "register_mcp_servers", None)
+        if callable(original_register_mcp_servers):
+            def openmaus_register_mcp_servers(config_map):
+                # A local visual operator may legitimately need several model
+                # passes. Its server-side execution deadline is eight minutes;
+                # keep the parent MCP wait above that deadline so it receives
+                # the real terminal result instead of retrying live work at
+                # Hermes' five-minute default.
+                bounded = {
+                    name: dict(config) if isinstance(config, dict) else config
+                    for name, config in dict(config_map or {}).items()
+                }
+                operator = bounded.get("computer_operator")
+                if isinstance(operator, dict):
+                    operator["timeout"] = _COMPUTER_OPERATOR_MCP_TIMEOUT_SECONDS
+                return original_register_mcp_servers(bounded)
+
+            mcp_tool_module.register_mcp_servers = openmaus_register_mcp_servers
+
         original_cache_mcp_image = getattr(mcp_tool_module, "_cache_mcp_image_block", None)
         if callable(original_cache_mcp_image):
             def openmaus_cache_mcp_image(block):

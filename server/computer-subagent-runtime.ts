@@ -5,8 +5,10 @@ import type { ComputerChildMonitor, ComputerChildMonitorListener } from "../shar
 
 export const MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES = 512_000;
 export const DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS = 30_000;
+export const DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 480_000;
 export const DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS = 2_000;
 export const DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS = 10_000;
+export const MAX_COMPUTER_SUBAGENT_TIMEOUT_MS = 900_000;
 
 export interface ComputerSubagentTargetSelection { targetKey: string; targetGeneration: string; boxId?: string }
 export interface ComputerSubagentCapabilityDescriptor extends ComputerSubagentTargetSelection { readonly opaqueCapability: unknown }
@@ -70,6 +72,10 @@ export interface ComputerSubagentRuntimeOptions {
    * Listener failures are isolated from the child runtime. */
   onMonitorChange?: ComputerChildMonitorListener;
   operationTimeoutMs?: number;
+  /** Absolute provider execution budget after launch. This deliberately does
+   * not renew on actions or pause for human takeover: every held target lease
+   * has a hard upper bound below the parent MCP call deadline. */
+  executionTimeoutMs?: number;
   abortGraceMs?: number;
   cleanupTimeoutMs?: number;
 }
@@ -89,6 +95,7 @@ interface Execution {
   interruptPromise: Promise<void> | null;
   interruptRequested: boolean;
   abortRequested: boolean;
+  stopCause: "caller-abort" | "steer" | "execution-timeout" | null;
   steering: boolean;
   acceptingActions: boolean;
   terminalized: boolean;
@@ -131,6 +138,7 @@ export class ComputerSubagentRuntime {
   private readonly onFinalScreenshot?: ComputerSubagentRuntimeOptions["onFinalScreenshot"];
   private readonly onMonitorChange?: ComputerChildMonitorListener;
   private readonly operationTimeoutMs: number;
+  private readonly executionTimeoutMs: number;
   private readonly abortGraceMs: number;
   private readonly cleanupTimeoutMs: number;
   private readonly executions = new Map<string, Execution>();
@@ -142,6 +150,7 @@ export class ComputerSubagentRuntime {
     this.onFinalScreenshot = options.onFinalScreenshot;
     this.onMonitorChange = options.onMonitorChange;
     this.operationTimeoutMs = this.validTimeout(options.operationTimeoutMs ?? DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS, "operationTimeoutMs");
+    this.executionTimeoutMs = this.validExecutionTimeout(options.executionTimeoutMs ?? DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS);
     this.abortGraceMs = this.validTimeout(options.abortGraceMs ?? DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS, "abortGraceMs");
     this.cleanupTimeoutMs = this.validTimeout(options.cleanupTimeoutMs ?? DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS, "cleanupTimeoutMs");
   }
@@ -150,7 +159,7 @@ export class ComputerSubagentRuntime {
   }
   accountActions(handle: ComputerSubagentHandle, amount = 1): number {
     const execution = this.execution(handle);
-    if (!execution.acceptingActions) throw new ComputerSubagentStateError(handle.childId, "is not accepting computer actions");
+    if (execution.stopCause || !execution.acceptingActions) throw new ComputerSubagentStateError(handle.childId, "is not accepting computer actions");
     const count = this.manager.consumeActions(handle, amount);
     const record = this.manager.get(handle.childId);
     if (record) this.publishMonitor(record);
@@ -183,6 +192,7 @@ export class ComputerSubagentRuntime {
   async abort(handle: ComputerSubagentHandle): Promise<ComputerSubagentCompletion | null> {
     const execution = this.execution(handle);
     if (execution.terminalized) return execution.chain.done.promise;
+    if (!this.latchStop(execution, "caller-abort")) return execution.chain.done.promise;
     execution.abortRequested = true; execution.interruptRequested = true;
     execution.abortController.abort();
     void this.interruptIfAvailable(execution);
@@ -196,7 +206,9 @@ export class ComputerSubagentRuntime {
     if (execution.steerPromise) {
       throw new ComputerSubagentStateError(handle.childId, "is already steering; retry after its successor starts");
     }
+    if (execution.stopCause) throw new ComputerSubagentStateError(handle.childId, "is already stopping");
     this.manager.queueSteer(handle, prompt);
+    if (!this.latchStop(execution, "steer")) throw new ComputerSubagentStateError(handle.childId, "is already stopping");
     execution.steering = true; execution.interruptRequested = true;
     execution.abortController.abort();
     execution.steerPromise = this.runSteer(execution);
@@ -220,7 +232,7 @@ export class ComputerSubagentRuntime {
       handle: created.handle,
       input: { parent: cloneParent(input.parent), target: cloneSelection(input.target), operatorModel: cloneModel(input.operatorModel), prompt: input.prompt },
       chain, child: null, target: null, settled: Promise.resolve(null), interruptPromise: null, interruptRequested: false,
-      abortRequested: false, steering: false, acceptingActions: false, terminalized: false, released: false, steerPromise: null,
+      abortRequested: false, stopCause: null, steering: false, acceptingActions: false, terminalized: false, released: false, steerPromise: null,
       abortController: new AbortController(), targetReleased: false, targetReleasePromise: null,
     };
     this.executions.set(execution.handle.childId, execution);
@@ -277,7 +289,12 @@ export class ComputerSubagentRuntime {
     }
 
     execution.acceptingActions = this.manager.get(execution.handle.childId)?.status === "running";
-    const outcomeResult = await this.racePhase(execution, launched.value.completion, 0);
+    const outcomeResult = await this.racePhase(
+      execution,
+      launched.value.completion,
+      this.executionTimeoutMs,
+      () => this.latchStop(execution, "execution-timeout"),
+    );
     execution.acceptingActions = false;
     if (!outcomeResult.ok) {
       const cleaned = await this.stopChild(execution, launched.value);
@@ -295,7 +312,12 @@ export class ComputerSubagentRuntime {
     if (execution.abortRequested && !execution.steering && outcome.status !== "failed") outcome = { status: "aborted", reason: "aborted by caller" };
     return this.finish(execution, outcome, true);
   }
-  private async racePhase<T>(execution: Execution, promise: Promise<T>, timeoutMs: number): Promise<PhaseResult<T>> {
+  private async racePhase<T>(
+    execution: Execution,
+    promise: Promise<T>,
+    timeoutMs: number,
+    onTimeout?: () => void,
+  ): Promise<PhaseResult<T>> {
     return new Promise((resolve) => {
       let settled = false;
       let timeout: ReturnType<typeof setTimeout> | null = null;
@@ -316,6 +338,7 @@ export class ComputerSubagentRuntime {
       if (execution.abortController.signal.aborted) onAbort();
       if (timeoutMs > 0) {
         timeout = setTimeout(() => {
+          onTimeout?.();
           execution.abortController.abort();
           finish({ ok: false, reason: "timeout" });
         }, timeoutMs);
@@ -437,7 +460,7 @@ export class ComputerSubagentRuntime {
   ): Promise<ComputerSubagentCompletion | null> {
     const detail = result.error ?? result.reason;
     if (contained) {
-      return this.finish(execution, execution.abortRequested || execution.steering
+      return this.finish(execution, execution.stopCause === "caller-abort" || execution.stopCause === "steer"
         ? { status: "aborted", reason: `${phase} cancelled: ${detail}` }
         : { status: "failed", error: `${phase} failed: ${detail}` }, true);
     }
@@ -575,9 +598,15 @@ export class ComputerSubagentRuntime {
     return a.botId === b.botId && a.threadId === b.threadId && a.turnId === b.turnId && a.generation === b.generation;
   }
   private requireHumanHandoffMutable(execution: Execution): void {
-    if (execution.abortRequested || execution.steering || execution.terminalized) {
+    if (execution.stopCause || execution.abortRequested || execution.steering || execution.terminalized) {
       throw new ComputerSubagentStateError(execution.handle.childId, "cannot change human handoff while stopping");
     }
+  }
+  private latchStop(execution: Execution, cause: NonNullable<Execution["stopCause"]>): boolean {
+    if (execution.stopCause) return false;
+    execution.stopCause = cause;
+    execution.acceptingActions = false;
+    return true;
   }
   private publishMonitor(record: ComputerSubagentRecord): ComputerChildMonitor {
     const parent = Object.freeze({
@@ -600,6 +629,12 @@ export class ComputerSubagentRuntime {
   }
   private validTimeout(value: number, label: string): number {
     if (!Number.isSafeInteger(value) || value < 1 || value > 300_000) throw new TypeError(`${label} must be a positive bounded safe integer`);
+    return value;
+  }
+  private validExecutionTimeout(value: number): number {
+    if (!Number.isSafeInteger(value) || value < 1 || value > MAX_COMPUTER_SUBAGENT_TIMEOUT_MS) {
+      throw new TypeError("executionTimeoutMs must be a positive bounded safe integer");
+    }
     return value;
   }
 }
