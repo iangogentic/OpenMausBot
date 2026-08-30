@@ -1780,7 +1780,7 @@ async function captureContainerComputerScreenshot(
           target.containerName,
           "sh",
           "-lc",
-          'raw=/tmp/openmausbot-preview.png; out=/tmp/openmausbot-agent.jpg; command -v convert >/dev/null 2>&1 || exit 69; convert "$raw" -resize "1024x768>" -strip -quality 72 "$out" || exit 70; bytes=$(wc -c < "$out"); if [ "$bytes" -gt 400000 ]; then convert "$raw" -resize "800x600>" -strip -quality 55 "$out" || exit 71; fi; test "$(wc -c < "$out")" -le 400000',
+          'raw=/tmp/openmausbot-preview.png; out=/tmp/openmausbot-agent.jpg; bytes=$(wc -c < "$raw"); if [ "$bytes" -le 400000 ]; then cp "$raw" "$out"; else command -v ffmpeg >/dev/null 2>&1 || exit 69; ffmpeg -loglevel error -y -i "$raw" -vf "scale=1024:-2:force_original_aspect_ratio=decrease" -frames:v 1 -q:v 5 "$out" || exit 70; if [ "$(wc -c < "$out")" -gt 400000 ]; then ffmpeg -loglevel error -y -i "$raw" -vf "scale=800:-2:force_original_aspect_ratio=decrease" -frames:v 1 -q:v 10 "$out" || exit 71; fi; fi; test "$(wc -c < "$out")" -le 400000',
         ],
         30_000,
       );

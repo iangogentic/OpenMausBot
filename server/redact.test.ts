@@ -157,6 +157,10 @@ describe("redactSecretsInText", () => {
 
   it("masks the value of a secret-shaped key=value or key: value, keeping the key", () => {
     expect(redactSecretsInText("export DATABASE_PASSWORD=hunter2hunter2")).toBe("export DATABASE_PASSWORD=«redacted 14 chars»");
+    expect(redactSecretsInText("OMB_LOCAL_VM_MCP_CAPABILITY=local-vm-capability-value-123"))
+      .toBe("OMB_LOCAL_VM_MCP_CAPABILITY=«redacted 29 chars»");
+    expect(redactSecretsInText("OMB_PHYSICAL_MCP_CAPABILITY: physical-capability-value-123"))
+      .toBe("OMB_PHYSICAL_MCP_CAPABILITY: «redacted 29 chars»");
     const apiKeyCanary = ["abcd1234", "efgh5678"].join("");
     expect(redactSecretsInText(`{"api_key": "${apiKeyCanary}"}`)).toBe('{"api_key": "«redacted 16 chars»"}');
     expect(redactSecretsInText("client_secret: 'zzzz-yyyy-xxxx-1'")).toBe("client_secret: '«redacted 16 chars»'");

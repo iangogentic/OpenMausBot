@@ -484,12 +484,14 @@ export function attachLocalVmMcpBroker(options: {
           }
           const response = await callBatchDriver(action);
           const nestedResult = response.result;
+          const nestedRecord = nestedResult !== null && typeof nestedResult === "object" && !Array.isArray(nestedResult)
+            ? nestedResult as Record<string, unknown>
+            : null;
           if (
             "error" in response ||
-            (nestedResult !== null &&
-              typeof nestedResult === "object" &&
-              !Array.isArray(nestedResult) &&
-              (nestedResult as Record<string, unknown>).isError === true)
+            !nestedRecord ||
+            "error" in nestedRecord ||
+            ("isError" in nestedRecord && nestedRecord.isError !== false && nestedRecord.isError !== undefined)
           ) {
             return { content: [{ type: "text", text: `The computer batch stopped after ${completed} completed actions because action ${completed + 1} failed.` }], isError: true };
           }
@@ -511,7 +513,7 @@ export function attachLocalVmMcpBroker(options: {
           }
         }
         if (!screenshot || screenshot.data.length > LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES) {
-          result = { content: [{ type: "text", text: `All ${completed} computer batch actions completed, but the bounded final screenshot was unavailable.` }], isError: true };
+          result = { content: [{ type: "text", text: `FAILED: visual postcondition unproven after ${completed} computer batch actions because the bounded final screenshot was unavailable. Do not claim success.` }], isError: true };
         } else {
           const frameHash = createHash("sha256")
             .update(screenshot.mimeType)
@@ -527,7 +529,7 @@ export function attachLocalVmMcpBroker(options: {
           };
         }
       } catch {
-        result = { content: [{ type: "text", text: `The computer batch stopped safely after ${completed} completed actions.` }], isError: true };
+        result = { content: [{ type: "text", text: `FAILED: visual postcondition unproven; the computer batch stopped after ${completed} completed actions. Do not claim success.` }], isError: true };
       } finally {
         if (!closed) {
           const actionId = activeBatchActionId;
@@ -660,9 +662,20 @@ export function attachLocalVmMcpBroker(options: {
                 }
               }
             } catch {
-              // The action already completed. Preserve its authoritative
-              // result and let the model request a fresh screenshot if the
-              // best-effort observation failed.
+              const result = frame?.result;
+              if (result && typeof result === "object" && !Array.isArray(result)) {
+                const content = Array.isArray((result as Record<string, unknown>).content)
+                  ? [...((result as Record<string, unknown>).content as unknown[])]
+                  : [];
+                content.push({
+                  type: "text",
+                  text: `FAILED: visual postcondition unproven for ${toolName} because the post-action screen could not be captured. Take a fresh screenshot before claiming success.`,
+                });
+                responseLine = JSON.stringify({
+                  ...frame,
+                  result: { ...(result as Record<string, unknown>), content, isError: true },
+                });
+              }
             }
           }
           if (!(await options.endAction(actionId))) {

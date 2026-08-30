@@ -91,8 +91,6 @@ const validPng = Buffer.concat([
   Buffer.alloc(600),
   Buffer.from("IEND", "ascii"),
 ]);
-const validJpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(600), Buffer.from([0xff, 0xd9])]);
-
 function preparedImageInspect() {
   return JSON.stringify([
     {
@@ -820,11 +818,11 @@ describe("Cua integration", () => {
     expect(fake.calls.some((call) => /xdotool|scrot|vnc/i.test(call))).toBe(false);
   });
 
-  it("bounds model-facing observations as stripped JPEG before relay", async () => {
+  it("keeps bounded PNG observations and has an ffmpeg fallback for oversized frames", async () => {
     const screenshotCall =
       `${driverExec} call get_desktop_state {} --socket ${CUA_SOCKET} ` +
       "--screenshot-out-file /tmp/openmausbot-preview.png";
-    const optimizeCall = `docker exec ${CONTAINER} sh -lc raw=/tmp/openmausbot-preview.png; out=/tmp/openmausbot-agent.jpg; command -v convert >/dev/null 2>&1 || exit 69; convert \"$raw\" -resize \"1024x768>\" -strip -quality 72 \"$out\" || exit 70; bytes=$(wc -c < \"$out\"); if [ \"$bytes\" -gt 400000 ]; then convert \"$raw\" -resize \"800x600>\" -strip -quality 55 \"$out\" || exit 71; fi; test \"$(wc -c < \"$out\")\" -le 400000`;
+    const optimizeCall = `docker exec ${CONTAINER} sh -lc raw=/tmp/openmausbot-preview.png; out=/tmp/openmausbot-agent.jpg; bytes=$(wc -c < \"$raw\"); if [ \"$bytes\" -le 400000 ]; then cp \"$raw\" \"$out\"; else command -v ffmpeg >/dev/null 2>&1 || exit 69; ffmpeg -loglevel error -y -i \"$raw\" -vf \"scale=1024:-2:force_original_aspect_ratio=decrease\" -frames:v 1 -q:v 5 \"$out\" || exit 70; if [ \"$(wc -c < \"$out\")\" -gt 400000 ]; then ffmpeg -loglevel error -y -i \"$raw\" -vf \"scale=800:-2:force_original_aspect_ratio=decrease\" -frames:v 1 -q:v 10 \"$out\" || exit 71; fi; fi; test \"$(wc -c < \"$out\")\" -le 400000`;
     const fake = runner({
       "/usr/bin/which docker": "docker\n",
       "/usr/bin/which podman": new Error("missing"),
@@ -838,11 +836,11 @@ describe("Cua integration", () => {
       [readinessRead]: validPng.toString("base64"),
       [screenshotCall]: "{}\n",
       [optimizeCall]: "",
-      [`docker exec ${CONTAINER} base64 -w0 /tmp/openmausbot-agent.jpg`]: validJpeg.toString("base64"),
+      [`docker exec ${CONTAINER} base64 -w0 /tmp/openmausbot-agent.jpg`]: validPng.toString("base64"),
     });
 
     const image = await containerComputerAgentScreenshot(fake.run, "linux");
-    expect(image).toBe(`data:image/jpeg;base64,${validJpeg.toString("base64")}`);
+    expect(image).toBe(`data:image/png;base64,${validPng.toString("base64")}`);
     expect(fake.calls).toContain(optimizeCall);
   });
 

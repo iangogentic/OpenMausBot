@@ -37,6 +37,9 @@ describe("computer proxy (fake box)", () => {
   let hash = "aaaa1111";
   let browserUrl = "https://example.com/";
   let cropFails = false;
+  let captureFails = false;
+  let actionFails = false;
+  let fileReadFails = false;
 
   const rpc = (msg: unknown) => proxy.stdin!.write(JSON.stringify(msg) + "\n");
   const results = new Map<number, any>();
@@ -60,7 +63,9 @@ describe("computer proxy (fake box)", () => {
           if (parsed.op === "read-file") {
             fileReads += 1;
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, status: 200, data: JPEG }));
+            res.end(JSON.stringify(fileReadFails
+              ? { ok: false, status: 500, error: "capture unavailable" }
+              : { ok: true, status: 200, data: JPEG }));
             return;
           }
           if (parsed.op !== "command") {
@@ -89,8 +94,10 @@ describe("computer proxy (fake box)", () => {
                 ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${JPEG}\nSEM ok\n`
             : cropFails && /convert "\$f" -crop/.test(command)
               ? `GEOM 1920 1080\nHASH ${hash}\nCROP_FAILED\n`
+              : captureFails && /GEOM/.test(command)
+                ? `GEOM 1920 1080\nACT ${actionFails ? "failed" : "ok"}\n`
               : /GEOM/.test(command)
-                ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${JPEG}\nACT ok\n`
+                ? `GEOM 1920 1080\nHASH ${hash}\nSIZE ${size}\nB64 ${JPEG}\nACT ${actionFails ? "failed" : "ok"}\n`
                 : "ACT ok\n";
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ ok: true, status: 200, exitCode: 0, stdout, stderr: "" }));
@@ -283,6 +290,43 @@ describe("computer proxy (fake box)", () => {
     expect(command).toMatch(/xdotool key Tab/);
     expect((command.match(/scrot/g) ?? []).length).toBe(1); // one capture
     expect(res.result.content[1]).toMatchObject({ type: "image" });
+  });
+
+  it("fails the protocol result when a batch cannot capture its proof frame", async () => {
+    captureFails = true;
+    fileReadFails = true;
+    try {
+      rpc({
+        jsonrpc: "2.0",
+        id: 61,
+        method: "tools/call",
+        params: { name: "computer_batch", arguments: { actions: [{ action: "press_key", keys: "Tab" }] } },
+      });
+      const res = await waitFor(61);
+      expect(res.result.isError).toBe(true);
+      expect(res.result.content[0].text).toMatch(/^FAILED: visual postcondition is unproven/);
+    } finally {
+      captureFails = false;
+      actionFails = false;
+      fileReadFails = false;
+    }
+  });
+
+  it("keeps an action failure failed even when a proof frame is available", async () => {
+    actionFails = true;
+    const originalHash = hash;
+    hash = "failed-action-frame";
+    try {
+      rpc({ jsonrpc: "2.0", id: 62, method: "tools/call", params: { name: "click", arguments: { x: 7, y: 8 } } });
+      const failed = await waitFor(62);
+      expect(failed.result.isError).toBe(true);
+      expect(failed.result.content[0].text).toMatch(/^FAILED:/);
+      expect(failed.result.content[1]).toMatchObject({ type: "image" });
+    } finally {
+      hash = originalHash;
+      captureFails = false;
+      actionFails = false;
+    }
   });
 
   it("skips the capture entirely when the caller opts out", async () => {

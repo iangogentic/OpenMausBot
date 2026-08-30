@@ -184,8 +184,8 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
         name: "computer_batch",
         arguments: { actions: [
           { name: "click", arguments: { x: 10, y: 20 } },
-          { name: "type_text", arguments: { text: "hello" } },
-          { name: "press_key", arguments: { key: "enter" } },
+          { name: "type_text", arguments: { text: "hello", pid: 1, window_id: 2, delivery_mode: "foreground" } },
+          { name: "press_key", arguments: { key: "enter", pid: 1, window_id: 2, delivery_mode: "foreground" } },
         ] },
       },
     }) + "\n");
@@ -215,7 +215,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
       jsonrpc: "2.0",
       id: 111,
       method: "tools/call",
-      params: { name: "computer_batch", arguments: { actions: [{ name: "press_key", arguments: { key: "enter" } }] } },
+      params: { name: "computer_batch", arguments: { actions: [{ name: "press_key", arguments: { key: "enter", pid: 1, window_id: 2, delivery_mode: "foreground" } }] } },
     }) + "\n");
     await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 111)).toBe(true));
     const response = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 111);
@@ -236,7 +236,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
       method: "tools/call",
       params: {
         name: "computer_batch",
-        arguments: { actions: Array.from({ length: 10 }, () => ({ name: "press_key", arguments: { key: "tab" } })) },
+        arguments: { actions: Array.from({ length: 10 }, () => ({ name: "press_key", arguments: { key: "tab", pid: 1, window_id: 2, delivery_mode: "foreground" } })) },
       },
     }) + "\n");
     await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
@@ -258,7 +258,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     }));
     socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 110, method: "tools/call", params: { name: "click", arguments: { x: 1, y: 1 } } }) + "\n");
     await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 110)).toBe(true));
-    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 111, method: "tools/call", params: { name: "computer_batch", arguments: { actions: Array.from({ length: 8 }, () => ({ name: "press_key", arguments: { key: "tab" } })) } } }) + "\n");
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 111, method: "tools/call", params: { name: "computer_batch", arguments: { actions: Array.from({ length: 8 }, () => ({ name: "press_key", arguments: { key: "tab", pid: 1, window_id: 2, delivery_mode: "foreground" } })) } } }) + "\n");
     await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 111)).toBe(true));
     socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 112, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "click", arguments: { x: 2, y: 2 } }] } } }) + "\n");
     await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 112)).toBe(true));
@@ -333,6 +333,50 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await handle.closed;
   });
 
+  it.each([
+    ["nested MCP error", `{ content: [], isError: true }`],
+    ["nested error object", `{ content: [], error: { message: "private detail" } }`],
+    ["malformed result", `"unexpected"`],
+    ["malformed truthy isError", `{ content: [], isError: "yes" }`],
+  ])("fails closed for a %s in a batch action", async (_label, resultSource) => {
+    const socket = new FakeSocket();
+    const captureAfterAction = vi.fn();
+    const script = String.raw`
+      const readline = require("node:readline");
+      const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+      rl.on("line", (line) => { const frame = JSON.parse(line);
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: ${resultSource} }) + "\n");
+      });
+    `;
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction,
+      spawnDriver: () => spawnResponder(script),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 112, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "press_key", arguments: { key: "enter", pid: 1, window_id: 2, delivery_mode: "foreground" } }] } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 112)).toBe(true));
+    const response = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 112);
+    expect(response.result.isError).toBe(true);
+    expect(captureAfterAction).not.toHaveBeenCalled();
+    expect(JSON.stringify(response)).not.toContain("private detail");
+    handle.close("nested failure complete");
+    await handle.closed;
+  });
+
+  it("marks a completed ordinary mutation unproven when post-action capture throws", async () => {
+    const socket = new FakeSocket();
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      captureAfterAction: async () => { throw new Error("private screenshot failure"); },
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 113, method: "tools/call", params: { name: "click", arguments: { x: 1, y: 2 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 113)).toBe(true));
+    const response = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 113);
+    expect(response.result.isError).toBe(true);
+    expect(JSON.stringify(response)).toContain("FAILED: visual postcondition unproven");
+    expect(JSON.stringify(response)).not.toContain("private screenshot failure");
+    handle.close("ordinary capture failure complete");
+    await handle.closed;
+  });
+
   it("reports a missing final capture as an error after safely releasing the batch ticket", async () => {
     const socket = new FakeSocket();
     const endAction = vi.fn(() => true);
@@ -358,7 +402,7 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
       quarantine,
       captureAfterAction: async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }),
     }));
-    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 106, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "press_key", arguments: { key: "tab" } }] } } }) + "\n");
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 106, method: "tools/call", params: { name: "computer_batch", arguments: { actions: [{ name: "press_key", arguments: { key: "tab", pid: 1, window_id: 2, delivery_mode: "foreground" } }] } } }) + "\n");
     await handle.closed;
     await vi.waitFor(() => expect(quarantine).toHaveBeenCalledOnce());
     expect(socket.open).toBe(false);

@@ -197,9 +197,9 @@ export const COMPUTER_BATCH_TOOL = {
         items: {
           oneOf: [
             { type: "object", properties: { name: { const: "click" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, button: { type: "string", enum: ["left", "right"] }, count: { type: "integer", minimum: 1, maximum: 2 } }, required: ["x", "y"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
-            { type: "object", properties: { name: { const: "type_text" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, text: { type: "string", minLength: 1, maxLength: 4096 } }, required: ["text"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
-            { type: "object", properties: { name: { const: "press_key" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, key: { type: "string", minLength: 1, maxLength: 64, description: "Canonical key name such as enter, tab, or escape." } }, required: ["key"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
-            { type: "object", properties: { name: { const: "hotkey" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, keys: { type: "array", minItems: 2, maxItems: 4, items: { type: "string", minLength: 1, maxLength: 32 } } }, required: ["keys"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "type_text" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, text: { type: "string", minLength: 1, maxLength: 4096 } }, required: ["text", "pid", "window_id", "delivery_mode"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "press_key" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, key: { type: "string", minLength: 1, maxLength: 64, description: "Canonical key name such as enter, tab, or escape." } }, required: ["key", "pid", "window_id", "delivery_mode"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
+            { type: "object", properties: { name: { const: "hotkey" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, keys: { type: "array", minItems: 2, maxItems: 4, items: { type: "string", minLength: 1, maxLength: 32 } } }, required: ["keys", "pid", "window_id", "delivery_mode"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
             { type: "object", properties: { name: { const: "scroll" }, arguments: { type: "object", properties: { ...BATCH_WINDOW_TARGET_SCHEMA, x: { type: "number", minimum: 0, maximum: 16384 }, y: { type: "number", minimum: 0, maximum: 16384 }, direction: { type: "string", enum: ["up", "down"] }, amount: { type: "integer", minimum: 1, maximum: 20 }, by: { type: "string", enum: ["line", "pixel"] } }, required: ["x", "y", "direction"], additionalProperties: false } }, required: ["name", "arguments"], additionalProperties: false },
           ],
         },
@@ -222,10 +222,11 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): 
   return Object.keys(value).every((key) => allowed.includes(key));
 }
 
-function validBatchWindowTarget(args: Record<string, unknown>): boolean {
+function validBatchWindowTarget(args: Record<string, unknown>, requireForegroundTarget = false): boolean {
   const hasPid = args.pid !== undefined;
   const hasWindow = args.window_id !== undefined;
   return hasPid === hasWindow &&
+    (!requireForegroundTarget || (hasPid && hasWindow && args.delivery_mode === "foreground")) &&
     (!hasPid || (Number.isInteger(args.pid) && Number(args.pid) > 0 && Number.isInteger(args.window_id) && Number(args.window_id) > 0)) &&
     (args.delivery_mode === undefined || args.delivery_mode === "background" || args.delivery_mode === "foreground");
 }
@@ -263,16 +264,16 @@ export function validateComputerBatchArguments(value: unknown): BatchValidation 
       actions.push({ name: "click", arguments: { ...batchWindowTarget(args), x: args.x, y: args.y, ...(args.button ? { button: args.button } : {}), ...(args.count !== undefined ? { count: Number(args.count) } : {}) } });
       continue;
     }
-    if (action.name === "type_text" && exactKeys(args, ["text", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) && typeof args.text === "string" && args.text.length >= 1 && args.text.length <= 4096) {
+    if (action.name === "type_text" && exactKeys(args, ["text", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args, true) && typeof args.text === "string" && args.text.length >= 1 && args.text.length <= 4096) {
       actions.push({ name: "type_text", arguments: { ...batchWindowTarget(args), text: args.text } });
       continue;
     }
-    if (action.name === "press_key" && exactKeys(args, ["key", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) && typeof args.key === "string" && args.key.length >= 1 && args.key.length <= 64) {
+    if (action.name === "press_key" && exactKeys(args, ["key", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args, true) && typeof args.key === "string" && args.key.length >= 1 && args.key.length <= 64) {
       const key = args.key.toLowerCase() === "return" ? "enter" : args.key;
       actions.push({ name: "press_key", arguments: { ...batchWindowTarget(args), key } });
       continue;
     }
-    if (action.name === "hotkey" && exactKeys(args, ["keys", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args) && Array.isArray(args.keys) && args.keys.length >= 2 && args.keys.length <= 4 && args.keys.every((key) => typeof key === "string" && key.length >= 1 && key.length <= 32)) {
+    if (action.name === "hotkey" && exactKeys(args, ["keys", "pid", "window_id", "delivery_mode"]) && validBatchWindowTarget(args, true) && Array.isArray(args.keys) && args.keys.length >= 2 && args.keys.length <= 4 && args.keys.every((key) => typeof key === "string" && key.length >= 1 && key.length <= 32)) {
       actions.push({ name: "hotkey", arguments: { ...batchWindowTarget(args), keys: [...args.keys] as string[] } });
       continue;
     }

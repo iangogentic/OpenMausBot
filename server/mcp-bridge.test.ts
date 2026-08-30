@@ -21,14 +21,14 @@ describe("computer_batch validation", () => {
   it("accepts only the explicit bounded mechanical schema", () => {
     expect(validateComputerBatchArguments({ actions: [
       { name: "click", arguments: { x: 10, y: 20, button: "left" } },
-      { name: "type_text", arguments: { text: "hello" } },
-      { name: "press_key", arguments: { key: "enter" } },
-      { name: "hotkey", arguments: { keys: ["ctrl", "l"] } },
+      { name: "type_text", arguments: { text: "hello", pid: 1, window_id: 2, delivery_mode: "foreground" } },
+      { name: "press_key", arguments: { key: "enter", pid: 1, window_id: 2, delivery_mode: "foreground" } },
+      { name: "hotkey", arguments: { keys: ["ctrl", "l"], pid: 1, window_id: 2, delivery_mode: "foreground" } },
       { name: "scroll", arguments: { x: 10, y: 20, direction: "down", amount: 3, by: "line" } },
     ] }).ok).toBe(true);
     expect(validateComputerBatchArguments({ actions: Array.from(
       { length: COMPUTER_BATCH_MAX_ACTIONS + 1 },
-      () => ({ name: "press_key", arguments: { key: "tab" } }),
+      () => ({ name: "press_key", arguments: { key: "tab", pid: 1, window_id: 2, delivery_mode: "foreground" } }),
     ) }).ok).toBe(false);
     expect(validateComputerBatchArguments({ actions: [
       { name: "click", arguments: { x: 1, y: 2, command: "cat /etc/passwd" } },

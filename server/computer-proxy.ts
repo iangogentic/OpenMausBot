@@ -520,9 +520,10 @@ function observed(
   frame: Frame | null,
   crop: CropRegion | null = null,
   followsAction = true,
+  actionFailed = false,
 ) {
   if (!frame) {
-    return text(id, `${note}\n(couldn't capture the screen — call screenshot to retry)`);
+    return text(id, `FAILED: visual postcondition is unproven because the screen could not be captured.\n${note}\nCall screenshot before claiming success.`, true);
   }
   const observation = observations.observeFrame(frame.hash ?? (crop ? null : frame.data), crop);
   if (!observation.changed) {
@@ -532,16 +533,21 @@ function observed(
     const guidance = followsAction
       ? " Don't repeat the action — it may already have succeeded. If you expected a change, call screenshot again after it has had time to render."
       : " No new image is attached.";
-    return text(id, `${note}\n(the screen is identical to the frame you already have.${guidance})`);
+    return text(
+      id,
+      `${actionFailed ? "FAILED: the action reported an error. " : ""}${note}\n(the screen is identical to the frame you already have.${guidance})`,
+      actionFailed,
+    );
   }
   send({
     jsonrpc: "2.0",
     id,
     result: {
       content: [
-        { type: "text", text: note },
+        { type: "text", text: actionFailed ? `FAILED: the action reported an error. ${note}` : note },
         { type: "image", data: frame.data, mimeType: frame.mime },
       ],
+      isError: actionFailed || undefined,
     },
   });
 }
@@ -851,7 +857,7 @@ async function actAndObserve(
     ? `${note}\n(${backend})`
     : `${note}\n(the action reported an error: ${out.stderr.slice(0, 160) || "no detail"}; ${backend})`;
   if (!observe) return text(id, full, !acted);
-  return observed(id, full, await frameFrom(out));
+  return observed(id, full, await frameFrom(out), null, true, !acted);
 }
 
 async function semanticActAndObserve(
