@@ -54,6 +54,10 @@ describe("dedicated computer operator mounts", () => {
     expect(codex).toContain('appServerArgs.push("-c", "mcp_servers={}")');
     const pi = readFileSync(new URL("./pi.ts", import.meta.url), "utf8");
     expect(pi).toContain('turn.integrations?.computerOperator ? ["--no-extensions"] : []');
-    expect(antigravity).toContain('{ exclusive: Boolean(turn.integrations?.computerOperator) }');
+    // Operator turns no longer mutate the provider-global config at all:
+    // they get a private temporary HOME containing only the exact operator
+    // server and copied login material.
+    expect(antigravity).toContain("createAntigravityOperatorEnvironment(env, operatorServer)");
+    expect(antigravity).toContain("operatorEnvironment?.cleanup()");
   });
 });
