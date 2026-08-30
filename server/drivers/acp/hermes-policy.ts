@@ -353,7 +353,13 @@ export function sanitizeHermesConfig(
   safe.agent = agent;
 
   const toolSearch = object(object(source.tools)?.tool_search);
-  if (toolSearch) safe.tools = { tool_search: toolSearch };
+  // The smaller local models used by hosted OpenMaus bots do not reliably
+  // discover an explicitly requested mounted tool after Hermes defers the MCP
+  // catalog behind tool_search. Directly expose the already policy-filtered
+  // catalog in restricted mode. This costs extra prompt tokens, but avoids a
+  // false "tool not mounted" response and makes computer control dependable.
+  if (restricted) safe.tools = { tool_search: { enabled: "off" } };
+  else if (toolSearch) safe.tools = { tool_search: toolSearch };
 
   const configuredMcps = object(source.mcp_servers);
   const ianBrain = configuredMcps ? object(configuredMcps.ian_brain) : null;

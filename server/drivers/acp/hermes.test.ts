@@ -227,6 +227,9 @@ providers:
 tool_loop_guardrails:
   warnings_enabled: false
   hard_stop_enabled: false
+tools:
+  tool_search:
+    enabled: on
 agent:
   max_turns: 42
   system_prompt: shared host identity
@@ -273,6 +276,7 @@ memory:
         idempotent_no_progress: 5,
       },
     });
+    expect(parsed.tools).toEqual({ tool_search: { enabled: "off" } });
     expect(parsed.host_files).toBeUndefined();
     expect(parsed.plugins).toBeUndefined();
     expect(parsed.terminal).toBeUndefined();
