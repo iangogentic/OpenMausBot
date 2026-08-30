@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { TurnExternalOperations } from "./turn-external-operations.ts";
+import { deliverProviderRequestWithDeadline } from "./provider-request-delivery.ts";
 
 describe("turn external operations", () => {
   const turn = { botId: "bot-a", threadId: "thread-a", generation: "generation-a" };
@@ -36,6 +37,25 @@ describe("turn external operations", () => {
     await Promise.all([old, next]);
     expect(oldSignal.aborted).toBe(true);
     expect(nextSignal.aborted).toBe(false);
+  });
+
+  it("drains cancellation after a bounded wrapper even when raw provider delivery hangs", async () => {
+    vi.useFakeTimers();
+    try {
+      const operations = new TurnExternalOperations();
+      const tracked = operations.run(turn, () =>
+        deliverProviderRequestWithDeadline(() => new Promise<string>(() => {}), 10_000));
+      let drained = false;
+      const cancelling = operations.cancelTurn(turn).then(() => { drained = true; });
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await expect(tracked).resolves.toEqual({ status: "timed-out" });
+      await cancelling;
+      expect(drained).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("cancels every bot generation without touching another bot", async () => {

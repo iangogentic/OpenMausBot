@@ -2455,12 +2455,15 @@ async function deliverProviderRequestResponse(
 ): Promise<{ outcome: RequestOutcome; timedOut: boolean }> {
   const instance = registry.get(pending.instanceId);
   if (!instance) return { outcome: "unavailable", timedOut: false };
-  const result = await deliverProviderRequestWithDeadline(
-    () => TURN_EXTERNAL_OPERATIONS.run(
-      pending.turn,
+  // Track the bounded operation, not the provider's potentially hung raw
+  // promise. Exact-turn cancellation can then drain after the deadline while
+  // interruptTurn terminates the provider process that owned the stale call.
+  const result = await TURN_EXTERNAL_OPERATIONS.run(
+    pending.turn,
+    () => deliverProviderRequestWithDeadline(
       () => instance.adapter.respondToRequest(pending.threadId, pending.requestId, { behavior, message }),
+      PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS,
     ),
-    PROVIDER_REQUEST_RESPONSE_TIMEOUT_MS,
   ).catch((): ProviderDeliveryResult<RequestOutcome> => ({ status: "returned", outcome: "unavailable" }));
   return result.status === "timed-out"
     ? { outcome: "unavailable", timedOut: true }
@@ -2484,7 +2487,7 @@ async function answerRequest(
   const pending = pendingProviderRequests.get(key);
   const cardMessage = store.messagesFor(threadId).find((candidate) => candidate.id === messageId);
   const card = cardMessage?.card;
-  const settleUnavailable = () => {
+  const settleUnavailable = (timedOut = false) => {
     const existing = messageId
       ? store.messagesFor(threadId).find((candidate) => candidate.id === messageId)
       : undefined;
@@ -2496,7 +2499,12 @@ async function answerRequest(
     store.appendMessage(threadId, {
       role: "bot",
       kind: "activity",
-      tool: { name: "Couldn't deliver that answer — the request is no longer open, so the action was not run", ok: false },
+      tool: {
+        name: timedOut
+          ? "The provider did not acknowledge the permission response; action status is unknown, so exact-turn cancellation started."
+          : "Couldn't deliver that answer — the request is no longer open, so the action was not run",
+        ok: false,
+      },
     });
   };
   if (
@@ -2551,7 +2559,7 @@ async function answerRequest(
     if (outcome === "unavailable") {
       if (pendingProviderRequests.get(key) === pending) pendingProviderRequests.delete(key);
       pendingProviderSettlements.delete(key, pending);
-      settleUnavailable();
+      settleUnavailable(timedOut);
       if (timedOutRequestStillOwned({ status: "timed-out" }, current === pending)) {
         void cancelExactTargetTurn(pending.turn).catch(() => {});
       }
