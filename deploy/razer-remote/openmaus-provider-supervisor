@@ -1275,6 +1275,11 @@ def prepare_sandbox(
         "XDG_CONFIG_HOME": os.path.join(provider_home, ".config"),
         "XDG_CACHE_HOME": os.path.join(provider_home, ".cache"),
         "XDG_DATA_HOME": os.path.join(provider_home, ".local", "share"),
+        # Package-manager caches commonly contain absolute symlinks and
+        # wheel-authored public modes. Keep those rebuildable artifacts in the
+        # turn-private tmpfs; installed bot state still persists in HOME.
+        "UV_CACHE_DIR": "/tmp/openmaus-uv-cache",
+        "PIP_CACHE_DIR": "/tmp/openmaus-pip-cache",
         "PATH": f"{provider_home}/.local/bin:/opt/openmaus-provider/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "OMB_PROVIDER_HOME": PROVIDER_ROOT,
         "OMB_PROVIDER_RUNTIME_DIR": RUNTIME_BASE,

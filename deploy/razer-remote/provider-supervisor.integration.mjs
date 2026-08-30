@@ -407,6 +407,7 @@ try {
     '  loaderControlEnvArrivedOnlyInsideSandbox: process.env.LD_PRELOAD?.endsWith("/hostile-loader.so") === true,',
     '  manifestEnvAbsent: process.env.OMB_PROVIDER_LAUNCH_MANIFEST === undefined,',
     '  controlTokenAbsent: process.env.OMB_UI_SESSION_TOKEN === undefined,',
+    '  packageCachesAreEphemeral: process.env.UV_CACHE_DIR === "/tmp/openmaus-uv-cache" && process.env.PIP_CACHE_DIR === "/tmp/openmaus-pip-cache",',
     '  manifestFileHidden: !fs.existsSync(`${scope}/launch.json`),',
     '  siblingScopeHidden: !fs.existsSync(sibling),',
     '  siblingNameHidden: !fs.readdirSync(runtimeBase).includes(sibling.split("/").pop()),',
