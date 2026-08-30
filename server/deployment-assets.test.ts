@@ -25,6 +25,7 @@ describe("Razer hostile-provider deployment assets", () => {
   it("installs and requires the exact firewall, private-net, and aggregate-slice checks", () => {
     const readme = asset("README.md");
     const service = asset("openmausbot.service");
+    const companionService = asset("openmausbot-companion.service");
     const supervisor = asset("openmaus-provider-supervisor");
     expect(readme).toContain("/usr/local/libexec/openmaus-provider-network");
     expect(readme).toContain("/usr/local/libexec/openmaus-provider-slice-check");
@@ -33,6 +34,7 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-network --check");
     expect(service).toContain("ExecStartPre=+/usr/local/libexec/openmaus-provider-slice-check --check");
     expect(service.match(/^ExecStartPre=\+\/usr\/bin\/btrfs qgroup show --raw /gm)).toHaveLength(3);
+    expect(companionService).toContain("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK");
     expect(service).toContain("/usr/bin/slirp4netns");
     expect(service).toContain('Environment="OMB_PROVIDER_HARNESS_HOST=10.0.2.2"');
     expect(service).toContain('Environment="OMB_REQUIRE_LOCAL_VM_NETWORK_ISOLATION=1"');
