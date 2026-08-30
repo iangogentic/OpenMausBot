@@ -37,6 +37,7 @@ describe("document parser guards", () => {
   it("accepts an XLSX-shaped central directory and rejects ZIP traversal and bombs", () => {
     expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "xl/workbook.xml"]))).not.toThrow();
     expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "../xl/workbook.xml"]))).toThrow(/unsafe archive path/);
+    expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "xl/workbook.xml", "xl/workbook.xml"]))).toThrow(/duplicate archive paths/);
     expect(() => validateXlsxArchive(centralArchive(["[Content_Types].xml", "xl/workbook.xml"], { compressed: 1, uncompressed: 2_000_000 }))).toThrow(/highly compressed/);
     expect(() => validateXlsxArchive(new Uint8Array([0x50, 0x4b, 0x03, 0x04]))).toThrow(/valid XLSX/);
   });

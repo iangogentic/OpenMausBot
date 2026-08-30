@@ -124,6 +124,7 @@ export function validateXlsxArchive(bytes: Uint8Array): void {
   let totalUncompressed = 0;
   let hasTypes = false;
   let hasWorkbook = false;
+  const archiveNames = new Set<string>();
   const decoder = new TextDecoder("utf-8", { fatal: false });
   for (let index = 0; index < entries; index += 1) {
     if (cursor + 46 > bytes.byteLength || u32(view, cursor) !== 0x02014b50) throw new Error("This XLSX archive is malformed.");
@@ -145,6 +146,8 @@ export function validateXlsxArchive(bytes: Uint8Array): void {
     if (next > bytes.byteLength) throw new Error("This XLSX archive is malformed.");
     const name = decoder.decode(bytes.subarray(nameStart, nameStart + nameLength)).replaceAll("\\", "/");
     if (name.startsWith("/") || name.split("/").includes("..")) throw new Error("This XLSX contains an unsafe archive path.");
+    if (archiveNames.has(name)) throw new Error("This XLSX contains duplicate archive paths.");
+    archiveNames.add(name);
     hasTypes ||= name === "[Content_Types].xml";
     hasWorkbook ||= name === "xl/workbook.xml";
     cursor = next;
