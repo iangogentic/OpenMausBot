@@ -844,6 +844,7 @@ function BotListItem({
               value={bot.name}
               onCommit={(name) => dispatch({ type: "updateBot", botId: bot.id, patch: { name } })}
               onEditingChange={setRenaming}
+              onActivate={() => dispatch({ type: "select", id: bot.id })}
               className="truncate"
               inputClassName="w-full rounded bg-inset px-1 py-0.5 text-[15px] font-semibold"
             />

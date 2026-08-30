@@ -115,7 +115,12 @@ export function RenameTitle({
       title="Double-click to rename"
       tabIndex={0}
       role="button"
-      aria-label={`Rename ${value}`}
+      aria-label={onActivate ? `Open ${value}; double-click to rename` : `Rename ${value}`}
+      onClick={(event) => {
+        if (!onActivate) return;
+        event.stopPropagation();
+        onActivate();
+      }}
       onDoubleClick={startRename}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {

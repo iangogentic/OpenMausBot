@@ -26,4 +26,15 @@ describe("RenameTitle", () => {
 
     expect(markup).toContain("Open Maus&#x27;s profile");
   });
+
+  it("exposes the single-click action while preserving the rename hint", () => {
+    const markup = renderToStaticMarkup(createElement(RenameTitle, {
+      value: "Hermes Qwen",
+      onCommit: vi.fn(),
+      onActivate: vi.fn(),
+    }));
+
+    expect(markup).toContain('aria-label="Open Hermes Qwen; double-click to rename"');
+    expect(markup).toContain('title="Double-click to rename"');
+  });
 });
