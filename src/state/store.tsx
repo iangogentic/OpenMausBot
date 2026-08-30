@@ -16,7 +16,7 @@ import {
 import type { CloudBackend, EffortLevel } from "../../server/contracts.ts";
 import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
-import type { ComputerChildMonitor } from "../../shared/computer-child-monitor";
+import type { ComputerChildMonitor, ComputerChildVisualState } from "../../shared/computer-child-monitor";
 import type { Routine, RoutineInput, RoutineRun } from "@/lib/routines";
 import type { WebhookAttempt, WebhookIngressStatus, WebhookTrigger } from "@/lib/webhooks";
 import { currentCall } from "@/lib/call";
@@ -395,6 +395,7 @@ export interface AppState {
   computerControl: Record<string, { held: boolean; helpReason: string | null }>;
   /** Authority-free delegated visual-operator lifecycle snapshots. */
   computerChildren: Record<string, ComputerChildMonitor>;
+  computerChildVisuals: Record<string, ComputerChildVisualState>;
   /** a search hit to scroll to once its thread is on screen; nonce lets the
    * same message be focused twice in a row */
   focusMessage: { threadId: string; messageId: string; nonce: number; consumed: boolean } | null;
@@ -453,6 +454,7 @@ export type Action =
       groups: Group[];
       computerControl: Record<string, { held: boolean; helpReason: string | null }>;
       computerChildren: ComputerChildMonitor[];
+      computerChildVisuals: ComputerChildVisualState[];
     }
   | { type: "showRoutines" }
   | { type: "showTeamMap" }
@@ -531,6 +533,8 @@ export type Action =
   | { type: "provisioning"; botId: string; on: boolean }
   | { type: "computerControl"; botId: string; held: boolean; helpReason: string | null }
   | { type: "computerChild"; monitor: ComputerChildMonitor }
+  | { type: "computerChildFrame"; childId: string; seq: number; at: number; frame: NonNullable<ComputerChildVisualState["frame"]> }
+  | { type: "computerChildCursor"; childId: string; seq: number; at: number; cursor: NonNullable<ComputerChildVisualState["cursor"]> }
   | { type: "setModel"; botId: string; selection: ModelSelection }
   | { type: "interrupt"; botId: string }
   | { type: "connected"; value: boolean }
@@ -633,6 +637,7 @@ export function reducer(state: AppState, action: Action): AppState {
         groups: action.groups,
         computerControl: action.computerControl,
         computerChildren: Object.fromEntries(action.computerChildren.map((monitor) => [monitor.childId, monitor])),
+        computerChildVisuals: Object.fromEntries(action.computerChildVisuals.map((visual) => [visual.childId, visual])),
         selectedId,
       };
     }
@@ -943,6 +948,38 @@ export function reducer(state: AppState, action: Action): AppState {
         ...state,
         computerChildren: upsertComputerChildMonitor(state.computerChildren, action.monitor),
       };
+    case "computerChildFrame": {
+      const previous = state.computerChildVisuals[action.childId];
+      if (previous && action.seq <= previous.lastSeq) return state;
+      return {
+        ...state,
+        computerChildVisuals: {
+          ...state.computerChildVisuals,
+          [action.childId]: {
+            childId: action.childId,
+            lastSeq: action.seq,
+            ...(previous?.cursor ? { cursor: previous.cursor } : {}),
+            frame: action.frame,
+          },
+        },
+      };
+    }
+    case "computerChildCursor": {
+      const previous = state.computerChildVisuals[action.childId];
+      if (previous && action.seq <= previous.lastSeq) return state;
+      return {
+        ...state,
+        computerChildVisuals: {
+          ...state.computerChildVisuals,
+          [action.childId]: {
+            childId: action.childId,
+            lastSeq: action.seq,
+            ...(previous?.frame ? { frame: previous.frame } : {}),
+            cursor: action.cursor,
+          },
+        },
+      };
+    }
     case "setModel":
       return updateBot(state, action.botId, (b) => ({ ...b, modelSelection: action.selection }));
     case "setComputerAuto":
@@ -1180,6 +1217,7 @@ export const initialState: AppState = {
   provisioning: {},
   computerControl: {},
   computerChildren: {},
+  computerChildVisuals: {},
   focusMessage: null,
   connected: false,
   error: null,
@@ -1648,13 +1686,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const loadAll = () =>
       Promise.all([
         api("/api/bots")
-          .then(({ bots, groups, computerControl, computerChildren }) =>
+          .then(({ bots, groups, computerControl, computerChildren, computerChildVisuals }) =>
             alive && rawDispatch({
               type: "hydrate",
               bots,
               groups: groups ?? [],
               computerControl: computerControl ?? {},
               computerChildren: computerChildren ?? [],
+              computerChildVisuals: computerChildVisuals ?? [],
             }))
           .catch(() => {}),
         api("/api/instances")
@@ -1876,6 +1915,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         case "computer-child":
           rawDispatch({ type: "computerChild", monitor: frame.monitor });
+          break;
+        case "computer-child-frame":
+          rawDispatch({ type: "computerChildFrame", childId: frame.childId, seq: frame.seq, at: frame.at, frame: frame.frame });
+          break;
+        case "computer-child-cursor":
+          rawDispatch({ type: "computerChildCursor", childId: frame.childId, seq: frame.seq, at: frame.at, cursor: frame.cursor });
           break;
         case "bot.deleted":
           botPatchQueue.cancel(frame.botId);

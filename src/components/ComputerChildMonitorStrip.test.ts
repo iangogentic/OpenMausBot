@@ -23,6 +23,7 @@ describe("ComputerChildMonitorStrip", () => {
     const other = { ...monitor("child-other", "failed", 4), parent: { ...exact.parent, botId: "bot-b" } };
     const markup = renderToStaticMarkup(createElement(ComputerChildMonitorStrip, {
       monitors: { exact, other }, botId: "bot-a", threadId: "thread-a",
+      visuals: {},
     }));
     expect(markup).toContain('data-computer-child="child-exact"');
     expect(markup).not.toContain("child-other");
@@ -39,11 +40,32 @@ describe("ComputerChildMonitorStrip", () => {
     };
     const markup = renderToStaticMarkup(createElement(ComputerChildMonitorStrip, {
       monitors, botId: "bot-a", threadId: "thread-a",
+      visuals: {},
     }));
     expect(markup).toContain('data-computer-child="active"');
     expect(markup).toContain('data-computer-child="newest"');
     expect(markup).toContain('data-computer-child="recent"');
     expect(markup).not.toContain('data-computer-child="old"');
     expect(markup).toContain("Waiting for you");
+  });
+
+  it("renders the exact child frame and scales its sanitized cursor", () => {
+    const exact = monitor("child-exact", "running", 3);
+    const data = Buffer.from("pixels").toString("base64");
+    const markup = renderToStaticMarkup(createElement(ComputerChildMonitorStrip, {
+      monitors: { exact }, botId: "bot-a", threadId: "thread-a",
+      visuals: {
+        "child-exact": {
+          childId: "child-exact",
+          lastSeq: 2,
+          frame: { mime: "image/png", data, hash: "a".repeat(64), seq: 1, at: 1, width: 1000, height: 500 },
+          cursor: { x: 250, y: 100, seq: 2, at: 2 },
+        },
+      },
+    }));
+    expect(markup).toContain(`data:image/png;base64,${data}`);
+    expect(markup).toContain("data-computer-child-cursor");
+    expect(markup).toContain("left:25%");
+    expect(markup).toContain("top:20%");
   });
 });

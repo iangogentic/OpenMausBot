@@ -59,6 +59,15 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("activeComputerOperatorForTarget(event.botId, event.targetKey)");
   });
 
+  it("publishes trusted child frames and cursors with server-owned ordering", () => {
+    expect(source).toContain("computerChildTelemetryCallbacks(authority.computerSubagent)");
+    expect(source).toContain('broadcast({ kind: "computer-child-frame"');
+    expect(source).toContain('broadcast({ kind: "computer-child-cursor"');
+    expect(source).toContain("nextComputerChildVisualSeq(childId)");
+    expect(source).toContain('timingSafeEqual(Buffer.from(frame.hash), Buffer.from(computedHash))');
+    expect(source).toContain('kind !== "computer-child-frame"');
+  });
+
   it("cleans exact-turn contexts and aborts active children at turn finish", () => {
     expect(source).toContain('COMPUTER_OPERATOR_CONTEXTS.delete(`${turn.botId}\\0${turn.threadId}\\0${turn.generation}`)');
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.cancelParent(operatorParent)");

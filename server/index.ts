@@ -185,7 +185,12 @@ import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
 import { ComputerSubagentManager, type ComputerSubagentHandle, type ComputerSubagentParent } from "./computer-subagent-manager.ts";
-import type { ComputerChildMonitor } from "../shared/computer-child-monitor.ts";
+import type {
+  ComputerChildCursor,
+  ComputerChildFrame,
+  ComputerChildMonitor,
+  ComputerChildVisualState,
+} from "../shared/computer-child-monitor.ts";
 import {
   ComputerSubagentRuntime,
   MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES,
@@ -242,6 +247,7 @@ import {
 } from "./physical-bridge.ts";
 import {
   LOCAL_VM_BROKER_ORIGIN,
+  LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES,
   LOCAL_VM_MCP_PATH,
   LocalVmMcpAdmissions,
   attachLocalVmMcpBroker,
@@ -1326,7 +1332,9 @@ const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
 
 const COMPUTER_SUBAGENT_MANAGER = new ComputerSubagentManager();
 const COMPUTER_CHILD_MONITORS = new Map<string, ComputerChildMonitor>();
+const COMPUTER_CHILD_VISUALS = new Map<string, ComputerChildVisualState>();
 const COMPUTER_CHILD_MONITOR_LIMIT = 128;
+const COMPUTER_CHILD_VISUAL_LIMIT = 16;
 
 function computerChildMonitors(): ComputerChildMonitor[] {
   return [...COMPUTER_CHILD_MONITORS.values()].sort((a, b) => a.createdAt - b.createdAt);
@@ -1343,8 +1351,71 @@ function retainComputerChildMonitor(monitor: ComputerChildMonitor): void {
     candidate.status === "aborted" || candidate.status === "unknown"
   );
   while (COMPUTER_CHILD_MONITORS.size > COMPUTER_CHILD_MONITOR_LIMIT && terminal.length) {
-    COMPUTER_CHILD_MONITORS.delete(terminal.shift()!.childId);
+    const removed = terminal.shift()!.childId;
+    COMPUTER_CHILD_MONITORS.delete(removed);
+    COMPUTER_CHILD_VISUALS.delete(removed);
   }
+}
+
+function retainComputerChildVisual(next: ComputerChildVisualState): void {
+  COMPUTER_CHILD_VISUALS.delete(next.childId);
+  COMPUTER_CHILD_VISUALS.set(next.childId, Object.freeze(next));
+  while (COMPUTER_CHILD_VISUALS.size > COMPUTER_CHILD_VISUAL_LIMIT) {
+    COMPUTER_CHILD_VISUALS.delete(COMPUTER_CHILD_VISUALS.keys().next().value!);
+  }
+}
+
+function nextComputerChildVisualSeq(childId: string): number {
+  return (COMPUTER_CHILD_VISUALS.get(childId)?.lastSeq ?? 0) + 1;
+}
+
+function publishComputerChildFrame(childId: string, frame: ComputerChildFrame): void {
+  const monitor = COMPUTER_CHILD_MONITORS.get(childId);
+  if (!monitor || monitor.status !== "running" || !monitor.leaseHeld) return;
+  const bytes = Buffer.from(frame.data, "base64");
+  if (bytes.byteLength <= 0 || bytes.byteLength > LOCAL_VM_BATCH_SCREENSHOT_MAX_BASE64_BYTES) return;
+  const computedHash = createHash("sha256")
+    .update(frame.mime)
+    .update("\0")
+    .update(frame.data)
+    .digest("hex");
+  if (!/^[a-f0-9]{64}$/.test(frame.hash) || !timingSafeEqual(Buffer.from(frame.hash), Buffer.from(computedHash))) return;
+  let dimensions: { width: number; height: number };
+  try { dimensions = imageDimensions(bytes, frame.mime); } catch { return; }
+  const seq = nextComputerChildVisualSeq(childId);
+  const at = Date.now();
+  const previous = COMPUTER_CHILD_VISUALS.get(childId);
+  const state: ComputerChildVisualState = {
+    childId,
+    lastSeq: seq,
+    ...(previous?.cursor ? { cursor: previous.cursor } : {}),
+    frame: { ...frame, ...dimensions, seq, at },
+  };
+  retainComputerChildVisual(state);
+  broadcast({ kind: "computer-child-frame", childId, seq, at, frame: state.frame });
+}
+
+function publishComputerChildCursor(childId: string, cursor: ComputerChildCursor): void {
+  const monitor = COMPUTER_CHILD_MONITORS.get(childId);
+  if (!monitor || monitor.status !== "running" || !monitor.leaseHeld) return;
+  const seq = nextComputerChildVisualSeq(childId);
+  const at = Date.now();
+  const previous = COMPUTER_CHILD_VISUALS.get(childId);
+  const state: ComputerChildVisualState = {
+    childId,
+    lastSeq: seq,
+    ...(previous?.frame ? { frame: previous.frame } : {}),
+    cursor: { ...cursor, seq, at },
+  };
+  retainComputerChildVisual(state);
+  broadcast({ kind: "computer-child-cursor", childId, seq, at, cursor: state.cursor });
+}
+
+function computerChildTelemetryCallbacks(handle: ComputerSubagentHandle) {
+  return {
+    onChildFrame: (frame: ComputerChildFrame) => publishComputerChildFrame(handle.childId, frame),
+    onChildCursor: (cursor: ComputerChildCursor) => publishComputerChildCursor(handle.childId, cursor),
+  };
 }
 
 const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
@@ -2214,7 +2285,8 @@ const replayBuffer: Array<{ seq: number; kind: string; frame: string | null }> =
 let replayBytes = 0;
 
 /** Screen frames are the only kind a client can decline. */
-const wants = (client: SseClient, kind: string) => kind !== "screen" || client.screens;
+const wants = (client: SseClient, kind: string) =>
+  (kind !== "screen" && kind !== "computer-child-frame") || client.screens;
 
 function disconnectSseClient(client: SseClient): void {
   if (client.closed) return;
@@ -2263,7 +2335,7 @@ function broadcast(payload: Record<string, unknown>) {
   // as soon as the next one arrives. Keep their sequence slots so resume-gap
   // detection stays honest, but never retain their base64 payloads.
   const frameBytes = Buffer.byteLength(frame);
-  const replayFrame = kind === "screen" || frameBytes > REPLAY_MAX_BYTES ? null : frame;
+  const replayFrame = kind === "screen" || kind === "computer-child-frame" || frameBytes > REPLAY_MAX_BYTES ? null : frame;
   replayBuffer.push({ seq, kind, frame: replayFrame });
   replayBytes += replayFrame ? frameBytes : 0;
   while (replayBuffer.length > REPLAY_MAX || replayBytes > REPLAY_MAX_BYTES) {
@@ -7402,6 +7474,7 @@ const server = createServer(async (req, res) => {
           }),
         ),
         computerChildren: computerChildMonitors(),
+        computerChildVisuals: [...COMPUTER_CHILD_VISUALS.values()],
       });
     }
 
@@ -10517,7 +10590,10 @@ server.on("upgrade", (req, socket, head) => {
         stillAuthorized,
         requireActionAccounting: Boolean(authority.computerSubagent),
         ...(authority.computerSubagent
-          ? { onActions: (amount: number) => COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount) }
+          ? {
+              onActions: (amount: number) => COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount),
+              ...computerChildTelemetryCallbacks(authority.computerSubagent),
+            }
           : {}),
         verifyCurrentGeneration: async () => {
           if (!stillAuthorized()) return false;
@@ -10670,7 +10746,10 @@ server.on("upgrade", (req, socket, head) => {
       stillAuthorized,
       requireActionAccounting: Boolean(authority.computerSubagent),
       ...(authority.computerSubagent
-        ? { onActions: (amount: number) => COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount) }
+        ? {
+            onActions: (amount: number) => COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount),
+            ...computerChildTelemetryCallbacks(authority.computerSubagent),
+          }
         : {}),
       beginAction: () => stillAuthorized()
         ? computerControl.beginAction(authority.botId, authority.targetKey, authority.bridgeId)

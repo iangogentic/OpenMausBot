@@ -16,4 +16,17 @@ describe("image dimensions", () => {
     expect(imageDimensions(jpeg, "image/jpeg")).toEqual({ width: 1280, height: 720 });
     expect(() => imageDimensions(Buffer.from("nope"), "image/jpeg")).toThrow(/invalid JPEG/);
   });
+
+  it("reads bounded WebP extended dimensions", () => {
+    const webp = Buffer.alloc(30);
+    webp.write("RIFF", 0, "ascii");
+    webp.writeUInt32LE(22, 4);
+    webp.write("WEBP", 8, "ascii");
+    webp.write("VP8X", 12, "ascii");
+    webp.writeUInt32LE(10, 16);
+    webp.writeUIntLE(1279, 24, 3);
+    webp.writeUIntLE(899, 27, 3);
+    expect(imageDimensions(webp, "image/webp")).toEqual({ width: 1280, height: 900 });
+    expect(() => imageDimensions(Buffer.from("not-webp"), "image/webp")).toThrow(/invalid WebP/);
+  });
 });

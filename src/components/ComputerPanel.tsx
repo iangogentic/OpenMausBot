@@ -1442,6 +1442,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
 
       <ComputerChildMonitorStrip
         monitors={state.computerChildren}
+        visuals={state.computerChildVisuals}
         botId={bot.id}
         threadId={bot.threadId}
       />

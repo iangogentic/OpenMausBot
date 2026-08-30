@@ -35,6 +35,38 @@ describe("computer child monitor fold", () => {
     expect(state.computerChildren["child-0"]).toBeUndefined();
     expect(state.computerChildren["child-139"]?.status).toBe("completed");
   });
+
+  it("rejects stale visual telemetry and preserves the latest frame across cursor updates", () => {
+    const frame = {
+      mime: "image/png" as const,
+      data: "aGVsbG8=",
+      hash: "a".repeat(64),
+      width: 100,
+      height: 50,
+      seq: 2,
+      at: 2,
+    };
+    let state = reducer(initialState, {
+      type: "computerChildFrame", childId: "child", seq: 2, at: 2, frame,
+    });
+    state = reducer(state, {
+      type: "computerChildCursor",
+      childId: "child",
+      seq: 3,
+      at: 3,
+      cursor: { x: 20, y: 10, seq: 3, at: 3 },
+    });
+    const current = state.computerChildVisuals.child;
+    expect(current).toMatchObject({ lastSeq: 3, frame, cursor: { x: 20, y: 10, seq: 3 } });
+    const stale = reducer(state, {
+      type: "computerChildCursor",
+      childId: "child",
+      seq: 1,
+      at: 4,
+      cursor: { x: 99, y: 49, seq: 1, at: 4 },
+    });
+    expect(stale).toBe(state);
+  });
 });
 
 describe("bot deletion confirmation", () => {

@@ -55,3 +55,20 @@ export interface ComputerChildCursor {
  * entry without trusting a provider-supplied counter. */
 export type ComputerChildFrameListener = (frame: ComputerChildFrame) => void | Promise<void>;
 export type ComputerChildCursorListener = (cursor: ComputerChildCursor) => void | Promise<void>;
+
+/** Latest public visual state for one child. Sequence numbers are allocated
+ * by the trusted server, never accepted from the provider. */
+export interface ComputerChildVisualState {
+  readonly childId: string;
+  readonly lastSeq: number;
+  readonly frame?: ComputerChildFrame & {
+    readonly seq: number;
+    readonly at: number;
+    readonly width: number;
+    readonly height: number;
+  };
+  readonly cursor?: ComputerChildCursor & {
+    readonly seq: number;
+    readonly at: number;
+  };
+}
