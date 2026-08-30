@@ -20,7 +20,7 @@ import { createHash } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
 import { chmodSync, lstatSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
-import { resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
+import { findCliCandidates, resolveCliSpawn, type ResolvedSpawn } from "./env-path.ts";
 import {
   PROVIDER_INSTANCE_HOME_ENV,
   PROVIDER_INSTANCE_STATE_ENV,
@@ -444,10 +444,13 @@ export function resolveProviderSpawn(
   ) {
     throw new Error("provider launcher must be a root-owned, executable, non-writable regular file");
   }
+  const providerCommand = isAbsolute(resolved.command)
+    ? resolved.command
+    : findCliCandidates(resolved.command)[0] ?? resolved.command;
   // The separator is part of the launcher contract. It keeps a resolved
   // command beginning with a dash from becoming an option to the privileged,
   // root-owned wrapper. No shell parses either the command or its arguments.
-  return { command: launcher, args: ["--", resolved.command, ...resolved.args] };
+  return { command: launcher, args: ["--", providerCommand, ...resolved.args] };
 }
 
 export function spawnCli(

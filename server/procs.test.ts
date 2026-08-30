@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { findCliCandidates } from "./env-path.ts";
 
 import {
   prepareProviderSandboxEnvironment,
@@ -35,6 +36,14 @@ describe("provider OS identity boundary", () => {
       command: "/usr/bin/env",
       args: ["--", "/usr/bin/provider", "--prompt", "$(id)", "two words"],
     });
+  });
+
+  it.runIf(process.platform !== "win32")("resolves a PATH command before crossing the absolute-only launcher boundary", () => {
+    const node = findCliCandidates("node")[0]!;
+    expect(resolveProviderSpawn(
+      { command: "node", args: ["--version"] },
+      { OMB_PROVIDER_LAUNCHER: "/usr/bin/env", OMB_REQUIRE_PROVIDER_ISOLATION: "1" },
+    )).toEqual({ command: "/usr/bin/env", args: ["--", node, "--version"] });
   });
 
   it.runIf(process.platform !== "win32")("rejects relative, missing, and writable launcher paths", () => {
