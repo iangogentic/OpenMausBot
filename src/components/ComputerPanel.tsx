@@ -34,6 +34,7 @@ import { LocalScreenPreview } from "./LocalScreenPreview";
 import { LinuxLocalControl } from "./LinuxLocalControl";
 import { MacLocalControl } from "./MacLocalControl";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
+import { ComputerSessionStrip } from "./ComputerSessionStrip";
 import {
   autoSelectsLocalComputer,
   instanceSupportsLocalComputer,
@@ -1405,6 +1406,15 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           <span>Collapse</span>
         </button>
       </div>
+
+      <ComputerSessionStrip
+        bots={state.bots}
+        screens={state.screens}
+        computerControl={state.computerControl}
+        selectedBotId={bot.id}
+        dispatch={dispatch}
+        variant="panel"
+      />
 
       {panelView === "android" && androidConnected ? (
         <div className="flex-1 overflow-y-auto px-4 pt-2">

@@ -33,6 +33,8 @@ export interface ComputerSessionStripProps {
   initiallyCollapsed?: boolean;
   /** Test/embedding hook; ordinary app use starts with the menu closed. */
   initiallyOverflowOpen?: boolean;
+  /** The computer-panel embedding uses two columns and no chat-width gutters. */
+  variant?: "chat" | "panel";
 }
 
 function statusTone(session: ComputerSession): string {
@@ -94,6 +96,7 @@ export function ComputerSessionStrip({
   now,
   initiallyCollapsed = false,
   initiallyOverflowOpen = false,
+  variant = "chat",
 }: ComputerSessionStripProps) {
   const [clock, setClock] = useState(() => now ?? Date.now());
   const [collapsed, setCollapsed] = useState(initiallyCollapsed);
@@ -170,7 +173,10 @@ export function ComputerSessionStrip({
       ref={rootRef}
       data-computer-session-strip
       data-session-count={sessions.length}
-      className="relative z-20 mx-auto w-full max-w-[900px] shrink-0 px-5 pb-2"
+      className={cn(
+        "relative z-20 mx-auto w-full shrink-0 pb-2",
+        variant === "panel" ? "px-4" : "max-w-[900px] px-5",
+      )}
     >
       <div className="rounded-xl border border-hairline/40 bg-panel/80 p-1.5 shadow-sm backdrop-blur">
         <div className="flex items-center justify-between gap-2 px-1">
@@ -198,7 +204,9 @@ export function ComputerSessionStrip({
           <div id={stripId} className="mt-1 flex min-w-0 items-stretch gap-1.5" role="toolbar" aria-label="Bot computer sessions">
             <div
               className="grid min-w-0 flex-1 gap-1.5"
-              style={{ gridTemplateColumns: `repeat(${direct.length}, minmax(0, 1fr))` }}
+              style={{
+                gridTemplateColumns: `repeat(${variant === "panel" ? Math.min(2, direct.length) : direct.length}, minmax(0, 1fr))`,
+              }}
             >
               {direct.map((session, index) => (
                 <button

@@ -32,7 +32,12 @@ function screen(id: string) {
   };
 }
 
-function render(ids: string[], initiallyCollapsed = false, initiallyOverflowOpen = false): string {
+function render(
+  ids: string[],
+  initiallyCollapsed = false,
+  initiallyOverflowOpen = false,
+  variant: "chat" | "panel" = "chat",
+): string {
   return renderToStaticMarkup(createElement(ComputerSessionStrip, {
     bots: ids.map(bot),
     screens: Object.fromEntries(ids.map((id) => [id, screen(id)])),
@@ -42,6 +47,7 @@ function render(ids: string[], initiallyCollapsed = false, initiallyOverflowOpen
     now,
     initiallyCollapsed,
     initiallyOverflowOpen,
+    variant,
   }));
 }
 
@@ -87,5 +93,12 @@ describe("ComputerSessionStrip", () => {
     expect(collapsed).toContain('aria-label="Expand computer sessions"');
     expect(collapsed).not.toContain("data-computer-session-bot");
     expect(collapsed).not.toContain('role="toolbar"');
+  });
+
+  it("uses a compact two-column layout inside the Computer panel", () => {
+    const markup = render(["a", "b", "c", "d"], false, false, "panel");
+    expect(markup).toContain("px-4");
+    expect(markup).toContain("grid-template-columns:repeat(2, minmax(0, 1fr))");
+    expect(markup).not.toContain("max-w-[900px]");
   });
 });
