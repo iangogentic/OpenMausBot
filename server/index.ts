@@ -99,7 +99,7 @@ import { describeSpawnFailure, execCli, retireProviderOwnerState } from "./procs
 import { retireStorageLeaf } from "./storage-leaf.ts";
 import { BotDeletionJournal, runBotDeletionGc, type BotDeletionCleanup } from "./bot-deletion-gc.ts";
 import { buildNotification, type Notification } from "./notify.ts";
-import { isEffortLevel, type RequestOutcome, type RuntimeEvent } from "./contracts.ts";
+import { isEffortLevel, type ModelSelection, type RequestOutcome, type RuntimeEvent } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
@@ -171,6 +171,17 @@ import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import { ComputerSubagentManager, type ComputerSubagentHandle, type ComputerSubagentParent } from "./computer-subagent-manager.ts";
+import {
+  ComputerSubagentRuntime,
+  MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES,
+  type ComputerSubagentCapabilityDescriptor,
+  type ComputerSubagentFinalScreenshot,
+  type ComputerSubagentRuntimeHandle,
+} from "./computer-subagent-runtime.ts";
+import { createComputerOperatorProviderRuntime } from "./computer-operator-provider.ts";
+import { executeComputerOperatorRequest } from "./computer-operator-surface.ts";
+import { imageDimensions } from "./image-dimensions.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
 import { createBotPackageExport } from "./package-export.ts";
@@ -458,6 +469,7 @@ const CONTROL_GENERATIONS_BY_RUNTIME_TURN = new Map<string, string>();
 // event may still be needed to settle that old busy state. Stable thread ids
 // alone are never sufficient because a successor reuses them.
 const EXPECTED_RUNTIME_TURNS = new Map<string, InternalCapabilityTurn>();
+const PROVIDER_RUNTIME_TURN_IDS = new Map<string, string>();
 const RUNTIME_EVENT_TURNS = new WeakMap<RuntimeEvent, InternalCapabilityTurn>();
 const AUTHORIZED_RUNTIME_EVENTS = new WeakSet<RuntimeEvent>();
 const SUCCESSFUL_DELEGATION_GENERATIONS = new Map<string, string>();
@@ -468,6 +480,10 @@ const TURN_ATTACHMENT_HANDOFFS = new Map<string, () => void>();
 
 function turnAttachmentHandoffKey(turn: InternalCapabilityTurn): string {
   return `${turn.botId}\0${turn.threadId}\0${turn.generation}`;
+}
+
+function providerRuntimeTurnId(turn: InternalCapabilityTurn): string | null {
+  return PROVIDER_RUNTIME_TURN_IDS.get(turnAttachmentHandoffKey(turn)) ?? null;
 }
 
 function registerTurnAttachmentHandoff(turn: InternalCapabilityTurn, cleanup: () => void): void {
@@ -663,6 +679,7 @@ function localModelRelayIntegration(
   modelId: string | null | undefined,
   turn: InternalCapabilityTurn,
   depth: number,
+  mountId = "primary",
 ) {
   const inject = decodeInjectId(modelId);
   if (!inject) return null;
@@ -671,7 +688,7 @@ function localModelRelayIntegration(
   if (process.env.OMB_REQUIRE_PROVIDER_ISOLATION === "1" && PROVIDER_HARNESS_HOST !== "10.0.2.2") {
     throw new Error("isolated providers require the private guest host gateway for the model relay");
   }
-  const binding = INTERNAL_CAPABILITY_TURNS.register("model", turn, depth);
+  const binding = INTERNAL_CAPABILITY_TURNS.register("model", turn, depth, undefined, mountId);
   try {
     const authority = createModelRelayAuthority({
       binding,
@@ -874,6 +891,7 @@ async function dispatchProviderTurn(
     if (!dispatchSignal || dispatchSignal.aborted) throw new TurnDispatchCancelled();
     if (!INTERNAL_CAPABILITY_TURNS.bindRuntime(runtimeKey, turn)) throw new TurnDispatchCancelled();
     EXPECTED_RUNTIME_TURNS.set(runtimeKey, turn);
+    PROVIDER_RUNTIME_TURN_IDS.set(turnAttachmentHandoffKey(turn), providerTurnId);
     const controlGeneration = ACTIVE_CONTROL_TARGETS.generationForThread(turn.threadId);
     if (controlGeneration) CONTROL_GENERATIONS_BY_RUNTIME_TURN.set(runtimeKey, controlGeneration);
     const started = await adapter.sendTurn({
@@ -914,6 +932,9 @@ async function dispatchProviderTurn(
       EXPECTED_RUNTIME_TURNS.delete(runtimeKey);
     }
     CONTROL_GENERATIONS_BY_RUNTIME_TURN.delete(runtimeKey);
+    if (PROVIDER_RUNTIME_TURN_IDS.get(turnAttachmentHandoffKey(turn)) === providerTurnId) {
+      PROVIDER_RUNTIME_TURN_IDS.delete(turnAttachmentHandoffKey(turn));
+    }
     throw error;
   }
 }
@@ -1009,6 +1030,22 @@ async function cancelExactTargetTurn(turn: InternalCapabilityTurn): Promise<void
 INTERNAL_CAPABILITY_TURNS.onFinished((turn) => {
   void TURN_EXTERNAL_OPERATIONS.cancelTurn(turn);
   void PEER_CALLS.cancelSource(turn).catch(() => {});
+  COMPUTER_OPERATOR_CONTEXTS.delete(`${turn.botId}\0${turn.threadId}\0${turn.generation}`);
+  const operatorParent = computerOperatorParentForTurn(turn);
+  if (operatorParent) {
+    const parentKey = computerOperatorParentKey(operatorParent);
+    ACTIVE_COMPUTER_OPERATORS.delete(parentKey);
+    void COMPUTER_SUBAGENT_RUNTIME.cancelParent(operatorParent).catch(() => {});
+  }
+  for (const [parentKey, active] of ACTIVE_COMPUTER_OPERATORS) {
+    if (
+      active.parent.botId !== turn.botId ||
+      active.parent.threadId !== turn.threadId ||
+      active.parent.generation !== turn.generation
+    ) continue;
+    ACTIVE_COMPUTER_OPERATORS.delete(parentKey);
+    void COMPUTER_SUBAGENT_RUNTIME.abort(active.handle).catch(() => {});
+  }
   // Provider-facing Ian Brain sessions retain their own exact source for the
   // cleanup guardian. The dispatch snapshot itself must disappear as soon as
   // this turn loses authority so a successor always captures fresh config.
@@ -1067,12 +1104,204 @@ type PhysicalCapabilityAuthority = PhysicalMcpAuthority & {
   readonly threadId: string;
   readonly generation: string;
 };
+type LocalVmCapabilityAuthority = LocalVmMcpAuthority & {
+  readonly computerSubagent?: ComputerSubagentHandle;
+};
 const PHYSICAL_CAPABILITY_AUTHORITIES = new Map<string, PhysicalCapabilityAuthority>();
 const PHYSICAL_MCP_CONNECTIONS = new Map<string, Set<{ close: (reason?: string) => void }>>();
-const LOCAL_VM_CAPABILITY_AUTHORITIES = new Map<string, LocalVmMcpAuthority>();
+const LOCAL_VM_CAPABILITY_AUTHORITIES = new Map<string, LocalVmCapabilityAuthority>();
 const LOCAL_VM_MCP_CONNECTIONS = new Map<string, Set<LocalVmMcpBrokerHandle>>();
 const LOCAL_VM_MCP_ADMISSIONS = new LocalVmMcpAdmissions();
 const MODEL_RELAY_AUTHORITIES = new Map<string, ModelRelayAuthority>();
+
+interface ComputerOperatorTargetCapability {
+  readonly localComputer: ReturnType<typeof containerComputerMcp>;
+  readonly modelRelay: NonNullable<ReturnType<typeof localModelRelayIntegration>>;
+  readonly localCapabilityToken: string;
+  readonly modelCapabilityToken: string;
+  readonly bridgeId: string;
+  readonly runtime: Runtime;
+  readonly target: LocalVmTarget;
+}
+
+interface ComputerOperatorTurnContext {
+  readonly turn: InternalCapabilityTurn;
+  readonly target: LocalVmTarget;
+  readonly runtime: Runtime;
+  readonly vmGeneration: string;
+  readonly operatorModel: ModelSelection;
+}
+
+interface ActiveComputerOperator {
+  readonly parent: ComputerSubagentParent;
+  handle: ComputerSubagentRuntimeHandle;
+}
+
+const COMPUTER_OPERATOR_CONTEXTS = new Map<string, ComputerOperatorTurnContext>();
+const COMPUTER_OPERATOR_CHILD_TARGETS = new Map<string, ComputerOperatorTargetCapability>();
+const ACTIVE_COMPUTER_OPERATORS = new Map<string, ActiveComputerOperator>();
+
+function computerOperatorParentKey(parent: ComputerSubagentParent): string {
+  return `${parent.botId}\0${parent.threadId}\0${parent.turnId}\0${String(parent.generation)}`;
+}
+
+function computerOperatorParentForTurn(turn: InternalCapabilityTurn): ComputerSubagentParent | null {
+  const turnId = providerRuntimeTurnId(turn);
+  return turnId ? { botId: turn.botId, threadId: turn.threadId, turnId, generation: turn.generation } : null;
+}
+
+function isComputerOperatorParentCurrent(parent: ComputerSubagentParent): boolean {
+  if (typeof parent.generation !== "string") return false;
+  const turn = INTERNAL_CAPABILITY_TURNS.forBot(parent.botId);
+  if (!turn || turn.threadId !== parent.threadId || turn.generation !== parent.generation) return false;
+  if (providerRuntimeTurnId(turn) !== parent.turnId) return false;
+  return EXPECTED_RUNTIME_TURNS.get(expectedRuntimeTurnKey(parent.threadId, parent.turnId)) === turn;
+}
+
+async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSelection> {
+  const preferred = store.bot(parentBotId);
+  const candidates = [preferred, ...store.bots.filter((bot) => bot.id !== parentBotId)].filter(Boolean);
+  for (const candidate of candidates) {
+    const selection = candidate!.modelSelection;
+    if (decodeInjectId(selection.model)?.host !== "desktop2_qwen") continue;
+    const instance = registry.get(selection.instanceId);
+    if (!instance || !instance.enabled || instance.driverKind !== "hermesAgent") continue;
+    const snapshot = await instance.snapshot().catch(() => null);
+    if (snapshot?.state !== "available") continue;
+    return { ...selection };
+  }
+  throw Object.assign(
+    new Error("a live Hermes bot configured for the desktop2 Qwen model is required for computer operation"),
+    { status: 409 },
+  );
+}
+
+async function closeComputerOperatorChildTarget(childId: string, reason: string): Promise<void> {
+  const resource = COMPUTER_OPERATOR_CHILD_TARGETS.get(childId);
+  if (!resource) return;
+  COMPUTER_OPERATOR_CHILD_TARGETS.delete(childId);
+  const connections = [...(LOCAL_VM_MCP_CONNECTIONS.get(resource.localCapabilityToken) ?? [])];
+  for (const connection of connections) connection.close(reason);
+  await Promise.allSettled(connections.map((connection) => connection.closed));
+  LOCAL_VM_MCP_CONNECTIONS.delete(resource.localCapabilityToken);
+  LOCAL_VM_CAPABILITY_AUTHORITIES.delete(resource.localCapabilityToken);
+  LOCAL_VM_MCP_ADMISSIONS.revoke(resource.localCapabilityToken);
+  INTERNAL_CAPABILITIES.revoke(resource.localCapabilityToken);
+  MODEL_RELAY_AUTHORITIES.delete(resource.modelCapabilityToken);
+  INTERNAL_CAPABILITIES.revoke(resource.modelCapabilityToken);
+  const bridge = CONTROL_BRIDGES.get(resource.bridgeId);
+  if (bridge) {
+    bridge.retired = true;
+    bridge.closed = true;
+    computerControl.quarantineActionsForBridge(bridge.botId, bridge.targetKey, resource.bridgeId);
+    pruneRetiredControlBridges(bridge.targetKey);
+  }
+}
+
+const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
+  prepare: async (input) => {
+    input.signal.throwIfAborted();
+    const capability = input.target.opaqueCapability as ComputerOperatorTargetCapability;
+    const inject = decodeInjectId(input.model.model);
+    const instance = registry.get(input.model.instanceId);
+    if (!instance || !instance.enabled || instance.driverKind !== "hermesAgent" || inject?.host !== "desktop2_qwen") {
+      throw new Error("computer operator model authority is unavailable");
+    }
+    const snapshot = await instance.snapshot();
+    input.signal.throwIfAborted();
+    if (snapshot.state !== "available") throw new Error("computer operator model is offline");
+    return {
+      adapter: instance.adapter,
+      turn: {
+        isolationKey: `computer-operator:${input.childId}`,
+        system: "You are the dedicated visual computer operator. Complete only the delegated task in the attached isolated Linux desktop. Inspect the current screen before acting, prefer accessibility targets over coordinates, verify focus before typing, and use small deliberate actions. Every mutation must be visually verified from its returned screen. Never claim success unless the final visible pixels prove the requested result. Stop for passwords, MFA, CAPTCHAs, purchases, destructive actions, or ambiguous targets and report the blocker. You have at most nine computer actions.",
+        integrations: {
+          modelRelay: capability.modelRelay,
+          localComputer: capability.localComputer,
+        },
+      },
+    };
+  },
+});
+
+const COMPUTER_SUBAGENT_MANAGER = new ComputerSubagentManager();
+const COMPUTER_SUBAGENT_RUNTIME = new ComputerSubagentRuntime({
+  manager: COMPUTER_SUBAGENT_MANAGER,
+  provider: COMPUTER_OPERATOR_PROVIDER,
+  acquireTarget: async (handle, parent, signal): Promise<ComputerSubagentCapabilityDescriptor> => {
+    signal.throwIfAborted();
+    if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn is stale");
+    const context = COMPUTER_OPERATOR_CONTEXTS.get(`${parent.botId}\0${parent.threadId}\0${String(parent.generation)}`);
+    if (!context || context.operatorModel.instanceId !== COMPUTER_SUBAGENT_MANAGER.get(handle.childId)?.operatorModel?.instanceId) {
+      throw new Error("computer operator target authority is unavailable");
+    }
+    const currentTarget = localVmTargetForBot(parent.botId);
+    if (currentTarget.key !== context.target.key || currentTarget.containerName !== context.target.containerName) {
+      throw new Error("computer operator target changed");
+    }
+    if (await currentContainerComputerGeneration(context.runtime, currentTarget) !== context.vmGeneration) {
+      throw new Error("computer operator VM generation changed");
+    }
+    signal.throwIfAborted();
+    const mountId = `computer-child:${handle.childId}`;
+    const modelRelay = localModelRelayIntegration(context.operatorModel.model, context.turn, 0, mountId);
+    if (!modelRelay) throw new Error("computer operator model relay could not be created");
+    let local: ScopedLocalVmComputerCapability;
+    try {
+      local = scopedLocalVmComputerCapability(
+        context.turn,
+        0,
+        context.runtime,
+        context.target,
+        context.vmGeneration,
+        { handle, mountId },
+      );
+    } catch (error) {
+      MODEL_RELAY_AUTHORITIES.delete(modelRelay.token);
+      INTERNAL_CAPABILITIES.revoke(modelRelay.token);
+      throw error;
+    }
+    const opaqueCapability: ComputerOperatorTargetCapability = {
+      localComputer: local.connection,
+      modelRelay,
+      localCapabilityToken: local.capabilityToken,
+      modelCapabilityToken: modelRelay.token,
+      bridgeId: local.bridgeId,
+      runtime: context.runtime,
+      target: context.target,
+    };
+    COMPUTER_OPERATOR_CHILD_TARGETS.set(handle.childId, opaqueCapability);
+    return { targetKey: context.target.key, targetGeneration: context.vmGeneration, opaqueCapability };
+  },
+  releaseTarget: async (childId) => closeComputerOperatorChildTarget(childId, "computer operator finished"),
+  captureFinalScreenshot: async ({ childId, parent, target }): Promise<ComputerSubagentFinalScreenshot> => {
+    if (!isComputerOperatorParentCurrent(parent)) throw new Error("computer operator parent turn is stale");
+    const capability = COMPUTER_OPERATOR_CHILD_TARGETS.get(childId);
+    if (!capability || capability !== target.opaqueCapability) throw new Error("computer operator screenshot authority is unavailable");
+    if (await currentContainerComputerGeneration(capability.runtime, capability.target) !== target.targetGeneration) {
+      throw new Error("computer operator VM generation changed before final screenshot");
+    }
+    const dataUrl = await containerComputerAgentScreenshot(undefined, undefined, capability.target);
+    const match = /^data:(image\/(?:png|jpeg));base64,([A-Za-z0-9+/]+={0,2})$/.exec(dataUrl);
+    if (!match) throw new Error("computer operator returned an unsupported final screenshot");
+    const mimeType = match[1] as "image/png" | "image/jpeg";
+    const bytes = Buffer.from(match[2]!, "base64");
+    if (bytes.byteLength <= 0 || bytes.byteLength > MAX_COMPUTER_SUBAGENT_SCREENSHOT_BYTES) {
+      throw new Error("computer operator final screenshot exceeded its bounded size");
+    }
+    const dimensions = imageDimensions(bytes, mimeType);
+    return {
+      mimeType,
+      dataBase64: match[2]!,
+      byteLength: bytes.byteLength,
+      ...dimensions,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  },
+  isParentCurrent: isComputerOperatorParentCurrent,
+  quarantineChild: async (childId) => closeComputerOperatorChildTarget(childId, "computer operator quarantined"),
+  onComplete: async () => undefined,
+});
 
 type BoxBrokerPromptAction = {
   botId: string;
@@ -1206,13 +1435,20 @@ function controlIntegration(
   };
 }
 
-function scopedLocalVmComputer(
+interface ScopedLocalVmComputerCapability {
+  readonly connection: ReturnType<typeof containerComputerMcp>;
+  readonly capabilityToken: string;
+  readonly bridgeId: string;
+}
+
+function scopedLocalVmComputerCapability(
   turn: InternalCapabilityTurn,
   depth: number,
   runtime: Runtime,
   target: LocalVmTarget,
   vmGeneration: string,
-) {
+  child?: { readonly handle: ComputerSubagentHandle; readonly mountId: string },
+): ScopedLocalVmComputerCapability {
   if (!/^[a-f0-9]{64}$/.test(vmGeneration)) {
     throw new Error("the Local VM did not provide an exact running generation");
   }
@@ -1226,8 +1462,8 @@ function scopedLocalVmComputer(
   const capability = INTERNAL_CAPABILITY_TURNS.register("local-vm", turn, depth, {
     targetKey: target.key,
     resourceId: vmGeneration,
-  });
-  const authority: LocalVmMcpAuthority = Object.freeze({
+  }, child?.mountId ?? "primary");
+  const authority: LocalVmCapabilityAuthority = Object.freeze({
     capabilityToken: capability.token,
     botId: turn.botId,
     threadId: turn.threadId,
@@ -1237,12 +1473,58 @@ function scopedLocalVmComputer(
     containerName: target.containerName,
     vmGeneration,
     bridgeId: control.bridgeId,
+    ...(child ? { computerSubagent: child.handle } : {}),
   });
   LOCAL_VM_CAPABILITY_AUTHORITIES.set(capability.token, authority);
-  return containerComputerMcp({
-    url: `${PROVIDER_HARNESS_WS}${LOCAL_VM_MCP_PATH}`,
-    token: capability.token,
+  return {
+    connection: containerComputerMcp({
+      url: `${PROVIDER_HARNESS_WS}${LOCAL_VM_MCP_PATH}`,
+      token: capability.token,
+    }),
+    capabilityToken: capability.token,
+    bridgeId: control.bridgeId,
+  };
+}
+
+function scopedLocalVmComputer(
+  turn: InternalCapabilityTurn,
+  depth: number,
+  runtime: Runtime,
+  target: LocalVmTarget,
+  vmGeneration: string,
+) {
+  return scopedLocalVmComputerCapability(turn, depth, runtime, target, vmGeneration).connection;
+}
+
+function computerOperatorIntegration(
+  turn: InternalCapabilityTurn,
+  depth: number,
+  runtime: Runtime,
+  target: LocalVmTarget,
+  vmGeneration: string,
+  operatorModel: ModelSelection,
+) {
+  ACTIVE_CONTROL_TARGETS.select(turn.botId, turn.threadId, target.key, turn.generation);
+  const binding = INTERNAL_CAPABILITY_TURNS.register("computer-operator", turn, depth, {
+    targetKey: target.key,
+    resourceId: vmGeneration,
   });
+  COMPUTER_OPERATOR_CONTEXTS.set(`${turn.botId}\0${turn.threadId}\0${turn.generation}`, {
+    turn,
+    target,
+    runtime,
+    vmGeneration,
+    operatorModel,
+  });
+  return {
+    command: process.execPath,
+    args: [SPAWNED_PROXIES.computerOperator],
+    env: {
+      ELECTRON_RUN_AS_NODE: "1",
+      OMB_HARNESS_URL: PROVIDER_HARNESS_HTTP,
+      OMB_COMPUTER_OPERATOR_CAPABILITY_TOKEN: binding.token,
+    },
+  };
 }
 
 function outboundPhysicalComputer(
@@ -2079,6 +2361,7 @@ bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "request.opened") watchdog.setWaitingOnHuman(event.threadId, true);
   else if (event.type === "request.resolved") watchdog.setWaitingOnHuman(event.threadId, false);
   else if (event.type === "turn.completed") {
+    PROVIDER_RUNTIME_TURN_IDS.delete(turnAttachmentHandoffKey(expectedTurn));
     watchdog.settle(event.threadId);
     const generation = controlGenerationForEvent(event);
     const bot = store.botByThread(event.threadId);
@@ -2103,6 +2386,7 @@ bus.subscribe((event: RuntimeEvent) => {
     });
   }
   else if (event.type === "session.exited") {
+    PROVIDER_RUNTIME_TURN_IDS.delete(turnAttachmentHandoffKey(expectedTurn));
     const generation = controlGenerationForEvent(event);
     const bot = store.botByThread(event.threadId);
     quarantineBoxBrokerPromptAction(expectedTurn);
@@ -3531,7 +3815,7 @@ async function startTurn(
       const mountsCloudComputer = mountsComputerMcp || instance.driverKind === "boxAgent";
       const mountsLocalComputer = instance.adapter.capabilities.localComputerMcp === true;
       let previewCapture: (() => Promise<{ png: string; format: string }>) | null = null;
-      let computerKind: "box" | "vps" | "vm" | "local" | null = null;
+      let computerKind: "box" | "vps" | "vm" | "vm-operator" | "local" | null = null;
       let autoVpsProblem: string | null = null;
 
       // Explicit destinations are strict. In particular, Local VM must never
@@ -3587,14 +3871,39 @@ async function startTurn(
         if (!localVm.vm_generation) {
           throw new Error("the Local VM identity changed during setup — retry after it is ready");
         }
-        integrations.localComputer = scopedLocalVmComputer(
-          internalTurn,
-          commsDepth,
-          localVm.runtime,
-          localVmTarget,
-          localVm.vm_generation,
-        );
-        computerKind = "vm";
+        const previewVmGeneration = localVm.vm_generation;
+        previewCapture = async () => {
+          if (await currentContainerComputerGeneration(localVm.runtime!, localVmTarget) !== previewVmGeneration) {
+            throw new Error("the Local VM generation changed before preview capture");
+          }
+          const image = await containerComputerScreenshot(undefined, undefined, localVmTarget);
+          const match = /^data:image\/(png|jpeg);base64,([A-Za-z0-9+/]+={0,2})$/.exec(image);
+          if (!match) throw new Error("the Local VM returned an unsupported preview frame");
+          return { png: match[2]!, format: match[1]! };
+        };
+        if (instance.adapter.capabilities.computerOperatorMcp === true) {
+          const operatorModel = await selectComputerOperatorModel(bot.id);
+          PENDING_TURN_DISPATCHES.assertPending(internalTurn);
+          if (!INTERNAL_CAPABILITY_TURNS.isActive(internalTurn)) throw new TurnDispatchCancelled();
+          integrations.computerOperator = computerOperatorIntegration(
+            internalTurn,
+            commsDepth,
+            localVm.runtime,
+            localVmTarget,
+            localVm.vm_generation,
+            operatorModel,
+          );
+          computerKind = "vm-operator";
+        } else {
+          integrations.localComputer = scopedLocalVmComputer(
+            internalTurn,
+            commsDepth,
+            localVm.runtime,
+            localVmTarget,
+            localVm.vm_generation,
+          );
+          computerKind = "vm";
+        }
       } else if (wants === "local") {
         const outbound = physicalRegistration();
         const cua = outbound ? null : readCuaConnection();
@@ -3812,7 +4121,9 @@ async function startTurn(
         transcript: providerTranscript,
         system:
           persona +
-          (computerKind === "vm"
+          (computerKind === "vm-operator"
+            ? " You have a dedicated visual computer operator for this bot's isolated Linux desktop. Delegate each concrete desktop task with delegate_computer and wait for its verified text plus final screenshot before deciding the next step. You do not have direct computer tools. Give the operator one clear outcome at a time, include relevant visible context, and judge success only from the returned final screen. At passwords, MFA, CAPTCHAs, purchases, destructive actions, or protected input, stop and ask the user."
+            : computerKind === "vm"
             ? localVmMode(cfg) === "per-bot"
               ? " You have your own isolated Cua sandbox: a Linux desktop in a container reserved for this bot. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. If multiple windows match, use their bounds and stacking order to select the newly opened or topmost requested window, click inside that exact window, and verify focus before typing. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged. A tool error does not prove its requested effect happened, and you must not claim success unless the resulting pixels visibly prove the requested postcondition. Use computer_batch for up to nine predictable click/type/key/scroll steps that do not need intermediate inspection; it returns one final screen and never truncates an oversized batch. On Linux, every batched keyboard action aimed at a known window must repeat that window's pid and window_id with delivery_mode set to foreground; use the canonical key name enter rather than Return."
               : " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. If multiple windows match, use their bounds and stacking order to select the newly opened or topmost requested window, click inside that exact window, and verify focus before typing. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged. A tool error does not prove its requested effect happened, and you must not claim success unless the resulting pixels visibly prove the requested postcondition. Use computer_batch for up to nine predictable click/type/key/scroll steps that do not need intermediate inspection; it returns one final screen and never truncates an oversized batch. On Linux, every batched keyboard action aimed at a known window must repeat that window's pid and window_id with delivery_mode set to foreground; use the canonical key name enter rather than Return."
@@ -5157,6 +5468,14 @@ async function reloadProviders() {
   releaseAllTurnAttachmentHandoffs();
   EXPECTED_RUNTIME_TURNS.clear();
   CONTROL_GENERATIONS_BY_RUNTIME_TURN.clear();
+  PROVIDER_RUNTIME_TURN_IDS.clear();
+  COMPUTER_OPERATOR_CONTEXTS.clear();
+  ACTIVE_COMPUTER_OPERATORS.clear();
+  await Promise.allSettled(
+    [...COMPUTER_OPERATOR_CHILD_TARGETS.keys()].map((childId) =>
+      closeComputerOperatorChildTarget(childId, "provider fleet reloaded")
+    ),
+  );
   for (const interrupted of interruptedRooms.values()) {
     const current = store.group(interrupted.groupId);
     const speaker = groupSpeakers.get(interrupted.threadId);
@@ -5508,6 +5827,83 @@ const server = createServer(async (req, res) => {
           selected ? { botId: capabilityBinding.botId, ...selected } : null,
         );
       };
+      if (path === "/api/internal/computer-operator") {
+        if (method !== "POST" || capabilityBinding?.kind !== "computer-operator") {
+          return json(res, 409, { error: "the computer operator capability is unavailable" });
+        }
+        const context = COMPUTER_OPERATOR_CONTEXTS.get(
+          `${capabilityBinding.botId}\0${capabilityBinding.threadId}\0${capabilityBinding.generation}`,
+        );
+        if (
+          !context ||
+          !sameInternalTurn(context.turn, capabilityBinding) ||
+          !capabilityBinding.scope ||
+          capabilityBinding.scope.targetKey !== context.target.key ||
+          capabilityBinding.scope.resourceId !== context.vmGeneration ||
+          !capabilityStillActive() ||
+          !scopedTargetStillActive()
+        ) return json(res, 409, { error: "the scoped computer operator turn is no longer active" });
+
+        const clientAbort = new AbortController();
+        const onAborted = () => clientAbort.abort(new DOMException("computer operator client disconnected", "AbortError"));
+        const onClosed = () => { if (!res.writableEnded) onAborted(); };
+        req.once("aborted", onAborted);
+        res.once("close", onClosed);
+        try {
+          const body = await readBody(req, 24 * 1024);
+          if (!capabilityStillActive() || !scopedTargetStillActive()) {
+            return json(res, 409, { error: "the computer operator turn ended while its request was being read" });
+          }
+          const result = await TURN_EXTERNAL_OPERATIONS.run(capabilityBinding, async (turnSignal) => {
+            const signal = AbortSignal.any([turnSignal, clientAbort.signal]);
+            return executeComputerOperatorRequest(body, signal, async (task, executionSignal) => {
+              const parent = computerOperatorParentForTurn(context.turn);
+              if (!parent || !isComputerOperatorParentCurrent(parent)) {
+                throw new Error("the computer operator parent runtime turn is unavailable");
+              }
+              const handle = COMPUTER_SUBAGENT_RUNTIME.start({
+                parent,
+                target: { targetKey: context.target.key, targetGeneration: context.vmGeneration },
+                operatorModel: context.operatorModel,
+                prompt: task,
+              });
+              const parentKey = computerOperatorParentKey(parent);
+              const active: ActiveComputerOperator = { parent, handle };
+              if (ACTIVE_COMPUTER_OPERATORS.has(parentKey)) {
+                void COMPUTER_SUBAGENT_RUNTIME.abort(handle);
+                throw new Error("this parent turn already has an active computer operator");
+              }
+              ACTIVE_COMPUTER_OPERATORS.set(parentKey, active);
+              const abortChild = () => { void COMPUTER_SUBAGENT_RUNTIME.abort(active.handle).catch(() => undefined); };
+              executionSignal.addEventListener("abort", abortChild, { once: true });
+              if (executionSignal.aborted) abortChild();
+              try {
+                const completion = await handle.done;
+                if (!completion) return { text: "computer operator ended without a terminal result", isError: true };
+                const text = completion.output?.trim() || completion.error?.trim() ||
+                  (completion.status === "completed" ? "Computer task completed." : `Computer task ${completion.status}.`);
+                if (completion.status !== "completed" || !completion.finalScreenshot) {
+                  return { text, isError: true };
+                }
+                return {
+                  text,
+                  image: {
+                    mimeType: completion.finalScreenshot.mimeType,
+                    data: completion.finalScreenshot.dataBase64,
+                  },
+                };
+              } finally {
+                executionSignal.removeEventListener("abort", abortChild);
+                if (ACTIVE_COMPUTER_OPERATORS.get(parentKey) === active) ACTIVE_COMPUTER_OPERATORS.delete(parentKey);
+              }
+            });
+          });
+          return json(res, 200, result);
+        } finally {
+          req.off("aborted", onAborted);
+          res.off("close", onClosed);
+        }
+      }
       if (isModelRelayRoute) {
         const authority = capabilityBinding ? MODEL_RELAY_AUTHORITIES.get(capabilityBinding.token) : null;
         if (
@@ -8259,6 +8655,41 @@ const server = createServer(async (req, res) => {
       if (bot.busy) {
         const instance = registry.get(bot.modelSelection.instanceId);
         const steeringTurn = INTERNAL_CAPABILITY_TURNS.forBot(bot.id);
+        const operatorParent = steeringTurn ? computerOperatorParentForTurn(steeringTurn) : null;
+        const activeOperator = operatorParent
+          ? ACTIVE_COMPUTER_OPERATORS.get(computerOperatorParentKey(operatorParent))
+          : null;
+        if (steeringTurn && operatorParent && activeOperator && !hasManagedAttachmentReferences(text)) {
+          const prompt = promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User");
+          const steered = await TURN_EXTERNAL_OPERATIONS.run(steeringTurn, async () => {
+            const successor = await COMPUTER_SUBAGENT_RUNTIME.steer(activeOperator.handle, prompt);
+            if (ACTIVE_COMPUTER_OPERATORS.get(computerOperatorParentKey(operatorParent)) === activeOperator) {
+              activeOperator.handle = successor;
+            }
+            return true;
+          }).catch(() => false);
+          const currentBot = store.bot(bot.id);
+          if (
+            botStopBlocked(bot.id) ||
+            !currentBot?.busy ||
+            currentBot.threadId !== bot.threadId ||
+            !sameInternalTurn(INTERNAL_CAPABILITY_TURNS.forBot(bot.id), steeringTurn)
+          ) {
+            return json(res, 409, { error: "the turn ended while this message was being delivered — send it again" });
+          }
+          if (!steered) {
+            return json(res, 409, { error: "the computer operator could not be steered safely — send it again after it stops" });
+          }
+          clearUnattended(bot.id);
+          store.appendMessage(bot.threadId, {
+            role: "user",
+            kind: "text",
+            text,
+            replyToId: replyTo?.id,
+            steered: true,
+          });
+          return json(res, 202, { ok: true, steered: true });
+        }
         if (
           steeringTurn?.threadId === bot.threadId &&
           instance?.adapter.capabilities.queueing &&
@@ -9703,6 +10134,10 @@ server.on("upgrade", (req, socket, head) => {
         authority,
         signal,
         stillAuthorized,
+        requireActionAccounting: Boolean(authority.computerSubagent),
+        ...(authority.computerSubagent
+          ? { onActions: (amount: number) => COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount) }
+          : {}),
         verifyCurrentGeneration: async () => {
           if (!stillAuthorized()) return false;
           const currentTarget = localVmTargetForBot(authority.botId);
@@ -9932,6 +10367,14 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     PHYSICAL_BRIDGES.closeAll();
     EXPECTED_RUNTIME_TURNS.clear();
     CONTROL_GENERATIONS_BY_RUNTIME_TURN.clear();
+    PROVIDER_RUNTIME_TURN_IDS.clear();
+    COMPUTER_OPERATOR_CONTEXTS.clear();
+    ACTIVE_COMPUTER_OPERATORS.clear();
+    await Promise.allSettled(
+      [...COMPUTER_OPERATOR_CHILD_TARGETS.keys()].map((childId) =>
+        closeComputerOperatorChildTarget(childId, "server shutting down")
+      ),
+    );
     server.close();
     // Do not leave a chunked request alive behind the dispatch snapshot. SSE
     // and viewer sockets are disposable during process shutdown.

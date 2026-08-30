@@ -40,6 +40,7 @@ const launchInput = {
   model: { instanceId: "hermes", model: "desktop2_qwen::qwen" },
   prompt: "open a terminal",
   target: { targetKey: "vm:bot", targetGeneration: "vm-generation", opaqueCapability: {} },
+  signal: new AbortController().signal,
 };
 
 describe("computer operator hidden provider child", () => {
@@ -59,7 +60,21 @@ describe("computer operator hidden provider child", () => {
       model: "desktop2_qwen::qwen",
       resumeCursor: undefined,
       transcript: undefined,
+      dispatchSignal: launchInput.signal,
     }));
+  });
+
+  it("does not dispatch after cancellation during preparation", async () => {
+    const fake = fakeAdapter();
+    const controller = new AbortController();
+    const runtime = createComputerOperatorProviderRuntime({
+      prepare: async () => {
+        controller.abort(new DOMException("parent stopped", "AbortError"));
+        return { adapter: fake.adapter };
+      },
+    });
+    await expect(runtime.launch({ ...launchInput, signal: controller.signal })).rejects.toThrow();
+    expect(fake.adapter.sendTurn).not.toHaveBeenCalled();
   });
 
   it("bounds arbitrarily large assistant output", async () => {

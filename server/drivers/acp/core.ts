@@ -827,6 +827,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
             sessionModelSwitch: "unsupported",
             agentsMcp: true,
             computerMcp: true,
+            computerOperatorMcp: true,
             composioMcp: true,
             images: support.images !== false,
             effortLevels: support.effortLevels,

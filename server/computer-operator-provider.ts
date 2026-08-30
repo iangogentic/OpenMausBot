@@ -50,7 +50,9 @@ export function createComputerOperatorProviderRuntime(
 ): ComputerSubagentProviderRuntime {
   return {
     launch: async (input) => {
+      input.signal.throwIfAborted();
       const prepared = await options.prepare(input);
+      input.signal.throwIfAborted();
       const { adapter } = prepared;
       const threadId = computerOperatorChildThreadId(input.childId);
       const turnId = input.childId;
@@ -103,6 +105,7 @@ export function createComputerOperatorProviderRuntime(
           threadId,
           turnId,
           isolationKey: prepared.turn?.isolationKey ?? threadId,
+          dispatchSignal: input.signal,
           text: input.prompt,
           model: input.model.model,
           // Hidden operator children are deliberately fresh and receive no
