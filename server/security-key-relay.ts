@@ -31,7 +31,7 @@ export interface SecurityKeyRelayBinding {
 export interface SecurityKeyBrowserBinding extends SecurityKeyRelayBinding {
   readonly botId: string;
   readonly targetKey: string;
-  readonly vmGeneration: number;
+  readonly vmGeneration: string;
   readonly browserGeneration: number;
 }
 
@@ -273,7 +273,7 @@ export class SecurityKeyRelayManager {
     browser: SecurityKeyBrowserBinding;
     controller: SecurityKeyControllerBinding;
     frame: Extract<SecurityKeyBrowserToRelayFrame, { type: "browser.request" }>;
-    trusted: { botId: string; targetKey: string; vmGeneration: number; browserGeneration: number };
+    trusted: { botId: string; targetKey: string; vmGeneration: string; browserGeneration: number };
     origin: string;
     rpId: string;
     botLabel: string;
@@ -434,7 +434,7 @@ export class SecurityKeyRelayManager {
     return true;
   }
 
-  cancelForTrustedTarget(input: { botId: string; targetKey: string; vmGeneration: number; browserGeneration: number }, reason: "turn-ended" | "target-replaced"): boolean {
+  cancelForTrustedTarget(input: { botId: string; targetKey: string; vmGeneration: string; browserGeneration: number }, reason: "turn-ended" | "target-replaced"): boolean {
     const active = this.active;
     if (!active || active.browser.botId !== input.botId || active.browser.targetKey !== input.targetKey
       || active.browser.vmGeneration !== input.vmGeneration || active.browser.browserGeneration !== input.browserGeneration) return false;

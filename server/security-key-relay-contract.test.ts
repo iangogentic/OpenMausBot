@@ -20,8 +20,8 @@ describe("security-key relay frames", () => {
       kind: "get",
       requestDetailsJson: "{}",
       botId: "bot_0123456789ab",
-      targetKey: "target_0123456789",
-      vmGeneration: 2,
+      targetKey: "local-vm:shared",
+      vmGeneration: "a".repeat(64),
       browserGeneration: 3,
     }))).toMatchObject({ type: "browser.request", kind: "get", chromeRequestId: 12 });
   });
@@ -47,12 +47,13 @@ describe("security-key relay frames", () => {
       chromeRequestId: 12,
       kind: "get",
       botId: "bot_0123456789ab",
-      targetKey: "target_0123456789",
-      vmGeneration: 2,
+      targetKey: "local-vm:shared",
+      vmGeneration: "a".repeat(64),
       browserGeneration: 3,
     };
     expect(() => parseSecurityKeyBrowserFrame({ ...base, requestDetailsJson: "not-json" })).toThrow();
     expect(() => parseSecurityKeyBrowserFrame({ ...base, requestDetailsJson: "[]" })).toThrow();
+    expect(() => parseSecurityKeyBrowserFrame({ ...base, vmGeneration: 2, requestDetailsJson: "{}" })).toThrow();
   });
 
   it("rejects oversized serialized frames before JSON parsing", () => {

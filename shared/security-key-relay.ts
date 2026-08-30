@@ -14,6 +14,8 @@ export const SECURITY_KEY_RELAY_HEARTBEAT_INTERVAL_MS = 10_000;
 export const SECURITY_KEY_RELAY_LIVENESS_TIMEOUT_MS = 30_000;
 
 const id = z.string().min(16).max(128).regex(/^[A-Za-z0-9_-]+$/);
+const targetKey = z.string().min(3).max(200).regex(/^[A-Za-z0-9_.:-]+$/);
+const vmGeneration = z.string().length(64).regex(/^[a-f0-9]{64}$/);
 const generation = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const sequence = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const timestamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -34,8 +36,8 @@ export const securityKeyBrowserToRelayFrameSchema = z.discriminatedUnion("type",
     type: z.literal("browser.register"),
     protocolVersion,
     botId: id,
-    targetKey: id,
-    vmGeneration: generation,
+    targetKey,
+    vmGeneration,
     browserGeneration: generation,
     extensionId: z.string().length(32).regex(/^[a-p]+$/),
     challengeResponse: id,
@@ -48,8 +50,8 @@ export const securityKeyBrowserToRelayFrameSchema = z.discriminatedUnion("type",
     kind: requestKind,
     requestDetailsJson: jsonText(SECURITY_KEY_RELAY_MAX_REQUEST_JSON_BYTES),
     botId: id,
-    targetKey: id,
-    vmGeneration: generation,
+    targetKey,
+    vmGeneration,
     browserGeneration: generation,
   }).strict(),
   z.object({
@@ -58,8 +60,8 @@ export const securityKeyBrowserToRelayFrameSchema = z.discriminatedUnion("type",
     ceremonyId: id,
     chromeRequestId: z.number().int().nonnegative().max(0x7fff_ffff),
     botId: id,
-    targetKey: id,
-    vmGeneration: generation,
+    targetKey,
+    vmGeneration,
     browserGeneration: generation,
   }).strict(),
   z.object({

@@ -8,6 +8,8 @@ const BOT_A = "bot_aaaaaaaaaaaaaaaa";
 const BOT_B = "bot_bbbbbbbbbbbbbbbb";
 const TARGET_A = "target_aaaaaaaaaaaaa";
 const TARGET_B = "target_bbbbbbbbbbbbb";
+const VM_A = "a".repeat(64);
+const VM_B = "b".repeat(64);
 const CEREMONY_A = "ceremony_aaaaaaaaaaaa";
 const CEREMONY_B = "ceremony_bbbbbbbbbbbb";
 
@@ -24,7 +26,7 @@ function fixture() {
     livenessTimeoutMs: 200,
   });
 
-  function browser(connectionId = "browser-a", botId = BOT_A, targetKey = TARGET_A, vmGeneration = 1, browserGeneration = 1) {
+  function browser(connectionId = "browser-a", botId = BOT_A, targetKey = TARGET_A, vmGeneration = VM_A, browserGeneration = 1) {
     const pending = manager.beginBrowserRegistration(connectionId);
     const challenge = pending.frame.type === "relay.challenge" ? pending.frame.challenge : "";
     const binding = manager.completeBrowserRegistration(pending.binding, {
@@ -154,12 +156,12 @@ describe("SecurityKeyRelayManager", () => {
     const crossBot = { ...f.request(browser), botId: BOT_B };
     await expect(f.manager.startCeremony({
       browser, controller, frame: crossBot,
-      trusted: { botId: browser.botId, targetKey: browser.targetKey, vmGeneration: 1, browserGeneration: 1 },
+      trusted: { botId: browser.botId, targetKey: browser.targetKey, vmGeneration: VM_A, browserGeneration: 1 },
       origin: "https://login.example.com", rpId: "login.example.com", botLabel: "Hermes", taskLabel: "Sign in",
     })).rejects.toThrow("generation fence mismatch");
     await expect(f.manager.startCeremony({
       browser, controller, frame: f.request(browser),
-      trusted: { botId: BOT_B, targetKey: TARGET_B, vmGeneration: 1, browserGeneration: 1 },
+      trusted: { botId: BOT_B, targetKey: TARGET_B, vmGeneration: VM_B, browserGeneration: 1 },
       origin: "https://login.example.com", rpId: "login.example.com", botLabel: "Hermes", taskLabel: "Sign in",
     })).rejects.toThrow("generation fence mismatch");
   });
@@ -199,7 +201,7 @@ describe("SecurityKeyRelayManager", () => {
     const oldBrowser = f.browser(); const controller = f.controller();
     f.beatBrowser(oldBrowser); f.beatController(controller);
     await f.start(oldBrowser, controller);
-    const replacement = f.browser("browser-a", BOT_A, TARGET_A, 1, 2);
+    const replacement = f.browser("browser-a", BOT_A, TARGET_A, VM_A, 2);
     expect(f.manager.status().activeCeremony).toBeNull();
     expect(() => f.beatBrowser(oldBrowser, 1)).toThrow("stale browser registration");
     f.beatBrowser(replacement);
