@@ -95,6 +95,45 @@ test("owned proxy pins every connection to exact OpenSSH host identity", async (
   }
 });
 
+test("a preferred renderer origin is reused exactly and a squatter fails closed", async () => {
+  const probe = net.createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen({ host: "127.0.0.1", port: 0, exclusive: true }, resolve);
+  });
+  const address = probe.address();
+  assert.ok(address && typeof address !== "string");
+  const preferredPort = address.port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const options = {
+    sshBinary: process.platform === "win32" ? "C:\\Windows\\System32\\OpenSSH\\ssh.exe" : "/usr/bin/ssh",
+    preferredServerPort: preferredPort,
+  };
+  const first = await startOwnedRemoteSshConnector(CONFIG, options);
+  assert.equal(first.serverPort, preferredPort);
+  assert.equal(new URL(first.serverUrl).port, String(preferredPort));
+  await first.stop();
+
+  const second = await startOwnedRemoteSshConnector(CONFIG, options);
+  assert.equal(second.serverPort, preferredPort);
+  await second.stop();
+
+  const hostile = net.createServer();
+  await new Promise((resolve, reject) => {
+    hostile.once("error", reject);
+    hostile.listen({ host: "127.0.0.1", port: preferredPort, exclusive: true }, resolve);
+  });
+  try {
+    await assert.rejects(
+      startOwnedRemoteSshConnector(CONFIG, options),
+      (error) => error?.code === "EADDRINUSE",
+    );
+  } finally {
+    await new Promise((resolve) => hostile.close(resolve));
+  }
+});
+
 test("SSH argv has a fixed -W target and cannot execute config text", () => {
   const args = remoteSshArgs(CONFIG.ssh, "/private/known_hosts", 8811);
   assert.deepEqual(args.slice(-3), ["-W", "127.0.0.1:8811", "razer.example.test"]);

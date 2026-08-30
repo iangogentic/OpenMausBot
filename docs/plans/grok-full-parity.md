@@ -31,42 +31,67 @@ OpenMaus status in this ledger is deliberately split:
 
 ## Current checkout and deployment boundary
 
-The audited and deployed implementation revision is `3ffbe4a` (`Drain timed out
-provider responses safely`) on `feat/grokbot-remote-client`, 76 commits ahead of
-`origin/feat/grokbot-remote-client` and 137 commits ahead of `upstream/main`
-before this ledger update. The complete `pnpm test` gate passed on that exact
-revision: 277 Vitest files / 2,900 passing tests (21 platform skips), seven
-broker tests, 133 passing Electron-node tests (one Windows-only skip), and the
-packaged-server smoke test. `pnpm typecheck` and the production
-UI/server/companion builds passed.
+The deployed implementation revision is
+`e93e6a5c21b5d8f9d3f8cd913139ae84cb14d3de` (`Persist remote chat selection
+safely`) on `feat/grokbot-remote-client`. Its complete repository gate,
+production build, immutable Razer cutover, and post-cutover live proof are
+recorded below rather than inferred from an earlier revision.
 The fork history identifies the material additions: hardened Razer deployment
 (`3692be8`), physical Windows and Mac bridges, desktop2 Qwen, Spark GLM, Hermes,
 Ian Brain, remote clients, and the recent Hermes visual-loop work. These are Ian
 fork additions; they are not upstream OpenMaus behavior. The exact commit list
 is available with `git log upstream/main..HEAD`.
 
-Revision `3ffbe4a8602b12ade814b5636a883d2712f94524` is installed at
-`/opt/openmausbot/releases/3ffbe4a8602b12ade814b5636a883d2712f94524` with the
+Revision `e93e6a5c21b5d8f9d3f8cd913139ae84cb14d3de` is installed at
+`/opt/openmausbot/releases/e93e6a5c21b5d8f9d3f8cd913139ae84cb14d3de` with the
 previous release retained as rollback. The atomic `current` symlink, server,
 companion, and four Unix sockets were verified after cutover and a second
-restart. The authenticated Mac app proved requested/effective policy `always`
-survived restart. `/api/bots?screens=off` returned zero inline screenshot
-pixels while explicit screens-on hydration retained the one expected
-425,748-byte base64 frame. A prior real Hermes Qwen turn selected the topmost
-terminal and executed one
-strict two-action batch (`type_text`, `press_key enter`) with the exact PID,
-window ID, and foreground delivery mode. The returned tool result carried a
-final-screen hash, the agent reported the visible postcondition, and an
-independent 1280x900 framebuffer pull visibly showed the executed command,
-`OPENMAUS-FINAL-7319`, and a fresh prompt. This proves the deployment, targeted
-keyboard delivery, final-capture path, and visible effect; a fresh-session
-unknown-pixel reading remains a separate vision acceptance gate. The deploy
+restart. The immutable manifest contains 629 verified files. The complete gate
+registered 2,958 Vitest cases (2,937 passed, 21 skipped), seven broker tests,
+and 148 Electron-node cases (147 passed, one Windows-only skip); typecheck,
+UI/server/companion builds, and packaged-server smoke also passed. The installed
+signed Mac app's `app.asar` SHA-256 is
+`14efbe4f1c79872ea6310fd1089a46b2cd499b5540e1a65f9a81f42a306a1807`.
+The authenticated Mac app also proved requested/effective policy `always`
+survived restart. The deploy
 README separates server/provider/companion identities, gives Docker authority
 to the server, and uses pinned SSH plus opaque per-turn capabilities
 (`deploy/razer-remote/README.md:1-24,123-150,183-215,384-402`). Broader
 acceptance still demands real generations, isolated VMs, and real
-Hermes/Pi/Claude turns (`README.md:420-471`); the single Qwen proof above does
-not satisfy those remaining lanes by itself.
+Hermes/Pi/Claude turns (`README.md:420-471`).
+
+The current implementation also has a fresh full delegated-operator proof through the
+actual Mac app. Hermes Qwen selected the managed `qwen-quality-canary` gateway,
+spawned a hidden Hermes child in an exact supervisor-validated private provider
+home with no parent workspace mount,
+and acted on its Razer VM. The first live attempt exposed and fixed a supervisor
+rejection caused by the child inheriting `/var/lib/openmausbot` as cwd. A second
+attempt exposed and fixed stale live action counts in the computer panel. The
+final bounded run used four of nine accounted actions, completed, released its
+lease, and returned a final 1024x720 frame. Independent inspection of that frame
+showed `OPENMAUS-FINAL-FRAME-53F0C0D` with a fresh prompt;
+the parent chat returned the same verified result. This proves one complete
+Mac UI -> Razer harness -> managed desktop2 Qwen -> hidden Hermes operator ->
+Razer VM -> final-pixel result path. The later `dd4a667` hardening makes each
+operator home stable per bot and target, retires those homes with bot deletion,
+fails private mode closed without OS isolation, post-validates target generation,
+and fences final capture as a target action so VM replacement or human takeover
+cannot cross the returned pixels.
+
+The latest post-cutover run used the actual installed Electron UI, selected
+Hermes Qwen, and persisted its exact opaque bot ID in the app-owned mode-0600
+selection file. After a full process kill and relaunch, the renderer proxy
+origin changed from port 58669 to 59176 and Hermes Qwen restored without a
+selection click. A fresh chat request then delegated the visual operator, opened
+a visible terminal in the Razer VM, typed and ran the marker command, and
+returned `OPENMAUS-E93E6A5-VISUAL-7C41`. Independent inspection of the returned
+1280x900 PNG visibly confirmed the exact marker and fresh prompt; the bot became
+idle afterward. This is a fresh unknown-pixel visual acceptance proof. That run
+also exposed the wider random-origin persistence defect: onboarding reappeared
+and other localStorage state could reset. The follow-up change persists and
+exclusively reuses the app-owned loopback pair, fails closed on a squatter, and
+acquires the single-instance lock before binding. It remains source-tested
+until a fresh package/install/restart run proves it live.
 
 ## Parity matrix
 
@@ -95,8 +120,10 @@ intentionally removed from the chat canvas by `4423af9`; controls belong in
 collapse, 320→368 px drag resize and reload persistence, panel collapse/reopen,
 the real 1232×800 physical-Mac preview, takeover changing the selected session
 to `Control held`, and hand-back releasing it. The UI was restored to 320 px
-with the panel closed and no held lease. Two simultaneous delegated child turns
-with distinct live frames remain a separate acceptance lane.
+with the panel closed and no held lease. A real Hermes/Qwen child now also
+live-proves its running session card, live 0→1 action update, terminal 4/9 count,
+fresh VM frame, completion, and lease release. Two simultaneous delegated child
+turns with distinct live frames remain a separate acceptance lane.
 
 ### 2. Hermes, Qwen/GLM vision, and Cua routing
 
@@ -130,15 +157,12 @@ at `server/local-vm-broker.ts:37,65,486-490` and `server/index.ts:9742-9745`.
 (`server/drivers/acp/hermes.test.ts:624-719,721-805`). The exact desktop2
 Qwen3.8 27B abliterated W8A16 service, its seven shards plus MTP artifact, both
 RTX 3090s, direct inference, and the Razer tunnel inference were live-verified.
-OpenMaus model discovery and the Hermes default select that exact model. This
-proves the model route, not a fresh unknown-pixel visual turn. The remaining gap
-is **live acceptance** at the provider observation boundary, not a reason to
-route local Cua through Box. Likely future change points are
-`hermes-policy.ts`, `local-vm-broker.ts`, and `server/index.ts`. Acceptance must
-run the exact Razer VM Hermes turn: `get_desktop_state` -> mutating Cua action ->
-next inference, and independently prove Qwen receives pixels while Spark is
-correctly text-only. Also assert no host-native tools, raw socket, bearer, or
-unscoped path is exposed.
+OpenMaus model discovery and Hermes select that exact model. The exact route and
+one fresh Qwen visual mutation/final-frame loop are now live-proven. Spark
+remains deliberately text-only and still needs its own fresh deployed
+acceptance. Do not route local Cua through Box: its separate authorization,
+lease, generation, and host-containment boundaries remain required. Also assert
+no host-native tools, raw socket, bearer, or unscoped path is exposed.
 
 ### 3. Browser lane
 
@@ -321,9 +345,11 @@ rendered App route and its backend lifecycle.
 
 1. **P0 — Finish live acceptance:** run two concurrent per-bot delegated
    computer turns, semantic browser actions, attachment preview isolation, and
-   a fresh unknown-pixel Hermes/Qwen turn on the deployed immutable release.
-2. **P0 — Child monitor live proof:** source implementation exists; prove two
-   simultaneous child IDs, frames/cursors, selected takeover, and resume.
+   a fresh Spark GLM lane acceptance on the deployed immutable release. The
+   Qwen unknown-pixel mutation/final-frame lane is now live-proven.
+2. **P0 — Child monitor concurrency proof:** one real child is live-proven with
+   frames, streaming action count, terminal state, and lease release; prove two
+   simultaneous child IDs plus selected takeover and resume.
 3. **P0 — WebAuthn/passkey relay:** preserve user presence and credential
    isolation across the remote browser boundary.
 4. **P1 — Product shell depth:** bulk sidebar organization, parent/child outline,

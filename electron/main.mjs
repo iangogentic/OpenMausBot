@@ -29,6 +29,10 @@ import {
   removeLegacyBridgeSecrets,
 } from "./remote-client.mjs";
 import { startOwnedRemoteSshConnector } from "./remote-ssh-connector.mjs";
+import {
+  readRemoteLoopbackPorts,
+  writeRemoteLoopbackPorts,
+} from "./remote-loopback-ports.mjs";
 import { watchRemoteServer } from "./remote-server-watch.mjs";
 import { readSelectedConversation, writeSelectedConversation } from "./selected-conversation.mjs";
 import { composePhysicalCapture, startOutboundPhysicalBridge } from "./outbound-physical-bridge.mjs";
@@ -108,13 +112,37 @@ const IS_REMOTE_PACKAGE = app.isPackaged && packagedExecutableName === "OpenMaus
 if (IS_REMOTE_PACKAGE) {
   app.setPath("userData", path.join(app.getPath("appData"), "OpenMaus Razer"));
 }
+// Acquire the process identity before reading, binding, or rewriting the
+// durable remote origin. A normal second launch must reach Electron's
+// second-instance handoff without racing or squatting the winner's port.
+if (!app.requestSingleInstanceLock()) {
+  console.log("[desktop] OpenMausBot is already running — focusing that window");
+  process.exit(0);
+}
 const REMOTE_DEPLOYMENT = readRemoteDeploymentConfig(app.getPath("userData"));
 if (IS_REMOTE_PACKAGE && !REMOTE_DEPLOYMENT) {
   throw new Error("OpenMaus Razer needs a private remote-client.json with pinned SSH settings");
 }
-const REMOTE_SSH_CONNECTOR = REMOTE_DEPLOYMENT
-  ? await startOwnedRemoteSshConnector(REMOTE_DEPLOYMENT)
+const REMOTE_LOOPBACK_PORTS_FILE = path.join(app.getPath("userData"), "remote-loopback-ports.json");
+const REMOTE_LOOPBACK_PORTS = REMOTE_DEPLOYMENT
+  ? readRemoteLoopbackPorts(REMOTE_LOOPBACK_PORTS_FILE)
   : null;
+const REMOTE_SSH_CONNECTOR = REMOTE_DEPLOYMENT
+  ? await startOwnedRemoteSshConnector(REMOTE_DEPLOYMENT, {
+      preferredServerPort: REMOTE_LOOPBACK_PORTS?.server ?? 0,
+      preferredCompanionPort: REMOTE_LOOPBACK_PORTS?.companion ?? 0,
+    })
+  : null;
+if (
+  REMOTE_SSH_CONNECTOR &&
+  !writeRemoteLoopbackPorts(REMOTE_LOOPBACK_PORTS_FILE, {
+    server: REMOTE_SSH_CONNECTOR.serverPort,
+    companion: REMOTE_SSH_CONNECTOR.companionPort,
+  })
+) {
+  await REMOTE_SSH_CONNECTOR.stop();
+  throw new Error("OpenMaus Razer could not persist its private loopback origin");
+}
 const REMOTE_SERVER_URL = REMOTE_SSH_CONNECTOR?.serverUrl ?? null;
 const REMOTE_COMPANION_URL = REMOTE_SSH_CONNECTOR?.companionUrl ?? null;
 const REMOTE_SERVER_NAME = REMOTE_DEPLOYMENT?.serverName ?? "Remote server";
@@ -242,13 +270,6 @@ if (process.platform === "linux") {
   app.setDesktopName("com.openmausbot.app.desktop");
 }
 
-// One instance per user: without this lock a second launch forks a second
-// harness server on a fallback port and splits data dirs in two. The loser
-// exits before any child or window exists; the winner surfaces itself.
-if (!app.requestSingleInstanceLock()) {
-  console.log("[desktop] OpenMausBot is already running — focusing that window");
-  process.exit(0);
-}
 function deliverPackageInstall(win) {
   if (!pendingPackageInstallUrl || !win || win.isDestroyed()) return;
   if (win.webContents.isLoadingMainFrame()) return;

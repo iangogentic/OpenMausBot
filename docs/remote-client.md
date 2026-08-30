@@ -16,8 +16,12 @@ currently quits and disconnects when its last window closes.
 
 ## Security boundary
 
-Bind the harness and companion ports to loopback. The desktop app owns its
-ephemeral loopback listeners and carries every accepted connection through
+Bind the harness and companion ports to loopback. On first launch the desktop
+app allocates its own loopback listeners, persists their numeric ports in a
+private app-owned file, and exclusively reuses that pair on later launches so
+the renderer keeps one browser-storage origin. If either saved port is occupied,
+startup fails closed; the app never connects to the occupant or silently moves
+the renderer to an empty origin. Every accepted connection is carried through
 the system OpenSSH client with strict host-key pinning. Two independent raw bearers exist only in the
 client's private `remote-client.json`: the harness receives only the SHA-256
 digest of the UI bearer, while the companion receives root-owned systemd
@@ -112,8 +116,13 @@ The public key is not a password, but its authenticity matters. Do not trust
 an unverified `ssh-keyscan` result from the same network path it is meant to
 authenticate.
 
-At launch, the app exclusively binds unpredictable loopback ports and writes a
-temporary known-hosts file containing only this pin. Every browser/API/
+On its first launch, the app exclusively binds OS-allocated unpredictable
+loopback ports. It saves that app-owned pair as mode `0600`, then reuses the
+exact ports across full restarts so onboarding, drafts, webhook setup data,
+theme, and sidebar preferences remain on the same origin. This is not a
+caller-managed fixed tunnel: the app owns the listeners and refuses startup if
+another process has taken either port. It also writes a temporary known-hosts
+file containing only the host pin. Every browser/API/
 WebSocket connection is sent through a fixed `ssh -W 127.0.0.1:<target>`
 process using `StrictHostKeyChecking=yes`, `BatchMode=yes`, and no user SSH
 config. If SSH or the Razer is unavailable, that app-owned connection closes;

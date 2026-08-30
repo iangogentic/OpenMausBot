@@ -120,6 +120,7 @@ async function listenOwnedProxy({
   targetPort,
   spawnProcess,
   createServer,
+  preferredPort = 0,
 }) {
   const active = new Set();
   const sockets = new Set();
@@ -177,7 +178,12 @@ async function listenOwnedProxy({
   });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, resolve);
+    // A remote desktop shell must keep one origin across full restarts: all
+    // browser-owned drafts, onboarding state, webhook one-time secrets and UI
+    // preferences are scoped by origin. Once allocated, the exact port is
+    // therefore an app-owned identity. If another process squats it, fail
+    // closed instead of silently loading a new origin with empty state.
+    server.listen({ host: "127.0.0.1", port: preferredPort, exclusive: true }, resolve);
   });
   server.on("error", () => {
     // A listener failure only removes the owned route; it must not make the
@@ -227,6 +233,7 @@ export async function startOwnedRemoteSshConnector(config, options = {}) {
       targetPort: 8799,
       spawnProcess,
       createServer,
+      preferredPort: options.preferredServerPort ?? 0,
     });
     proxies.push(server);
     let companion = null;
@@ -238,12 +245,15 @@ export async function startOwnedRemoteSshConnector(config, options = {}) {
         targetPort: 8811,
         spawnProcess,
         createServer,
+        preferredPort: options.preferredCompanionPort ?? 0,
       });
       proxies.push(companion);
     }
     return Object.freeze({
       serverUrl: server.origin,
+      serverPort: server.port,
       companionUrl: companion?.origin ?? null,
+      companionPort: companion?.port ?? null,
       stop: async () => {
         await Promise.all(proxies.map((proxy) => proxy.stop()));
         try { fileSystem.rmSync(runtimeDirectory, { recursive: true, force: true }); } catch {}
