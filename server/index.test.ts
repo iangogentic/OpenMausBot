@@ -15,6 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 import { openSse } from "./testing/sse.ts";
 import { IMAGE_MAX_BYTES } from "./attachments.ts";
+import { MODEL_RELAY_ROUTE } from "./model-relay.ts";
 import { vpsContainerName } from "./vps-computer.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -640,6 +641,20 @@ describe("harness HTTP API", () => {
     expect(await statusWithHeaders({ host: `127.0.0.2:${PORT}` })).toBe(200);
     expect(await statusWithHeaders({ host: `[::1]:${PORT}` })).toBe(200);
     expect(await statusWithHeaders({ origin: `http://[::1]:${PORT}` })).toBe(200);
+  });
+
+  it("admits the private provider gateway only on the capability-bound model relay", async () => {
+    expect(await statusWithHeaders({ host: `10.0.2.2:${PORT}` })).toBe(403);
+    expect(await pathStatusWithHeaders(`${MODEL_RELAY_ROUTE}/v1/models`, {
+      host: `10.0.2.2:${PORT}`,
+    })).toBe(401);
+    expect(await pathStatusWithHeaders("/api/internal/ian-brain/mcp", {
+      host: `10.0.2.2:${PORT}`,
+    })).toBe(403);
+    expect(await pathStatusWithHeaders(`${MODEL_RELAY_ROUTE}/v1/models`, {
+      host: `10.0.2.2:${PORT}`,
+      origin: "https://example.com",
+    })).toBe(403);
   });
 
   it("rejects the wrong origin before either private physical WebSocket upgrades", async () => {

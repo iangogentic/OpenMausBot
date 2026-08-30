@@ -5351,6 +5351,10 @@ function isLoopbackHost(host: string | undefined): boolean {
   return hostname === "::1" || hostname === "0:0:0:0:0:0:0:1";
 }
 
+function isProviderGatewayHost(host: string | undefined): boolean {
+  return typeof host === "string" && /^10\.0\.2\.2(?::\d+)?$/.test(host.trim());
+}
+
 function isViewerHost(host: string | undefined): boolean {
   if (!host) return false;
   return /^openmaus-viewer\.localhost(?::\d+)?$/i.test(host.trim());
@@ -5397,8 +5401,14 @@ const server = createServer(async (req, res) => {
     if (shutdownStarted) {
       return json(res, 503, { error: "OpenMausBot is shutting down" });
     }
+    // Provider children reach the host-side relay through slirp's fixed
+    // gateway. Admit that authority only for the nonce-bound model relay;
+    // every human/UI route retains the loopback-only DNS-rebinding boundary.
+    const providerModelRelayHost =
+      (path === MODEL_RELAY_ROUTE || path.startsWith(`${MODEL_RELAY_ROUTE}/`)) &&
+      isProviderGatewayHost(req.headers.host);
     // loopback-host + loopback-origin gate before any route (DNS rebinding / CSRF)
-    if (!isLoopbackHost(req.headers.host)) {
+    if (!isLoopbackHost(req.headers.host) && !providerModelRelayHost) {
       return json(res, 403, { error: "forbidden: loopback host required" });
     }
     const origin = req.headers.origin;
