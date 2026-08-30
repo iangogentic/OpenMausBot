@@ -51,6 +51,7 @@ import {
   type SidebarDensity,
 } from "@/lib/sidebar-preferences";
 import { phoneSettingsAction, SidebarPhoneButton } from "./SidebarPhoneButton";
+import { SidebarBotPreview } from "./SidebarBotPreview";
 
 /** "Milind Soni" → "MS", "milind" → "M", "you@x.dev" → "Y", unset → "?" */
 function profileInitials(profile?: { name?: string; email?: string }): string {
@@ -742,18 +743,56 @@ function BotListItem({
 }) {
   const { state, dispatch } = useStore();
   const [renaming, setRenaming] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewPosition, setPreviewPosition] = useState({ top: 8, left: 88 });
+  const selectRef = useRef<HTMLButtonElement>(null);
   const selected = state.activeView === "chat" && state.selectedId === bot.id;
   const mascotMotion = selected && state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const iconOnly = density === "icons";
   useEffect(() => {
     if (iconOnly) setRenaming(false);
   }, [iconOnly]);
+  useEffect(() => {
+    if (renaming) setPreviewOpen(false);
+  }, [renaming]);
+  useEffect(() => {
+    if (!previewOpen) return;
+    const close = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node) || !selectRef.current?.parentElement?.contains(target)) {
+        setPreviewOpen(false);
+      }
+    };
+    const closeForViewportChange = () => setPreviewOpen(false);
+    document.addEventListener("mousedown", close);
+    window.addEventListener("resize", closeForViewportChange);
+    window.addEventListener("scroll", closeForViewportChange, true);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      window.removeEventListener("resize", closeForViewportChange);
+      window.removeEventListener("scroll", closeForViewportChange, true);
+    };
+  }, [previewOpen]);
+  const openPreview = () => {
+    const rect = selectRef.current?.getBoundingClientRect();
+    if (rect) {
+      const width = 292;
+      const left = rect.right + 10 + width <= window.innerWidth
+        ? rect.right + 10
+        : Math.max(8, rect.left - width - 10);
+      setPreviewPosition({
+        left,
+        top: Math.max(8, Math.min(rect.top, window.innerHeight - 360)),
+      });
+    }
+    setPreviewOpen(true);
+  };
   const avatarSize = iconOnly ? 44 : density === "compact" ? 40 : 56;
   // the visible branch, so a version switch changes the row with the chat
   const visible = visibleMessages(bot);
   const last = visible.at(-1);
   const rowClass = cn(
-    "flex w-full items-center rounded-xl border text-left",
+    "relative flex w-full items-center rounded-xl border text-left",
     iconOnly
       ? "justify-center px-1 py-1.5"
       : density === "compact"
@@ -833,22 +872,37 @@ function BotListItem({
   }
 
   return (
-    <div className="group relative" title={iconOnly ? bot.name : undefined}>
-      <div
-        role="button"
-        tabIndex={0}
-        aria-label={iconOnly ? bot.name : undefined}
-        onClick={() => dispatch({ type: "select", id: bot.id })}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            dispatch({ type: "select", id: bot.id });
-          }
-        }}
-        onContextMenu={onContextMenu}
-        className={rowClass}
-      >
-        {body}
+    <div
+      className="group relative"
+      onPointerEnter={openPreview}
+      onPointerLeave={() => setPreviewOpen(false)}
+    >
+      <div className={rowClass} onContextMenu={onContextMenu}>
+        <button
+          ref={selectRef}
+          type="button"
+          aria-label={`Open ${bot.name}${preview(bot) ? `, ${preview(bot)}` : ""}`}
+          aria-describedby={previewOpen ? `sidebar-bot-preview-${bot.id}` : undefined}
+          onClick={() => dispatch({ type: "select", id: bot.id })}
+          onFocus={openPreview}
+          onBlur={(event) => {
+            if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) setPreviewOpen(false);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && previewOpen) {
+              event.preventDefault();
+              event.stopPropagation();
+              setPreviewOpen(false);
+              event.currentTarget.focus();
+            }
+          }}
+          className="absolute inset-0 rounded-xl focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+        >
+          <span className="sr-only">Open conversation</span>
+        </button>
+        <div className="pointer-events-none contents [&_[role=button]]:relative [&_[role=button]]:z-10 [&_[role=button]]:pointer-events-auto [&_input]:relative [&_input]:z-10 [&_input]:pointer-events-auto">
+          {body}
+        </div>
       </div>
       {iconOnly && bot.unread && (
         <span className="pointer-events-none absolute bottom-1.5 right-1.5 size-2 rounded-full border border-panel bg-accent" />
@@ -865,10 +919,19 @@ function BotListItem({
               ? "Keep at least one active bot"
               : `Archive ${bot.name}`
         }
-        className="absolute right-1 top-1/2 flex size-10 -translate-y-1/2 items-center justify-center rounded-lg bg-card/90 text-ink-secondary opacity-0 shadow-sm transition hover:bg-raised hover:text-ink focus:opacity-100 disabled:cursor-default disabled:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100"
+        className="absolute right-1 top-1/2 z-10 flex size-10 -translate-y-1/2 items-center justify-center rounded-lg bg-card/90 text-ink-secondary opacity-0 shadow-sm transition hover:bg-raised hover:text-ink focus:opacity-100 disabled:cursor-default disabled:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 max-md:opacity-100"
       >
         <Archive size={14} />
       </button>}
+      {previewOpen && createPortal(
+        <div
+          className="pointer-events-none fixed z-50 animate-pop-in"
+          style={previewPosition}
+        >
+          <SidebarBotPreview bot={bot} />
+        </div>,
+        document.body,
+      )}
     </div>
   );
 }
