@@ -44,7 +44,7 @@ async function line(child: ChildProcessWithoutNullStreams): Promise<Record<strin
 
 describe("Ian Brain stdio bridge", () => {
   it("relays JSON and SSE frames with one opaque session and deletes it on teardown", async () => {
-    const seen: Array<{ method: string; authorization: string; session: string; body: string }> = [];
+    const seen: Array<{ method: string; host: string; authorization: string; session: string; body: string }> = [];
     let deleted = false;
     const server = createServer((req, res) => {
       let body = "";
@@ -52,6 +52,7 @@ describe("Ian Brain stdio bridge", () => {
       req.on("end", () => {
         seen.push({
           method: req.method ?? "",
+          host: String(req.headers.host ?? ""),
           authorization: String(req.headers.authorization ?? ""),
           session: String(req.headers["mcp-session-id"] ?? ""),
           body,
@@ -95,6 +96,7 @@ describe("Ian Brain stdio bridge", () => {
     expect(deleted).toBe(true);
     expect(seen.map((request) => request.method)).toEqual(["POST", "POST", "DELETE"]);
     expect(seen.every((request) => request.authorization === `Bearer ${TOKEN}`)).toBe(true);
+    expect(seen.every((request) => request.host === `127.0.0.1:${port}`)).toBe(true);
     expect(seen[0]?.session).toBe("");
     expect(seen[1]?.session).toBe("session-exact-1");
     expect(seen[2]?.session).toBe("session-exact-1");

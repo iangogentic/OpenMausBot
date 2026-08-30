@@ -41,6 +41,7 @@ function checkedUpstream(value: string): string {
 }
 
 const UPSTREAM = checkedUpstream(RAW_UPSTREAM);
+const HARNESS_HOST = `127.0.0.1:${new URL(UPSTREAM).port}`;
 if (TOKEN.length < 32 || TOKEN.length > 1_024 || /[\s\0\r\n]/.test(TOKEN)) {
   throw new Error("Ian Brain MCP capability is invalid");
 }
@@ -134,6 +135,7 @@ async function relay(message: Json): Promise<Json | null> {
       method: "POST",
       redirect: "error",
       headers: {
+        host: HARNESS_HOST,
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
         authorization: `Bearer ${TOKEN}`,
@@ -177,6 +179,7 @@ async function closeUpstream(): Promise<void> {
     method: "DELETE",
     redirect: "error",
     headers: {
+      host: HARNESS_HOST,
       authorization: `Bearer ${TOKEN}`,
       "mcp-session-id": session,
     },
