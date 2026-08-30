@@ -5,6 +5,7 @@
 //
 // stdout is the MCP transport. Never log there.
 import { readBoundedResponseText } from "./bounded-response.ts";
+import { request as httpRequest } from "node:http";
 import {
   assertBoundedJsonShape,
   BoundedJsonLineDecoder,
@@ -79,6 +80,50 @@ function rpcError(id: unknown, message: string): Json {
   return { jsonrpc: "2.0", id, error: { code: -32000, message } };
 }
 
+function requestHarness(
+  method: "POST" | "DELETE",
+  headers: Record<string, string>,
+  body: string | undefined,
+  signal: AbortSignal,
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(UPSTREAM, {
+      method,
+      headers: { host: HARNESS_HOST, ...headers },
+      signal,
+    });
+    request.once("error", reject);
+    request.once("response", (incoming) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      incoming.on("data", (chunk: Buffer) => {
+        total += chunk.byteLength;
+        if (total > MAX_RESPONSE_BYTES) {
+          incoming.destroy(new Error("Ian Brain response exceeded 2 MB"));
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      });
+      incoming.once("error", reject);
+      incoming.once("end", () => {
+        const responseHeaders = new Headers();
+        for (const [name, value] of Object.entries(incoming.headers)) {
+          if (Array.isArray(value)) for (const item of value) responseHeaders.append(name, item);
+          else if (value !== undefined) responseHeaders.set(name, value);
+        }
+        const bytes = Buffer.concat(chunks, total);
+        const status = incoming.statusCode ?? 502;
+        resolve(new Response(status === 204 || status === 304 ? null : bytes, {
+          status,
+          statusText: incoming.statusMessage,
+          headers: responseHeaders,
+        }));
+      });
+    });
+    request.end(body);
+  });
+}
+
 async function parseUpstream(response: Response, expectedId: unknown): Promise<Json | null> {
   const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
   if (!contentType.includes("text/event-stream")) {
@@ -131,19 +176,17 @@ async function relay(message: Json): Promise<Json | null> {
   const controller = new AbortController();
   active.add(controller);
   try {
-    const response = await fetch(UPSTREAM, {
-      method: "POST",
-      redirect: "error",
-      headers: {
-        host: HARNESS_HOST,
+    const response = await requestHarness(
+      "POST",
+      {
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
         authorization: `Bearer ${TOKEN}`,
         ...(upstreamSessionId ? { "mcp-session-id": upstreamSessionId } : {}),
       },
-      body: JSON.stringify(message),
-      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(RELAY_TIMEOUT_MS)]),
-    });
+      JSON.stringify(message),
+      AbortSignal.any([controller.signal, AbortSignal.timeout(RELAY_TIMEOUT_MS)]),
+    );
     const nextSession = response.headers.get("mcp-session-id");
     if (nextSession) upstreamSessionId = nextSession;
     if (!response.ok) {
@@ -188,16 +231,15 @@ async function closeUpstream(): Promise<void> {
   if (!upstreamSessionId) return;
   const session = upstreamSessionId;
   upstreamSessionId = "";
-  await fetch(UPSTREAM, {
-    method: "DELETE",
-    redirect: "error",
-    headers: {
-      host: HARNESS_HOST,
+  await requestHarness(
+    "DELETE",
+    {
       authorization: `Bearer ${TOKEN}`,
       "mcp-session-id": session,
     },
-    signal: AbortSignal.timeout(2_000),
-  }).then((response) => response.body?.cancel()).catch(() => {});
+    undefined,
+    AbortSignal.timeout(2_000),
+  ).then((response) => response.body?.cancel()).catch(() => {});
 }
 
 const input = new BoundedJsonLineDecoder(PROVIDER_NDJSON_LIMITS);

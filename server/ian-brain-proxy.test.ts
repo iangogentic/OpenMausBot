@@ -116,9 +116,10 @@ describe("Ian Brain stdio bridge", () => {
     const stderr: Buffer[] = [];
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} })}\n`);
+    setTimeout(() => child.kill("SIGTERM"), 250).unref();
     const [code] = await once(child, "exit") as [number];
     const output = Buffer.concat(stderr).toString("utf8");
-    expect(code).toBeGreaterThanOrEqual(0);
+    expect(code === 0 || code === null).toBe(true);
     expect(output).not.toContain("outside the private harness boundary");
   });
 
