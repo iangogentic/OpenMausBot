@@ -13,8 +13,17 @@ export class ProviderRequestSettlements<K, G, B, O> {
   settle(key: K, generation: G, behavior: B, deliver: () => Promise<O>): Promise<O> {
     const existing = this.#records.get(key);
     if (existing?.generation === generation) return existing.promise;
-    const promise = deliver();
+    let resolve!: (outcome: O | PromiseLike<O>) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<O>((onResolve, onReject) => {
+      resolve = onResolve;
+      reject = onReject;
+    });
+    // Publish ownership before invoking provider code. Some adapters emit a
+    // synchronous request event from respondToRequest; that reentrant path
+    // must join this promise rather than deliver a contradictory response.
     this.#records.set(key, Object.freeze({ generation, behavior, promise }));
+    void Promise.resolve().then(deliver).then(resolve, reject);
     return promise;
   }
 

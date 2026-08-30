@@ -235,6 +235,32 @@ describe("main renderer screen transport", () => {
     expect(computerPanelVisible({ ...visible, selectedId: "room" })).toBe(false);
     expect(computerPanelVisible({ ...visible, computerOpen: false })).toBe(false);
   });
+
+  it("cannot retain transcript screenshot pixels after the panel closes", () => {
+    let state = reducer(openComputerState(), {
+      type: "hydrate",
+      bots: [{
+        id: "bot",
+        threadId: "thread",
+        messages: [{ id: "screen", role: "bot", kind: "screen", png: "pixels", mime: "image/png", at: 1 }],
+      } as Bot],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+    });
+    expect(state.bots[0]?.messages[0]?.png).toBe("pixels");
+
+    state = reducer(state, { type: "toggleComputer", open: false });
+    expect(state.bots[0]?.messages[0]?.png).toBeUndefined();
+
+    state = reducer(state, {
+      type: "messageAdded",
+      threadId: "thread",
+      message: { id: "late", role: "bot", kind: "screen", png: "late-pixels", mime: "image/png", at: 2 },
+    });
+    expect(state.bots[0]?.messages.find((message) => message.id === "late")?.png).toBeUndefined();
+  });
 });
 
 describe("bot deletion confirmation", () => {

@@ -26,5 +26,6 @@ describe("command palette keyboard selection", () => {
     expect(source).toContain("dialogRef.current?.querySelectorAll<HTMLElement>");
     expect(source).toContain("disabled={disabled}");
     expect(source).toContain("tabIndex={disabled ? -1 : undefined}");
+    expect(source).toContain("onFocus={() => !disabled && setCursor(index)}");
   });
 });

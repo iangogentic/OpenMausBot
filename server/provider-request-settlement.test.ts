@@ -33,4 +33,23 @@ describe("provider request settlement serialization", () => {
       settlements.settle("thread:request", newGeneration, "allow", async () => "new-allowed"),
     ).resolves.toBe("new-allowed");
   });
+
+  it("publishes the claim before a synchronously reentrant delivery", async () => {
+    const settlements = new ProviderRequestSettlements<string, object, "allow" | "deny", string>();
+    const generation = {};
+    const deliveries: string[] = [];
+    let inner!: Promise<string>;
+    const outer = settlements.settle("thread:request", generation, "allow", async () => {
+      deliveries.push("allow");
+      inner = settlements.settle("thread:request", generation, "deny", async () => {
+        deliveries.push("deny");
+        return "denied";
+      });
+      return "allowed";
+    });
+
+    await expect(outer).resolves.toBe("allowed");
+    await expect(inner).resolves.toBe("allowed");
+    expect(deliveries).toEqual(["allow"]);
+  });
 });

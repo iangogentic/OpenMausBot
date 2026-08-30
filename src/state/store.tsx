@@ -1231,10 +1231,28 @@ function reduceAppState(state: AppState, action: Action): AppState {
  */
 function withoutHiddenComputerPixels(state: AppState): AppState {
   if (computerPanelVisible(state)) return state;
-  if (Object.keys(state.screens).length === 0 && Object.keys(state.computerChildVisuals).length === 0) {
+  const hasTranscriptPixels = [...state.bots, ...state.groups].some((conversation) =>
+    (conversation.messages ?? []).some((message) => message.kind === "screen" && Boolean(message.png))
+  );
+  if (
+    Object.keys(state.screens).length === 0
+    && Object.keys(state.computerChildVisuals).length === 0
+    && !hasTranscriptPixels
+  ) {
     return state;
   }
-  return { ...state, screens: {}, computerChildVisuals: {} };
+  const strip = (messages: Message[]) => messages.map((message) =>
+    message.kind === "screen" && message.png
+      ? { ...message, png: undefined, mime: undefined }
+      : message
+  );
+  return {
+    ...state,
+    screens: {},
+    computerChildVisuals: {},
+    bots: state.bots.map((bot) => ({ ...bot, messages: strip(bot.messages ?? []) })),
+    groups: state.groups.map((group) => ({ ...group, messages: strip(group.messages ?? []) })),
+  };
 }
 
 export function reducer(state: AppState, action: Action): AppState {

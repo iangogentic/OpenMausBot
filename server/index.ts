@@ -2170,7 +2170,10 @@ const storedAvatarExists = (avatarUrl: string): boolean =>
 
 const publicBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
   ...wireBot(bot),
-  messages: store.messagesFor(bot.threadId),
+  // Rich task/import bot frames travel to every SSE client. Keep archived
+  // desktop pixels out of that shared shape; current screens use their
+  // dedicated, visibility-gated transport.
+  messages: store.messagesFor(bot.threadId).map(slimMessage),
   activeLeafId: store.activeLeaf(bot.threadId),
   tasks: store.tasks(bot.id).map(wireTask),
 });
@@ -2240,13 +2243,19 @@ function slimMessage(message: Message): Message | Record<string, unknown> {
 }
 
 /** `limit === undefined` is the original, unpaginated shape. */
-function messagePage(threadId: string, limit: number | undefined, before?: string | null) {
+function messagePage(
+  threadId: string,
+  limit: number | undefined,
+  before?: string | null,
+  includeScreens = true,
+) {
   const all = store.messagesFor(threadId);
-  if (limit === undefined) return { messages: all };
+  const project = includeScreens ? (message: Message) => message : slimMessage;
+  if (limit === undefined) return { messages: all.map(project) };
   const end = before ? all.findIndex((msg) => msg.id === before) : -1;
   const stop = end === -1 ? all.length : end;
   const start = Math.max(0, stop - limit);
-  return { messages: all.slice(start, stop).map(slimMessage), hasMore: start > 0 };
+  return { messages: all.slice(start, stop).map(project), hasMore: start > 0 };
 }
 
 /** A bounded page centred on a known message, used when a search result is
@@ -2296,6 +2305,22 @@ let replayBytes = 0;
 const wants = (client: SseClient, kind: string) =>
   (kind !== "screen" && kind !== "computer-child-frame") || client.screens;
 
+function pixelFreeEventPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const project = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(project);
+    if (!value || typeof value !== "object") return value;
+    const record = value as Record<string, unknown>;
+    const next = Object.fromEntries(Object.entries(record).map(([key, nested]) => [key, project(nested)]));
+    if (record.kind === "screen" && typeof record.png === "string") {
+      delete next.png;
+      delete next.mime;
+      next.hasImage = true;
+    }
+    return next;
+  };
+  return project(payload) as Record<string, unknown>;
+}
+
 function disconnectSseClient(client: SseClient): void {
   if (client.closed) return;
   client.closed = true;
@@ -2339,20 +2364,22 @@ function broadcast(payload: Record<string, unknown>) {
   const seq = ++lastSeq;
   const kind = String(payload.kind ?? "");
   const frame = `id: ${STREAM_ID}:${seq}\ndata: ${JSON.stringify({ ...payload, seq })}\n\n`;
+  const safeFrame = `id: ${STREAM_ID}:${seq}\ndata: ${JSON.stringify({ ...pixelFreeEventPayload(payload), seq })}\n\n`;
   // Live desktop captures can each be hundreds of kilobytes and become stale
   // as soon as the next one arrives. Keep their sequence slots so resume-gap
   // detection stays honest, but never retain their base64 payloads.
   const frameBytes = Buffer.byteLength(frame);
-  const replayFrame = kind === "screen" || kind === "computer-child-frame" || frameBytes > REPLAY_MAX_BYTES ? null : frame;
+  const safeFrameBytes = Buffer.byteLength(safeFrame);
+  const replayFrame = kind === "screen" || kind === "computer-child-frame" || safeFrameBytes > REPLAY_MAX_BYTES ? null : safeFrame;
   replayBuffer.push({ seq, kind, frame: replayFrame });
-  replayBytes += replayFrame ? frameBytes : 0;
+  replayBytes += replayFrame ? safeFrameBytes : 0;
   while (replayBuffer.length > REPLAY_MAX || replayBytes > REPLAY_MAX_BYTES) {
     const removed = replayBuffer.shift();
     if (removed?.frame) replayBytes -= Buffer.byteLength(removed.frame);
   }
   for (const client of [...sseClients]) {
     if (!wants(client, kind)) continue;
-    writeSseClient(client, frame);
+    writeSseClient(client, client.screens ? frame : safeFrame);
   }
 }
 
@@ -2511,18 +2538,17 @@ async function enforceNeverOnPendingPermissions(): Promise<void> {
     const key = providerRequestKey(pending.threadId, pending.requestId);
     const settling = pendingProviderSettlements.get(key);
     if (settling?.generation === pending) {
-      await settling.promise.catch(() => "unavailable" as const);
       // The first response owns the request. Never must not send a second
-      // denial after an in-flight Allow; stop the exact turn instead.
+      // denial after an in-flight Allow. Start exact-generation cancellation
+      // immediately; never wait behind provider delivery or use a delayed
+      // thread-only interrupt that could kill a successor turn.
       if (settling.behavior === "allow") {
-        const instance = registry.get(pending.instanceId);
-        await instance?.adapter.interruptTurn(pending.threadId).catch(() => {});
+        void cancelExactTargetTurn(pending.turn).catch(() => {});
       }
       continue;
     }
     if (!pending.messageId) {
-      const instance = registry.get(pending.instanceId);
-      await instance?.adapter.interruptTurn(pending.threadId).catch(() => {});
+      void cancelExactTargetTurn(pending.turn).catch(() => {});
       if (pendingProviderRequest(pending.threadId, pending.requestId) === pending) {
         pendingProviderRequests.delete(providerRequestKey(pending.threadId, pending.requestId));
         pendingProviderSettlements.delete(providerRequestKey(pending.threadId, pending.requestId));
@@ -2531,14 +2557,14 @@ async function enforceNeverOnPendingPermissions(): Promise<void> {
     }
     const card = store.messagesFor(pending.threadId).find((message) => message.id === pending.messageId)?.card;
     if (!card?.tool || card.answered || card.dismissed) continue;
-    await answerRequest(
+    void answerRequest(
       pending.threadId,
       pending.requestId,
       pending.messageId,
       "deny",
       undefined,
       true,
-    );
+    ).catch(() => {});
   }
 }
 
@@ -7583,8 +7609,8 @@ const server = createServer(async (req, res) => {
         req.headers["x-openmausbot-companion"] !== "1" &&
         url.searchParams.get("screens") !== "off";
       return json(res, 200, {
-        bots: store.bots.map((bot) => ({ ...publicBot(bot), ...messagePage(bot.threadId, limit) })),
-        groups: store.groups.map((g) => ({ ...g, ...messagePage(g.threadId, limit) })),
+        bots: store.bots.map((bot) => ({ ...publicBot(bot), ...messagePage(bot.threadId, limit, null, includeScreens) })),
+        groups: store.groups.map((g) => ({ ...g, ...messagePage(g.threadId, limit, null, includeScreens) })),
         computerControl: Object.fromEntries(
           store.bots.map((bot) => {
             const snapshot = computerControl.snapshot(bot.id, computerControlTargetForBot(bot.id));
@@ -9475,7 +9501,7 @@ const server = createServer(async (req, res) => {
     // the client showing the previous task's conversation.
     const botWithThread = (bot: NonNullable<ReturnType<typeof store.bot>>) => ({
       ...wireBot(bot),
-      messages: store.messagesFor(bot.threadId),
+      messages: store.messagesFor(bot.threadId).map(slimMessage),
       activeLeafId: store.activeLeaf(bot.threadId),
       tasks: store.tasks(bot.id).map(wireTask),
     });

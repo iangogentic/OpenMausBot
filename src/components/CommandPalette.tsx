@@ -200,6 +200,7 @@ export function CommandPalette() {
       key={key}
       ref={index === selected ? selectedRef : undefined}
       onClick={onPick}
+      onFocus={() => !disabled && setCursor(index)}
       disabled={disabled}
       tabIndex={disabled ? -1 : undefined}
       aria-disabled={disabled || undefined}

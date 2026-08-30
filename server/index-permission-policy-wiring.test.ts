@@ -35,5 +35,7 @@ describe("fleet permission policy wiring", () => {
     expect(source).toContain("pendingProviderSettlements.settle(key, pending, deliveredBehavior");
     expect(source).toContain("pendingProviderSettlements.settle(");
     expect(source).toContain("if (settling?.generation === pending)");
+    expect(source).toContain("void cancelExactTargetTurn(pending.turn).catch(() => {})");
+    expect(source).not.toMatch(/await settling\.promise[\s\S]{0,500}interruptTurn\(pending\.threadId\)/);
   });
 });
