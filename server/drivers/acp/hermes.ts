@@ -120,7 +120,7 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
     // hidden-reasoning pass can otherwise hold a bot for many minutes before
     // its first tool call. Genuine long or tool-call truncations retain their
     // native `length` reason and Hermes' bounded continuation path.
-    ...(hostId === "spark_glm" ? { max_tokens: 4_096 } : {}),
+    ...(hostId === "spark_glm" || model.toLowerCase() === "glm-5.3-flash" ? { max_tokens: 4_096 } : {}),
   };
   // The desktop2 Qwen endpoint accepts OpenAI-compatible image content in
   // tool messages. Hermes cannot infer that capability for a private model
@@ -128,6 +128,7 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
   // text-only fallback. Scope the declaration to this exact injected route;
   // Spark GLM remains deliberately text-only.
   const desktop2VisionModel = hostId === "desktop2_qwen" && new Set([
+    "qwen-3.8-27b",
     "qwen-quality-canary",
     "qwen3.8-27b-abliterated",
     "qwen3.8-27b",
@@ -237,7 +238,8 @@ const SPARK_FINAL_CONTRACT = [
 ].join(" ");
 
 function isSparkHermesModel(modelId: string | undefined): boolean {
-  return decodeInjectId(modelId)?.host === "spark_glm";
+  const injected = decodeInjectId(modelId);
+  return injected?.host === "spark_glm" || injected?.model.toLowerCase() === "glm-5.3-flash";
 }
 
 export function buildHermesPromptText(turn: Pick<SendTurnInput, "model" | "system" | "text">): string {
@@ -586,7 +588,9 @@ const support: AcpSupport = {
     const restricted = true;
     const computerMounted = Boolean(turn.integrations?.computer || turn.integrations?.localComputer);
     const injected = decodeInjectId(turn.model);
-    if (injected?.host === "spark_glm") env.OPENMAUSBOT_HERMES_SPARK_IMPLICIT_THINK = "1";
+    if (injected?.host === "spark_glm" || injected?.model.toLowerCase() === "glm-5.3-flash") {
+      env.OPENMAUSBOT_HERMES_SPARK_IMPLICIT_THINK = "1";
+    }
     else delete env.OPENMAUSBOT_HERMES_SPARK_IMPLICIT_THINK;
     // The Ian Brain credential deny applies even when Computer is Off. The
     // official Hermes launcher strips PYTHONPATH, so every turn must bypass it

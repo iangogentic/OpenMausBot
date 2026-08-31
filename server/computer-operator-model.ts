@@ -4,8 +4,8 @@ import type { LocalHost } from "./drivers/local-inject.ts";
 import { encodeInjectId } from "./drivers/local-inject.ts";
 
 export const COMPUTER_OPERATOR_HOST_ID = "desktop2_qwen";
-export const COMPUTER_OPERATOR_MODEL_ID = "qwen-quality-canary";
-export const COMPUTER_OPERATOR_UPSTREAM_MODEL_ID = "qwen38-huihui-w8-quality-canary";
+export const COMPUTER_OPERATOR_MODEL_ID = "qwen-3.8-27b";
+export const COMPUTER_OPERATOR_UPSTREAM_MODEL_ID = "qwen-3.8-27b";
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_MAX_BYTES = 256 * 1024;
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS = 5_000;
 

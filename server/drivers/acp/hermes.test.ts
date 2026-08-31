@@ -31,6 +31,7 @@ import {
 
 describe("normalizeHermesAssistantText", () => {
   const spark = "spark_glm::glm53-ablit-dflash2-k7-b4096-ms1-1m";
+  const stableSpark = "desktop2_qwen::glm-5.3-flash";
 
   it("collapses one exact whole-answer repeat for Spark GLM", () => {
     const answer = "GLM_POSTDEPLOY_OK — 1280x900 @1x; 22425 events.";
@@ -51,6 +52,14 @@ describe("normalizeHermesAssistantText", () => {
     expect(buildHermesPromptText({ model: "desktop2::qwen", system: "persona", text: "do work" })).toBe(
       "persona\n\ndo work",
     );
+    expect(buildHermesPromptText({ model: stableSpark, system: "persona", text: "do work" })).toContain(
+      "OpenMaus output protocol",
+    );
+  });
+
+  it("applies Spark response cleanup through the stable gateway alias", () => {
+    const answer = "A complete terminal answer from the stable GLM route.";
+    expect(normalizeHermesAssistantText(`${answer}${answer}`, stableSpark)).toBe(answer);
   });
 
   it("preserves partial repeats, short answers, and every other Hermes route", () => {
@@ -251,10 +260,10 @@ describe("Hermes injected vision capability", () => {
 
   it("marks only audited desktop2 Qwen aliases as vision-capable", () => {
     const qwenEnv = isolated();
-    ensureHermesInjectProvider("desktop2_qwen::qwen3.8-27b-abliterated", qwenEnv);
+    ensureHermesInjectProvider("desktop2_qwen::qwen-3.8-27b", qwenEnv);
     const qwen = parseYaml(readFileSync(join(qwenEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
     expect(qwen.model.supports_vision).toBe(true);
-    expect(qwen.providers.desktop2_qwen.models["qwen3.8-27b-abliterated"].supports_vision).toBe(true);
+    expect(qwen.providers.desktop2_qwen.models["qwen-3.8-27b"].supports_vision).toBe(true);
 
     const sparkEnv = isolated();
     ensureHermesInjectProvider("spark_glm::glm53-ablit", sparkEnv);
@@ -271,7 +280,7 @@ describe("Hermes injected vision capability", () => {
 
   it("does not retain route-specific vision or token limits when one durable profile switches models", () => {
     const env = isolated();
-    ensureHermesInjectProvider("desktop2_qwen::qwen-quality-canary", env);
+    ensureHermesInjectProvider("desktop2_qwen::qwen-3.8-27b", env);
     let config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
     expect(config.model.supports_vision).toBe(true);
     expect(config.model.max_tokens).toBeUndefined();
@@ -281,7 +290,12 @@ describe("Hermes injected vision capability", () => {
     expect(config.model.supports_vision).toBeUndefined();
     expect(config.model.max_tokens).toBe(4_096);
 
-    ensureHermesInjectProvider("desktop2_qwen::qwen3.8-27b", env);
+    ensureHermesInjectProvider("desktop2_qwen::glm-5.3-flash", env);
+    config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(config.model.supports_vision).toBeUndefined();
+    expect(config.model.max_tokens).toBe(4_096);
+
+    ensureHermesInjectProvider("desktop2_qwen::qwen-3.8-27b", env);
     config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
     expect(config.model.supports_vision).toBe(true);
     expect(config.model.max_tokens).toBeUndefined();

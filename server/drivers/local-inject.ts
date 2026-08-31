@@ -34,7 +34,7 @@ export const MODEL_RELAY_ENV = Object.freeze({
 export const LOCAL_HOSTS: LocalHost[] = [
   {
     id: "desktop2_qwen",
-    label: "desktop2 · Qwen 3.8 27B Abliterated",
+    label: "desktop2 gateway · Qwen 3.8 / Spark GLM 5.3",
     baseUrl: process.env.OPENMAUSBOT_DESKTOP2_QWEN_URL || "http://127.0.0.1:18011/v1",
     apiKeyEnv: "OPENMAUSBOT_DESKTOP2_QWEN_API_KEY",
     apiKey: "local",
