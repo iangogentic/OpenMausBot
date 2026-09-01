@@ -8,8 +8,8 @@ import {
 } from "./computer-operator-model.ts";
 import type { LocalHost } from "./drivers/local-inject.ts";
 
-const host: LocalHost = { id: "desktop2_qwen", label: "desktop2", baseUrl: "http://127.0.0.1:18011/v1" };
-const glmHost: LocalHost = { id: "spark_glm", label: "Sparks", baseUrl: "http://100.103.69.46:8888/v1" };
+const host: LocalHost = { id: "ian_models", label: "Ian Models", baseUrl: "https://models.zai-brain.com/v1" };
+const glmHost: LocalHost = host;
 const signal = () => new AbortController().signal;
 
 describe("computer operator model preflight", () => {
@@ -29,14 +29,14 @@ describe("computer operator model preflight", () => {
   });
 
   it("canonicalizes a mixed-case configured Qwen id before relay launch", () => {
-    expect(canonicalComputerOperatorModel("desktop2_qwen", "QWEN-3.8-27B"))
-      .toBe("desktop2_qwen::qwen-3.8-27b");
-    expect(canonicalComputerOperatorModel("desktop2_qwen", "compatible-alias")).toBeNull();
+    expect(canonicalComputerOperatorModel("ian_models", "QWEN-3.8-27B"))
+      .toBe("ian_models::qwen-3.8-27b");
+    expect(canonicalComputerOperatorModel("ian_models", "compatible-alias")).toBeNull();
   });
   it("canonicalizes the audited Spark GLM vision route", () => {
-    expect(canonicalComputerOperatorModel("spark_glm", "GLM-5.3-FLASH"))
-      .toBe("spark_glm::glm-5.3-flash");
-    expect(canonicalComputerOperatorModel("spark_glm", "legacy-glm-slug")).toBeNull();
+    expect(canonicalComputerOperatorModel("ian_models", "GLM-5.3-FLASH"))
+      .toBe("ian_models::glm-5.3-flash");
+    expect(canonicalComputerOperatorModel("ian_models", "legacy-glm-slug")).toBeNull();
   });
   it("accepts only the exact model advertised by desktop2", async () => {
     const fetcher = vi.fn(async (input: string | URL | Request) => new Response(JSON.stringify(
@@ -45,7 +45,7 @@ describe("computer operator model preflight", () => {
         : { model: "qwen-3.8-27b", choices: [{ message: { content: "O" } }] },
     )));
     await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), fetcher)).resolves.toBeUndefined();
-    expect(fetcher).toHaveBeenCalledWith("http://127.0.0.1:18011/v1/models", expect.objectContaining({
+    expect(fetcher).toHaveBeenCalledWith("https://models.zai-brain.com/v1/models", expect.objectContaining({
       headers: expect.objectContaining({ authorization: "Bearer secret" }),
     }));
   });
@@ -109,7 +109,7 @@ describe("computer operator model preflight", () => {
     )).rejects.toThrow("route is not trusted");
   });
 
-  it("preflights the exact Spark GLM route and rejects cross-host model swaps", async () => {
+  it("preflights the exact hosted GLM route and rejects unreviewed models", async () => {
     let calls = 0;
     await expect(preflightComputerOperatorModel(
       glmHost,
@@ -122,7 +122,7 @@ describe("computer operator model preflight", () => {
     )).resolves.toBeUndefined();
     await expect(preflightComputerOperatorModel(
       glmHost,
-      "qwen-3.8-27b",
+      "unreviewed-model",
       "secret",
       signal(),
       async () => new Response("unused"),

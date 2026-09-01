@@ -128,7 +128,7 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
   // screenshot with a text-only fallback. Keep this exact-route allowlist in
   // sync with live multimodal acceptance tests; unknown local models remain
   // fail-closed.
-  const auditedVisionModel = (hostId === "desktop2_qwen" && new Set([
+  const auditedVisionModel = (new Set(["ian_models", "desktop2_qwen"]).has(hostId) && new Set([
     "qwen-3.8-27b",
     "qwen-quality-canary",
     "qwen3.8-27b-abliterated",

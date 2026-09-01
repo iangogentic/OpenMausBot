@@ -107,8 +107,14 @@ describe("trusted local model relay", () => {
     expect(JSON.stringify(connection)).not.toContain(source.upstreamApiKey);
   });
 
-  it("requires a literal pinned upstream IP and a model capability", () => {
+  it("allows only the Ian Models API or a private literal upstream", () => {
+    expect(authority({
+      hostId: "ian_models",
+      model: "glm-5.3-flash",
+      upstreamBaseUrl: "https://models.zai-brain.com/v1",
+    }).upstreamBaseUrl).toBe("https://models.zai-brain.com/v1");
     expect(() => authority({ upstreamBaseUrl: "http://models.internal:18011/v1" })).toThrow(/literal, pinned IP/);
+    expect(() => authority({ upstreamBaseUrl: "https://models.zai-brain.com.evil.invalid/v1" })).toThrow(/literal, pinned IP/);
     expect(() => authority({ upstreamBaseUrl: "http://169.254.169.254:80/v1" })).toThrow(/private literal/);
     expect(() => authority({ upstreamBaseUrl: "http://203.0.113.8:18011/v1" })).toThrow(/private literal/);
     expect(() => authority({ binding: binding({ kind: "agents" }) })).toThrow(/model capability/);

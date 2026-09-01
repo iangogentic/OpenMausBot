@@ -271,6 +271,18 @@ describe("Hermes injected vision capability", () => {
   };
 
   it("marks only audited desktop2 and direct-Spark routes as vision-capable", () => {
+    const hostedQwenEnv = isolated();
+    ensureHermesInjectProvider("ian_models::qwen-3.8-27b", hostedQwenEnv);
+    const hostedQwen = parseYaml(readFileSync(join(hostedQwenEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(hostedQwen.model.supports_vision).toBe(true);
+    expect(hostedQwen.providers.ian_models.models["qwen-3.8-27b"].supports_vision).toBe(true);
+
+    const hostedGlmEnv = isolated();
+    ensureHermesInjectProvider("ian_models::glm-5.3-flash", hostedGlmEnv);
+    const hostedGlm = parseYaml(readFileSync(join(hostedGlmEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(hostedGlm.model.supports_vision).toBe(true);
+    expect(hostedGlm.providers.ian_models.models["glm-5.3-flash"].supports_vision).toBe(true);
+
     const qwenEnv = isolated();
     ensureHermesInjectProvider("desktop2_qwen::qwen-3.8-27b", qwenEnv);
     const qwen = parseYaml(readFileSync(join(qwenEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;

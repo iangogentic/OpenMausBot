@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 import type { ModelCatalog, SendTurnInput } from "../contracts.ts";
 import { readBoundedResponseText } from "../bounded-response.ts";
-import { normalizedPinnedModelBaseUrl } from "../model-relay.ts";
+import { IAN_MODELS_BASE_URL, normalizedPinnedModelBaseUrl } from "../model-relay.ts";
 import { assertBoundedJsonShape, CATALOG_NDJSON_LIMITS } from "./bounded-json-lines.ts";
 
 export interface LocalHost {
@@ -32,6 +32,12 @@ export const MODEL_RELAY_ENV = Object.freeze({
 } as const);
 
 export const LOCAL_HOSTS: LocalHost[] = [
+  {
+    id: "ian_models",
+    label: "Ian Models API · Qwen 3.8 / GLM 5.3",
+    baseUrl: process.env.OPENMAUSBOT_IAN_MODELS_URL || IAN_MODELS_BASE_URL,
+    apiKeyEnv: "OPENMAUSBOT_IAN_MODELS_API_KEY",
+  },
   {
     id: "desktop2_qwen",
     label: "desktop2 gateway · Qwen 3.8 / Spark GLM 5.3",

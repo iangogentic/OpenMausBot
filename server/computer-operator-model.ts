@@ -3,10 +3,10 @@ import { readBoundedResponseText } from "./bounded-response.ts";
 import type { LocalHost } from "./drivers/local-inject.ts";
 import { encodeInjectId } from "./drivers/local-inject.ts";
 
-export const COMPUTER_OPERATOR_HOST_ID = "desktop2_qwen";
+export const COMPUTER_OPERATOR_HOST_ID = "ian_models";
 export const COMPUTER_OPERATOR_MODEL_ID = "qwen-3.8-27b";
 export const COMPUTER_OPERATOR_UPSTREAM_MODEL_ID = "qwen-3.8-27b";
-export const COMPUTER_OPERATOR_GLM_HOST_ID = "spark_glm";
+export const COMPUTER_OPERATOR_GLM_HOST_ID = COMPUTER_OPERATOR_HOST_ID;
 export const COMPUTER_OPERATOR_GLM_MODEL_ID = "glm-5.3-flash";
 export const COMPUTER_OPERATOR_GLM_UPSTREAM_MODEL_ID = "glm-5.3-flash";
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_MAX_BYTES = 256 * 1024;

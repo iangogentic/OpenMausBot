@@ -54,6 +54,20 @@ describe("inject ids", () => {
     expect(decodeInjectId(`omlx::${"m".repeat(LOCAL_MODEL_ID_MAX_CHARS + 1)}`)).toBeNull();
   });
 
+  it("exposes the hosted Ian Models API as the canonical Qwen and GLM target", () => {
+    const hosted = LOCAL_HOSTS.find((host) => host.id === "ian_models");
+    expect(hosted).toEqual({
+      id: "ian_models",
+      label: "Ian Models API · Qwen 3.8 / GLM 5.3",
+      baseUrl: "https://models.zai-brain.com/v1",
+      apiKeyEnv: "OPENMAUSBOT_IAN_MODELS_API_KEY",
+    });
+    expect(decodeInjectId("ian_models::glm-5.3-flash")).toEqual({
+      host: "ian_models",
+      model: "glm-5.3-flash",
+    });
+  });
+
   it("exposes the desktop2 Qwen service as a named local harness target", () => {
     const desktop2 = LOCAL_HOSTS.find((host) => host.id === "desktop2_qwen");
     expect(desktop2).toEqual({

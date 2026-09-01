@@ -24,6 +24,7 @@ export const MODEL_RELAY_TURN_RESPONSE_BYTES = 256 * 1024 * 1024;
 export const MODEL_RELAY_MAX_STREAM_FRAME_BYTES = 1024 * 1024;
 export const MODEL_RELAY_TURN_STREAM_FRAMES = 32_768;
 export const MODEL_RELAY_TOTAL_TIMEOUT_MS = 10 * 60_000;
+export const IAN_MODELS_BASE_URL = "https://models.zai-brain.com/v1";
 
 const MODEL_ID = /^[\w][\w./:+-]*$/;
 const HOST_ID = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -109,9 +110,9 @@ function privateModelHostIp(value: string): boolean {
   return false;
 }
 
-/** Canonicalize one trusted local-model source. Catalog probing and turn
- * relaying share this exact rule: no DNS (therefore no rebinding), no public
- * or link-local metadata address, explicit port, and an OpenAI `/v1` base. */
+/** Canonicalize one trusted model source. Catalog probing and turn relaying
+ * share this exact rule: the reviewed Ian Models HTTPS API, or a private
+ * literal address with an explicit port. Arbitrary DNS names remain denied. */
 export function normalizedPinnedModelBaseUrl(value: string): string {
   let url: URL;
   try {
@@ -122,19 +123,20 @@ export function normalizedPinnedModelBaseUrl(value: string): string {
   if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || url.search || url.hash) {
     throw new Error("the local model host has an invalid base URL");
   }
-  // The reviewed local-host table uses explicit loopback/tunnel addresses.
-  // Never turn a long-lived model capability into a DNS-rebinding primitive;
-  // a DNS deployment must resolve and pin its address before it enters here.
+  const pathname = url.pathname.replace(/\/+$/, "");
+  if (!pathname.endsWith("/v1")) throw new Error("the model host base URL must end in /v1");
+  url.pathname = pathname;
+  const normalized = url.toString().replace(/\/$/, "");
+  if (normalized === IAN_MODELS_BASE_URL) return normalized;
+
+  // Every other reviewed source must remain an explicit private address.
   const literalHost = url.hostname.startsWith("[") && url.hostname.endsWith("]")
     ? url.hostname.slice(1, -1)
     : url.hostname;
   if (!privateModelHostIp(literalHost) || !url.port) {
     throw new Error("the local model host must use a private literal, pinned IP address and explicit port");
   }
-  const pathname = url.pathname.replace(/\/+$/, "");
-  if (!pathname.endsWith("/v1")) throw new Error("the local model host base URL must end in /v1");
-  url.pathname = pathname;
-  return url.toString().replace(/\/$/, "");
+  return normalized;
 }
 
 export function createModelRelayAuthority(input: {
