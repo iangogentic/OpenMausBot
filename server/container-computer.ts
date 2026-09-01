@@ -37,7 +37,7 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // Image and container labels below remain the authoritative compatibility
 // check, not the mutable tag.
 export const IMAGE_REPOSITORY = "localhost/openmausbot/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "6";
+export const IMAGE_LAYER_VERSION = "7";
 export const IMAGE_LAYER_LABEL = "com.openmausbot.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export const CONTAINER = "openmausbot-computer";
@@ -277,7 +277,7 @@ RUN set -eux; \\
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$chrome_deb"; \\
       chrome_version="$(google-chrome --version | sed 's/[[:space:]]*$//')"; \\
       test "$chrome_version" = "Google Chrome ${GOOGLE_CHROME_VERSION}"; \\
-      printf '%s\\n' '#!/bin/sh' 'exec /usr/bin/google-chrome-stable --no-sandbox --force-renderer-accessibility "$@"' > /usr/local/bin/openmaus-google-chrome; \\
+      printf '%s\\n' '#!/bin/sh' 'exec /usr/bin/google-chrome-stable --no-sandbox --force-renderer-accessibility --no-first-run --disable-default-apps "$@"' > /usr/local/bin/openmaus-google-chrome; \\
       chmod 0755 /usr/local/bin/openmaus-google-chrome; \\
       ln -sf /usr/local/bin/openmaus-google-chrome /usr/local/bin/google-chrome; \\
       sed -i 's|/usr/bin/google-chrome-stable|/usr/local/bin/openmaus-google-chrome|g' /usr/share/applications/google-chrome.desktop; \\

@@ -797,7 +797,7 @@ describe("Cua integration", () => {
     expect(dockerfile).toContain(`Google Chrome ${GOOGLE_CHROME_VERSION}`);
     expect(dockerfile).toContain("google-chrome --version | sed 's/[[:space:]]*$//'");
     expect(dockerfile).toContain(
-      'exec /usr/bin/google-chrome-stable --no-sandbox --force-renderer-accessibility "$@"',
+      'exec /usr/bin/google-chrome-stable --no-sandbox --force-renderer-accessibility --no-first-run --disable-default-apps "$@"',
     );
     expect(dockerfile).toContain("/usr/local/bin/openmaus-google-chrome");
     expect(dockerfile).toContain('{"CommandLineFlagSecurityWarningsEnabled": false}');
