@@ -26,6 +26,7 @@ import {
   resolvePermissionPolicy,
 } from "./permission-policy.ts";
 import { ProviderRequestSettlements } from "./provider-request-settlement.ts";
+import { httpStatusForError } from "./http-status.ts";
 import {
   deliverProviderRequestWithDeadline,
   timedOutRequestStillOwned,
@@ -10807,7 +10808,7 @@ const server = createServer(async (req, res) => {
 
     return json(res, 404, { error: `no route: ${method} ${path}` });
   } catch (e) {
-    const status = (e as any)?.status ?? 500;
+    const status = httpStatusForError(e);
     return json(res, status, { error: e instanceof Error ? e.message : String(e) });
   }
 });

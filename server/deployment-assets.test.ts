@@ -12,6 +12,8 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(setup).toMatch(/"\/var\/lib\/openmausbot-vm-homes"[\s\S]*?"root",\s*"openmaus-runtime",\s*0o730/);
     expect(leaf).toMatch(/"\/var\/lib\/openmausbot-vm-homes"[\s\S]*?"root",\s*"openmaus-runtime",\s*0o730/);
     expect(leaf).toContain("normalize_vm_leaf(path, device, owner, group)");
+    expect(leaf).toContain("TRANSIENT_BROWSER_PROFILE_DIRS");
+    expect(leaf).toContain("arbitrary VM symlink bypassed normalization");
     expect(leaf).toContain("os.fchown(child_fd, owner, group)");
     expect(service).toContain('Environment="OMB_LOCAL_VM_HOME_DIR=/var/lib/openmausbot-vm-homes"');
     expect(service).toContain('Environment="OMB_LOCAL_VM_GUEST_ADMIN=1"');

@@ -22,6 +22,11 @@ GETFACL = "/usr/bin/getfacl"
 FINDMNT = "/usr/bin/findmnt"
 SERVER_USER = "openmaus-server"
 VM_GUEST_USER = "openmaus-vm-guest"
+TRANSIENT_BROWSER_PROFILE_DIRS = {
+    (".browser-profiles", "google-chrome"),
+    (".browser-profiles", "chromium"),
+}
+TRANSIENT_BROWSER_ENTRY_NAMES = {"SingletonLock", "SingletonSocket", "SingletonCookie", ".parentlock"}
 
 
 @dataclass(frozen=True)
@@ -209,6 +214,7 @@ def normalize_vm_tree_fd(
     group: int,
     budget: list[int],
     depth: int = 0,
+    relative_parts: tuple[str, ...] = (),
 ) -> None:
     """Return stopped-guest content to the server before it reapplies ACLs."""
     info = os.fstat(directory_fd)
@@ -222,7 +228,21 @@ def normalize_vm_tree_fd(
         if name in (".", "..") or "/" in name or "\x00" in name:
             raise RuntimeError("Local VM storage contains an unsafe name")
         child_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if child_info.st_dev != expected_device or stat.S_ISLNK(child_info.st_mode):
+        if child_info.st_dev != expected_device:
+            raise RuntimeError("Local VM storage contains a link or nested mount")
+        transient_browser_entry = (
+            relative_parts in TRANSIENT_BROWSER_PROFILE_DIRS
+            and name in TRANSIENT_BROWSER_ENTRY_NAMES
+        )
+        if transient_browser_entry and (
+            stat.S_ISLNK(child_info.st_mode) or stat.S_ISSOCK(child_info.st_mode)
+        ):
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (child_info.st_dev, child_info.st_ino):
+                raise RuntimeError("Local VM browser lock changed during normalization")
+            os.unlink(name, dir_fd=directory_fd)
+            continue
+        if stat.S_ISLNK(child_info.st_mode):
             raise RuntimeError("Local VM storage contains a link or nested mount")
         if stat.S_ISDIR(child_info.st_mode):
             child_fd = os.open(
@@ -236,7 +256,15 @@ def normalize_vm_tree_fd(
                     raise RuntimeError("Local VM storage directory changed during normalization")
                 if btrfs_probe_fd(child_fd):
                     raise RuntimeError("Local VM storage contains an unexpected nested subvolume")
-                normalize_vm_tree_fd(child_fd, expected_device, owner, group, budget, depth + 1)
+                normalize_vm_tree_fd(
+                    child_fd,
+                    expected_device,
+                    owner,
+                    group,
+                    budget,
+                    depth + 1,
+                    (*relative_parts, name),
+                )
                 os.fchown(child_fd, owner, group)
                 os.fchmod(child_fd, 0o700)
             finally:
@@ -427,6 +455,23 @@ def integration_test() -> None:
         normalized = os.lstat(guest_file)
         if normalized.st_uid != owner or normalized.st_gid != group or stat.S_IMODE(normalized.st_mode) != 0o600:
             raise RuntimeError("guest-owned VM state was not normalized for server ACL repair")
+        browser_profile = os.path.join(first, ".browser-profiles", "google-chrome")
+        os.makedirs(browser_profile, mode=0o700)
+        browser_lock = os.path.join(browser_profile, "SingletonLock")
+        os.symlink("/etc/passwd", browser_lock)
+        normalize_vm_leaf(first, os.lstat(first).st_dev, owner, group)
+        if os.path.lexists(browser_lock):
+            raise RuntimeError("transient browser lock survived VM normalization")
+        hostile_link = os.path.join(first, "hostile-link")
+        os.symlink("/etc/passwd", hostile_link)
+        try:
+            normalize_vm_leaf(first, os.lstat(first).st_dev, owner, group)
+        except RuntimeError as error:
+            if "link or nested mount" not in str(error):
+                raise
+        else:
+            raise RuntimeError("arbitrary VM symlink bypassed normalization")
+        os.unlink(hostile_link)
         fill = subprocess.run(
             ["/usr/bin/dd", "if=/dev/zero", f"of={first}/bomb", "bs=1M", "count=96", "conv=fsync"],
             stdin=subprocess.DEVNULL,
