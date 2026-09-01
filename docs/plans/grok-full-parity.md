@@ -32,8 +32,8 @@ OpenMaus status in this ledger is deliberately split:
 ## Current checkout and deployment boundary
 
 The deployed implementation revision is
-`750254b4a299c7c02d012d2881b7c75438909f68` (`Keep remote renderer origin
-stable`) on `feat/grokbot-remote-client`. Its complete repository gate,
+`06f73697598baea9c90711d7cf993ae248b2e583` (`Repair guest-owned local VM
+homes safely`) on `feat/grokbot-remote-client`. Its complete repository gate,
 production build, immutable Razer cutover, and post-cutover live proof are
 recorded below rather than inferred from an earlier revision.
 The fork history identifies the material additions: hardened Razer deployment
@@ -42,12 +42,12 @@ Ian Brain, remote clients, and the recent Hermes visual-loop work. These are Ian
 fork additions; they are not upstream OpenMaus behavior. The exact commit list
 is available with `git log upstream/main..HEAD`.
 
-Revision `750254b4a299c7c02d012d2881b7c75438909f68` is installed at
-`/opt/openmausbot/releases/750254b4a299c7c02d012d2881b7c75438909f68` with the
+Revision `06f73697598baea9c90711d7cf993ae248b2e583` is installed at
+`/opt/openmausbot/releases/06f73697598baea9c90711d7cf993ae248b2e583` with the
 previous release retained as rollback. The atomic `current` symlink, server,
 companion, and four Unix sockets were verified after cutover and a second
 restart. The immutable manifest contains 629 verified files. The complete gate
-registered 2,958 Vitest cases (2,937 passed, 21 skipped), seven broker tests,
+registered 2,963 Vitest cases (2,942 passed, 21 skipped), seven broker tests,
 and 148 Electron-node cases (147 passed, one Windows-only skip); typecheck,
 UI/server/companion builds, and packaged-server smoke also passed. The installed
 signed Mac app's `app.asar` SHA-256 is
@@ -77,6 +77,24 @@ operator home stable per bot and target, retires those homes with bot deletion,
 fails private mode closed without OS isolation, post-validates target generation,
 and fences final capture as a target action so VM replacement or human takeover
 cannot cross the returned pixels.
+
+The current stable model routes supersede the historical canary names. The
+installed Mac app now offers and persists Hermes Qwen as
+`desktop2_qwen::qwen-3.8-27b` and Hermes GLM as
+`desktop2_qwen::glm-5.3-flash`. Both traverse Razer's authenticated loopback
+gateway; desktop2 serves Qwen locally and forwards GLM over a pinned Tailscale
+SSH link to the Spark. After final deployment and restart, simultaneous fresh
+turns returned `OPENMAUS-QWEN-FINAL-06F7369-OK` and
+`OPENMAUS-GLM-FINAL-06F7369-OK` through the actual installed Mac app. That run
+also found an older VM-home ownership defect before model invocation. The
+root-owned storage helper now normalizes stopped guest-owned entries through
+pinned descriptors before the unprivileged server reapplies exact ACLs. Its
+live Btrfs integration test and both retried bot turns passed.
+The final Qwen acceptance then delegated a real visual child through the new
+stable alias, used four of nine bounded actions, released its lease, and
+returned a generation-fenced 1280x900 final PNG. Independent pixel inspection
+showed `OPENMAUS-QWEN-VISUAL-06F7369` in the VM terminal; the parent returned
+`OPENMAUS-QWEN-VISUAL-06F7369-OK`.
 
 The latest post-cutover run used the actual installed Electron UI, selected
 Hermes Qwen, and persisted its exact opaque bot ID in the app-owned mode-0600
@@ -159,12 +177,12 @@ at `server/local-vm-broker.ts:37,65,486-490` and `server/index.ts:9742-9745`.
 
 **Status:** Source-built and source-tested, including policy tests
 (`server/drivers/acp/hermes.test.ts:624-719,721-805`). The exact desktop2
-Qwen3.8 27B abliterated W8A16 service, its seven shards plus MTP artifact, both
-RTX 3090s, direct inference, and the Razer tunnel inference were live-verified.
-OpenMaus model discovery and Hermes select that exact model. The exact route and
-one fresh Qwen visual mutation/final-frame loop are now live-proven. Spark
-remains deliberately text-only and still needs its own fresh deployed
-acceptance. Do not route local Cua through Box: its separate authorization,
+Qwen 3.8 27B service, both RTX 3090s, direct inference, and the Razer tunnel
+inference were live-verified. OpenMaus model discovery and Hermes select the
+stable `qwen-3.8-27b` alias; the exact route and one fresh Qwen visual
+mutation/final-frame loop are live-proven. The Spark GLM route is deliberately
+text-only and now has a fresh deployed text-turn acceptance through the stable
+`glm-5.3-flash` alias. Do not route local Cua through Box: its separate authorization,
 lease, generation, and host-containment boundaries remain required. Also assert
 no host-native tools, raw socket, bearer, or unscoped path is exposed.
 

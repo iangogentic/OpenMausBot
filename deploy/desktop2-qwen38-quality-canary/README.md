@@ -1,13 +1,14 @@
-# desktop2 Qwen quality-canary restart policy
+# desktop2 stable Qwen backend restart policy
 
 The active OpenMaus computer-operator model is the existing Docker container
-`qwen38-huihui-quality-canary`, serving
-`qwen38-huihui-w8-quality-canary` on desktop2 loopback port 8012. Bifrost and
-llama-swap expose the stable authenticated alias `qwen-quality-canary`; Razer
+`qwen38-huihui-quality-canary`, serving on desktop2 loopback port 8012. Bifrost
+and llama-swap expose the stable authenticated alias `qwen-3.8-27b`; Razer
 reaches Bifrost only through its persistent loopback SSH tunnel.
 
-Docker owns boot recovery for the exact active container. Install or repair
-that policy on desktop2 with:
+The user service `qwen38-huihui-quality-canary.service` owns boot recovery for
+the exact active container; Docker's own restart policy remains `no`. The
+legacy helper below is retained only for older deployments and must not replace
+the current systemd ownership contract without a reviewed migration:
 
 ```sh
 sudo ./ensure-restart-policy.sh
@@ -23,6 +24,7 @@ Verify the served artifact after a restart:
 
 ```sh
 curl -fsS http://127.0.0.1:8012/v1/models
+systemctl --user is-active qwen38-huihui-quality-canary.service
 docker inspect -f '{{.HostConfig.RestartPolicy.Name}} {{.State.Running}}' \
   qwen38-huihui-quality-canary
 ```
