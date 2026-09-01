@@ -19,13 +19,17 @@ export function watchRemoteServer(
   let checking = false;
   let consecutiveFailures = 0;
   let confirmedOutage = false;
+  // BrowserWindow.webContents can throw once the native window has already
+  // been destroyed. Keep the EventEmitter reference while it is live so the
+  // closed cleanup path cannot crash the Electron main process.
+  const webContents = win.webContents;
 
   const onFailedLoad = (_event, _code, _description, url, isMainFrame) => {
     if (isMainFrame !== false && url.startsWith(serverUrl)) {
       loadFailed = true;
     }
   };
-  win.webContents.on("did-fail-load", onFailedLoad);
+  webContents.on("did-fail-load", onFailedLoad);
 
   const check = async () => {
     if (checking || win.isDestroyed()) return;
@@ -69,7 +73,7 @@ export function watchRemoteServer(
   timer.unref?.();
   const stop = () => {
     clearIntervalImpl(timer);
-    win.webContents.removeListener?.("did-fail-load", onFailedLoad);
+    webContents.removeListener?.("did-fail-load", onFailedLoad);
   };
   win.once("closed", stop);
   void check();

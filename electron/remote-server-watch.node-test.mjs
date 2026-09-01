@@ -24,7 +24,7 @@ function harness(fetchImpl) {
     clearIntervalImpl: () => {},
     timeoutSignal: () => undefined,
   });
-  return { intervals, loads, webContents };
+  return { intervals, loads, webContents, win, windowEvents };
 }
 
 test("does not reload a live renderer after a transient health miss", async () => {
@@ -76,4 +76,13 @@ test("ignores subframe and foreign-origin failures", async () => {
   await state.intervals[0]();
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(state.loads, []);
+});
+
+test("closing an already-destroyed remote window cannot crash the main process", () => {
+  const state = harness(async () => ({ ok: true }));
+  Object.defineProperty(state.win, "webContents", {
+    get() { throw new TypeError("Object has been destroyed"); },
+  });
+  assert.doesNotThrow(() => state.windowEvents.emit("closed"));
+  assert.equal(state.webContents.listenerCount("did-fail-load"), 0);
 });
