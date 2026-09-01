@@ -194,10 +194,85 @@ def ensure_leaf(path: str, kind: LeafClass, owner: int, group: int) -> None:
         except BaseException:
             subprocess.run([BTRFS, "subvolume", "delete", path], env=SAFE_ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             raise
-    checked_leaf(path, kind, owner, group)
+    device = checked_leaf(path, kind, owner, group)
+    if kind.root == LEAVES["vm"].root:
+        normalize_vm_leaf(path, device, owner, group)
     # Reapply on every open so an administrative qgroup change cannot silently
     # leave a previously created bot unbounded.
     run([BTRFS, "qgroup", "limit", str(kind.limit), path])
+
+
+def normalize_vm_tree_fd(
+    directory_fd: int,
+    expected_device: int,
+    owner: int,
+    group: int,
+    budget: list[int],
+    depth: int = 0,
+) -> None:
+    """Return stopped-guest content to the server before it reapplies ACLs."""
+    info = os.fstat(directory_fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_dev != expected_device or depth > 64:
+        raise RuntimeError("Local VM storage contains an unsafe directory")
+    names = os.listdir(directory_fd)
+    budget[0] -= len(names)
+    if budget[0] < 0:
+        raise RuntimeError("Local VM storage exceeded its bounded entry budget")
+    for name in names:
+        if name in (".", "..") or "/" in name or "\x00" in name:
+            raise RuntimeError("Local VM storage contains an unsafe name")
+        child_info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if child_info.st_dev != expected_device or stat.S_ISLNK(child_info.st_mode):
+            raise RuntimeError("Local VM storage contains a link or nested mount")
+        if stat.S_ISDIR(child_info.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                pinned = os.fstat(child_fd)
+                if (pinned.st_dev, pinned.st_ino) != (child_info.st_dev, child_info.st_ino):
+                    raise RuntimeError("Local VM storage directory changed during normalization")
+                if btrfs_probe_fd(child_fd):
+                    raise RuntimeError("Local VM storage contains an unexpected nested subvolume")
+                normalize_vm_tree_fd(child_fd, expected_device, owner, group, budget, depth + 1)
+                os.fchown(child_fd, owner, group)
+                os.fchmod(child_fd, 0o700)
+            finally:
+                os.close(child_fd)
+            continue
+        if not stat.S_ISREG(child_info.st_mode):
+            raise RuntimeError("Local VM storage contains an unsupported inode")
+        child_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd)
+        try:
+            pinned = os.fstat(child_fd)
+            if (
+                (pinned.st_dev, pinned.st_ino) != (child_info.st_dev, child_info.st_ino)
+                or not stat.S_ISREG(pinned.st_mode)
+            ):
+                raise RuntimeError("Local VM storage file changed during normalization")
+            os.fchown(child_fd, owner, group)
+            os.fchmod(child_fd, 0o700 if child_info.st_mode & 0o111 else 0o600)
+        finally:
+            os.close(child_fd)
+
+
+def normalize_vm_leaf(path: str, expected_device: int, owner: int, group: int) -> None:
+    """Normalize one exact, stopped VM leaf through a pinned directory fd."""
+    current = os.lstat(path)
+    leaf_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        pinned = os.fstat(leaf_fd)
+        if (
+            (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino)
+            or pinned.st_dev != expected_device
+            or not btrfs_probe_fd(leaf_fd)
+        ):
+            raise RuntimeError("Local VM storage leaf changed during normalization")
+        normalize_vm_tree_fd(leaf_fd, expected_device, owner, group, [100_000])
+    finally:
+        os.close(leaf_fd)
 
 
 def empty_tree_fd(directory_fd: int, expected_device: int, budget: list[int], depth: int = 0) -> None:
@@ -342,6 +417,16 @@ def integration_test() -> None:
         sibling = os.path.join(mountpoint, "2222222222222222")
         ensure_leaf(first, kind, owner, group)
         ensure_leaf(sibling, kind, owner, group)
+        guest_file = os.path.join(first, "guest-owned")
+        with open(guest_file, "xb", buffering=0) as output:
+            output.write(b"guest state")
+        guest = pwd.getpwnam(VM_GUEST_USER)
+        os.chown(guest_file, guest.pw_uid, guest.pw_gid, follow_symlinks=False)
+        os.chmod(guest_file, 0o666, follow_symlinks=False)
+        normalize_vm_leaf(first, os.lstat(first).st_dev, owner, group)
+        normalized = os.lstat(guest_file)
+        if normalized.st_uid != owner or normalized.st_gid != group or stat.S_IMODE(normalized.st_mode) != 0o600:
+            raise RuntimeError("guest-owned VM state was not normalized for server ACL repair")
         fill = subprocess.run(
             ["/usr/bin/dd", "if=/dev/zero", f"of={first}/bomb", "bs=1M", "count=96", "conv=fsync"],
             stdin=subprocess.DEVNULL,

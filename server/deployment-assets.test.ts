@@ -11,6 +11,8 @@ describe("Razer hostile-provider deployment assets", () => {
     const service = asset("openmausbot.service");
     expect(setup).toMatch(/"\/var\/lib\/openmausbot-vm-homes"[\s\S]*?"root",\s*"openmaus-runtime",\s*0o730/);
     expect(leaf).toMatch(/"\/var\/lib\/openmausbot-vm-homes"[\s\S]*?"root",\s*"openmaus-runtime",\s*0o730/);
+    expect(leaf).toContain("normalize_vm_leaf(path, device, owner, group)");
+    expect(leaf).toContain("os.fchown(child_fd, owner, group)");
     expect(service).toContain('Environment="OMB_LOCAL_VM_HOME_DIR=/var/lib/openmausbot-vm-homes"');
     expect(service).toContain('Environment="OMB_REQUIRE_STORAGE_ISOLATION=1"');
     expect(leaf).toContain("os.O_CREAT | os.O_EXCL");

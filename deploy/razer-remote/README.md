@@ -138,7 +138,12 @@ server create an exact hash leaf without letting Ian, the provider, companion,
 or the locked guest list/traverse sibling homes. Before every Linux-Docker
 create/run, source provisions/revalidates the exact 8 GiB qgroup leaf, rejects
 symlinks/nested mounts, and replaces ACLs with only the exact server and guest
-UIDs. A networkless, read-only-root, tightly capped cleanup container under the
+UIDs. Because guest-created files are numerically owned by uid 61000, the
+root-owned storage helper first walks the stopped VM leaf through pinned file
+descriptors, rejects links, nested subvolumes, mounts and special inodes, and
+returns each bounded entry to the server owner. The unprivileged server can
+then replace every ACL without needing `CAP_FOWNER`. A networkless,
+read-only-root, tightly capped cleanup container under the
 trusted server's Docker authority removes hostile guest-owned contents before
 the exact leaf is retired. Never make the directory world-writable, reuse a
 human host UID, or give the provider Docker/VM-guest group authority.
