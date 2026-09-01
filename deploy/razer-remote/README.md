@@ -118,7 +118,8 @@ protect the host and trusted server state from a hostile workspace/VM disk
 bomb. The root-owned leaf helper additionally creates every bot workspace as a
 4 GiB qgroup-limited subvolume and every Local VM home as an 8 GiB
 qgroup-limited subvolume, so one bot cannot consume the aggregate and starve
-all siblings. Provider native homes retain their narrower 128 MiB ceiling.
+all siblings. Provider native homes retain a narrower 512 MiB ceiling plus the
+instance-wide 8 GiB aggregate ceiling.
 
 `openmaus-server` is deliberately trusted and the service unit's explicit
 Docker supplementary group is root-equivalent: the harness already exposes
@@ -185,13 +186,13 @@ Never put another instance's credential, or any UI, companion, server-state,
 Ian Brain upstream, or broker-control secret in the seed.
 
 The supervisor accepts at most 64 persistent bot homes per provider instance.
-Every home is a Btrfs subvolume with a hard 128 MiB referenced-byte qgroup
-limit, is also validated at 16,384 inodes or less, and the maximum 64 homes
-therefore cannot exceed 8 GiB of referenced bot data. An instance-wide root
-lock serializes new-home accounting while a separate per-bot lock rejects a
-second process against the same native session. Bot deletion retires its exact
-hash-only home; the root-admin procedure below is the whole-instance emergency
-reset. Never delete or rename a state leaf by hand.
+Every home is a Btrfs subvolume with a hard 512 MiB referenced-byte qgroup
+limit and is also validated at 16,384 inodes or less. The provider instance has
+a separate hard 8 GiB aggregate ceiling across its maximum 64 homes. An
+instance-wide root lock serializes new-home accounting while a separate per-bot
+lock rejects a second process against the same native session. Bot deletion
+retires its exact hash-only home; the root-admin procedure below is the
+whole-instance emergency reset. Never delete or rename a state leaf by hand.
 
 The exact sharing contract is:
 

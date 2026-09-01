@@ -51,7 +51,7 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RUNTIME_PATHS = 33
 MAX_RUNTIME_NODES = 4096
 MAX_INSTANCE_HOME_BYTES = 128 * 1024 * 1024
-MAX_PERSISTENT_HOME_BYTES = 128 * 1024 * 1024
+MAX_PERSISTENT_HOME_BYTES = 512 * 1024 * 1024
 MAX_PERSISTENT_HOME_NODES = 16384
 MAX_INSTANCE_PERSISTENT_HOMES = 64
 MAX_INSTANCE_STATE_BYTES = 8 * 1024 * 1024 * 1024
@@ -478,7 +478,7 @@ def validate_persistent_home(
                 raise RuntimeError("provider persistent home contains a hard link")
             total_bytes += info.st_size
             if total_bytes > MAX_PERSISTENT_HOME_BYTES:
-                raise RuntimeError("provider persistent home exceeds 128 MiB")
+                raise RuntimeError("provider persistent home exceeds 512 MiB")
         else:
             raise RuntimeError("provider persistent home contains an unsupported inode")
     return count, total_bytes
@@ -545,7 +545,7 @@ def instance_state_usage(instance_state: str) -> tuple[int, int]:
                     raise RuntimeError("provider state contains an unsafe lock")
             else:
                 raise RuntimeError("provider state contains an unexpected entry")
-    # Each home also has a hard 128 MiB qgroup. This aggregate allocated-byte
+    # Each home also has a hard 512 MiB qgroup. This aggregate allocated-byte
     # check cannot be poisoned by a sparse file or malformed sibling inode.
     if total_bytes > MAX_INSTANCE_STATE_BYTES:
         raise RuntimeError("provider instance state exceeds 8 GiB allocated")
