@@ -61,6 +61,7 @@ const RESERVED_EXPLICIT_NAMES = new Set([
   // generated relay connection, never an upstream URL or host credential.
   "OPENMAUSBOT_DESKTOP2_QWEN_URL",
   "OPENMAUSBOT_SPARK_GLM_URL",
+  "OPENMAUSBOT_SPARK_GLM_API_KEY",
   "UNSLOTH_STUDIO_AUTH_TOKEN",
 ]);
 

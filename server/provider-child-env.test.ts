@@ -34,6 +34,7 @@ describe("providerChildEnvironment", () => {
       OMB_MODEL_RELAY_OPENAI_BASE_URL: "http://attacker.invalid/v1",
       OPENMAUSBOT_DESKTOP2_QWEN_URL: "http://real-upstream:18011/v1",
       OPENMAUSBOT_SPARK_GLM_URL: "http://real-upstream:18002/v1",
+      OPENMAUSBOT_SPARK_GLM_API_KEY: "real-spark-upstream-key",
       UNSLOTH_STUDIO_AUTH_TOKEN: "real-upstream-key",
     }, {
       internal: { PATH: "/trusted/bin", OPENMAUSBOT_POLICY: "1" },

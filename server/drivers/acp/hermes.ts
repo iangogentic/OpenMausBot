@@ -128,15 +128,17 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
   // screenshot with a text-only fallback. Keep this exact-route allowlist in
   // sync with live multimodal acceptance tests; unknown local models remain
   // fail-closed.
-  const desktop2VisionModel = hostId === "desktop2_qwen" && new Set([
+  const auditedVisionModel = (hostId === "desktop2_qwen" && new Set([
     "qwen-3.8-27b",
     "qwen-quality-canary",
     "qwen3.8-27b-abliterated",
     "qwen3.8-27b",
     "glm-5.3-flash",
     "glm-live/glm-5.3-flash",
-  ]).has(model.toLowerCase());
-  if (desktop2VisionModel) {
+  ]).has(model.toLowerCase())) || (
+    hostId === "spark_glm" && model.toLowerCase() === "glm-5.3-flash"
+  );
+  if (auditedVisionModel) {
     // Hermes normalizes `custom:desktop2_qwen` to the runtime provider
     // `custom`, but its current per-provider capability lookup does not strip
     // the configured prefix before indexing `providers`. Also set the

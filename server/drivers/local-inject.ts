@@ -43,6 +43,7 @@ export const LOCAL_HOSTS: LocalHost[] = [
     id: "spark_glm",
     label: "DGX Sparks · GLM 5.3 Flash Abliterated",
     baseUrl: process.env.OPENMAUSBOT_SPARK_GLM_URL || "http://127.0.0.1:18002/v1",
+    apiKeyEnv: "OPENMAUSBOT_SPARK_GLM_API_KEY",
     apiKey: "local",
   },
   { id: "omlx", label: "oMLX", baseUrl: "http://127.0.0.1:8080/v1", apiKey: "omlx" },

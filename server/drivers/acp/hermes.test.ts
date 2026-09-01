@@ -270,7 +270,7 @@ describe("Hermes injected vision capability", () => {
     return { HERMES_HOME: root, OPENMAUSBOT_HERMES_POLICY: "1" };
   };
 
-  it("marks only audited desktop2 Qwen and GLM aliases as vision-capable", () => {
+  it("marks only audited desktop2 and direct-Spark routes as vision-capable", () => {
     const qwenEnv = isolated();
     ensureHermesInjectProvider("desktop2_qwen::qwen-3.8-27b", qwenEnv);
     const qwen = parseYaml(readFileSync(join(qwenEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
@@ -284,10 +284,16 @@ describe("Hermes injected vision capability", () => {
     expect(glm.providers.desktop2_qwen.models["glm-5.3-flash"].supports_vision).toBe(true);
 
     const sparkEnv = isolated();
-    ensureHermesInjectProvider("spark_glm::glm53-ablit", sparkEnv);
+    ensureHermesInjectProvider("spark_glm::glm-5.3-flash", sparkEnv);
     const spark = parseYaml(readFileSync(join(sparkEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
-    expect(spark.providers.spark_glm.models).toBeUndefined();
-    expect(spark.model.supports_vision).toBeUndefined();
+    expect(spark.model.supports_vision).toBe(true);
+    expect(spark.providers.spark_glm.models["glm-5.3-flash"].supports_vision).toBe(true);
+
+    const unknownSparkEnv = isolated();
+    ensureHermesInjectProvider("spark_glm::legacy-glm-slug", unknownSparkEnv);
+    const unknownSpark = parseYaml(readFileSync(join(unknownSparkEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(unknownSpark.model.supports_vision).toBeUndefined();
+    expect(unknownSpark.providers.spark_glm.models).toBeUndefined();
 
     const unknownEnv = isolated();
     ensureHermesInjectProvider("desktop2_qwen::unknown-text-model", unknownEnv);
@@ -303,7 +309,7 @@ describe("Hermes injected vision capability", () => {
     expect(config.model.supports_vision).toBe(true);
     expect(config.model.max_tokens).toBeUndefined();
 
-    ensureHermesInjectProvider("spark_glm::glm53-ablit", env);
+    ensureHermesInjectProvider("spark_glm::legacy-glm-slug", env);
     config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
     expect(config.model.supports_vision).toBeUndefined();
     expect(config.model.max_tokens).toBe(4_096);

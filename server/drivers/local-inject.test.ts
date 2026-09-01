@@ -75,6 +75,7 @@ describe("inject ids", () => {
       id: "spark_glm",
       label: "DGX Sparks · GLM 5.3 Flash Abliterated",
       baseUrl: "http://127.0.0.1:18002/v1",
+      apiKeyEnv: "OPENMAUSBOT_SPARK_GLM_API_KEY",
       apiKey: "local",
     });
     expect(decodeInjectId("spark_glm::glm53-ablit-dflash2-k7-b4096-ms1-1m")).toEqual({
