@@ -109,7 +109,8 @@ _PINNED_MCP = frozenset({
     # High-frequency, read-oriented Ian Brain entry points.
     "mcp_ian_brain_context_store_stats", "mcp_ian_brain_ian_context_brief",
     "mcp_ian_brain_projects_search", "mcp_ian_brain_memory_recall",
-    "mcp_ian_brain_files_search", "mcp_ian_brain_wiki_index",
+    "mcp_ian_brain_files_search", "mcp_ian_brain_files_neighbors",
+    "mcp_ian_brain_wiki_index",
     "mcp_ian_brain_world_model_query", "mcp_ian_brain_work_item_list",
 })
 _DENIED_MCP_PREFIXES = (

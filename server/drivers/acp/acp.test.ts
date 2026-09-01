@@ -73,6 +73,16 @@ const ClassifiedErrorDriver = createAcpDriver({
       : undefined,
 });
 
+const RecoveryDriver = createAcpDriver({
+  ...SELECT_MODEL_SUPPORT,
+  driverKind: "recoveryTest",
+  selectModel: undefined,
+  deferAssistantText: () => true,
+  recoverAssistantText: (text, _turn, attempt) =>
+    text.startsWith("⚠️ No reply:") && attempt === 0 ? "continue from the same session" : null,
+  terminalAssistantFailure: (text) => text.startsWith("⚠️ No reply:") ? "empty_response" : null,
+});
+
 describe("skipSubscriptionAuthForLocalInject", () => {
   it("is true only for a host:: inject id", () => {
     expect(skipSubscriptionAuthForLocalInject("omlx::MiniMax-M3-4bit")).toBe(true);
@@ -265,6 +275,7 @@ describe("ACP turns (fake CLI)", () => {
   afterEach(async () => {
     delete process.env.FAKE_ACP_MODE;
     delete process.env.FAKE_ACP_DUMP;
+    delete process.env.FAKE_ACP_RPC_DUMP;
     delete process.env.XAI_API_KEY;
     delete process.env.OPENCODE_API_KEY;
     delete process.env.CURSOR_API_KEY;
@@ -331,6 +342,38 @@ describe("ACP turns (fake CLI)", () => {
       .filter((e) => e.type === "item.completed" && (e as { itemType?: string }).itemType === "assistant_text")
       .map((e) => (e as { text: string }).text);
     expect(texts).toEqual(["before one", "before two", "after"]);
+  });
+
+  it("recovers a provider empty-reply sentinel on the same ACP session", async () => {
+    const rpcDump = join(scratch, "recovery-rpc.json");
+    process.env.FAKE_ACP_RPC_DUMP = rpcDump;
+    await create(RecoveryDriver, "empty-then-recover");
+    await instance.adapter.sendTurn({ threadId: "t-recover", text: "use tools then answer" });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: true });
+    expect(recorder.events.some((event) => event.type === "content.delta")).toBe(false);
+    const replies = recorder.events
+      .filter((event) => event.type === "item.completed" && (event as { itemType?: string }).itemType === "assistant_text")
+      .map((event) => (event as { text: string }).text);
+    expect(replies).toEqual(["recovered final answer"]);
+    const methods = JSON.parse(readFileSync(rpcDump, "utf8")) as string[];
+    expect(methods.filter((method) => method === "session/prompt")).toHaveLength(2);
+  });
+
+  it("reports a provider empty-reply sentinel as a failed turn after recovery is exhausted", async () => {
+    await create(RecoveryDriver, "empty-always");
+    await instance.adapter.sendTurn({ threadId: "t-recover-fails", text: "use tools then answer" });
+    const done = await recorder.until((event) => event.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: false, stopReason: "empty_response" });
+    expect(recorder.events.some((event) => event.type === "content.delta")).toBe(false);
+    const replies = recorder.events
+      .filter((event) => event.type === "item.completed" && (event as { itemType?: string }).itemType === "assistant_text")
+      .map((event) => (event as { text: string }).text);
+    expect(replies).toEqual([
+      "⚠️ No reply: the model returned empty content after retries and any fallback providers. Try `continue`.",
+    ]);
   });
 
   it("reads token usage from the root of the prompt result", async () => {

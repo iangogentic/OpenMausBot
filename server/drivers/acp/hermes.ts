@@ -122,16 +122,19 @@ function upsertHermesBootstrapModel(text: string, hostId: string, model: string)
     // native `length` reason and Hermes' bounded continuation path.
     ...(hostId === "spark_glm" || model.toLowerCase() === "glm-5.3-flash" ? { max_tokens: 4_096 } : {}),
   };
-  // The desktop2 Qwen endpoint accepts OpenAI-compatible image content in
-  // tool messages. Hermes cannot infer that capability for a private model
-  // absent from models.dev, and otherwise replaces every screenshot with a
-  // text-only fallback. Scope the declaration to this exact injected route;
-  // Spark GLM remains deliberately text-only.
+  // The desktop2 gateway's audited Qwen and GLM routes accept OpenAI-compatible
+  // image content in tool messages. Hermes cannot infer that capability for a
+  // private model absent from models.dev, and otherwise replaces every
+  // screenshot with a text-only fallback. Keep this exact-route allowlist in
+  // sync with live multimodal acceptance tests; unknown local models remain
+  // fail-closed.
   const desktop2VisionModel = hostId === "desktop2_qwen" && new Set([
     "qwen-3.8-27b",
     "qwen-quality-canary",
     "qwen3.8-27b-abliterated",
     "qwen3.8-27b",
+    "glm-5.3-flash",
+    "glm-live/glm-5.3-flash",
   ]).has(model.toLowerCase());
   if (desktop2VisionModel) {
     // Hermes normalizes `custom:desktop2_qwen` to the runtime provider
@@ -236,6 +239,7 @@ const SPARK_FINAL_CONTRACT = [
   `wrapped once in ${SPARK_FINAL_OPEN} and ${SPARK_FINAL_CLOSE}.`,
   "Put no reasoning inside that element. The closing tag must be your final output.",
 ].join(" ");
+const HERMES_EMPTY_REPLY = /^⚠️\s*No reply:\s*the model returned empty content after retries\b/i;
 
 function isSparkHermesModel(modelId: string | undefined): boolean {
   const injected = decodeInjectId(modelId);
@@ -272,6 +276,44 @@ export function normalizeHermesAssistantText(text: string, modelId: string | und
     }
   }
   return text;
+}
+
+/** Hermes can finish an ACP prompt with end_turn while its user-visible text
+ * is only the empty-response explainer. Continue on the same ACP session so
+ * the successful tool results remain available. Two bounded stages avoid an
+ * infinite loop: first permit necessary follow-up tools, then require a best-
+ * effort answer from evidence already collected. */
+export function hermesEmptyReplyRecovery(
+  text: string,
+  modelId: string | undefined,
+  attempt: number,
+): string | null {
+  if (!isSparkHermesModel(modelId) || !HERMES_EMPTY_REPLY.test(text.trim())) return null;
+  if (attempt === 0) {
+    return [
+      "OpenMaus recovery: your previous internal pass completed tool calls but emitted no user-visible answer.",
+      "Continue from the tool results already present in this same session; do not restart broad discovery.",
+      "Use another tool only when it is strictly necessary to finish the user's task.",
+      SPARK_FINAL_CONTRACT,
+    ].join(" ");
+  }
+  if (attempt === 1) {
+    return [
+      "OpenMaus final recovery: stop calling tools and answer now using the evidence already collected.",
+      "Provide the most useful complete result possible and state any missing evidence plainly.",
+      SPARK_FINAL_CONTRACT,
+    ].join(" ");
+  }
+  return null;
+}
+
+export function hermesTerminalAssistantFailure(
+  text: string,
+  modelId: string | undefined,
+): string | null {
+  return isSparkHermesModel(modelId) && HERMES_EMPTY_REPLY.test(text.trim())
+    ? "empty_response"
+    : null;
 }
 
 function nonEmptyDotenvValue(text: string, name: string): string | null {
@@ -676,6 +718,12 @@ const support: AcpSupport = {
   },
   buildPromptText: buildHermesPromptText,
   normalizeAssistantText: (text, turn) => normalizeHermesAssistantText(text, turn.model),
+  // A terminal Hermes warning must never flash in the chat before the same
+  // session gets its bounded recovery prompt. Tool and reasoning events still
+  // stream; only Spark's final assistant text is deferred until settlement.
+  deferAssistantText: (turn) => isSparkHermesModel(turn.model),
+  recoverAssistantText: (text, turn, attempt) => hermesEmptyReplyRecovery(text, turn.model, attempt),
+  terminalAssistantFailure: (text, turn) => hermesTerminalAssistantFailure(text, turn.model),
   discardAssistantTextBeforeTool: (_text, turn) => isSparkHermesModel(turn.model),
 };
 

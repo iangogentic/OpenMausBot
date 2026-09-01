@@ -9,6 +9,8 @@ import { removeTempDir } from "../../testing/cleanup.ts";
 import {
   buildHermesPromptText,
   HERMES_CONFIG_MODEL_ID,
+  hermesEmptyReplyRecovery,
+  hermesTerminalAssistantFailure,
   normalizeHermesAssistantText,
   hermesAcpModelId,
   hermesConfiguredModel,
@@ -67,6 +69,16 @@ describe("normalizeHermesAssistantText", () => {
     expect(normalizeHermesAssistantText(answer, spark)).toBe(answer);
     expect(normalizeHermesAssistantText("OKOK", spark)).toBe("OKOK");
     expect(normalizeHermesAssistantText("answeranswer", "desktop2::qwen")).toBe("answeranswer");
+  });
+
+  it("bounds same-session recovery for Hermes' empty-response sentinel", () => {
+    const warning = "⚠️ No reply: the model returned empty content after retries and any fallback providers. Try continue.";
+    expect(hermesEmptyReplyRecovery(warning, stableSpark, 0)).toContain("Continue from the tool results");
+    expect(hermesEmptyReplyRecovery(warning, stableSpark, 1)).toContain("stop calling tools");
+    expect(hermesEmptyReplyRecovery(warning, stableSpark, 2)).toBeNull();
+    expect(hermesEmptyReplyRecovery(warning, "desktop2_qwen::qwen-3.8-27b", 0)).toBeNull();
+    expect(hermesTerminalAssistantFailure(warning, stableSpark)).toBe("empty_response");
+    expect(hermesTerminalAssistantFailure("A real answer.", stableSpark)).toBeNull();
   });
 });
 
@@ -258,12 +270,18 @@ describe("Hermes injected vision capability", () => {
     return { HERMES_HOME: root, OPENMAUSBOT_HERMES_POLICY: "1" };
   };
 
-  it("marks only audited desktop2 Qwen aliases as vision-capable", () => {
+  it("marks only audited desktop2 Qwen and GLM aliases as vision-capable", () => {
     const qwenEnv = isolated();
     ensureHermesInjectProvider("desktop2_qwen::qwen-3.8-27b", qwenEnv);
     const qwen = parseYaml(readFileSync(join(qwenEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
     expect(qwen.model.supports_vision).toBe(true);
     expect(qwen.providers.desktop2_qwen.models["qwen-3.8-27b"].supports_vision).toBe(true);
+
+    const glmEnv = isolated();
+    ensureHermesInjectProvider("desktop2_qwen::glm-5.3-flash", glmEnv);
+    const glm = parseYaml(readFileSync(join(glmEnv.HERMES_HOME, "config.yaml"), "utf8")) as any;
+    expect(glm.model.supports_vision).toBe(true);
+    expect(glm.providers.desktop2_qwen.models["glm-5.3-flash"].supports_vision).toBe(true);
 
     const sparkEnv = isolated();
     ensureHermesInjectProvider("spark_glm::glm53-ablit", sparkEnv);
@@ -292,7 +310,8 @@ describe("Hermes injected vision capability", () => {
 
     ensureHermesInjectProvider("desktop2_qwen::glm-5.3-flash", env);
     config = parseYaml(readFileSync(join(env.HERMES_HOME, "config.yaml"), "utf8")) as any;
-    expect(config.model.supports_vision).toBeUndefined();
+    expect(config.model.supports_vision).toBe(true);
+    expect(config.providers.desktop2_qwen.models["glm-5.3-flash"].supports_vision).toBe(true);
     expect(config.model.max_tokens).toBe(4_096);
 
     ensureHermesInjectProvider("desktop2_qwen::qwen-3.8-27b", env);
@@ -442,6 +461,7 @@ mcp_servers:
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_get_desktop_state"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_computer_get_accessibility_tree", "mcp_computer_zoom"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_context_store_stats"');
+    expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_files_neighbors"');
     expect(HERMES_POLICY_PYTHON).toContain("tool_search_module._core_tool_names = guarded_core_tool_names");
     expect(HERMES_POLICY_PYTHON).toContain('code="openmaus_search_loop_halt"');
     expect(HERMES_POLICY_PYTHON).toContain("HermesACPAgent.set_session_model = guarded_set_session_model");

@@ -169,6 +169,19 @@ export interface AcpSupport {
    * provider-scoped by the support implementation; streaming deltas remain
    * untouched so the adapter cannot silently rewrite another harness. */
   normalizeAssistantText?(text: string, turn: SendTurnInput): string;
+  /** Keep assistant text buffered until the prompt result settles. This lets
+   * provider-specific recovery discard a terminal failure sentinel before it
+   * ever becomes visible, at the small cost of disabling token streaming for
+   * that exact route. Reasoning and tool events continue to stream normally. */
+  deferAssistantText?(turn: SendTurnInput): boolean;
+  /** A provider may turn a known terminal failure sentinel into bounded
+   * follow-up prompts on the same ACP session. The session retains the tool
+   * results that produced the failure, unlike starting a brand-new turn. */
+  recoverAssistantText?(text: string, turn: SendTurnInput, attempt: number): string | null;
+  /** Classify a provider-visible terminal sentinel after bounded recovery is
+   * exhausted. ACP agents often report these with stopReason=end_turn; without
+   * this hook the harness would incorrectly persist them as successful turns. */
+  terminalAssistantFailure?(text: string, turn: SendTurnInput): string | null;
   /** Drop provider-visible narration that arrived immediately before a tool
    * call. Used only by supports whose model exposes hidden planning as normal
    * assistant text; the tool activity itself is still emitted. */
@@ -418,6 +431,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         });
 
         const state = { settled: false, settling: false, promptSent: false, text: "" };
+        const deferAssistantText = support.deferAssistantText?.(cliTurn) === true;
         const asks = new Map<string, (behavior: string, source?: "user" | "timeout" | "system") => void>();
         let nextId = 1;
         let sessionId: string | null = null;
@@ -580,7 +594,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               const delta = u.content?.text;
               if (typeof delta === "string" && delta) {
                 state.text += delta;
-                emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
+                if (!deferAssistantText) {
+                  emit({ ...base(threadId, turnId), type: "content.delta", streamKind: "assistant_text", delta });
+                }
               }
               break;
             }
@@ -794,10 +810,22 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               : turn.system
                 ? `${turn.system}\n\n${turn.text}`
                 : turn.text;
-            const result = await request("session/prompt", {
-              sessionId,
-              prompt: [{ type: "text", text }],
-            });
+            let recoveryAttempt = 0;
+            let promptText = text;
+            let result: any;
+            while (true) {
+              result = await request("session/prompt", {
+                sessionId,
+                prompt: [{ type: "text", text: promptText }],
+              });
+              if (result?.stopReason !== "end_turn" || !support.recoverAssistantText) break;
+              const normalized = support.normalizeAssistantText?.(state.text, cliTurn) ?? state.text;
+              const recovery = support.recoverAssistantText(normalized, cliTurn, recoveryAttempt);
+              if (!recovery) break;
+              recoveryAttempt += 1;
+              state.text = "";
+              promptText = recovery;
+            }
             // opencode 1.18.18 reports usage at the result root; grok and
             // gemini put it under _meta. Read both rather than lose the count.
             const usage = result?.usage ?? result?._meta ?? {};
@@ -810,7 +838,12 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
               });
             }
             const reason = result?.stopReason;
-            if (reason === "end_turn") settle(true, null);
+            const normalizedFinal = support.normalizeAssistantText?.(state.text, cliTurn) ?? state.text;
+            const terminalFailure = reason === "end_turn"
+              ? support.terminalAssistantFailure?.(normalizedFinal, cliTurn) ?? null
+              : null;
+            if (terminalFailure) settle(false, terminalFailure);
+            else if (reason === "end_turn") settle(true, null);
             else if (reason === "cancelled") settle(true, "cancelled");
             else settle(false, reason ?? "failed");
           } catch (e) {

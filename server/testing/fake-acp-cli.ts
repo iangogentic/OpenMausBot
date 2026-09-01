@@ -11,6 +11,9 @@
 //                   | output-by-prompt (same, but only when prompt text
 //                     contains [hostile-output], for sibling-turn tests)
 //                   | interleave (message → tool → message → tool → message)
+//                   | empty-then-recover (first prompt returns Hermes' empty
+//                     terminal warning; a same-session follow-up succeeds)
+//                   | empty-always (every prompt returns the empty warning)
 //                   | no-session-config (reject session/set_mode + set_model
 //                     with -32601, i.e. an agent predating those methods)
 //                   | ask-peer (spawn the injected "agents" MCP server from
@@ -198,6 +201,7 @@ const recordMethod = (method: string) => {
 
 // session/set_mode + session/set_model calls seen this run
 const configCalls: Array<{ method: string; params: unknown }> = [];
+let promptCount = 0;
 
 // pending server→client permission request id → resolver
 let pendingPermissionId: number | null = null;
@@ -398,6 +402,7 @@ function handle(msg: any) {
       break;
     }
     case "session/prompt": {
+      promptCount += 1;
       if (mode === "hang") {
         // never resolve the prompt — lets tests exercise interrupt
         setInterval(() => {}, 1_000);
@@ -438,6 +443,20 @@ function handle(msg: any) {
             : { stopReason: "end_turn", _meta: { inputTokens: 10, outputTokens: 5 } },
         );
       };
+      if (mode === "empty-then-recover" || mode === "empty-always") {
+        const text = mode === "empty-then-recover" && promptCount > 1
+          ? "recovered final answer"
+          : promptCount === 1 || mode === "empty-always"
+          ? "⚠️ No reply: the model returned empty content after retries and any fallback providers. Try `continue`."
+          : "recovered final answer";
+        out({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: { update: { sessionUpdate: "agent_message_chunk", content: { text } } },
+        });
+        complete();
+        return;
+      }
       if (mode === "ask-peer" && agentsMcp) {
         // the comms e2e: reach a peer bot through the injected agents proxy
         // and reply with whatever it said (the peer's fake runs plain happy
