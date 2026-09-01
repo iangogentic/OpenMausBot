@@ -1,0 +1,29 @@
+[Unit]
+Description=Pinned loopback HTTPS bridge for OpenMaus Qwen
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=openmaus-server
+Group=openmaus-runtime
+ExecStart=/usr/bin/node /usr/local/libexec/openmaus-qwen-cloud-proxy.mjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
