@@ -6565,7 +6565,7 @@ const server = createServer(async (req, res) => {
                   actionLimit: context.kind === "local-vm"
                     ? MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS
                     : MAX_COMPUTER_SUBAGENT_ACTIONS,
-                  ...(context.kind === "local-vm" ? { executionTimeoutMs: 480_000 } : {}),
+                  ...(context.kind === "local-vm" ? { executionTimeoutMs: 900_000 } : {}),
                 });
                 return { parent, handle } satisfies ActiveComputerOperator;
               });
@@ -6585,15 +6585,13 @@ const server = createServer(async (req, res) => {
                 if (!completion) return { text: "computer operator ended without a terminal result", isError: true };
                 const text = completion.output?.trim() || completion.error?.trim() ||
                   (completion.status === "completed" ? "Computer task completed." : `Computer task ${completion.status}.`);
-                if (completion.status !== "completed" || !completion.finalScreenshot) {
-                  return { text, isError: true };
-                }
                 return {
                   text,
-                  image: {
+                  ...(completion.finalScreenshot ? { image: {
                     mimeType: completion.finalScreenshot.mimeType,
                     data: completion.finalScreenshot.dataBase64,
-                  },
+                  } } : {}),
+                  ...(completion.status !== "completed" || !completion.finalScreenshot ? { isError: true } : {}),
                 };
               } finally {
                 executionSignal.removeEventListener("abort", abortChild);

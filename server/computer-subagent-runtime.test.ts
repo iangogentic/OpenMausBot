@@ -335,20 +335,21 @@ describe("ComputerSubagentRuntime", () => {
     expect(completion).toMatchObject({
       status: "failed",
       error: "provider completion failed: timeout",
-      finalScreenshotCaptured: false,
+      finalScreenshotCaptured: true,
+      finalScreenshot: screenshot,
     });
-    expect(h.screenshots).toEqual([]);
+    expect(h.screenshots).toEqual([handle.childId]);
     expect(h.released).toEqual([handle.childId]);
     expect(h.completions).toEqual([{
       status: "failed",
-      finalScreenshotCaptured: false,
+      finalScreenshotCaptured: true,
       childId: handle.childId,
     }]);
     expect(h.manager.get(handle.childId)).toMatchObject({ status: "failed", leaseHeld: false });
     child.completionControl.resolve({ status: "completed", output: "late" });
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(h.completions).toHaveLength(1);
-    expect(h.screenshots).toEqual([]);
+    expect(h.screenshots).toEqual([handle.childId]);
   });
 
   it("honors a bounded per-child execution timeout override", async () => {

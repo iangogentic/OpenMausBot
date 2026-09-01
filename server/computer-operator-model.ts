@@ -7,7 +7,7 @@ export const COMPUTER_OPERATOR_HOST_ID = "desktop2_qwen";
 export const COMPUTER_OPERATOR_MODEL_ID = "qwen-3.8-27b";
 export const COMPUTER_OPERATOR_UPSTREAM_MODEL_ID = "qwen-3.8-27b";
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_MAX_BYTES = 256 * 1024;
-export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS = 5_000;
+export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS = 30_000;
 
 export function canonicalComputerOperatorModel(host: string, model: string): string | null {
   if (host !== COMPUTER_OPERATOR_HOST_ID || model.toLowerCase() !== COMPUTER_OPERATOR_MODEL_ID) return null;
@@ -27,15 +27,13 @@ export async function preflightComputerOperatorModel(
 ): Promise<void> {
   if (host.id !== COMPUTER_OPERATOR_HOST_ID) throw new Error("computer operator model host is not trusted");
   signal.throwIfAborted();
-  const timeout = AbortSignal.timeout(COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS);
-  const combined = AbortSignal.any([signal, timeout]);
   const url = `${host.baseUrl.replace(/\/+$/, "")}/models`;
   let response: Response;
   try {
     response = await fetchImpl(url, {
       method: "GET",
       headers: { authorization: `Bearer ${apiKey}`, accept: "application/json" },
-      signal: combined,
+      signal: AbortSignal.any([signal, AbortSignal.timeout(COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS)]),
     });
   } catch (error) {
     if (signal.aborted) throw signal.reason;
@@ -83,7 +81,9 @@ export async function preflightComputerOperatorModel(
         temperature: 0,
         stream: false,
       }),
-      signal: combined,
+      // The inference probe gets its own deadline. Reusing the catalog
+      // deadline makes a slow-but-valid catalog consume the probe's budget.
+      signal: AbortSignal.any([signal, AbortSignal.timeout(COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS)]),
     });
   } catch (error) {
     if (signal.aborted) throw signal.reason;

@@ -453,8 +453,8 @@ mcp_servers:
   });
 
   it("hard-denies Ian Brain credential tools in both catalog and dispatch policy", () => {
-    expect(HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS).toBe(600_000);
-    expect(HERMES_POLICY_PYTHON).toContain("_COMPUTER_OPERATOR_MCP_TIMEOUT_SECONDS = 600");
+    expect(HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS).toBe(1_200_000);
+    expect(HERMES_POLICY_PYTHON).toContain("_COMPUTER_OPERATOR_MCP_TIMEOUT_SECONDS = 1200");
     expect(HERMES_POLICY_PYTHON).toContain('"mcp__ian_brain__creds_"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp__ian_brain__mcp_ian_brain_creds_"');
     expect(HERMES_POLICY_PYTHON).toContain('"mcp_ian_brain_creds_"');
@@ -855,7 +855,7 @@ mcp_servers:
     expect(executed.status, executed.stderr).toBe(0);
     expect(JSON.parse(executed.stdout.trim())).toEqual({
       computer: { command: "cua" },
-      computer_operator: { command: "proxy", timeout: 600 },
+      computer_operator: { command: "proxy", timeout: 1200 },
     });
   });
 

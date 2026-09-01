@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   COMPUTER_OPERATOR_MODEL_PREFLIGHT_MAX_BYTES,
+  COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS,
   canonicalComputerOperatorModel,
   preflightComputerOperatorModel,
 } from "./computer-operator-model.ts";
@@ -11,6 +12,21 @@ const host: LocalHost = { id: "desktop2_qwen", label: "desktop2", baseUrl: "http
 const signal = () => new AbortController().signal;
 
 describe("computer operator model preflight", () => {
+  it("gives the catalog and inference probe separate load-tolerant deadlines", async () => {
+    const signals: AbortSignal[] = [];
+    let calls = 0;
+    await preflightComputerOperatorModel(host, "secret", signal(), async (_input, init) => {
+      signals.push(init?.signal as AbortSignal);
+      return new Response(JSON.stringify(++calls === 1
+        ? { data: [{ id: "qwen-3.8-27b" }] }
+        : { model: "qwen-3.8-27b", choices: [{ message: { content: "O" } }] }));
+    });
+    expect(COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS).toBe(30_000);
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).not.toBe(signals[1]);
+    expect(signals.every((item) => !item.aborted)).toBe(true);
+  });
+
   it("canonicalizes a mixed-case configured Qwen id before relay launch", () => {
     expect(canonicalComputerOperatorModel("desktop2_qwen", "QWEN-3.8-27B"))
       .toBe("desktop2_qwen::qwen-3.8-27b");

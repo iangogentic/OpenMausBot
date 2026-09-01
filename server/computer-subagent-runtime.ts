@@ -8,7 +8,7 @@ export const DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS = 30_000;
 export const DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 350_000;
 export const DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS = 2_000;
 export const DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS = 10_000;
-export const MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 480_000;
+export const MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 900_000;
 
 export interface ComputerSubagentTargetSelection {
   targetKey: string;
@@ -535,8 +535,14 @@ export class ComputerSubagentRuntime {
     let output = outcome.status === "completed" ? outcome.output : undefined;
     let error = outcome.status === "failed" ? outcome.error : outcome.status === "aborted" ? outcome.reason : outcome.status === "unknown" ? outcome.error : undefined;
     let finalScreenshot: ComputerSubagentFinalScreenshot | undefined;
-    if (outcome.status === "completed") {
-      if (!execution.target) { status = "failed"; error = "completed provider had no acquired target"; }
+    // A contained provider failure can still leave valuable pixels on its
+    // target. Preserve that last/current frame so the parent reports visible
+    // progress honestly, while retaining the failed status and error.
+    const shouldCapture = outcome.status === "completed" || (outcome.status === "failed" && cleanupProven);
+    if (shouldCapture) {
+      if (!execution.target) {
+        if (outcome.status === "completed") { status = "failed"; error = "completed provider had no acquired target"; }
+      }
       else if (!(await this.parentCurrent(execution.input.parent))) {
         status = "aborted";
         error = "parent generation is no longer current before final screenshot";
@@ -547,7 +553,9 @@ export class ComputerSubagentRuntime {
           childId: execution.handle.childId,
           parent: cloneParent(execution.input.parent),
           target: execution.target,
-          signal: execution.abortController.signal,
+          // Execution timeout aborts the provider controller before cleanup.
+          // Final capture is a separate, bounded read-only phase.
+          signal: AbortSignal.timeout(this.operationTimeoutMs),
         }), this.operationTimeoutMs);
         if (!captured.ok) throw new Error(captured.error ?? captured.reason);
         finalScreenshot = validateScreenshot(captured.value);
@@ -566,11 +574,13 @@ export class ComputerSubagentRuntime {
           })).catch(() => undefined), this.cleanupTimeoutMs);
         }
       } catch (captureError) {
-        status = execution.abortController.signal.aborted ? "aborted" : "failed";
-        error = execution.abortController.signal.aborted
-          ? "aborted during final screenshot"
-          : `final screenshot failed: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
-        output = undefined;
+        if (outcome.status === "completed") {
+          status = execution.abortController.signal.aborted ? "aborted" : "failed";
+          error = execution.abortController.signal.aborted
+            ? "aborted during final screenshot"
+            : `final screenshot failed: ${captureError instanceof Error ? captureError.message : String(captureError)}`;
+          output = undefined;
+        }
       }
     }
     let capabilityReleased = !execution.target;

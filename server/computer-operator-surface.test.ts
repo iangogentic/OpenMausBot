@@ -36,6 +36,18 @@ describe("computer operator surface", () => {
     });
   });
 
+  it("preserves screen proof alongside an error result", () => {
+    expect(normalizeComputerOperatorResult({
+      text: "provider completion failed: timeout",
+      isError: true,
+      image: { mimeType: "image/jpeg", data: pixel },
+    })).toEqual({
+      text: "provider completion failed: timeout",
+      isError: true,
+      image: { mimeType: "image/jpeg", data: pixel },
+    });
+  });
+
   it("rejects oversized and malformed images", () => {
     expect(() => normalizeComputerOperatorResult({
       text: "done",
