@@ -33,8 +33,6 @@ import {
   type ProviderDeliveryResult,
 } from "./provider-request-delivery.ts";
 import {
-  COMPUTER_OPERATOR_HOST_ID,
-  COMPUTER_OPERATOR_MODEL_ID,
   canonicalComputerOperatorModel,
   preflightComputerOperatorModel,
 } from "./computer-operator-model.ts";
@@ -222,7 +220,7 @@ import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
 import { createBotPackageExport } from "./package-export.ts";
 import { shouldMountLocalComputer } from "./local-routing.ts";
-import { decodeInjectId, encodeInjectId, hostApiKey, localHost } from "./drivers/local-inject.ts";
+import { decodeInjectId, hostApiKey, localHost } from "./drivers/local-inject.ts";
 import {
   LocalVmViewerProxy,
   type LocalVmViewerBinding,
@@ -1266,7 +1264,7 @@ function isComputerOperatorParentCurrent(parent: ComputerSubagentParent): boolea
 async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSelection> {
   const preferred = store.bot(parentBotId);
   const candidates = [preferred, ...store.bots.filter((bot) => bot.id !== parentBotId)].filter(Boolean);
-  let readinessFailure = "no enabled Hermes bot is configured for the trusted desktop2 Qwen model";
+  let readinessFailure = "no enabled Hermes bot is configured for a trusted vision model";
   for (const candidate of candidates) {
     const selection = candidate!.modelSelection;
     const inject = decodeInjectId(selection.model);
@@ -1288,13 +1286,13 @@ async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSe
     }
     const host = localHost(inject.host);
     if (!host) {
-      readinessFailure = "the trusted desktop2 model host is not configured";
+      readinessFailure = "the trusted vision model host is not configured";
       continue;
     }
     try {
-      await preflightComputerOperatorModel(host, hostApiKey(host, process.env), new AbortController().signal);
+      await preflightComputerOperatorModel(host, inject.model, hostApiKey(host, process.env), new AbortController().signal);
     } catch (error) {
-      readinessFailure = boundedComputerOperatorFailure("desktop2 Qwen readiness check failed", error);
+      readinessFailure = boundedComputerOperatorFailure(`${inject.model} readiness check failed`, error);
       continue;
     }
     return {
@@ -1303,7 +1301,7 @@ async function selectComputerOperatorModel(parentBotId: string): Promise<ModelSe
     };
   }
   throw Object.assign(
-    new Error(`a live Hermes bot configured for the desktop2 Qwen model is required for computer operation: ${readinessFailure}`),
+    new Error(`a live Hermes bot configured for a trusted vision model is required for computer operation: ${readinessFailure}`),
     { status: 409 },
   );
 }
@@ -1347,14 +1345,15 @@ const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
     input.signal.throwIfAborted();
     const capability = input.target.opaqueCapability as ComputerOperatorTargetCapability;
     const inject = decodeInjectId(input.model.model);
+    const canonicalModel = inject ? canonicalComputerOperatorModel(inject.host, inject.model) : null;
     const instance = registry.get(input.model.instanceId);
     if (
       !instance ||
       !instance.enabled ||
       instance.driverKind !== "hermesAgent" ||
-      inject?.host !== COMPUTER_OPERATOR_HOST_ID ||
-      input.model.model !== encodeInjectId(COMPUTER_OPERATOR_HOST_ID, COMPUTER_OPERATOR_MODEL_ID) ||
-      inject.model !== COMPUTER_OPERATOR_MODEL_ID
+      !inject ||
+      !canonicalModel ||
+      input.model.model !== canonicalModel
     ) {
       throw new Error("computer operator model authority is unavailable");
     }
@@ -1363,7 +1362,7 @@ const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
     if (snapshot.state !== "available") throw new Error("computer operator model is offline");
     const host = localHost(inject.host);
     if (!host) throw new Error("computer operator model host is unavailable");
-    await preflightComputerOperatorModel(host, hostApiKey(host, process.env), input.signal);
+    await preflightComputerOperatorModel(host, inject.model, hostApiKey(host, process.env), input.signal);
     input.signal.throwIfAborted();
     return {
       adapter: instance.adapter,

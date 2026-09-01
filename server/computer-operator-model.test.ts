@@ -9,13 +9,14 @@ import {
 import type { LocalHost } from "./drivers/local-inject.ts";
 
 const host: LocalHost = { id: "desktop2_qwen", label: "desktop2", baseUrl: "http://127.0.0.1:18011/v1" };
+const glmHost: LocalHost = { id: "spark_glm", label: "Sparks", baseUrl: "http://100.103.69.46:8888/v1" };
 const signal = () => new AbortController().signal;
 
 describe("computer operator model preflight", () => {
   it("gives the catalog and inference probe separate load-tolerant deadlines", async () => {
     const signals: AbortSignal[] = [];
     let calls = 0;
-    await preflightComputerOperatorModel(host, "secret", signal(), async (_input, init) => {
+    await preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), async (_input, init) => {
       signals.push(init?.signal as AbortSignal);
       return new Response(JSON.stringify(++calls === 1
         ? { data: [{ id: "qwen-3.8-27b" }] }
@@ -32,33 +33,38 @@ describe("computer operator model preflight", () => {
       .toBe("desktop2_qwen::qwen-3.8-27b");
     expect(canonicalComputerOperatorModel("desktop2_qwen", "compatible-alias")).toBeNull();
   });
+  it("canonicalizes the audited Spark GLM vision route", () => {
+    expect(canonicalComputerOperatorModel("spark_glm", "GLM-5.3-FLASH"))
+      .toBe("spark_glm::glm-5.3-flash");
+    expect(canonicalComputerOperatorModel("spark_glm", "legacy-glm-slug")).toBeNull();
+  });
   it("accepts only the exact model advertised by desktop2", async () => {
     const fetcher = vi.fn(async (input: string | URL | Request) => new Response(JSON.stringify(
       String(input).endsWith("/models")
         ? { data: [{ id: "QWEN-3.8-27B" }] }
         : { model: "qwen-3.8-27b", choices: [{ message: { content: "O" } }] },
     )));
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), fetcher)).resolves.toBeUndefined();
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), fetcher)).resolves.toBeUndefined();
     expect(fetcher).toHaveBeenCalledWith("http://127.0.0.1:18011/v1/models", expect.objectContaining({
       headers: expect.objectContaining({ authorization: "Bearer secret" }),
     }));
   });
 
   it("fails closed when the endpoint is dead", async () => {
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), async () => {
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), async () => {
       throw new Error("connect ECONNREFUSED");
     })).rejects.toThrow("endpoint is unreachable");
   });
 
   it("fails closed for a live endpoint serving the wrong model", async () => {
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), async () =>
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), async () =>
       new Response(JSON.stringify({ data: [{ id: "some-compatible-alias" }] })),
     )).rejects.toThrow("is not serving qwen-3.8-27b");
   });
 
   it("fails closed when the exact advertised model cannot perform a tiny inference", async () => {
     let calls = 0;
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), async () => {
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), async () => {
       calls += 1;
       return calls === 1
         ? new Response(JSON.stringify({ data: [{ id: "qwen-3.8-27b" }] }))
@@ -73,22 +79,22 @@ describe("computer operator model preflight", () => {
         ? { data: [{ id: "qwen-3.8-27b" }] }
         : completion));
     };
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), responses({
       model: "compatible-alias",
       choices: [{ message: { content: "O" } }],
     }))).rejects.toThrow("wrong model identity");
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), responses({
       model: "qwen-3.8-27b",
       choices: [{ message: { content: "   " } }],
     }))).rejects.toThrow("no completion");
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), responses({
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), responses({
       model: "qwen-3.8-27b",
       choices: [{ message: { content: null, reasoning: "O" } }],
     }))).resolves.toBeUndefined();
   });
 
   it("bounds a dishonest catalog response before parsing", async () => {
-    await expect(preflightComputerOperatorModel(host, "secret", signal(), async () =>
+    await expect(preflightComputerOperatorModel(host, "qwen-3.8-27b", "secret", signal(), async () =>
       new Response("x".repeat(COMPUTER_OPERATOR_MODEL_PREFLIGHT_MAX_BYTES + 1)),
     )).rejects.toThrow("exceeded its bounded size");
   });
@@ -96,9 +102,30 @@ describe("computer operator model preflight", () => {
   it("rejects a model match from any other host", async () => {
     await expect(preflightComputerOperatorModel(
       { ...host, id: "compatible_alias" },
+      "qwen-3.8-27b",
       "secret",
       signal(),
       async () => new Response(JSON.stringify({ data: [{ id: "qwen-3.8-27b" }] })),
-    )).rejects.toThrow("host is not trusted");
+    )).rejects.toThrow("route is not trusted");
+  });
+
+  it("preflights the exact Spark GLM route and rejects cross-host model swaps", async () => {
+    let calls = 0;
+    await expect(preflightComputerOperatorModel(
+      glmHost,
+      "glm-5.3-flash",
+      "secret",
+      signal(),
+      async () => new Response(JSON.stringify(++calls === 1
+        ? { data: [{ id: "glm-5.3-flash" }] }
+        : { model: "glm-5.3-flash", choices: [{ message: { content: "O" } }] })),
+    )).resolves.toBeUndefined();
+    await expect(preflightComputerOperatorModel(
+      glmHost,
+      "qwen-3.8-27b",
+      "secret",
+      signal(),
+      async () => new Response("unused"),
+    )).rejects.toThrow("route is not trusted");
   });
 });

@@ -6,12 +6,41 @@ import { encodeInjectId } from "./drivers/local-inject.ts";
 export const COMPUTER_OPERATOR_HOST_ID = "desktop2_qwen";
 export const COMPUTER_OPERATOR_MODEL_ID = "qwen-3.8-27b";
 export const COMPUTER_OPERATOR_UPSTREAM_MODEL_ID = "qwen-3.8-27b";
+export const COMPUTER_OPERATOR_GLM_HOST_ID = "spark_glm";
+export const COMPUTER_OPERATOR_GLM_MODEL_ID = "glm-5.3-flash";
+export const COMPUTER_OPERATOR_GLM_UPSTREAM_MODEL_ID = "glm-5.3-flash";
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_MAX_BYTES = 256 * 1024;
 export const COMPUTER_OPERATOR_MODEL_PREFLIGHT_TIMEOUT_MS = 30_000;
 
+interface ComputerOperatorModelRoute {
+  hostId: string;
+  modelId: string;
+  upstreamModelId: string;
+}
+
+const COMPUTER_OPERATOR_MODEL_ROUTES: readonly ComputerOperatorModelRoute[] = [
+  {
+    hostId: COMPUTER_OPERATOR_HOST_ID,
+    modelId: COMPUTER_OPERATOR_MODEL_ID,
+    upstreamModelId: COMPUTER_OPERATOR_UPSTREAM_MODEL_ID,
+  },
+  {
+    hostId: COMPUTER_OPERATOR_GLM_HOST_ID,
+    modelId: COMPUTER_OPERATOR_GLM_MODEL_ID,
+    upstreamModelId: COMPUTER_OPERATOR_GLM_UPSTREAM_MODEL_ID,
+  },
+];
+
+function computerOperatorModelRoute(host: string, model: string): ComputerOperatorModelRoute | null {
+  const normalizedModel = model.toLowerCase();
+  return COMPUTER_OPERATOR_MODEL_ROUTES.find((route) =>
+    route.hostId === host && route.modelId === normalizedModel
+  ) ?? null;
+}
+
 export function canonicalComputerOperatorModel(host: string, model: string): string | null {
-  if (host !== COMPUTER_OPERATOR_HOST_ID || model.toLowerCase() !== COMPUTER_OPERATOR_MODEL_ID) return null;
-  return encodeInjectId(COMPUTER_OPERATOR_HOST_ID, COMPUTER_OPERATOR_MODEL_ID);
+  const route = computerOperatorModelRoute(host, model);
+  return route ? encodeInjectId(route.hostId, route.modelId) : null;
 }
 
 type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
@@ -21,11 +50,13 @@ type Fetch = (input: string | URL | Request, init?: RequestInit) => Promise<Resp
  * insufficient authority for a visual child that can control a computer. */
 export async function preflightComputerOperatorModel(
   host: LocalHost,
+  model: string,
   apiKey: string,
   signal: AbortSignal,
   fetchImpl: Fetch = fetch,
 ): Promise<void> {
-  if (host.id !== COMPUTER_OPERATOR_HOST_ID) throw new Error("computer operator model host is not trusted");
+  const route = computerOperatorModelRoute(host.id, model);
+  if (!route) throw new Error("computer operator model route is not trusted");
   signal.throwIfAborted();
   const url = `${host.baseUrl.replace(/\/+$/, "")}/models`;
   let response: Response;
@@ -61,9 +92,9 @@ export async function preflightComputerOperatorModel(
   const exact = rows.some((row) =>
     row !== null && typeof row === "object" &&
     typeof (row as { id?: unknown }).id === "string" &&
-    (row as { id: string }).id.toLowerCase() === COMPUTER_OPERATOR_MODEL_ID,
+    (row as { id: string }).id.toLowerCase() === route.modelId,
   );
-  if (!exact) throw new Error(`computer operator endpoint is not serving ${COMPUTER_OPERATOR_MODEL_ID}`);
+  if (!exact) throw new Error(`computer operator endpoint is not serving ${route.modelId}`);
 
   let completion: Response;
   try {
@@ -75,7 +106,7 @@ export async function preflightComputerOperatorModel(
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: COMPUTER_OPERATOR_MODEL_ID,
+        model: route.modelId,
         messages: [{ role: "user", content: "Reply OK." }],
         max_tokens: 1,
         temperature: 0,
@@ -110,7 +141,7 @@ export async function preflightComputerOperatorModel(
   const servedModel = completionJson && typeof completionJson === "object"
     ? (completionJson as { model?: unknown }).model
     : null;
-  if (servedModel !== COMPUTER_OPERATOR_UPSTREAM_MODEL_ID) {
+  if (servedModel !== route.upstreamModelId) {
     throw new Error("computer operator inference probe returned the wrong model identity");
   }
   const first = Array.isArray(choices) && choices[0] && typeof choices[0] === "object"

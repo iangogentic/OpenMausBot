@@ -10,15 +10,16 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("You do not have direct computer tools");
   });
 
-  it("fails closed onto the exact live desktop2 Qwen Hermes selection", () => {
+  it("prefers the parent's exact trusted vision route and fails closed otherwise", () => {
     expect(source).toContain("canonicalComputerOperatorModel(inject.host, inject.model)");
     expect(source).toContain("preflightComputerOperatorModel(");
     expect(source).toContain("model: canonicalModel");
-    expect(source).toContain("input.model.model !== encodeInjectId(COMPUTER_OPERATOR_HOST_ID, COMPUTER_OPERATOR_MODEL_ID)");
+    expect(source).toContain("const canonicalModel = inject ? canonicalComputerOperatorModel(inject.host, inject.model) : null");
+    expect(source).toContain("input.model.model !== canonicalModel");
     expect(source).toContain('instance.driverKind !== "hermesAgent"');
     expect(source).toContain('snapshot?.state !== "available"');
-    expect(source).toContain("a live Hermes bot configured for the desktop2 Qwen model is required");
-    expect(source).toContain('boundedComputerOperatorFailure("desktop2 Qwen readiness check failed", error)');
+    expect(source).toContain("a live Hermes bot configured for a trusted vision model is required");
+    expect(source).toContain("boundedComputerOperatorFailure(`${inject.model} readiness check failed`, error)");
     expect(source).toContain("readinessFailure" + "}`)");
   });
 

@@ -167,9 +167,9 @@ are staged into the provider runtime by `server/index.ts:3454-3469`.
 
 **Capabilities and current hardening.** Generic ACP metadata says
 `images: support.images !== false` (`server/drivers/acp/core.ts:821-831`), but
-Hermes's injected model declaration marks only `desktop2_qwen` as
-`supports_vision:true`; Spark GLM remains deliberately text-only
-(`server/drivers/acp/hermes.ts:120-147`). HEAD `4b34dc8` adds policy version 2,
+Hermes's injected model declaration marks the audited `desktop2_qwen` Qwen and
+`spark_glm` GLM routes as `supports_vision:true`
+(`server/drivers/acp/hermes.ts:120-164`). HEAD `4b34dc8` adds policy version 2,
 hook attestation, trusted image hashes, observation/mutation loop bounds, and
 fail-closed computer-hook requirements (`hermes-policy.ts:27,117-148,237-268,
 308-435,575-672,777-807`). Local VM post-action settle/capture is implemented
@@ -180,9 +180,10 @@ at `server/local-vm-broker.ts:37,65,486-490` and `server/index.ts:9742-9745`.
 Qwen 3.8 27B service, both RTX 3090s, direct inference, and the Razer tunnel
 inference were live-verified. OpenMaus model discovery and Hermes select the
 stable `qwen-3.8-27b` alias; the exact route and one fresh Qwen visual
-mutation/final-frame loop are live-proven. The Spark GLM route is deliberately
-text-only and now has a fresh deployed text-turn acceptance through the stable
-`glm-5.3-flash` alias. Do not route local Cua through Box: its separate authorization,
+mutation/final-frame loop are live-proven. The Spark GLM route has direct
+image-input acceptance through the stable `glm-5.3-flash` alias and is selected
+for a GLM parent's visual child; Qwen remains the visual child for a Qwen
+parent. Do not route local Cua through Box: its separate authorization,
 lease, generation, and host-containment boundaries remain required. Also assert
 no host-native tools, raw socket, bearer, or unscoped path is exposed.
 
