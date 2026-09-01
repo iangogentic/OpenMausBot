@@ -44,7 +44,7 @@ describe("turn-scoped Ian Brain relay", () => {
     }) as typeof fetch;
 
     const result = await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
@@ -108,7 +108,7 @@ describe("turn-scoped Ian Brain relay", () => {
     expect(ianBrainRequestCallsCredentialTool(body)).toBe(true);
     expect(ianBrainRequestCallsUnsafeTool(body)).toBe(true);
     const result = await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body,
@@ -136,7 +136,7 @@ describe("turn-scoped Ian Brain relay", () => {
   ])("denies %s before the upstream sees an indirect credential attempt", async (name, args) => {
     const upstream = vi.fn() as unknown as typeof fetch;
     const result = await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 9, method: "tools/call", params: { name, arguments: args } },
@@ -160,7 +160,7 @@ describe("turn-scoped Ian Brain relay", () => {
       }), { headers: { "content-type": "application/json" } });
     }) as typeof fetch;
     const result = await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "memory_recall", arguments: { query: "GPU Cats" } } },
@@ -184,7 +184,7 @@ describe("turn-scoped Ian Brain relay", () => {
     ]) {
       expect(ianBrainRequestAllowed(body)).toBe(false);
       const result = await relayIanBrainMcp({
-        url: "http://127.0.0.1:15050/mcp",
+        url: "https://mcp.iansalways.com/mcp",
         key: SIGNING_KEY,
         ...TURN_IDENTITY,
         body,
@@ -202,7 +202,7 @@ describe("turn-scoped Ian Brain relay", () => {
       { jsonrpc: "2.0", id: 3, method: "ping" },
     ];
     const result = await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body,
@@ -256,7 +256,7 @@ describe("turn-scoped Ian Brain relay", () => {
       });
     }) as typeof fetch;
     const initialized = await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
+      url: "https://mcp.iansalways.com/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
     }, upstream);
     const clientSession = initialized.transportSessionId!;
@@ -265,18 +265,18 @@ describe("turn-scoped Ian Brain relay", () => {
     expect(validateIanBrainTransportSession(SIGNING_KEY, "bot-beta", TURN_IDENTITY.generation, clientSession)).toBe(false);
     expectedUpstreamSession = "upstream-session-a";
     await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
+      url: "https://mcp.iansalways.com/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
       transportSessionId: clientSession,
       body: { jsonrpc: "2.0", id: 2, method: "tools/list" },
     }, upstream);
     await expect(relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp", key: SIGNING_KEY,
+      url: "https://mcp.iansalways.com/mcp", key: SIGNING_KEY,
       botId: "bot-beta", generation: TURN_IDENTITY.generation,
       transportSessionId: clientSession,
       body: { jsonrpc: "2.0", id: 3, method: "tools/list" },
     }, upstream)).rejects.toThrow(/different turn/);
     await expect(relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp", key: SIGNING_KEY,
+      url: "https://mcp.iansalways.com/mcp", key: SIGNING_KEY,
       botId: TURN_IDENTITY.botId, generation: "generation_abcdef1234567890",
       transportSessionId: clientSession,
       body: { jsonrpc: "2.0", id: 4, method: "tools/list" },
@@ -288,7 +288,7 @@ describe("turn-scoped Ian Brain relay", () => {
       headers: { "content-type": "application/json", "mcp-session-id": "upstream-delete-a" },
     })) as typeof fetch;
     const initialized = await relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
+      url: "https://mcp.iansalways.com/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
     }, initializeUpstream);
     const deleteUpstream = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -298,13 +298,13 @@ describe("turn-scoped Ian Brain relay", () => {
       return new Response(null, { status: 204 });
     }) as typeof fetch;
     const deleted = await relayIanBrainSessionDelete({
-      url: "http://127.0.0.1:15050/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
+      url: "https://mcp.iansalways.com/mcp", key: SIGNING_KEY, ...TURN_IDENTITY,
       transportSessionId: initialized.transportSessionId!,
     }, deleteUpstream);
     expect(deleted.status).toBe(204);
     expect(deleteUpstream).toHaveBeenCalledTimes(1);
     await expect(relayIanBrainSessionDelete({
-      url: "http://127.0.0.1:15050/mcp", key: SIGNING_KEY,
+      url: "https://mcp.iansalways.com/mcp", key: SIGNING_KEY,
       botId: "bot-beta", generation: TURN_IDENTITY.generation,
       transportSessionId: initialized.transportSessionId!,
     }, deleteUpstream)).rejects.toThrow(/different turn/);
@@ -333,7 +333,7 @@ describe("turn-scoped Ian Brain relay", () => {
       });
     }) as typeof fetch;
     const pending = relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
@@ -363,7 +363,7 @@ describe("turn-scoped Ian Brain relay", () => {
     })) as typeof fetch;
 
     await expect(relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 1, method: "tools/list" },
@@ -388,7 +388,7 @@ describe("turn-scoped Ian Brain relay", () => {
     })) as typeof fetch;
 
     await expect(relayIanBrainMcp({
-      url: "http://127.0.0.1:15050/mcp",
+      url: "https://mcp.iansalways.com/mcp",
       key: SIGNING_KEY,
       ...TURN_IDENTITY,
       body: { jsonrpc: "2.0", id: 1, method: "tools/list" },

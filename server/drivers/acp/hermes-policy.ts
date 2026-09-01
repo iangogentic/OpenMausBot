@@ -25,7 +25,7 @@ import { dirname, join, posix, win32 } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 export const HERMES_POLICY_VERSION = 2;
-export const IAN_BRAIN_MCP_URL = "http://127.0.0.1:15050/mcp";
+export const IAN_BRAIN_MCP_URL = "https://mcp.iansalways.com/mcp";
 export const HERMES_COMPUTER_OPERATOR_MCP_TIMEOUT_MS = 1_200_000;
 
 export interface HermesIanBrainBroker {

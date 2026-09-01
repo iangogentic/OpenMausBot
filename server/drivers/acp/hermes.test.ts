@@ -363,7 +363,7 @@ agent:
   disabled_toolsets: [tts]
 mcp_servers:
   ian_brain:
-    url: http://127.0.0.1:15050/mcp
+    url: https://mcp.iansalways.com/mcp
     headers:
       Authorization: Bearer \${MCP_IAN_BRAIN_API_KEY}
   host_files:
@@ -514,7 +514,7 @@ mcp_servers:
     mkdirSync(source, { recursive: true });
     writeFileSync(
       join(source, "config.yaml"),
-      "agent:\n  disabled_toolsets: [tts]\nmcp_servers:\n  ian_brain:\n    url: http://127.0.0.1:15050/mcp\n",
+      "agent:\n  disabled_toolsets: [tts]\nmcp_servers:\n  ian_brain:\n    url: https://mcp.iansalways.com/mcp\n",
     );
     writeFileSync(join(source, ".env"), "MCP_IAN_BRAIN_API_KEY=real-upstream-secret\nOPENROUTER_API_KEY=model-key\n");
     const env: Record<string, string | undefined> = {

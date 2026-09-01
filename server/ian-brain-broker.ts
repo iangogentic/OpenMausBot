@@ -376,9 +376,9 @@ export function validateIanBrainTransportSession(
 function canonicalIanBrainUrl(raw: string): URL {
   const url = new URL(raw);
   if (
-    url.protocol !== "http:" ||
-    url.hostname !== "127.0.0.1" ||
-    url.port !== "15050" ||
+    url.protocol !== "https:" ||
+    url.hostname !== "mcp.iansalways.com" ||
+    url.port ||
     url.pathname !== "/mcp" ||
     url.search ||
     url.hash ||

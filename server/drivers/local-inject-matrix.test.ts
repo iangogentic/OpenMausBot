@@ -629,7 +629,7 @@ describe("Qwen / Hermes ACP turns", () => {
     mkdirSync(join(home, ".hermes"), { recursive: true });
     writeFileSync(
       join(home, ".hermes", "config.yaml"),
-      "model: qwen\nmcp_servers:\n  ian_brain:\n    url: http://127.0.0.1:15050/mcp\n",
+      "model: qwen\nmcp_servers:\n  ian_brain:\n    url: https://mcp.iansalways.com/mcp\n",
     );
     const dump = join(home, "env.json");
     const instance = await HermesAgentDriver.create({
@@ -681,7 +681,7 @@ describe("Qwen / Hermes ACP turns", () => {
     mkdirSync(join(home, ".hermes"), { recursive: true });
     writeFileSync(
       join(home, ".hermes", "config.yaml"),
-      "agent:\n  disabled_toolsets: [tts]\nmcp_servers:\n  ian_brain:\n    url: http://127.0.0.1:15050/mcp\n",
+      "agent:\n  disabled_toolsets: [tts]\nmcp_servers:\n  ian_brain:\n    url: https://mcp.iansalways.com/mcp\n",
     );
     const dump = join(home, "env.json");
     const instance = await HermesAgentDriver.create({
