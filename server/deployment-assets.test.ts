@@ -14,6 +14,7 @@ describe("Razer hostile-provider deployment assets", () => {
     expect(leaf).toContain("normalize_vm_leaf(path, device, owner, group)");
     expect(leaf).toContain("os.fchown(child_fd, owner, group)");
     expect(service).toContain('Environment="OMB_LOCAL_VM_HOME_DIR=/var/lib/openmausbot-vm-homes"');
+    expect(service).toContain('Environment="OMB_LOCAL_VM_GUEST_ADMIN=1"');
     expect(service).toContain('Environment="OMB_REQUIRE_STORAGE_ISOLATION=1"');
     expect(leaf).toContain("os.O_CREAT | os.O_EXCL");
     expect(leaf).toContain("storage root lock is unsafe");

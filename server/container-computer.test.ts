@@ -16,12 +16,17 @@ import {
   CUA_EXECUTABLE,
   CUA_SOCKET,
   DRIVER_LABEL,
+  GOOGLE_CHROME_DEB_SHA256,
+  GOOGLE_CHROME_DEB_URL,
+  GOOGLE_CHROME_VERSION,
   IMAGE,
   IMAGE_LAYER_LABEL,
   IMAGE_LAYER_VERSION,
   MANAGED_LABEL,
   CONTAINER_NETWORK_LABEL,
   LOCAL_VM_NETWORK_POLICY,
+  LOCAL_VM_ADMIN_CAPABILITIES,
+  LOCAL_VM_IDENTITY_CAPABILITIES,
   NETWORK_LAYER_LABEL,
   NETWORK_LAYER_VERSION,
   NETWORK_MANAGED_LABEL,
@@ -44,11 +49,15 @@ import {
   containerRuntimeStatus,
   containerRunArgs,
   configuredLocalVmWorkspaceRoot,
+  configuredLocalVmGuestAdmin,
   deleteLocalVmWorkspace,
   ensureVmWorkspace,
   ensureLocalVmNetwork,
+  guestAdminWorkspaceMountIsHardened,
+  guestAdminRuntimeIsSupported,
   localVmNetworkCreateArgs,
   localVmNetworkIdentity,
+  localVmCapabilities,
   localVmNetworkPolicyIsValid,
   linuxDockerWorkspaceCleanupArgs,
   managedImageDockerfile,
@@ -136,7 +145,7 @@ function readyInspect(overrides: Record<string, unknown> = {}) {
         NanoCpus: 2_000_000_000,
         PidsLimit: 512,
         CapDrop: ["ALL"],
-        CapAdd: ["CAP_SETUID", "CAP_SETGID"],
+        CapAdd: LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`),
         Privileged: false,
         IpcMode: "private",
         CgroupnsMode: "private",
@@ -237,8 +246,8 @@ describe("containerComputerStatus", () => {
       UTSMode: "private",
       CgroupnsMode: null,
     };
-    detail.EffectiveCaps = ["CAP_SETGID", "CAP_SETUID"];
-    detail.BoundingCaps = ["CAP_SETGID", "CAP_SETUID"];
+    detail.EffectiveCaps = LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`);
+    detail.BoundingCaps = LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`);
     const targetDriverExec =
       `podman exec -u cua -e HOME=/home/cua -e DISPLAY=:1 -e CUA_DRIVER_INSTALL_CHANNEL=python_package ` +
       `-e CUA_DRIVER_RS_TELEMETRY_ENABLED=0 ${target.containerName} ${CUA_EXECUTABLE}`;
@@ -294,13 +303,13 @@ describe("containerComputerStatus", () => {
     };
     expect(podmanSecurityIsHardened(
       config,
-      ["CAP_SETGID", "CAP_SETUID"],
-      ["CAP_SETGID", "CAP_SETUID"],
+      LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`),
+      LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`),
     )).toBe(true);
     expect(podmanSecurityIsHardened(
       config,
-      ["CAP_NET_RAW", "CAP_SETGID", "CAP_SETUID"],
-      ["CAP_SETGID", "CAP_SETUID"],
+      [...LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`), "CAP_SYS_ADMIN"],
+      LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`),
     )).toBe(false);
   });
 
@@ -438,7 +447,7 @@ describe("containerComputerStatus", () => {
           NanoCpus: 2_000_000_000,
           PidsLimit: 512,
           CapDrop: ["ALL"],
-          CapAdd: ["CAP_SETUID", "CAP_SETGID"],
+          CapAdd: LOCAL_VM_IDENTITY_CAPABILITIES.map((capability) => `CAP_${capability}`),
           PortBindings: { "6901/tcp": [{ HostIp: "0.0.0.0" }] },
         },
       }),
@@ -761,6 +770,7 @@ describe("Cua integration", () => {
     expect(dockerfile).toContain(`install -D -m 0755 "$driver_bin" ${CUA_EXECUTABLE}`);
     expect(dockerfile).toContain(`cua-driver ${CUA_DRIVER_VERSION}`);
     expect(dockerfile).toContain(`serve --socket ${CUA_SOCKET} --permission-mode standard`);
+    expect(dockerfile).toContain("--grant existing-profile");
     expect(dockerfile).toContain(`groupmod -g ${VM_WORKSPACE_GUEST_GID} cua`);
     expect(dockerfile).toContain(`usermod -u ${VM_WORKSPACE_GUEST_UID} -g ${VM_WORKSPACE_GUEST_GID} cua`);
     expect(CUA_SOCKET).toContain("/home/cua/.openmausbot/");
@@ -774,6 +784,47 @@ describe("Cua integration", () => {
     expect(dockerfile).toContain(`${IMAGE_LAYER_LABEL}="${IMAGE_LAYER_VERSION}"`);
     expect(dockerfile).toContain("did not become ready within 45 seconds");
     expect(dockerfile).not.toContain("while ! DISPLAY=:1 xset q");
+  });
+
+  it("preinstalls a checksum-pinned Chrome without weakening runtime isolation", () => {
+    const dockerfile = managedImageDockerfile();
+    expect(GOOGLE_CHROME_DEB_URL).toMatch(
+      /^https:\/\/dl\.google\.com\/linux\/chrome\/deb\/pool\/main\/g\/google-chrome-stable\/google-chrome-stable_[^/]+_amd64\.deb$/,
+    );
+    expect(GOOGLE_CHROME_DEB_SHA256).toMatch(/^[a-f0-9]{64}$/);
+    expect(dockerfile).toContain(GOOGLE_CHROME_DEB_URL);
+    expect(dockerfile).toContain(`${GOOGLE_CHROME_DEB_SHA256}  /tmp/google-chrome-stable.deb`);
+    expect(dockerfile).toContain(`Google Chrome ${GOOGLE_CHROME_VERSION}`);
+    expect(dockerfile).toContain("google-chrome --version | sed 's/[[:space:]]*$//'");
+    expect(dockerfile).toContain(
+      'exec /usr/bin/google-chrome-stable --no-sandbox --force-renderer-accessibility "$@"',
+    );
+    expect(dockerfile).toContain("/usr/local/bin/openmaus-google-chrome");
+    expect(dockerfile).toContain('{"CommandLineFlagSecurityWarningsEnabled": false}');
+    expect(dockerfile).not.toContain("--cap-add SYS_ADMIN");
+    expect(dockerfile).toContain("update-alternatives --set x-www-browser /usr/bin/google-chrome-stable");
+    expect(dockerfile).toContain('if [ "$arch" = "x86_64" ]');
+    expect(dockerfile).toContain("Google Chrome is not published for $arch");
+
+    const generic = containerRunArgs("docker", "test-password", SHARED_LOCAL_VM_TARGET).join(" ");
+    expect(generic).toContain("--cap-drop ALL --cap-add SETUID --cap-add SETGID");
+    expect(generic).not.toContain("--cap-add CHOWN");
+    expect(localVmCapabilities("docker", true)).toEqual(LOCAL_VM_ADMIN_CAPABILITIES);
+    expect(localVmCapabilities("podman", true)).toEqual(LOCAL_VM_IDENTITY_CAPABILITIES);
+    expect(localVmCapabilities("container", true)).toEqual(LOCAL_VM_IDENTITY_CAPABILITIES);
+    expect(LOCAL_VM_ADMIN_CAPABILITIES).not.toContain("SYS_ADMIN");
+    expect(guestAdminRuntimeIsSupported(
+      { runtime: "docker", available: ["docker"], daemonUp: true },
+      "linux",
+    )).toBe(true);
+    expect(guestAdminRuntimeIsSupported(
+      { runtime: "podman", available: ["podman"], daemonUp: true },
+      "linux",
+    )).toBe(false);
+    expect(guestAdminRuntimeIsSupported(
+      { runtime: "container", available: ["container"], daemonUp: true },
+      "darwin",
+    )).toBe(false);
   });
 
   it("rejects a zero-byte OpenSSL base image before the wheel download needs curl", () => {
@@ -1073,6 +1124,26 @@ describe("setupCommands", () => {
     expect(() => configuredLocalVmWorkspaceRoot({ OMB_LOCAL_VM_HOME_DIR: "relative/vms" })).toThrow(
       "must be an absolute path",
     );
+    expect(configuredLocalVmGuestAdmin({})).toBe(false);
+    expect(configuredLocalVmGuestAdmin({
+      OMB_LOCAL_VM_GUEST_ADMIN: "1",
+      OMB_REQUIRE_STORAGE_ISOLATION: "1",
+      OMB_LOCAL_VM_HOME_DIR: root,
+    }, "linux")).toBe(true);
+    expect(() => configuredLocalVmGuestAdmin({ OMB_LOCAL_VM_GUEST_ADMIN: "1" }, "linux")).toThrow(
+      "requires bounded storage isolation",
+    );
+    expect(() => configuredLocalVmGuestAdmin({ OMB_LOCAL_VM_GUEST_ADMIN: "true" })).toThrow(
+      "must be 1",
+    );
+    expect(() => configuredLocalVmGuestAdmin({
+      OMB_LOCAL_VM_GUEST_ADMIN: "1",
+      OMB_REQUIRE_STORAGE_ISOLATION: "1",
+      OMB_LOCAL_VM_HOME_DIR: root,
+    }, "darwin")).toThrow("hardened Linux Docker deployment");
+    expect(guestAdminWorkspaceMountIsHardened("rw,noatime,nodev,nosuid")).toBe(true);
+    expect(guestAdminWorkspaceMountIsHardened("rw,nodev")).toBe(false);
+    expect(guestAdminWorkspaceMountIsHardened("rw,nosuid")).toBe(false);
 
     const moduleUrl = new URL(`./container-computer.ts?workspace-root=${Date.now()}`, import.meta.url).href;
     const output = execFileSync(process.execPath, [
@@ -1087,6 +1158,7 @@ describe("setupCommands", () => {
     const paths = JSON.parse(output.trim());
     expect(paths.shared).toBe(join(root, "shared"));
     expect(paths.bot).toMatch(new RegExp(`^${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/[a-f0-9]{16}$`));
+
   });
 
   it("builds a root-only, networkless cleanup for the exact managed workspace", () => {
@@ -1343,12 +1415,15 @@ describe("setupCommands", () => {
     expect(setupCommands("docker", "linux").start).toBeNull();
   });
 
-  it("limits resources and retains only the sandbox supervisor's identity-switch caps", () => {
+  it("keeps generic Docker guests narrow when hardened admin storage was not configured", () => {
     const command = setupCommands("docker", "linux").run!;
     expect(command).toContain("--memory 4g --memory-swap 4g");
     expect(command).toContain("--cpus 2 --pids-limit 512");
     expect(command).toContain("--ipc private --cgroupns private");
     expect(command).toContain("--cap-drop ALL --cap-add SETUID --cap-add SETGID");
+    expect(command).not.toContain("--cap-add CHOWN");
+    expect(command).not.toContain("--privileged");
+    expect(command).not.toContain("--cap-add SYS_ADMIN");
     expect(command).toContain(`--label ${MANAGED_LABEL}=1`);
     expect(command).toContain(`--label ${DRIVER_LABEL}=${CUA_DRIVER_VERSION}`);
     expect(command).toContain(`--label ${WORKSPACE_LABEL}=1`);

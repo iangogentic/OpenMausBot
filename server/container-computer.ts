@@ -37,7 +37,7 @@ export const BASE_IMAGE = `${BASE_IMAGE_REPOSITORY}@${BASE_IMAGE_DIGEST}`;
 // Image and container labels below remain the authoritative compatibility
 // check, not the mutable tag.
 export const IMAGE_REPOSITORY = "localhost/openmausbot/cua-local-vm";
-export const IMAGE_LAYER_VERSION = "5";
+export const IMAGE_LAYER_VERSION = "6";
 export const IMAGE_LAYER_LABEL = "com.openmausbot.image-layer";
 export const IMAGE = `${IMAGE_REPOSITORY}:driver-${CUA_DRIVER_VERSION}-v${IMAGE_LAYER_VERSION}`;
 export const CONTAINER = "openmausbot-computer";
@@ -58,6 +58,52 @@ export const LOCAL_VM_GUEST_ACCOUNT = "openmaus-vm-guest";
 // identity before it can create a bind-mounted file.
 export const VM_WORKSPACE_GUEST_UID = 61_000;
 export const VM_WORKSPACE_GUEST_GID = 61_000;
+export const LOCAL_VM_IDENTITY_CAPABILITIES = ["SETUID", "SETGID"] as const;
+export const LOCAL_VM_ADMIN_CAPABILITIES = [
+  "AUDIT_WRITE",
+  "CHOWN",
+  "DAC_OVERRIDE",
+  "FOWNER",
+  "FSETID",
+  "KILL",
+  "MKNOD",
+  "NET_BIND_SERVICE",
+  "NET_RAW",
+  "SETFCAP",
+  "SETGID",
+  "SETPCAP",
+  "SETUID",
+  "SYS_CHROOT",
+] as const;
+
+export function configuredLocalVmGuestAdmin(
+  environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const raw = environment.OMB_LOCAL_VM_GUEST_ADMIN?.trim();
+  if (!raw) return false;
+  if (raw !== "1") throw new Error("OMB_LOCAL_VM_GUEST_ADMIN must be 1 when set");
+  if (platform !== "linux") {
+    throw new Error("Local VM guest admin is supported only by the hardened Linux Docker deployment");
+  }
+  if (environment.OMB_REQUIRE_STORAGE_ISOLATION !== "1" || !configuredLocalVmWorkspaceRoot(environment)) {
+    throw new Error(
+      "Local VM guest admin requires bounded storage isolation and an explicit OMB_LOCAL_VM_HOME_DIR",
+    );
+  }
+  return true;
+}
+
+// Chrome is installed while the trusted image is built so common browser work
+// starts immediately. Runtime package installs are also allowed inside the
+// isolated guest, but only /home/cua/workspace survives VM replacement.
+// Google publishes Chrome only for amd64; arm64 retains the pinned base
+// image's browser.
+export const GOOGLE_CHROME_VERSION = "152.0.7977.64";
+export const GOOGLE_CHROME_DEB_URL =
+  "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_152.0.7977.64-1_amd64.deb";
+export const GOOGLE_CHROME_DEB_SHA256 =
+  "4eae0736a812d9bc851cd2937f7af00e47dbaf8305845eed452703ff009873c7";
 
 /** A deployment can put durable VM homes on a separately bounded filesystem.
  * Reject relative values at process startup; a service-owned environment is
@@ -74,6 +120,7 @@ export function configuredLocalVmWorkspaceRoot(
 }
 
 const CONFIGURED_VM_WORKSPACE_ROOT = configuredLocalVmWorkspaceRoot();
+export const LOCAL_VM_GUEST_ADMIN_ENABLED = configuredLocalVmGuestAdmin();
 export const VM_WORKSPACE_ROOT = CONFIGURED_VM_WORKSPACE_ROOT ?? join(DATA_DIR, "vm-homes");
 export const VM_WORKSPACE_DIR = CONFIGURED_VM_WORKSPACE_ROOT
   ? join(VM_WORKSPACE_ROOT, "shared")
@@ -220,6 +267,28 @@ RUN set -eux; \\
     install -D -m 0755 "$driver_bin" ${CUA_EXECUTABLE}; \\
     install -d -o cua -g cua -m 0700 ${VM_WORKSPACE_GUEST}; \\
     test "$(${CUA_EXECUTABLE} --version)" = "cua-driver ${CUA_DRIVER_VERSION}"
+RUN set -eux; \\
+    arch="$(uname -m)"; \\
+    if [ "$arch" = "x86_64" ]; then \\
+      chrome_deb='/tmp/google-chrome-stable.deb'; \\
+      curl -fsSL '${GOOGLE_CHROME_DEB_URL}' -o "$chrome_deb"; \\
+      echo '${GOOGLE_CHROME_DEB_SHA256}  /tmp/google-chrome-stable.deb' | sha256sum -c -; \\
+      apt-get update; \\
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$chrome_deb"; \\
+      chrome_version="$(google-chrome --version | sed 's/[[:space:]]*$//')"; \\
+      test "$chrome_version" = "Google Chrome ${GOOGLE_CHROME_VERSION}"; \\
+      printf '%s\\n' '#!/bin/sh' 'exec /usr/bin/google-chrome-stable --no-sandbox --force-renderer-accessibility "$@"' > /usr/local/bin/openmaus-google-chrome; \\
+      chmod 0755 /usr/local/bin/openmaus-google-chrome; \\
+      ln -sf /usr/local/bin/openmaus-google-chrome /usr/local/bin/google-chrome; \\
+      sed -i 's|/usr/bin/google-chrome-stable|/usr/local/bin/openmaus-google-chrome|g' /usr/share/applications/google-chrome.desktop; \\
+      install -d -m 0755 /etc/opt/chrome/policies/managed; \\
+      printf '%s\\n' '{"CommandLineFlagSecurityWarningsEnabled": false}' > /etc/opt/chrome/policies/managed/openmaus.json; \\
+      update-alternatives --set x-www-browser /usr/bin/google-chrome-stable; \\
+      rm -f "$chrome_deb"; \\
+      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb; \\
+    else \\
+      echo "Google Chrome is not published for $arch; retaining the pinned base browser"; \\
+    fi
 RUN printf '%s\\n' \\
       '#!/bin/sh' \\
       'set -eu' \\
@@ -255,7 +324,7 @@ RUN printf '%s\\n' \\
       '  if [ "$attempt" -ge 45 ]; then echo "X display :1 did not become ready within 45 seconds" >&2; exit 1; fi' \\
       '  sleep 1' \\
       'done' \\
-      'exec env CUA_DRIVER_INSTALL_CHANNEL=python_package CUA_DRIVER_RS_TELEMETRY_ENABLED=0 ${CUA_EXECUTABLE} serve --socket ${CUA_SOCKET} --permission-mode standard' \\
+      'exec env CUA_DRIVER_INSTALL_CHANNEL=python_package CUA_DRIVER_RS_TELEMETRY_ENABLED=0 ${CUA_EXECUTABLE} serve --socket ${CUA_SOCKET} --permission-mode standard --grant existing-profile' \\
       > /usr/local/bin/start-openmausbot-cua-driver.sh \\
     && chmod 0755 /usr/local/bin/start-openmausbot-cua-driver.sh
 RUN printf '%s\\n' \\
@@ -304,6 +373,13 @@ export interface ContainerRuntimeStatus {
   runtime: Runtime | null;
   available: Runtime[];
   daemonUp: boolean;
+}
+
+export function guestAdminRuntimeIsSupported(
+  status: ContainerRuntimeStatus,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === "linux" && status.runtime === "docker" && status.daemonUp;
 }
 
 /** Inspect only the host runtime. Unlike a full Local VM status check, this
@@ -805,7 +881,9 @@ export async function containerComputerStatus(
       status.security = (
         status.runtime === "podman"
           ? podmanSecurityIsHardened(detail?.HostConfig, detail?.EffectiveCaps, detail?.BoundingCaps)
-          : dockerSecurityIsHardened(detail?.HostConfig)
+          : dockerSecurityIsHardened(detail?.HostConfig, {
+              capabilities: localVmCapabilities(status.runtime),
+            })
       ) ? "hardened" : "unsafe";
       const password = viewerPassword(detail?.Config?.Env);
       status.viewer_url = viewerUrl(password, status.viewer_port);
@@ -1025,13 +1103,17 @@ export interface DockerHardeningConfig {
 /** One hardening contract for both managed containers (Local VM here, the
  * BYO-VPS backend in vps-computer.ts): exact resource limits, no privilege,
  * no host namespaces or devices, no disabled security profiles. The only
- * knob the callers legitimately disagree on is the restart policy — the VPS
- * container must survive a reboot nobody is watching ("unless-stopped"),
- * while the Local VM must NOT auto-resume: its desktop leaves a stale X lock
- * on stop, so a restarted container is a broken one. */
+ * knobs the callers legitimately disagree on are the restart policy and exact
+ * capability profile. A VPS must survive an unattended reboot; a Local VM
+ * must not auto-resume because its desktop leaves a stale X lock. Broad guest
+ * admin capabilities are accepted only for the Razer deployment whose
+ * dedicated bind-mounted storage is separately proven nosuid,nodev. */
 export function dockerSecurityIsHardened(
   config: DockerHardeningConfig | undefined,
-  options: { restartPolicy?: "no" | "unless-stopped" } = {},
+  options: {
+    restartPolicy?: "no" | "unless-stopped";
+    capabilities?: readonly string[];
+  } = {},
 ): boolean {
   if (!config) return false;
   const capDrop = (config.CapDrop ?? []).map((cap) => cap.toLowerCase());
@@ -1044,13 +1126,17 @@ export function dockerSecurityIsHardened(
     options.restartPolicy === "unless-stopped"
       ? restartPolicy === "unless-stopped"
       : restartPolicy === undefined || restartPolicy === "" || restartPolicy === "no";
+  const expectedCapabilities = (options.capabilities ?? ["SETGID", "SETUID"])
+    .map((cap) => cap.toLowerCase().replace(/^cap_/, ""))
+    .sort()
+    .join(",");
   return (
     config.Memory === MEMORY_BYTES &&
     (config.MemorySwap ?? 0) === MEMORY_BYTES &&
     (config.NanoCpus ?? 0) === NANO_CPUS &&
     config.PidsLimit === PIDS_LIMIT &&
     capDrop.includes("all") &&
-    capAdd.join(",") === "setgid,setuid" &&
+    capAdd.join(",") === expectedCapabilities &&
     config.Privileged === false &&
     !config.PidMode &&
     config.IpcMode === "private" &&
@@ -1080,17 +1166,20 @@ export function podmanSecurityIsHardened(
   const normalizeCaps = (caps: string[] | undefined) => (caps ?? [])
     .map((cap) => cap.toLowerCase().replace(/^cap_/, ""))
     .sort();
-  const exactCaps = "setgid,setuid";
+  const exactCaps = LOCAL_VM_IDENTITY_CAPABILITIES.map((cap) => cap.toLowerCase()).sort().join(",");
   if (normalizeCaps(effectiveCaps).join(",") !== exactCaps) return false;
   if (normalizeCaps(boundingCaps).join(",") !== exactCaps) return false;
-  return dockerSecurityIsHardened({
-    ...config,
-    CapDrop: ["all"],
-    CapAdd: effectiveCaps,
-    PidMode: config.PidMode === "private" ? "" : config.PidMode,
-    UTSMode: config.UTSMode === "private" ? "" : config.UTSMode,
-    CgroupnsMode: config.CgroupnsMode || "private",
-  });
+  return dockerSecurityIsHardened(
+    {
+      ...config,
+      CapDrop: ["all"],
+      CapAdd: effectiveCaps,
+      PidMode: config.PidMode === "private" ? "" : config.PidMode,
+      UTSMode: config.UTSMode === "private" ? "" : config.UTSMode,
+      CgroupnsMode: config.CgroupnsMode || "private",
+    },
+    { capabilities: LOCAL_VM_IDENTITY_CAPABILITIES },
+  );
 }
 
 type ManagedNetworkInspect = {
@@ -1256,6 +1345,7 @@ export function containerRunArgs(
   if (runtime === "container" && target.key !== SHARED_LOCAL_VM_TARGET.key) {
     throw new Error("Per-bot Local VMs require Docker or Podman because Apple container requires a fixed host port");
   }
+  const capabilities = localVmCapabilities(runtime);
   const common = ["run", "-d", "--name", target.containerName];
   const network = localVmNetworkIdentity(target);
   common.push(
@@ -1285,10 +1375,7 @@ export function containerRunArgs(
       "2",
       "--cap-drop",
       "ALL",
-      "--cap-add",
-      "SETUID",
-      "--cap-add",
-      "SETGID",
+      ...capabilities.flatMap((capability) => ["--cap-add", capability]),
       "--shm-size",
       "512m",
     );
@@ -1316,10 +1403,7 @@ export function containerRunArgs(
       "private",
       "--cap-drop",
       "ALL",
-      "--cap-add",
-      "SETUID",
-      "--cap-add",
-      "SETGID",
+      ...capabilities.flatMap((capability) => ["--cap-add", capability]),
       "--shm-size",
       "512m",
     );
@@ -1338,6 +1422,15 @@ export function containerRunArgs(
     IMAGE,
   );
   return common;
+}
+
+export function localVmCapabilities(
+  runtime: Runtime,
+  guestAdminEnabled = LOCAL_VM_GUEST_ADMIN_ENABLED,
+): readonly string[] {
+  return runtime === "docker" && guestAdminEnabled
+    ? LOCAL_VM_ADMIN_CAPABILITIES
+    : LOCAL_VM_IDENTITY_CAPABILITIES;
 }
 
 function managedVmWorkspacePath(path: string): boolean {
@@ -1499,6 +1592,13 @@ async function validateWorkspaceLocation(target: LocalVmTarget, create: boolean)
   return canonical;
 }
 
+export function guestAdminWorkspaceMountIsHardened(mountOptions: string): boolean {
+  const normalized = new Set(
+    mountOptions.trim().split(/[\s,]+/).map((option) => option.trim().toLowerCase()).filter(Boolean),
+  );
+  return normalized.has("nosuid") && normalized.has("nodev");
+}
+
 /** Production preparation entrypoint used by lifecycle code and deployment
  * acceptance. It validates the configured bounded root before invoking the
  * one authoritative ACL implementation. */
@@ -1514,6 +1614,16 @@ export async function ensureVmWorkspace(
   storage.ensure("vm", storageLeafKeyForTarget(target));
   const canonical = await validateWorkspaceLocation(target, true);
   if (platform === "linux" && runtime === "docker") {
+    if (LOCAL_VM_GUEST_ADMIN_ENABLED) {
+      const mountOptions = (await runner(
+        "/usr/bin/findmnt",
+        ["--noheadings", "--output", "OPTIONS", "--target", canonical],
+        8_000,
+      )).stdout;
+      if (!guestAdminWorkspaceMountIsHardened(mountOptions)) {
+        throw new Error("Local VM guest admin requires a workspace filesystem mounted nosuid,nodev");
+      }
+    }
     const serverUid = process.getuid?.();
     if (serverUid === undefined) throw new Error("Linux Docker workspace ACL needs the service UID");
     await verifyDedicatedGuestIdentity(runner);

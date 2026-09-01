@@ -76,7 +76,9 @@ import {
   currentContainerComputerGeneration,
   containerRuntimeStatus,
   deletePerBotLocalVmWorkspace,
+  guestAdminRuntimeIsSupported,
   perBotLocalVmTarget,
+  LOCAL_VM_GUEST_ADMIN_ENABLED,
   SHARED_LOCAL_VM_TARGET,
   setupCommands,
   type ContainerComputerStatus,
@@ -291,6 +293,9 @@ import {
 import { computerChildVisualsForWire } from "./computer-child-visual-wire.ts";
 
 const PORT = Number(process.env.OMB_PORT || process.env.OGB_PORT || 8799);
+const LOCAL_VM_PACKAGE_SYSTEM_PROMPT = LOCAL_VM_GUEST_ADMIN_ENABLED
+  ? " You have passwordless administrator rights inside this isolated VM and may use sudo, apt, and dpkg when the task requires them; those system changes disappear when the VM is replaced. Google Chrome is already installed on x86_64, so open it directly instead of downloading it again."
+  : " System package installation is disabled in this VM. Google Chrome is already installed on x86_64; if another system package is absent, report it instead of retrying sudo.";
 const PROVIDER_HARNESS_HOST = process.env.OMB_PROVIDER_HARNESS_HOST?.trim() || "127.0.0.1";
 if (PROVIDER_HARNESS_HOST !== "127.0.0.1" && PROVIDER_HARNESS_HOST !== "10.0.2.2") {
   throw new Error("OMB_PROVIDER_HARNESS_HOST must be the local host or the private provider gateway");
@@ -4781,8 +4786,8 @@ async function startTurn(
             ? " You have a dedicated visual computer operator for the user's explicitly approved physical Mac or Windows computer. Call delegate_computer exactly once for the user's complete concrete visual outcome and wait for its verified text plus a fresh final screenshot. You do not have direct computer tools. After the operator returns, answer the user directly from that result; never delegate a second time or perform memory bookkeeping in the same turn. Never delegate passwords, MFA, CAPTCHAs, purchases, destructive actions, or other protected input."
             : computerKind === "vm"
             ? localVmMode(cfg) === "per-bot"
-              ? " You have your own isolated Cua sandbox: a Linux desktop in a container reserved for this bot. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. If multiple windows match, use their bounds and stacking order to select the newly opened or topmost requested window, click inside that exact window, and verify focus before typing. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged. A tool error does not prove its requested effect happened, and you must not claim success unless the resulting pixels visibly prove the requested postcondition. Use computer_batch for up to nine predictable click/type/key/scroll steps that do not need intermediate inspection; it returns one final screen and never truncates an oversized batch. On Linux, every batched keyboard action aimed at a known window must repeat that window's pid and window_id with delivery_mode set to foreground; use the canonical key name enter rather than Return."
-              : " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted. Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. If multiple windows match, use their bounds and stacking order to select the newly opened or topmost requested window, click inside that exact window, and verify focus before typing. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged. A tool error does not prove its requested effect happened, and you must not claim success unless the resulting pixels visibly prove the requested postcondition. Use computer_batch for up to nine predictable click/type/key/scroll steps that do not need intermediate inspection; it returns one final screen and never truncates an oversized batch. On Linux, every batched keyboard action aimed at a known window must repeat that window's pid and window_id with delivery_mode set to foreground; use the canonical key name enter rather than Return."
+              ? " You have your own isolated Cua sandbox: a Linux desktop in a container reserved for this bot. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted." + LOCAL_VM_PACKAGE_SYSTEM_PROMPT + " Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. If multiple windows match, use their bounds and stacking order to select the newly opened or topmost requested window, click inside that exact window, and verify focus before typing. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged. A tool error does not prove its requested effect happened, and you must not claim success unless the resulting pixels visibly prove the requested postcondition. Use computer_batch for up to nine predictable click/type/key/scroll steps that do not need intermediate inspection; it returns one final screen and never truncates an oversized batch. On Linux, every batched keyboard action aimed at a known window must repeat that window's pid and window_id with delivery_mode set to foreground; use the canonical key name enter rather than Return."
+              : " You have a shared, isolated Cua sandbox: a Linux desktop in a container on this machine. Only /home/cua/workspace is durable; save downloads, repositories, working files, and browser profiles there because everything else inside the VM is disposable. No other host folder is mounted." + LOCAL_VM_PACKAGE_SYSTEM_PROMPT + " Use the computer tools for desktop, accessibility, window, and shell work. Inspect the desktop state once before acting, prefer accessibility targets over raw coordinates, and work carefully. If multiple windows match, use their bounds and stacking order to select the newly opened or topmost requested window, click inside that exact window, and verify focus before typing. Mutating actions already return the resulting screen; inspect that attached result instead of immediately requesting another desktop capture, and never repeat an action merely because the screen was unchanged. A tool error does not prove its requested effect happened, and you must not claim success unless the resulting pixels visibly prove the requested postcondition. Use computer_batch for up to nine predictable click/type/key/scroll steps that do not need intermediate inspection; it returns one final screen and never truncates an oversized batch. On Linux, every batched keyboard action aimed at a known window must repeat that window's pid and window_id with delivery_mode set to foreground; use the canonical key name enter rather than Return."
             : computerKind === "box" && instance.driverKind !== "boxAgent"
             ? " You have your own cloud computer. In Chrome, prefer browser_snapshot with browser_click/browser_fill for semantic, trusted actions; use screenshot/click/type_text for visual or non-browser UI, open_url for navigation, and computer_exec for Linux tasks. Every action already returns the resulting screen, so don't follow it with screenshot; batch predictable pixel actions with computer_batch."
             : computerKind === "vps"
@@ -11155,6 +11160,13 @@ server.on("upgrade", (req, socket, head) => {
     })
     .catch(() => reject(500, "Internal Server Error"));
 });
+
+if (LOCAL_VM_GUEST_ADMIN_ENABLED) {
+  const guestAdminRuntime = await containerRuntimeStatus();
+  if (!guestAdminRuntimeIsSupported(guestAdminRuntime)) {
+    throw new Error("Local VM guest admin requires the hardened Linux Docker runtime");
+  }
+}
 
 const harnessListener = await listenHarnessServer(server, {
   port: PORT,
