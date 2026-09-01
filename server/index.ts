@@ -274,6 +274,7 @@ import {
 import { acceptRawWebSocket } from "./raw-websocket.ts";
 import { listenHarnessServer } from "./listen-socket.ts";
 import {
+  MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES,
   MODEL_RELAY_CONCURRENCY_LIMIT,
   MODEL_RELAY_REQUEST_LIMIT,
   MODEL_RELAY_ROUTE,
@@ -6583,8 +6584,11 @@ const server = createServer(async (req, res) => {
                   throw new DOMException("computer operator parent became stale before result delivery", "AbortError");
                 }
                 if (!completion) return { text: "computer operator ended without a terminal result", isError: true };
-                const text = completion.output?.trim() || completion.error?.trim() ||
+                const baseText = completion.output?.trim() || completion.error?.trim() ||
                   (completion.status === "completed" ? "Computer task completed." : `Computer task ${completion.status}.`);
+                const text = completion.finalScreenshot && completion.status !== "completed"
+                  ? `${baseText} A final screen is attached from the contained operator; inspect it before reporting what did or did not happen.`
+                  : baseText;
                 return {
                   text,
                   ...(completion.finalScreenshot ? { image: {
@@ -6657,7 +6661,9 @@ const server = createServer(async (req, res) => {
               capabilityBinding,
               "model-request-bytes",
               body.length,
-              MODEL_RELAY_TURN_REQUEST_BYTES,
+              capabilityBinding.mountId?.startsWith("computer-child:")
+                ? MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES
+                : MODEL_RELAY_TURN_REQUEST_BYTES,
             )
           ) return json(res, 429, { error: "this turn reached its local model request-byte limit" });
           if (!capabilityStillActive() || MODEL_RELAY_AUTHORITIES.get(capabilityBinding.token) !== authority) {

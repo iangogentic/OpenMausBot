@@ -5,7 +5,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { InternalCapabilityBinding } from "./internal-capabilities.ts";
 import {
+  MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES,
+  MODEL_RELAY_MAX_REQUEST_BYTES,
+  MODEL_RELAY_REQUEST_LIMIT,
   MODEL_RELAY_ROUTE,
+  MODEL_RELAY_TURN_REQUEST_BYTES,
   ModelRelayError,
   ModelRelayFrameGuard,
   createModelRelayAuthority,
@@ -16,6 +20,12 @@ import {
   validateModelRelayRequest,
   writeModelRelayResponse,
 } from "./model-relay.ts";
+
+it("gives screenshot-heavy visual children a larger but still bounded aggregate request budget", () => {
+  expect(MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES).toBeGreaterThan(MODEL_RELAY_TURN_REQUEST_BYTES);
+  expect(MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES)
+    .toBeLessThanOrEqual(MODEL_RELAY_REQUEST_LIMIT * MODEL_RELAY_MAX_REQUEST_BYTES);
+});
 
 function binding(overrides: Partial<InternalCapabilityBinding> = {}): InternalCapabilityBinding {
   return Object.freeze({

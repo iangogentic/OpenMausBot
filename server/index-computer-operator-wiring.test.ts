@@ -33,6 +33,9 @@ describe("production computer operator wiring", () => {
     expect(source).toContain('targetClass: "physical"');
     expect(source).toContain("executionTimeoutMs: 900_000");
     expect(source).toContain("completion.finalScreenshot ? { image:");
+    expect(source).toContain("A final screen is attached from the contained operator");
+    expect(source).toContain('capabilityBinding.mountId?.startsWith("computer-child:")');
+    expect(source).toContain("MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES");
     expect(source).toContain("maxComputerActions: COMPUTER_SUBAGENT_MANAGER.get(authority.computerSubagent.childId)?.actionLimit");
     expect(source).toContain("error instanceof ComputerOperatorRequestError || error instanceof SyntaxError");
     expect(source).toContain("return json(res, 409, { error: \"the computer operator request was cancelled\" })");

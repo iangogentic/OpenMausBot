@@ -12,6 +12,10 @@ export const MODEL_RELAY_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 export const MODEL_RELAY_REQUEST_LIMIT = 256;
 export const MODEL_RELAY_CONCURRENCY_LIMIT = 4;
 export const MODEL_RELAY_TURN_REQUEST_BYTES = 32 * 1024 * 1024;
+/** Visual children resend a growing screenshot conversation on each model
+ * step. Their 32-action ceiling and 8 MiB per-request cap keep this bounded,
+ * but the ordinary text-turn aggregate is too small for legitimate runs. */
+export const MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES = 512 * 1024 * 1024;
 export const MODEL_RELAY_TURN_RESPONSE_BYTES = 256 * 1024 * 1024;
 export const MODEL_RELAY_MAX_STREAM_FRAME_BYTES = 1024 * 1024;
 export const MODEL_RELAY_TURN_STREAM_FRAMES = 32_768;
