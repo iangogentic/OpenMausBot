@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { InternalCapabilityBinding } from "./internal-capabilities.ts";
 import {
   MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES,
+  MODEL_RELAY_COMPUTER_PARENT_TURN_REQUEST_BYTES,
   MODEL_RELAY_MAX_REQUEST_BYTES,
   MODEL_RELAY_REQUEST_LIMIT,
   MODEL_RELAY_ROUTE,
@@ -21,8 +22,10 @@ import {
   writeModelRelayResponse,
 } from "./model-relay.ts";
 
-it("gives screenshot-heavy visual children a larger but still bounded aggregate request budget", () => {
+it("gives visual parent and child turns larger but still bounded aggregate request budgets", () => {
   expect(MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES).toBeGreaterThan(MODEL_RELAY_TURN_REQUEST_BYTES);
+  expect(MODEL_RELAY_COMPUTER_PARENT_TURN_REQUEST_BYTES).toBeGreaterThan(MODEL_RELAY_TURN_REQUEST_BYTES);
+  expect(MODEL_RELAY_COMPUTER_PARENT_TURN_REQUEST_BYTES).toBeLessThan(MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES);
   expect(MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES)
     .toBeLessThanOrEqual(MODEL_RELAY_REQUEST_LIMIT * MODEL_RELAY_MAX_REQUEST_BYTES);
 });

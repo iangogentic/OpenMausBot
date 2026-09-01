@@ -35,6 +35,8 @@ describe("production computer operator wiring", () => {
     expect(source).toContain("completion.finalScreenshot ? { image:");
     expect(source).toContain("A final screen is attached from the contained operator");
     expect(source).toContain('capabilityBinding.mountId?.startsWith("computer-child:")');
+    expect(source).toContain('capabilityBinding.mountId?.startsWith("computer-parent:")');
+    expect(source).toContain("MODEL_RELAY_COMPUTER_PARENT_TURN_REQUEST_BYTES");
     expect(source).toContain("MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES");
     expect(source).toContain("maxComputerActions: COMPUTER_SUBAGENT_MANAGER.get(authority.computerSubagent.childId)?.actionLimit");
     expect(source).toContain("error instanceof ComputerOperatorRequestError || error instanceof SyntaxError");

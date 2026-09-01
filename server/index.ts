@@ -275,6 +275,7 @@ import { acceptRawWebSocket } from "./raw-websocket.ts";
 import { listenHarnessServer } from "./listen-socket.ts";
 import {
   MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES,
+  MODEL_RELAY_COMPUTER_PARENT_TURN_REQUEST_BYTES,
   MODEL_RELAY_CONCURRENCY_LIMIT,
   MODEL_RELAY_REQUEST_LIMIT,
   MODEL_RELAY_ROUTE,
@@ -4383,7 +4384,15 @@ async function startTurn(
         text: attachmentHandoff.texts[index + 1]!,
       }));
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
-      const modelRelay = localModelRelayIntegration(model, internalTurn, commsDepth);
+      const modelRelay = localModelRelayIntegration(
+        model,
+        internalTurn,
+        commsDepth,
+        instance.adapter.capabilities.computerOperatorMcp === true &&
+            (plannedWants === "vm" || plannedWants === "local")
+          ? `computer-parent:${plannedWants}`
+          : "primary",
+      );
       if (modelRelay) integrations.modelRelay = modelRelay;
       const selectedSkills = selectBundledSkills(
         text,
@@ -6663,7 +6672,9 @@ const server = createServer(async (req, res) => {
               body.length,
               capabilityBinding.mountId?.startsWith("computer-child:")
                 ? MODEL_RELAY_COMPUTER_OPERATOR_TURN_REQUEST_BYTES
-                : MODEL_RELAY_TURN_REQUEST_BYTES,
+                : capabilityBinding.mountId?.startsWith("computer-parent:")
+                  ? MODEL_RELAY_COMPUTER_PARENT_TURN_REQUEST_BYTES
+                  : MODEL_RELAY_TURN_REQUEST_BYTES,
             )
           ) return json(res, 429, { error: "this turn reached its local model request-byte limit" });
           if (!capabilityStillActive() || MODEL_RELAY_AUTHORITIES.get(capabilityBinding.token) !== authority) {
