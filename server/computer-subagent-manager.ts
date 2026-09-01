@@ -2,6 +2,10 @@ import { newId, type ModelSelection } from "./contracts.ts";
 
 /** The hard action ceiling for one computer-use child runtime. */
 export const MAX_COMPUTER_SUBAGENT_ACTIONS = 9;
+/** An isolated disposable VM can safely support longer research workflows.
+ * Physical-computer children keep the tighter default above. */
+export const MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS = 32;
+export type ComputerSubagentTargetClass = "physical" | "isolated-vm";
 /** Recent released records are useful for diagnostics, but this always-on
  * server must not retain one object for every computer delegation forever. */
 export const MAX_COMPUTER_SUBAGENT_HISTORY = 256;
@@ -22,7 +26,11 @@ export interface ComputerSubagentStartInput {
   parent: ComputerSubagentParent;
   targetKey: string;
   targetGeneration: string;
+  /** Trusted target class used to enforce the physical-computer safety cap. */
+  targetClass?: ComputerSubagentTargetClass;
   operatorModel?: ModelSelection;
+  /** Per-child mutation ceiling. Values above nine require an isolated VM. */
+  actionLimit?: number;
   /** Tests and deterministic callers may provide the runtime id. Production
    * callers should omit it and use the generated id. */
   childId?: string;
@@ -52,6 +60,7 @@ export interface ComputerSubagentRecord {
   operatorModel?: ModelSelection;
   status: ComputerSubagentStatus;
   actionCount: number;
+  actionLimit: number;
   pendingSteerCount: number;
   leaseHeld: boolean;
   createdAt: number;
@@ -119,6 +128,7 @@ function snapshot(record: MutableRecord): ComputerSubagentRecord {
     operatorModel: cloneModel(record.operatorModel),
     status: record.status,
     actionCount: record.actionCount,
+    actionLimit: record.actionLimit,
     pendingSteerCount: record.pendingSteer.length,
     leaseHeld: record.leaseHeld,
     createdAt: record.createdAt,
@@ -178,6 +188,17 @@ export class ComputerSubagentManager {
       assertText(input.operatorModel.instanceId, "operatorModel.instanceId");
       assertText(input.operatorModel.model, "operatorModel.model");
     }
+    const targetClass = input.targetClass ?? "physical";
+    const actionLimit = input.actionLimit ?? MAX_COMPUTER_SUBAGENT_ACTIONS;
+    const maximumActionLimit = targetClass === "isolated-vm"
+      ? MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS
+      : MAX_COMPUTER_SUBAGENT_ACTIONS;
+    if (
+      !Number.isSafeInteger(actionLimit) || actionLimit < 1 ||
+      actionLimit > maximumActionLimit
+    ) {
+      throw new RangeError(`actionLimit must be between 1 and ${maximumActionLimit} for ${targetClass}`);
+    }
     if (this.targetLeases.has(input.targetKey)) throw new ComputerSubagentTargetBusyError(input.targetKey);
 
     const childId = input.childId ?? newId();
@@ -190,6 +211,7 @@ export class ComputerSubagentManager {
       operatorModel: cloneModel(input.operatorModel),
       status: "queued",
       actionCount: 0,
+      actionLimit,
       pendingSteer: [],
       pendingSteerCount: 0,
       leaseHeld: true,
@@ -238,7 +260,7 @@ export class ComputerSubagentManager {
     const record = this.owned(handle);
     this.requireStatus(record, "running");
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new TypeError("action amount must be a positive integer");
-    const remaining = MAX_COMPUTER_SUBAGENT_ACTIONS - record.actionCount;
+    const remaining = record.actionLimit - record.actionCount;
     if (amount > remaining) throw new ComputerSubagentActionBudgetError(record.childId, amount, remaining);
     record.actionCount += amount;
     return record.actionCount;

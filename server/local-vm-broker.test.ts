@@ -731,6 +731,28 @@ describe.skipIf(process.platform === "win32")("trusted Local VM MCP broker", () 
     await handle.closed;
   });
 
+  it("supports a larger whole-turn budget while keeping each batch capped at nine", async () => {
+    const socket = new FakeSocket();
+    let ticket = 0;
+    const beginAction = vi.fn(() => ({ allowed: true as const, actionId: `extended-${++ticket}` }));
+    const handle = attachLocalVmMcpBroker(baseOptions(socket, {
+      beginAction,
+      maxComputerActions: 10,
+      captureAfterAction: async () => ({ data: "aW1hZ2U=", mimeType: "image/png" as const }),
+    }));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 120, method: "tools/call", params: { name: "click", arguments: { x: 1, y: 1 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 120)).toBe(true));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 121, method: "tools/call", params: { name: "computer_batch", arguments: { actions: Array.from({ length: 9 }, () => ({ name: "press_key", arguments: { key: "tab", pid: 1, window_id: 2, delivery_mode: "foreground" } })) } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 121)).toBe(true));
+    socket.receive(JSON.stringify({ jsonrpc: "2.0", id: 122, method: "tools/call", params: { name: "click", arguments: { x: 2, y: 2 } } }) + "\n");
+    await vi.waitFor(() => expect(socket.sent.some((bytes) => JSON.parse(bytes.toString()).id === 122)).toBe(true));
+    const rejected = socket.sent.map((bytes) => JSON.parse(bytes.toString())).find((frame) => frame.id === 122);
+    expect(rejected.result.isError).toBe(true);
+    expect(beginAction).toHaveBeenCalledTimes(2);
+    handle.close("extended budget complete");
+    await handle.closed;
+  });
+
   it("does not interleave a second provider request while the batch ticket is held", async () => {
     const socket = new FakeSocket();
     const delayed = String.raw`

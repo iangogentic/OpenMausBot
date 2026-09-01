@@ -351,6 +351,68 @@ describe("ComputerSubagentRuntime", () => {
     expect(h.screenshots).toEqual([]);
   });
 
+  it("honors a bounded per-child execution timeout override", async () => {
+    const h = harness({
+      executionTimeoutMs: 20,
+      acquireTarget: async () => ({
+        ...target,
+        targetClass: "isolated-vm",
+        opaqueCapability: { trusted: true },
+      }),
+    });
+    const handle = h.runtime.start({
+      parent,
+      target: { ...target, targetClass: "isolated-vm" },
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "long isolated task",
+      childId: "child-timeout-override",
+      actionLimit: 32,
+      executionTimeoutMs: 100,
+    });
+    const child = await waitForChild(h.children);
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    await settle(child, { status: "completed", output: "finished" });
+    expect(await handle.done).toMatchObject({ status: "completed" });
+    expect(h.manager.get(handle.childId)).toMatchObject({ actionLimit: 32, actionCount: 0 });
+  });
+
+  it("rejects an elevated budget for a physical target before acquisition", () => {
+    const h = harness();
+    expect(() => h.runtime.start({
+      parent,
+      target: { ...target, targetClass: "physical" },
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "physical task",
+      childId: "child-physical-over-limit",
+      actionLimit: 10,
+    })).toThrow(/between 1 and 9 for physical/);
+    expect(h.children).toHaveLength(0);
+  });
+
+  it("rejects an isolated claim when trusted acquisition identifies a physical target", async () => {
+    const h = harness({
+      acquireTarget: async () => ({
+        ...target,
+        targetClass: "physical",
+        opaqueCapability: { trusted: true },
+      }),
+    });
+    const handle = h.runtime.start({
+      parent,
+      target: { ...target, targetClass: "isolated-vm" },
+      operatorModel: { instanceId: "qwen", model: "vision" },
+      prompt: "mislabeled target",
+      childId: "child-target-class-mismatch",
+      actionLimit: 32,
+    });
+    expect(await handle.done).toMatchObject({
+      status: "failed",
+      error: "acquired target identity does not match the leased target",
+    });
+    expect(h.launched).toHaveLength(0);
+    expect(h.released).toEqual([handle.childId]);
+  });
+
   it("rejects steer, human handoff, and actions after the execution deadline latches", async () => {
     const h = harness({ executionTimeoutMs: 20 });
     const handle = h.runtime.start({

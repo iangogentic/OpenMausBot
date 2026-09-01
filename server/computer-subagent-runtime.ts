@@ -1,5 +1,5 @@
-import type { ComputerSubagentHandle, ComputerSubagentManager, ComputerSubagentParent, ComputerSubagentRecord } from "./computer-subagent-manager.ts";
-import { COMPUTER_SUBAGENT_TERMINAL_STATUSES, MAX_COMPUTER_SUBAGENT_ACTIONS, ComputerSubagentOwnershipError, ComputerSubagentStateError } from "./computer-subagent-manager.ts";
+import type { ComputerSubagentHandle, ComputerSubagentManager, ComputerSubagentParent, ComputerSubagentRecord, ComputerSubagentTargetClass } from "./computer-subagent-manager.ts";
+import { COMPUTER_SUBAGENT_TERMINAL_STATUSES, ComputerSubagentOwnershipError, ComputerSubagentStateError } from "./computer-subagent-manager.ts";
 import type { ModelSelection } from "./contracts.ts";
 import type { ComputerChildMonitor, ComputerChildMonitorListener } from "../shared/computer-child-monitor.ts";
 
@@ -8,9 +8,15 @@ export const DEFAULT_COMPUTER_SUBAGENT_OPERATION_TIMEOUT_MS = 30_000;
 export const DEFAULT_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 350_000;
 export const DEFAULT_COMPUTER_SUBAGENT_ABORT_GRACE_MS = 2_000;
 export const DEFAULT_COMPUTER_SUBAGENT_CLEANUP_TIMEOUT_MS = 10_000;
-export const MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 350_000;
+export const MAX_COMPUTER_SUBAGENT_EXECUTION_TIMEOUT_MS = 480_000;
 
-export interface ComputerSubagentTargetSelection { targetKey: string; targetGeneration: string; boxId?: string }
+export interface ComputerSubagentTargetSelection {
+  targetKey: string;
+  targetGeneration: string;
+  boxId?: string;
+  /** Omission is treated as a physical target and cannot receive >9 actions. */
+  targetClass?: ComputerSubagentTargetClass;
+}
 export interface ComputerSubagentCapabilityDescriptor extends ComputerSubagentTargetSelection { readonly opaqueCapability: unknown }
 export interface ComputerSubagentFinalScreenshot {
   mimeType: "image/jpeg" | "image/png";
@@ -81,6 +87,8 @@ export interface ComputerSubagentRuntimeOptions {
 }
 export interface ComputerSubagentRuntimeStartInput {
   parent: ComputerSubagentParent; target: ComputerSubagentTargetSelection; operatorModel: ModelSelection; prompt: string; childId?: string;
+  actionLimit?: number;
+  executionTimeoutMs?: number;
 }
 export interface ComputerSubagentRuntimeHandle extends ComputerSubagentHandle { done: Promise<ComputerSubagentCompletion | null> }
 interface Deferred<T> { promise: Promise<T>; resolve: (value: T) => void }
@@ -230,10 +238,13 @@ export class ComputerSubagentRuntime {
   private startInChain(input: ComputerSubagentRuntimeStartInput, chain: Chain): ComputerSubagentRuntimeHandle {
     if (!input.target.targetKey.trim()) throw new TypeError("target.targetKey must be non-empty");
     if (!input.target.targetGeneration.trim()) throw new TypeError("target.targetGeneration must be non-empty");
-    const created = this.manager.start({ parent: input.parent, targetKey: input.target.targetKey, targetGeneration: input.target.targetGeneration, operatorModel: input.operatorModel, childId: input.childId });
+    const executionTimeoutMs = input.executionTimeoutMs === undefined
+      ? this.executionTimeoutMs
+      : this.validExecutionTimeout(input.executionTimeoutMs);
+    const created = this.manager.start({ parent: input.parent, targetKey: input.target.targetKey, targetGeneration: input.target.targetGeneration, targetClass: input.target.targetClass, operatorModel: input.operatorModel, childId: input.childId, actionLimit: input.actionLimit });
     const execution: Execution = {
       handle: created.handle,
-      input: { parent: cloneParent(input.parent), target: cloneSelection(input.target), operatorModel: cloneModel(input.operatorModel), prompt: input.prompt },
+      input: { parent: cloneParent(input.parent), target: cloneSelection(input.target), operatorModel: cloneModel(input.operatorModel), prompt: input.prompt, actionLimit: input.actionLimit, executionTimeoutMs },
       chain, child: null, target: null, settled: Promise.resolve(null), interruptPromise: null, interruptRequested: false,
       abortRequested: false, stopCause: null, steering: false, acceptingActions: false, terminalized: false, released: false, steerPromise: null,
       abortController: new AbortController(), targetReleased: false, targetReleasePromise: null,
@@ -262,7 +273,13 @@ export class ComputerSubagentRuntime {
       return this.finishInterruptedPhase(execution, "target acquisition", acquired, contained);
     }
     execution.target = acquired.value;
-    if (acquired.value.targetKey !== execution.input.target.targetKey || acquired.value.targetGeneration !== execution.input.target.targetGeneration) {
+    const requestedTargetClass = execution.input.target.targetClass ?? "physical";
+    const acquiredTargetClass = acquired.value.targetClass ?? "physical";
+    if (
+      acquired.value.targetKey !== execution.input.target.targetKey ||
+      acquired.value.targetGeneration !== execution.input.target.targetGeneration ||
+      acquiredTargetClass !== requestedTargetClass
+    ) {
       return this.finish(execution, { status: "failed", error: "acquired target identity does not match the leased target" }, true);
     }
     if (execution.abortRequested && !execution.steering) {
@@ -305,7 +322,7 @@ export class ComputerSubagentRuntime {
     const outcomeResult = await this.racePhase(
       execution,
       launched.value.completion,
-      this.executionTimeoutMs,
+      execution.input.executionTimeoutMs ?? this.executionTimeoutMs,
       () => this.latchStop(execution, "execution-timeout"),
     );
     execution.acceptingActions = false;
@@ -498,7 +515,7 @@ export class ComputerSubagentRuntime {
     const record = this.manager.get(execution.handle.childId);
     if (!record) throw new ComputerSubagentOwnershipError(execution.handle.childId);
     try {
-      return this.startInChain({ parent: record.parent, target: execution.input.target, operatorModel: record.operatorModel ?? execution.input.operatorModel, prompt }, execution.chain);
+      return this.startInChain({ parent: record.parent, target: execution.input.target, operatorModel: record.operatorModel ?? execution.input.operatorModel, prompt, actionLimit: record.actionLimit, executionTimeoutMs: execution.input.executionTimeoutMs }, execution.chain);
     } catch (error) { await this.deliverFinal(execution.chain, predecessor); throw error; }
   }
   private async interruptIfAvailable(execution: Execution): Promise<void> {
@@ -634,7 +651,7 @@ export class ComputerSubagentRuntime {
       parent,
       status: record.status,
       actionCount: record.actionCount,
-      actionLimit: MAX_COMPUTER_SUBAGENT_ACTIONS,
+      actionLimit: record.actionLimit,
       leaseHeld: record.leaseHeld,
       createdAt: record.createdAt,
       ...(record.finishedAt === undefined ? {} : { finishedAt: record.finishedAt }),

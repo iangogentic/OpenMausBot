@@ -432,6 +432,9 @@ export function attachLocalVmMcpBroker(options: {
   maxToolCalls?: number;
   /** Narrow test seam; production uses the exported response deadline. */
   responseTimeoutMs?: number;
+  /** Whole-turn mutation budget. A single computer_batch remains capped at
+   * nine actions; isolated computer children may receive a larger total. */
+  maxComputerActions?: number;
 }): LocalVmMcpBrokerHandle {
   let child: DriverChild | null = null;
   let closed = false;
@@ -442,8 +445,12 @@ export function attachLocalVmMcpBroker(options: {
   let toolCalls = 0;
   // One child/turn mechanical-action budget shared by ordinary calls and all
   // synthetic batches. A batch reserves its full size before action one, so a
-  // failed prefix cannot be retried to exceed the nine-action contract.
+  // failed prefix cannot be retried to exceed the child runtime's contract.
   let computerActionsConsumed = 0;
+  const maxComputerActions = options.maxComputerActions ?? COMPUTER_BATCH_MAX_ACTIONS;
+  if (!Number.isSafeInteger(maxComputerActions) || maxComputerActions < 1 || maxComputerActions > 64) {
+    throw new RangeError("maxComputerActions must be between 1 and 64");
+  }
   let lastDeliveredFrameHash: string | null = null;
   let inputFrames = 0;
   let outputFrames = 0;
@@ -831,7 +838,7 @@ export function attachLocalVmMcpBroker(options: {
   const gate: GateInterceptor = createGateInterceptor({
     beginAction: async (toolName) => {
       if (!(await claimToolCall())) return { allowed: false, reason: "unavailable" };
-      if (LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName) && computerActionsConsumed >= COMPUTER_BATCH_MAX_ACTIONS) {
+      if (LOCAL_VM_ACT_AND_OBSERVE_TOOLS.has(toolName) && computerActionsConsumed >= maxComputerActions) {
         return { allowed: false, reason: "unavailable" };
       }
       const permit = await options.beginAction();
@@ -909,8 +916,8 @@ export function attachLocalVmMcpBroker(options: {
       if (closed || !(await authorizedAndCurrent())) {
         return { content: [{ type: "text", text: "Local VM authority is unavailable; no batch actions were run." }], isError: true };
       }
-      if (computerActionsConsumed + actions.length > COMPUTER_BATCH_MAX_ACTIONS) {
-        return { content: [{ type: "text", text: `The Local VM allows at most ${COMPUTER_BATCH_MAX_ACTIONS} mechanical actions per turn; this entire batch was rejected and none ran.` }], isError: true };
+      if (computerActionsConsumed + actions.length > maxComputerActions) {
+        return { content: [{ type: "text", text: `The Local VM allows at most ${maxComputerActions} mechanical actions per turn; this entire batch was rejected and none ran.` }], isError: true };
       }
       const permit = await Promise.resolve(options.beginAction()).catch(
         (): ActionPermit => ({ allowed: false, reason: "unavailable" }),

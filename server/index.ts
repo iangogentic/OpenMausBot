@@ -190,7 +190,13 @@ import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./
 import { memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
-import { ComputerSubagentManager, type ComputerSubagentHandle, type ComputerSubagentParent } from "./computer-subagent-manager.ts";
+import {
+  ComputerSubagentManager,
+  MAX_COMPUTER_SUBAGENT_ACTIONS,
+  MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS,
+  type ComputerSubagentHandle,
+  type ComputerSubagentParent,
+} from "./computer-subagent-manager.ts";
 import type {
   ComputerChildCursor,
   ComputerChildFrame,
@@ -203,6 +209,7 @@ import {
   type ComputerSubagentCapabilityDescriptor,
   type ComputerSubagentFinalScreenshot,
   type ComputerSubagentRuntimeHandle,
+  type ComputerSubagentTargetSelection,
 } from "./computer-subagent-runtime.ts";
 import { createComputerOperatorProviderRuntime } from "./computer-operator-provider.ts";
 import { ComputerOperatorRequestError, executeComputerOperatorRequest } from "./computer-operator-surface.ts";
@@ -1221,12 +1228,13 @@ async function resumeComputerOperatorAfterHuman(active: ActiveComputerOperator |
     && !computerControl.targetReservedForHuman(targetKey));
 }
 
-function computerOperatorTarget(context: ComputerOperatorTurnContext): { targetKey: string; targetGeneration: string } {
+function computerOperatorTarget(context: ComputerOperatorTurnContext): ComputerSubagentTargetSelection {
   return context.kind === "local-vm"
-    ? { targetKey: context.target.key, targetGeneration: context.vmGeneration }
+    ? { targetKey: context.target.key, targetGeneration: context.vmGeneration, targetClass: "isolated-vm" }
     : {
         targetKey: "physical:host",
         targetGeneration: `${context.registrationId}:${context.executorGeneration}`,
+        targetClass: "physical",
       };
 }
 
@@ -1358,7 +1366,7 @@ const COMPUTER_OPERATOR_PROVIDER = createComputerOperatorProviderRuntime({
         // sharing provider state. The worker gets no parent workspace mount.
         isolationKey: `computer-operator:${input.parent.botId}:${input.target.targetKey}`,
         providerPrivateCwd: true,
-        system: `You are the dedicated visual computer operator. Complete only the delegated task on the attached ${capability.kind === "local-vm" ? "isolated Linux desktop" : "user-approved physical Mac or Windows computer"}. Inspect the current screen before acting, prefer accessibility targets over coordinates, verify focus before typing, and use small deliberate actions. Every mutation must be visually verified from its returned screen. Never claim success unless the final visible pixels prove the requested result. For exact text or small UI details, inspect the actual screenshot pixels. Prefer mcp_computer_get_browser_state for web state, then mcp_computer_get_accessibility_tree for native text; when the full desktop is not decisive, use mcp_computer_zoom for a focused fresh observation before reporting that something is absent. mcp_computer_get_desktop_state does not accept pid or window filters: call it without invented filters and use accessibility or zoom for a focused check. As soon as the delegated outcome is proven, stop observing and report it. Report uncertainty instead of guessing, never retry an invalid argument shape, and never invent unsupported tool arguments. Stop for passwords, MFA, CAPTCHAs, purchases, destructive actions, or ambiguous targets and report the blocker. You have at most nine computer actions.`,
+        system: `You are the dedicated visual computer operator. Complete only the delegated task on the attached ${capability.kind === "local-vm" ? "isolated Linux desktop" : "user-approved physical Mac or Windows computer"}. Inspect the current screen, then act immediately; do not spend the turn debating the action budget. Prefer accessibility targets over coordinates, verify focus before typing, and use small deliberate actions. Every mutation must be visually verified from its returned screen. Never claim success unless the final visible pixels prove the requested result. For exact text or small UI details, inspect the actual screenshot pixels. Prefer mcp_computer_get_browser_state for web state, then mcp_computer_get_accessibility_tree for native text; when the full desktop is not decisive, use mcp_computer_zoom for a focused fresh observation before reporting that something is absent. Read-only observations do not consume the mutation budget. mcp_computer_get_desktop_state does not accept pid or window filters: call it without invented filters and use accessibility or zoom for a focused check. As soon as the delegated outcome is proven, stop observing and report it. Report uncertainty instead of guessing, never retry an invalid argument shape, and never invent unsupported tool arguments. Stop for passwords, MFA, CAPTCHAs, purchases, destructive actions, or ambiguous targets and report the blocker. You have at most ${capability.kind === "local-vm" ? MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS : MAX_COMPUTER_SUBAGENT_ACTIONS} state-changing computer actions.`,
         integrations: {
           modelRelay: capability.modelRelay,
           localComputer: capability.localComputer,
@@ -6548,6 +6556,10 @@ const server = createServer(async (req, res) => {
                   target: operatorTarget,
                   operatorModel: context.operatorModel,
                   prompt: task,
+                  actionLimit: context.kind === "local-vm"
+                    ? MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS
+                    : MAX_COMPUTER_SUBAGENT_ACTIONS,
+                  ...(context.kind === "local-vm" ? { executionTimeoutMs: 480_000 } : {}),
                 });
                 return { parent, handle } satisfies ActiveComputerOperator;
               });
@@ -10921,6 +10933,9 @@ server.on("upgrade", (req, socket, head) => {
         signal,
         stillAuthorized,
         requireActionAccounting: Boolean(authority.computerSubagent),
+        ...(authority.computerSubagent
+          ? { maxComputerActions: COMPUTER_SUBAGENT_MANAGER.get(authority.computerSubagent.childId)?.actionLimit }
+          : {}),
         ...(authority.computerSubagent
           ? {
               onActions: (amount: number) => COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount),

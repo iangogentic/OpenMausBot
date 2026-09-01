@@ -27,6 +27,12 @@ describe("production computer operator wiring", () => {
     expect(source).toContain('capabilityBinding?.kind !== "computer-operator"');
     expect(source).toContain("requireActionAccounting: Boolean(authority.computerSubagent)");
     expect(source).toContain("COMPUTER_SUBAGENT_RUNTIME.accountActions(authority.computerSubagent!, amount)");
+    expect(source).toContain("MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS");
+    expect(source).toContain("Read-only observations do not consume the mutation budget");
+    expect(source).toContain('targetClass: "isolated-vm"');
+    expect(source).toContain('targetClass: "physical"');
+    expect(source).toContain("executionTimeoutMs: 480_000");
+    expect(source).toContain("maxComputerActions: COMPUTER_SUBAGENT_MANAGER.get(authority.computerSubagent.childId)?.actionLimit");
     expect(source).toContain("error instanceof ComputerOperatorRequestError || error instanceof SyntaxError");
     expect(source).toContain("return json(res, 409, { error: \"the computer operator request was cancelled\" })");
   });

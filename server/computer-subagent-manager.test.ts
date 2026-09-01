@@ -8,6 +8,7 @@ import {
   ComputerSubagentTargetBusyError,
   MAX_COMPUTER_SUBAGENT_ACTIONS,
   MAX_COMPUTER_SUBAGENT_HISTORY,
+  MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS,
   type ComputerSubagentHandle,
   type ComputerSubagentParent,
 } from "./computer-subagent-manager.ts";
@@ -78,6 +79,36 @@ describe("ComputerSubagentManager", () => {
     expect(manager.get(handle.childId)?.actionCount).toBe(9);
     expect(() => manager.consumeActions(handle, 2)).toThrow(ComputerSubagentActionBudgetError);
     expect(manager.get(handle.childId)?.actionCount).toBe(9);
+  });
+
+  it("allows a larger explicit budget only within the isolated-computer ceiling", () => {
+    const manager = new ComputerSubagentManager();
+    const created = manager.start({
+      parent,
+      targetKey: "vm:isolated",
+      targetGeneration: "generation-isolated",
+      targetClass: "isolated-vm",
+      childId: "child-isolated",
+      actionLimit: MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS,
+    });
+    manager.markRunning(created.handle);
+    expect(manager.consumeActions(created.handle, MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS)).toBe(32);
+    expect(manager.get(created.handle.childId)).toMatchObject({ actionCount: 32, actionLimit: 32 });
+    expect(() => manager.consumeActions(created.handle)).toThrow(ComputerSubagentActionBudgetError);
+    expect(() => manager.start({
+      parent: { ...parent, turnId: "turn-over-limit" },
+      targetKey: "vm:over-limit",
+      targetGeneration: "generation-over-limit",
+      targetClass: "isolated-vm",
+      actionLimit: MAX_ISOLATED_COMPUTER_SUBAGENT_ACTIONS + 1,
+    })).toThrow(RangeError);
+    expect(() => manager.start({
+      parent: { ...parent, turnId: "turn-physical-over-limit" },
+      targetKey: "physical:host",
+      targetGeneration: "generation-physical",
+      targetClass: "physical",
+      actionLimit: MAX_COMPUTER_SUBAGENT_ACTIONS + 1,
+    })).toThrow(/between 1 and 9 for physical/);
   });
 
   it("queues steer text but refuses to hand it to a successor while active", () => {
