@@ -1430,19 +1430,18 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         </button>
       </div>
 
-      <ComputerChildMonitorStrip
-        monitors={state.computerChildren}
-        visuals={state.computerChildVisuals}
-        botId={bot.id}
-        threadId={bot.threadId}
-      />
-
       {panelView === "android" && androidConnected ? (
         <div className="flex-1 overflow-y-auto px-4 pt-2">
           <AndroidDevicePanel status={androidStatus} />
         </div>
       ) : (
       <div className={cn("flex-1 overflow-y-auto px-5", controlIsMine ? "pb-24" : "pb-5")}>
+          <ComputerChildMonitorStrip
+            monitors={state.computerChildren}
+            visuals={state.computerChildVisuals}
+            botId={bot.id}
+            threadId={bot.threadId}
+          />
           {/* Screen preview */}
           <div className="mb-1.5 mt-2 flex items-end justify-between gap-3 text-[13px] text-ink-secondary">
             <div className="min-w-0">

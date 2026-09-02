@@ -213,7 +213,7 @@ describe("computer proxy (fake box)", () => {
     // one command carried the click, the settle and the capture
     expect(commands.length - before).toBe(1);
     const command = commands.at(-1)!;
-    expect(command).toContain('exec env -i HOME="$HOME"');
+    expect(command).not.toContain("exec env -i");
     if (process.platform !== "win32") expect(spawnSync("/bin/bash", ["-n", "-c", command]).status).toBe(0);
     expect(command).toMatch(/xdotool mousemove \$CX \$CY click 1/);
     expect(command).toContain("/opt/ogb/cua-driver call click");
@@ -245,6 +245,20 @@ describe("computer proxy (fake box)", () => {
     expect(res.result.content[0].text).toMatch(/identical to the frame you already have/i);
     // must not tell the model to redo a possibly-successful action
     expect(res.result.content[0].text).toMatch(/don't repeat the action/i);
+  });
+
+  it("forwards an exact 4,000-character computer command without pre-expanding it", async () => {
+    const exact = "x".repeat(4_000);
+    rpc({
+      jsonrpc: "2.0",
+      id: 4010,
+      method: "tools/call",
+      params: { name: "computer_exec", arguments: { command: exact, observe: false } },
+    });
+    const res = await waitFor(4010);
+
+    expect(res.result.isError).not.toBe(true);
+    expect(commands.at(-1)).toBe(exact);
   });
 
   it("sends a new frame once the screen actually changes", async () => {

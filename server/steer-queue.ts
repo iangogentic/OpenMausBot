@@ -30,10 +30,28 @@ interface QueueEntry {
    * happen on a DIFFERENT thread (a room turn) — drain matches on "this
    * queue's bot is idle now", which needs the bot, not the settling thread. */
   botId: string;
-  items: Array<{ messageId: string; text: string; prompt: string; replyToId?: string }>;
+  items: Array<{ messageId: string; text: string; prompt: string; replyToId?: string; byteLength: number }>;
 }
 
 const queues = new Map<string, QueueEntry>(); // threadId → waiting sends
+
+export const MAX_QUEUED_STEER_MESSAGES_PER_THREAD = 4;
+export const MAX_QUEUED_STEER_MESSAGES = 64;
+export const MAX_QUEUED_STEER_BYTES = 256 * 1024;
+
+function steerQueueTotals() {
+  let messages = 0;
+  let bytes = 0;
+  for (const entry of queues.values()) {
+    messages += entry.items.length;
+    for (const item of entry.items) bytes += item.byteLength;
+  }
+  return { messages, bytes };
+}
+
+function steerQueueLimitError(message: string): Error & { status: number } {
+  return Object.assign(new Error(message), { status: 429 });
+}
 
 /** Hold a mid-turn send off the transcript until drain. */
 export function queueSteeredMessage(
@@ -44,9 +62,34 @@ export function queueSteeredMessage(
   const threadId = bot.threadId;
   const id = newId();
   const entry = queues.get(threadId) ?? { botId: bot.id, items: [] };
-  entry.items.push({ messageId: id, text, prompt: options.prompt ?? text, replyToId: options.replyToId });
+  if (entry.botId !== bot.id) throw new Error("queued task belongs to another bot");
+  if (entry.items.length >= MAX_QUEUED_STEER_MESSAGES_PER_THREAD) {
+    throw steerQueueLimitError(`this chat already has ${MAX_QUEUED_STEER_MESSAGES_PER_THREAD} queued messages`);
+  }
+  const prompt = options.prompt ?? text;
+  const byteLength = Buffer.byteLength(text, "utf8") + Buffer.byteLength(prompt, "utf8");
+  const totals = steerQueueTotals();
+  if (totals.messages >= MAX_QUEUED_STEER_MESSAGES) {
+    throw steerQueueLimitError("the chat queue is full — wait for pending work to finish");
+  }
+  if (byteLength > MAX_QUEUED_STEER_BYTES || totals.bytes + byteLength > MAX_QUEUED_STEER_BYTES) {
+    throw steerQueueLimitError("the chat queue has reached its text limit — wait for pending work to finish");
+  }
+  entry.items.push({ messageId: id, text, prompt, replyToId: options.replyToId, byteLength });
   queues.set(threadId, entry);
   return { id };
+}
+
+/** Authenticated UI hydration receipt. Prompts and provider metadata stay
+ * private; the renderer needs only enough to restore its pending chip. */
+export function pendingSteeredMessageSnapshot(): Array<{
+  threadId: string;
+  queueId: string;
+  text: string;
+}> {
+  return [...queues.entries()].flatMap(([threadId, entry]) =>
+    entry.items.map((item) => ({ threadId, queueId: item.messageId, text: item.text })),
+  );
 }
 
 /** Drain every queue whose bot is idle: append the held lines (leaf is now
@@ -133,4 +176,8 @@ export function cancelSteeredMessages(store: SteerStore, botId: string): string[
 /** Test helper: how many messages remain queued for a thread. */
 export function _queuedCount(threadId: string): number {
   return queues.get(threadId)?.items.length ?? 0;
+}
+
+export function _clearSteeredQueuesForTests(): void {
+  queues.clear();
 }

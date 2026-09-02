@@ -100,6 +100,9 @@ describe("ComputerChildMonitorStrip", () => {
     expect(markup).toContain('data-computer-child="newer"');
     expect(markup).toContain('data-selected="true"');
     expect(markup).toContain('tabindex="-1"');
+    expect(markup).toContain("max-h-32");
+    expect(markup).toContain('aria-label="Visual operator 1 of 2: Using computer, 3/9 actions, Live · now"');
+    expect(markup).toContain('aria-label="Visual operator 2 of 2: Using computer, 3/9 actions, Live · now"');
   });
 
   it("exposes deterministic keyboard tab selection", () => {

@@ -67,6 +67,46 @@ describe("server-owned scoped Box operations", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("runs scoped commands through the shared isolated remote shell", async () => {
+    let forwarded: { command?: string } | undefined;
+    globalThis.fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      forwarded = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ exitCode: 0, stdout: "ok" }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const result = await scopedBoxOperation(
+      { box: { token: "real-provider-key" } },
+      "box-a",
+      { op: "command", command: "printf safe" },
+    );
+
+    expect(result).toMatchObject({ ok: true, exitCode: 0 });
+    expect(forwarded?.command).toEqual(expect.stringContaining("exec env -i"));
+    expect(forwarded?.command).toEqual(expect.stringContaining("/bin/bash -c 'printf safe'"));
+    expect(forwarded?.command).not.toBe("printf safe");
+  });
+
+  it("accepts the exact public command limit before adding broker isolation", async () => {
+    let forwarded = "";
+    globalThis.fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      forwarded = String((JSON.parse(String(init?.body)) as { command?: string }).command ?? "");
+      return new Response(JSON.stringify({ exitCode: 0 }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const command = "x".repeat(SCOPED_BOX_MAX_COMMAND_CHARS);
+
+    await expect(scopedBoxOperation(
+      { box: { token: "real-provider-key" } },
+      "box-a",
+      { op: "command", command },
+    )).resolves.toMatchObject({ ok: true });
+    expect(forwarded.length).toBeGreaterThan(command.length);
+    expect(forwarded).toContain(command);
+  });
+
   it.each([
     ["state fetch", { op: "state" }],
     ["long command fetch", { op: "command", command: "sleep 60" }],

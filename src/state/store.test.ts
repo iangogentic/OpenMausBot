@@ -858,6 +858,54 @@ describe("pending queued chip", () => {
     modelSelection: { instanceId: "acp", model: "fake" },
   } satisfies Omit<Bot, "messages">;
 
+  it("replaces stale local chips with the authenticated server snapshot on reload", () => {
+    const stale = {
+      ...initialState,
+      pendingQueued: { old: [{ queueId: "old-id", text: "stale" }] },
+    };
+    const hydrated = reducer(stale, {
+      type: "hydrate",
+      bots: [],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+      pendingQueued: [
+        { threadId: "t1", queueId: "q1", text: "restored" },
+        { threadId: "t1", queueId: "q1", text: "duplicate ignored" },
+      ],
+    });
+
+    expect(hydrated.pendingQueued).toEqual({ t1: [{ queueId: "q1", text: "restored" }] });
+  });
+
+  it("does not let an older empty hydration erase a queue receipt acknowledged after GET began", () => {
+    const started = {
+      ...initialState,
+      pendingQueued: { old: [{ queueId: "old-id", text: "remove if absent" }] },
+    };
+    const acknowledged = reducer(started, {
+      type: "pendingQueued",
+      threadId: "t1",
+      queueId: "q-after-get",
+      text: "keep this newer receipt",
+    });
+    const hydrated = reducer(acknowledged, {
+      type: "hydrate",
+      bots: [],
+      groups: [],
+      computerControl: {},
+      computerChildren: [],
+      computerChildVisuals: [],
+      pendingQueued: [],
+      pendingQueuedIdsAtStart: ["old-id"],
+    });
+
+    expect(hydrated.pendingQueued).toEqual({
+      t1: [{ queueId: "q-after-get", text: "keep this newer receipt" }],
+    });
+  });
+
   it("records queue-fallback text and drops it when that user line lands", () => {
     const withBot = reducer(initialState, { type: "botPatched", bot });
     const queued = reducer(withBot, {

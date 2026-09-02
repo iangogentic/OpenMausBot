@@ -127,8 +127,18 @@ import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type C
 import { searchMessages } from "./message-db.ts";
 import { promptWithReply, transcriptText } from "./replies.ts";
 import { _loadPending, cancelDelegationsForBot, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
-import { cancelSteeredMessages, drainSteeredMessages, queueSteeredMessage } from "./steer-queue.ts";
-import { drainChannelMessages, queueChannelMessage } from "./channel-queue.ts";
+import {
+  cancelSteeredMessages,
+  drainSteeredMessages,
+  pendingSteeredMessageSnapshot,
+  queueSteeredMessage,
+} from "./steer-queue.ts";
+import {
+  cancelChannelMessages,
+  drainChannelMessages,
+  pendingChannelMessageSnapshot,
+  queueChannelMessage,
+} from "./channel-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
@@ -4034,6 +4044,27 @@ function cancelQueuedSendsForBot(botId: string) {
   }
 }
 
+function cancelQueuedChannelSends(groupId: string, reason: string): void {
+  const affectedThreads = new Set<string>();
+  for (const item of cancelChannelMessages(groupId)) {
+    affectedThreads.add(item.threadId);
+    store.appendMessage(item.threadId, {
+      role: "user",
+      kind: "text",
+      text: item.text,
+      replyToId: item.replyToId,
+      queueId: item.queueId,
+    });
+  }
+  for (const threadId of affectedThreads) {
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: reason, ok: false },
+    });
+  }
+}
+
 // ── live screen: poll the bot's computer while it works ───────────────
 // Frames stream to clients as SSE {kind:'screen'} (the "Bot's screen"
 // panel); the final frame is folded into the transcript on turn end.
@@ -5435,6 +5466,13 @@ function drainQueuedChannelSends(): void {
         startGroupTurn(groupId, text, replyTo, id);
       } catch (error) {
         store.appendMessage(group.threadId, {
+          role: "user",
+          kind: "text",
+          text,
+          replyToId,
+          queueId: id,
+        });
+        store.appendMessage(group.threadId, {
           role: "bot",
           kind: "activity",
           tool: {
@@ -6131,6 +6169,10 @@ async function reloadProviders() {
     const turn = INTERNAL_CAPABILITY_TURNS.forThread(group.threadId);
     const speaker = groupSpeakers.get(group.threadId);
     if (!turn || turn.botId !== group.busyBotId || speaker?.botId !== turn.botId) continue;
+    cancelQueuedChannelSends(
+      group.id,
+      "Queued room message was saved here but not run because provider settings changed",
+    );
     cancelGroupTurnBatches(group.id);
     const batch = activeGroupTurnBatches.get(group.id);
     roomStallCompletions.providerReloaded(group.threadId, turn.generation);
@@ -6896,7 +6938,7 @@ const server = createServer(async (req, res) => {
                 credentialUse.config,
                 capabilityBinding.scope!.resourceId,
                 body,
-                { signal },
+                { signal, trustedProxyCommand: Boolean(proxyBridge) },
               ),
             );
             if (body?.op === "prompt" && brokerAction?.allowed && result.ok !== false) {
@@ -7847,6 +7889,10 @@ const server = createServer(async (req, res) => {
         ),
         computerChildren: computerChildMonitors(),
         computerChildVisuals: computerChildVisualsForWire(COMPUTER_CHILD_VISUALS.values(), includeScreens),
+        pendingQueued: [
+          ...pendingSteeredMessageSnapshot(),
+          ...pendingChannelMessageSnapshot(),
+        ].map(({ threadId, queueId, text }) => ({ threadId, queueId, text })),
       });
     }
 
@@ -8649,6 +8695,10 @@ const server = createServer(async (req, res) => {
       let cancelledTurn: InternalCapabilityTurn | null = retainedTurn;
       try {
         cancelPendingResumesForThread(group.threadId);
+        cancelQueuedChannelSends(
+          group.id,
+          "Queued room message was saved here but not run because Stop cancels all pending work",
+        );
         cancelGroupTurnBatches(group.id);
         const delegationDrain = busy
           ? cancelDelegationsForBot(commsBus, busy.id, "Room Stop canceled this bot's pending delegation")
@@ -9697,7 +9747,13 @@ const server = createServer(async (req, res) => {
         // a bot busy in a ROOM is running on the room's thread — stopping it
         // from its own chat must reach that turn, not just the 1:1 thread
         const busyGroup = store.groups.find((g) => g.busyBotId === bot.id);
-        if (busyGroup) cancelGroupTurnBatches(busyGroup.id);
+        if (busyGroup) {
+          cancelQueuedChannelSends(
+            busyGroup.id,
+            "Queued room message was saved here but not run because Stop cancels all pending work",
+          );
+          cancelGroupTurnBatches(busyGroup.id);
+        }
         const cancelled = cancelBotTurnAuthority(bot.id);
         activeTurn = cancelled.turn;
         quarantineCancelledTurn(activeTurn);

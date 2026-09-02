@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 import { cloudComputerRemovalConfirmation } from "../lib/cloud-computer-removal";
 import {
@@ -53,6 +54,19 @@ describe("computer panel collapse interactions", () => {
     expect(escapeClosesComputerPanel({ ...ordinary, routineEditorOpen: true })).toBe(false);
     expect(escapeClosesComputerPanel({ ...ordinary, warningOpen: true })).toBe(false);
     expect(escapeClosesComputerPanel({ ...ordinary, key: "Enter" })).toBe(false);
+  });
+});
+
+describe("computer panel viewport ownership", () => {
+  it("keeps operator sessions inside the selected bot's scrolling computer view", () => {
+    const source = readFileSync(new URL("./ComputerPanel.tsx", import.meta.url), "utf8");
+    const scrollOwner = source.indexOf('cn("flex-1 overflow-y-auto px-5"');
+    const operatorStrip = source.indexOf("<ComputerChildMonitorStrip", scrollOwner);
+    const screenPreview = source.indexOf("{/* Screen preview */}", operatorStrip);
+
+    expect(scrollOwner).toBeGreaterThan(-1);
+    expect(operatorStrip).toBeGreaterThan(scrollOwner);
+    expect(screenPreview).toBeGreaterThan(operatorStrip);
   });
 });
 

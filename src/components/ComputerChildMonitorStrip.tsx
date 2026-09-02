@@ -185,14 +185,14 @@ export function ComputerChildMonitorStrip({
   };
 
   return (
-    <section className="mx-4 mb-1 rounded-xl border border-hairline/40 bg-inset/45 p-2" aria-label="Visual operator sessions">
+    <section className="mb-3 rounded-xl border border-hairline/40 bg-inset/45 p-2" aria-label="Visual operator sessions">
       <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-ink-secondary">
         <Bot size={13} aria-hidden="true" />
         <span>Visual operators</span>
         <span className="rounded-full bg-raised px-1.5 py-0.5 tabular-nums">{visible.length}</span>
       </div>
 
-      <div className="space-y-1" role="tablist" aria-label="Visual operator screens" aria-orientation="vertical">
+      <div className="max-h-32 space-y-1 overflow-y-auto pr-1" role="tablist" aria-label="Visual operator screens" aria-orientation="vertical">
         {visible.map((monitor, index) => {
           const visual = visuals[monitor.childId];
           const frameState = computerChildFrameLabel(monitor, visual, now ?? clock, receivedAt(monitor.childId, visual));
@@ -206,6 +206,7 @@ export function ComputerChildMonitorStrip({
               id={`${stageId}-tab-${index}`}
               aria-controls={stageId}
               aria-selected={isSelected}
+              aria-label={`Visual operator ${index + 1} of ${visible.length}: ${statusCopy(monitor.status)}, ${monitor.actionCount}/${monitor.actionLimit} actions, ${frameState.label}`}
               tabIndex={isSelected ? 0 : -1}
               onClick={() => setRequestedChildId(monitor.childId)}
               onKeyDown={(event) => moveSelection(index, event)}

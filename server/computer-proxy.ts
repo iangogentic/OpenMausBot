@@ -46,7 +46,6 @@ import {
 } from "./control-client.ts";
 import {
   ensureRemoteCuaCommand,
-  isolatedRemoteCommand,
   MAX_REMOTE_COMMAND_LENGTH,
   REMOTE_CUA_EXECUTABLE,
   REMOTE_CUA_SESSION,
@@ -151,14 +150,13 @@ async function resumeBox(): Promise<boolean> {
 }
 
 async function runOnBox(command: string, timeoutMs = 60_000, allowWake = true): Promise<RunOut> {
-  // Old boxes may predate noEnv:true. Run every agent-issued command with an
-  // explicit desktop-only environment so provider/account credentials cannot
-  // leak through `computer_exec` or a child GUI process.
-  const isolatedCommand = isolatedRemoteCommand(command);
+  // The authenticated broker is the single shell-isolation boundary. Sending
+  // the raw bounded command here avoids double wrapping and lets an exact
+  // 4,000-character computer_exec retain its documented limit.
   const body: any = await callBoxBroker(
     broker,
     "command",
-    { command: isolatedCommand, timeoutMs },
+    { command, timeoutMs },
     { timeoutMs: Math.min(timeoutMs + 5_000, 180_000), signal: proxyAbortController.signal },
   );
   if (body?.status === 409 && allowWake) {

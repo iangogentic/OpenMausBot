@@ -14,9 +14,20 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import { cancelSteeredMessages, drainSteeredMessages, queueSteeredMessage, _queuedCount, type SteerStore } from "./steer-queue.ts";
+import {
+  cancelSteeredMessages,
+  drainSteeredMessages,
+  MAX_QUEUED_STEER_BYTES,
+  MAX_QUEUED_STEER_MESSAGES,
+  MAX_QUEUED_STEER_MESSAGES_PER_THREAD,
+  pendingSteeredMessageSnapshot,
+  queueSteeredMessage,
+  _clearSteeredQueuesForTests,
+  _queuedCount,
+  type SteerStore,
+} from "./steer-queue.ts";
 import type { BotRecord, Message } from "./store.ts";
 
 const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +75,8 @@ function fakeStore(bots: BotRecord[]): SteerStore & { messages: Message[] } {
 }
 
 describe("steer-queue module", () => {
+  afterEach(() => _clearSteeredQueuesForTests());
+
   it("does not append a queued user message until drain", () => {
     const bot = fakeBot("bot-a", "thread-a", true);
     const store = fakeStore([bot]);
@@ -166,6 +179,45 @@ describe("steer-queue module", () => {
     }]);
     expect(run).not.toHaveBeenCalled();
     expect(_queuedCount(bot.threadId)).toBe(0);
+  });
+
+  it("exposes only the pending receipt fields needed to restore UI chips", () => {
+    const bot = fakeBot("bot-snapshot", "thread-snapshot", true);
+    const queued = queueSteeredMessage(bot, "visible pending text", {
+      prompt: "private provider prompt",
+      replyToId: "reply-id",
+    });
+
+    expect(pendingSteeredMessageSnapshot()).toContainEqual({
+      threadId: bot.threadId,
+      queueId: queued.id,
+      text: "visible pending text",
+    });
+    expect(JSON.stringify(pendingSteeredMessageSnapshot())).not.toContain("private provider prompt");
+    cancelSteeredMessages(fakeStore([bot]), bot.id);
+  });
+
+  it("bounds each chat and the process-wide pending queue", () => {
+    const bot = fakeBot("bounded", "bounded-thread", true);
+    for (let index = 0; index < MAX_QUEUED_STEER_MESSAGES_PER_THREAD; index += 1) {
+      queueSteeredMessage(bot, `chat-${index}`);
+    }
+    expect(() => queueSteeredMessage(bot, "one too many")).toThrow(/already has/);
+
+    _clearSteeredQueuesForTests();
+    for (let index = 0; index < MAX_QUEUED_STEER_MESSAGES; index += 1) {
+      queueSteeredMessage(fakeBot(`bot-${index}`, `thread-${index}`, true), "x");
+    }
+    expect(() => queueSteeredMessage(fakeBot("overflow", "overflow", true), "x"))
+      .toThrow(/queue is full/);
+  });
+
+  it("bounds aggregate queued display and provider text by UTF-8 bytes", () => {
+    const bot = fakeBot("bytes", "bytes-thread", true);
+    const half = "x".repeat(Math.floor(MAX_QUEUED_STEER_BYTES / 2));
+    queueSteeredMessage(bot, half, { prompt: half });
+    expect(() => queueSteeredMessage(fakeBot("more", "more-thread", true), "y"))
+      .toThrow(/text limit/);
   });
 
 });

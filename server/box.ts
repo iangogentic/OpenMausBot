@@ -15,7 +15,12 @@ import { createHash } from "node:crypto";
 import type { AppConfig } from "./config.ts";
 import { readBoundedResponseBytes, readBoundedResponseText } from "./bounded-response.ts";
 import { assertBoundedJsonShape, PROVIDER_NDJSON_LIMITS } from "./drivers/bounded-json-lines.ts";
-import { ensureRemoteCuaCommand, remoteComputerBootstrapCommand } from "./remote-computer.ts";
+import {
+  ensureRemoteCuaCommand,
+  isolatedRemoteCommand,
+  MAX_REMOTE_COMMAND_LENGTH,
+  remoteComputerBootstrapCommand,
+} from "./remote-computer.ts";
 
 // overridable so tests can point at a stub instead of the live provider
 const BOX_API = process.env.OMB_BOX_API || "https://ascii.dev/api/box/v1";
@@ -619,7 +624,8 @@ export type ScopedBoxOperation =
   | "events"
   | "interrupt";
 
-export const SCOPED_BOX_MAX_COMMAND_CHARS = 32_768;
+export const SCOPED_BOX_MAX_COMMAND_CHARS = MAX_REMOTE_COMMAND_LENGTH;
+export const SCOPED_BOX_MAX_TRUSTED_COMMAND_CHARS = 32_768;
 export const SCOPED_BOX_MAX_PROMPT_CHARS = 131_072;
 
 /** Execute the deliberately narrow Box API surface exposed by a turn-bound
@@ -630,20 +636,23 @@ export async function scopedBoxOperation(
   cfg: AppConfig,
   boxId: string,
   request: Record<string, unknown>,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; trustedProxyCommand?: boolean } = {},
 ): Promise<Record<string, unknown>> {
   const op = request.op as ScopedBoxOperation;
   if (!boxId) throw Object.assign(new Error("scoped Box id is missing"), { status: 403 });
   if (op === "command") {
     const command = typeof request.command === "string" ? request.command : "";
-    if (!command || command.length > SCOPED_BOX_MAX_COMMAND_CHARS) {
+    const commandLimit = options.trustedProxyCommand
+      ? SCOPED_BOX_MAX_TRUSTED_COMMAND_CHARS
+      : SCOPED_BOX_MAX_COMMAND_CHARS;
+    if (!command || command.length > commandLimit) {
       throw Object.assign(new Error("a bounded command is required"), { status: 400 });
     }
     const requestedTimeout = Number(request.timeoutMs);
     const timeoutMs = Number.isFinite(requestedTimeout)
       ? Math.max(100, Math.min(Math.trunc(requestedTimeout), 180_000))
       : 60_000;
-    return runCommand(cfg, boxId, command, { timeoutMs, signal: options.signal });
+    return runCommand(cfg, boxId, isolatedRemoteCommand(command), { timeoutMs, signal: options.signal });
   }
   if (op === "resume") {
     const result = await boxJson(cfg, `/boxes/${boxId}/resume`, { method: "POST", signal: options.signal });

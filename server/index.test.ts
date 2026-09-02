@@ -2259,6 +2259,16 @@ describe("harness HTTP API", () => {
         return groups.find((candidate: { id: string }) => candidate.id === room.id)?.busyBotId;
       }).toBe(bot.id);
 
+      const waiting = await api("POST", `/api/groups/${room.id}/messages`, {
+        text: "save these queued words but never run them after Stop",
+      });
+      expect(waiting).toMatchObject({ status: 202, body: { ok: true, queued: true } });
+      expect((await api("GET", "/api/bots")).body.pendingQueued).toContainEqual({
+        threadId: room.threadId,
+        queueId: waiting.body.queueId,
+        text: "save these queued words but never run them after Stop",
+      });
+
       // Fail only after the provider emitted its terminal event. This clears
       // the room's visible busyBotId and proves retry recovery comes from the
       // retained exact generation, not from mutable room UI state.
@@ -2267,6 +2277,21 @@ describe("harness HTTP API", () => {
       expect(failed.status).toBe(409);
       expect(failed.body.error).toMatch(/terminal cleanup/i);
       expect(readFileSync(fakeClaudeInterruptFailures, "utf8")).toBe("0");
+      const afterFailedStop = (await api("GET", "/api/bots")).body;
+      expect(afterFailedStop.pendingQueued).not.toContainEqual(expect.objectContaining({
+        queueId: waiting.body.queueId,
+      }));
+      const stoppedRoom = afterFailedStop.groups.find((candidate: { id: string }) => candidate.id === room.id);
+      expect(stoppedRoom.messages).toContainEqual(expect.objectContaining({
+        role: "user",
+        queueId: waiting.body.queueId,
+        text: "save these queued words but never run them after Stop",
+      }));
+      expect(stoppedRoom.messages).toContainEqual(expect.objectContaining({
+        role: "bot",
+        kind: "activity",
+        tool: expect.objectContaining({ name: expect.stringMatching(/saved here but not run because Stop/i) }),
+      }));
       await expect.poll(async () => {
         const groups = (await api("GET", "/api/bots")).body.groups;
         return groups.find((candidate: { id: string }) => candidate.id === room.id)?.busyBotId ?? null;

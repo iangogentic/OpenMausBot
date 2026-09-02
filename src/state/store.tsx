@@ -477,6 +477,37 @@ function rememberConsumedQueueId(consumed: Record<string, true>, queueId: string
   return next;
 }
 
+function pendingQueuedFromSnapshot(
+  items: Array<{ threadId: string; queueId: string; text: string }>,
+) {
+  const pending: Record<string, Array<{ queueId: string; text: string }>> = {};
+  for (const item of items) {
+    if (!item.threadId || !item.queueId || pending[item.threadId]?.some((entry) => entry.queueId === item.queueId)) continue;
+    (pending[item.threadId] ??= []).push({ queueId: item.queueId, text: item.text });
+  }
+  return pending;
+}
+
+function reconcilePendingQueuedSnapshot(
+  snapshot: Array<{ threadId: string; queueId: string; text: string }>,
+  current: Record<string, Array<{ queueId: string; text: string }>>,
+  idsAtSnapshotStart: string[] | undefined,
+) {
+  const pending = pendingQueuedFromSnapshot(snapshot);
+  if (!idsAtSnapshotStart) return pending;
+  const existedAtStart = new Set(idsAtSnapshotStart);
+  for (const [threadId, entries] of Object.entries(current)) {
+    for (const entry of entries) {
+      // A POST acknowledged after this GET began. The older snapshot cannot
+      // disprove it, and enqueue has no SSE creation frame to restore it.
+      if (existedAtStart.has(entry.queueId)) continue;
+      if (pending[threadId]?.some((candidate) => candidate.queueId === entry.queueId)) continue;
+      (pending[threadId] ??= []).push(entry);
+    }
+  }
+  return pending;
+}
+
 export type BotAnnouncement = Omit<Bot, "messages"> & { messages?: Message[] };
 
 export type Action =
@@ -487,6 +518,8 @@ export type Action =
       computerControl: Record<string, { held: boolean; helpReason: string | null }>;
       computerChildren: ComputerChildMonitor[];
       computerChildVisuals: ComputerChildVisualState[];
+      pendingQueued?: Array<{ threadId: string; queueId: string; text: string }>;
+      pendingQueuedIdsAtStart?: string[];
       /** Reject a snapshot that started before a later navigation. */
       selectionEpoch?: number;
     }
@@ -696,6 +729,13 @@ function reduceAppState(state: AppState, action: Action): AppState {
           Object.fromEntries(action.computerChildVisuals.map((visual) => [visual.childId, visual])),
           computerChildren,
         ),
+        pendingQueued: action.pendingQueued
+          ? reconcilePendingQueuedSnapshot(
+              action.pendingQueued,
+              state.pendingQueued,
+              action.pendingQueuedIdsAtStart,
+            )
+          : state.pendingQueued,
         selectedId,
         hasHydrated: true,
         pendingPersistedSelectionId: "",
@@ -1921,10 +1961,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     let alive = true;
     let hydrationGeneration = 0;
     let rehydrateRequested = false;
-    const loadAll = (generation: number, selectionEpochAtStart: number) =>
+    const loadAll = (
+      generation: number,
+      selectionEpochAtStart: number,
+      pendingQueuedIdsAtStart: string[],
+    ) =>
       Promise.all([
         api(screenTransportUrl("/api/bots", computerScreensVisible))
-          .then(({ bots, groups, computerControl, computerChildren, computerChildVisuals }) => {
+          .then(({ bots, groups, computerControl, computerChildren, computerChildVisuals, pendingQueued }) => {
             if (!alive || generation !== hydrationGeneration) return;
             rawDispatch({
               type: "hydrate",
@@ -1933,6 +1977,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               computerControl: computerControl ?? {},
               computerChildren: computerChildren ?? [],
               computerChildVisuals: computerChildVisuals ?? [],
+              pendingQueued: Array.isArray(pendingQueued) ? pendingQueued : undefined,
+              pendingQueuedIdsAtStart,
               selectionEpoch: selectionEpochAtStart,
             });
           })
@@ -1963,6 +2009,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const hydrate = () => {
       const generation = ++hydrationGeneration;
       const selectionEpochAtStart = stateRef.current.selectionEpoch;
+      const pendingQueuedIdsAtStart = Object.values(stateRef.current.pendingQueued)
+        .flat()
+        .map((entry) => entry.queueId);
       if (hydrating) {
         // A second non-resumable hello means this snapshot may have started
         // before another connection gap. Run one more after it settles.
@@ -1971,7 +2020,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
       hydrating = true;
       hydrated = false;
-      void loadAll(generation, selectionEpochAtStart).finally(() => {
+      void loadAll(generation, selectionEpochAtStart, pendingQueuedIdsAtStart).finally(() => {
         if (!alive) return;
         hydrating = false;
         if (rehydrateRequested) {
