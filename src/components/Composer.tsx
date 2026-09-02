@@ -1,6 +1,6 @@
 import { track } from "@/lib/analytics";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users, X } from "lucide-react";
+import { ArrowUp, Check, Clock, Hand, Mic, Paperclip, ShieldCheck, Square, Users } from "lucide-react";
 import { useStore, visibleMessages, type Bot, type Group, type Message } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { useComposerDraft } from "@/lib/drafts";
@@ -275,16 +275,11 @@ export function Composer({
     });
   };
 
-  // Rooms hold one message client-side while a member speaks; it auto-sends
-  // the moment the room settles. 1:1 mid-turn sends still POST (the harness
-  // queue), but stay off the transcript until drain — the chip here is the
-  // pending row so they cannot become the active leaf mid-turn.
-  const [queued, setQueued] = useState<{ text: string; replyToId?: string } | null>(null);
-  const pendingChip = group
-    ? queued?.text
-    : bot
-      ? state.pendingQueued?.[bot.threadId]?.map((entry) => entry.text).join("\n")
-      : undefined;
+  // Busy sends belong to the harness immediately. A composer-local channel
+  // queue was lost when navigation unmounted this component.
+  const pendingChip = state.pendingQueued?.[group?.threadId ?? bot?.threadId ?? ""]
+    ?.map((entry) => entry.text)
+    .join("\n");
   // a chip on its own is a message: the send control has to appear for it
   const fileInput = useRef<HTMLInputElement>(null);
   const [autoWarn, setAutoWarn] = useState(false);
@@ -330,16 +325,9 @@ export function Composer({
     }
     const t = composeMessage(text, attachments);
     if (!t) return;
-    if (busy && group) {
-      setQueued({ text: t, replyToId: replyTo?.id });
-      setText("");
-      setAttachments([]);
-      onClearReply?.();
-      return;
-    }
     if (group) {
       dispatch({ type: "sendGroup", groupId: group.id, text: t, replyToId: replyTo?.id });
-      track("message_sent", { room: true });
+      track("message_sent", { room: true, queued: busy });
     } else if (bot) {
       dispatch({ type: "send", botId: bot.id, text: t, replyToId: replyTo?.id });
       track("message_sent", { driver: bot.modelSelection?.instanceId, queued: busy && !canSteer });
@@ -348,19 +336,6 @@ export function Composer({
     setAttachments([]);
     onClearReply?.();
   };
-  useEffect(() => {
-    if (busy || !queued) return;
-    if (group) {
-      if (queued.text.includes("<attached-image ") && !imageTargetsSupport(queued.text)) {
-        dispatch({ type: "error", message: "The selected responder does not support image attachments." });
-        setQueued(null);
-        return;
-      }
-      dispatch({ type: "sendGroup", groupId: group.id, text: queued.text, replyToId: queued.replyToId });
-      track("message_sent", { room: true, queued: true });
-    }
-    setQueued(null);
-  }, [busy, queued, group, members, state.instances, dispatch]);
 
   // native dictation: partials stream into the input while the Swift
   // helper runs; the final transcript stays in the box, ready to edit/send
@@ -419,15 +394,6 @@ export function Composer({
             <span className="min-w-0 flex-1 truncate">
               Queued — sends when {busyName} finishes: “{pendingChip}”
             </span>
-            {group && (
-              <button
-                onClick={() => setQueued(null)}
-                aria-label="Discard queued message"
-                className="rounded p-0.5 hover:bg-raised hover:text-ink"
-              >
-                <X size={13} />
-              </button>
-            )}
           </div>
         )}
         {pickerOpen && (

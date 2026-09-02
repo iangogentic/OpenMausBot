@@ -34,7 +34,6 @@ import { LocalScreenPreview } from "./LocalScreenPreview";
 import { LinuxLocalControl } from "./LinuxLocalControl";
 import { MacLocalControl } from "./MacLocalControl";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
-import { ComputerSessionStrip } from "./ComputerSessionStrip";
 import { ComputerChildMonitorStrip } from "./ComputerChildMonitorStrip";
 import {
   autoSelectsLocalComputer,
@@ -1430,15 +1429,6 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           <span>Collapse</span>
         </button>
       </div>
-
-      <ComputerSessionStrip
-        bots={state.bots}
-        screens={state.screens}
-        computerControl={state.computerControl}
-        selectedBotId={bot.id}
-        dispatch={dispatch}
-        variant="panel"
-      />
 
       <ComputerChildMonitorStrip
         monitors={state.computerChildren}

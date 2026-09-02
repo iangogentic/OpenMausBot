@@ -36,7 +36,7 @@ describe("ComputerChildMonitorStrip", () => {
     expect(markup).not.toContain("turn-a");
   });
 
-  it("keeps active children and bounds terminal history", () => {
+  it("shows only actionable children and leaves terminal frames in the conversation", () => {
     const monitors = {
       active: monitor("active", "waiting-on-human", 1),
       newest: monitor("newest", "completed", 4),
@@ -48,8 +48,8 @@ describe("ComputerChildMonitorStrip", () => {
       visuals: {},
     }));
     expect(markup).toContain('data-computer-child="active"');
-    expect(markup).toContain('data-computer-child="newest"');
-    expect(markup).toContain('data-computer-child="recent"');
+    expect(markup).not.toContain('data-computer-child="newest"');
+    expect(markup).not.toContain('data-computer-child="recent"');
     expect(markup).not.toContain('data-computer-child="old"');
     expect(markup).toContain("Waiting for you");
   });
@@ -70,6 +70,7 @@ describe("ComputerChildMonitorStrip", () => {
       },
     }));
     expect(markup).toContain(`data:image/png;base64,${data}`);
+    expect(markup.match(new RegExp(data, "g"))).toHaveLength(1);
     expect(markup).toContain("data-computer-child-cursor");
     expect(markup).toContain("left:25%");
     expect(markup).toContain("top:20%");

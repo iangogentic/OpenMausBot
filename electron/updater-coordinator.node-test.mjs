@@ -14,7 +14,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function harness() {
+function harness(options) {
   const updater = new EventEmitter();
   // electron-updater has its own error listener; model that without routing it.
   updater.on("error", () => {});
@@ -23,7 +23,7 @@ function harness() {
   const coordinator = createUpdaterCoordinator(updater, (patch) => {
     state = { ...state, ...patch };
     states.push({ ...state });
-  });
+  }, options);
   return { updater, coordinator, states, getState: () => state };
 }
 
@@ -166,6 +166,40 @@ test("a synchronous install failure becomes a user-visible error", () => {
   coordinator.install();
 
   assert.deepEqual(getState(), { status: "error", message: "install threw" });
+});
+
+test("a package hand-off receives the staged file and never quits the app", async () => {
+  const received = [];
+  const { updater, coordinator, getState } = harness({
+    handOffInstall: async (files) => {
+      received.push(files);
+      return { command: "sudo apt-get install -y '/tmp/update.deb'", terminalOpened: true };
+    },
+  });
+  updater.downloadUpdate = () => Promise.resolve(["/tmp/update.deb"]);
+  updater.quitAndInstall = () => assert.fail("hand-off must not quit the running app");
+
+  await coordinator.download();
+  coordinator.install();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(received, [["/tmp/update.deb"]]);
+  assert.deepEqual(getState(), {
+    status: "handed-off",
+    command: "sudo apt-get install -y '/tmp/update.deb'",
+    terminalOpened: true,
+  });
+});
+
+test("a failed package hand-off becomes a visible error", async () => {
+  const { coordinator, getState } = harness({
+    handOffInstall: () => Promise.reject(new Error("package disappeared")),
+  });
+
+  coordinator.install();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(getState(), { status: "error", message: "package disappeared" });
 });
 
 test("an active download state survives a later background check failure", async () => {

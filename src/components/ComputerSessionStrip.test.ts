@@ -69,21 +69,15 @@ describe("ComputerSessionStrip", () => {
     expect(openMarkup).toContain('data-computer-session-overflow-bot="f"');
   });
 
-  it("never substitutes one bot's frame for another bot", () => {
+  it("uses a compact status switcher without rendering peer screen pixels", () => {
     const markup = render(["a", "b"]);
     const aFrame = Buffer.from("pixels-a").toString("base64");
     const bFrame = Buffer.from("pixels-b").toString("base64");
 
-    expect(markup).toContain(`data:image/png;base64,${aFrame}`);
-    expect(markup).toContain(`data:image/png;base64,${bFrame}`);
-    expect(markup).toContain('data-screen-bot-id="a"');
-    expect(markup).toContain('data-screen-bot-id="b"');
-    const aTile = markup.match(/data-computer-session-bot="a"[\s\S]*?<\/button>/)?.[0] ?? "";
-    const bTile = markup.match(/data-computer-session-bot="b"[\s\S]*?<\/button>/)?.[0] ?? "";
-    expect(aTile).toContain(aFrame);
-    expect(aTile).not.toContain(bFrame);
-    expect(bTile).toContain(bFrame);
-    expect(bTile).not.toContain(aFrame);
+    expect(markup).toContain("Switch computer");
+    expect(markup).not.toContain(aFrame);
+    expect(markup).not.toContain(bFrame);
+    expect(markup).not.toContain("data-screen-bot-id");
   });
 
   it("is absent for one session and hides every tile when collapsed", () => {

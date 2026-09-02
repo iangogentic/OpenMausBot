@@ -136,9 +136,11 @@ export function ComputerChildMonitorStrip({
   const children = Object.values(monitors)
     .filter((monitor) => monitor.parent.botId === botId && monitor.parent.threadId === threadId)
     .sort((a, b) => b.createdAt - a.createdAt);
-  const visible = children.filter((monitor) => !terminal.has(monitor.status)).concat(
-    children.filter((monitor) => terminal.has(monitor.status)).slice(0, 2),
-  );
+  // Completed operators already publish one fenced final frame into the
+  // conversation. Keeping their thumbnail and a second large stage here made
+  // opening one bot's Computer panel look like several computers were open.
+  // This live surface is only for operators that are still actionable.
+  const visible = children.filter((monitor) => !terminal.has(monitor.status));
   const selected = visible.find((monitor) => monitor.childId === requestedChildId) ?? visible[0] ?? null;
   const visibleIds = new Set(visible.map((monitor) => monitor.childId));
   for (const childId of receivedFrames.current.keys()) {
@@ -215,11 +217,9 @@ export function ComputerChildMonitorStrip({
                 isSelected ? "border-accent/55 bg-accent/10" : "border-transparent bg-panel/75 hover:border-hairline hover:bg-raised/75",
               )}
             >
-              {computerChildFrameSrc(visual) ? <div className="mr-1 shrink-0"><ChildFrame visual={visual} /></div> : (
-                <span className="mr-1 flex aspect-video w-20 shrink-0 items-center justify-center rounded-md bg-inset text-ink-secondary/65">
-                  <Monitor size={16} aria-hidden="true" />
-                </span>
-              )}
+              <span className="mr-1 flex size-7 shrink-0 items-center justify-center rounded-md bg-inset text-ink-secondary/65">
+                <Monitor size={15} aria-hidden="true" />
+              </span>
               <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                 <span className="flex min-w-0 items-center justify-between gap-3">
                   <span className={cn(

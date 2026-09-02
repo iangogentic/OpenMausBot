@@ -1791,9 +1791,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           break;
         }
         case "sendGroup":
-          api(`/api/groups/${action.groupId}/messages`, {
+          void api(`/api/groups/${action.groupId}/messages`, {
             method: "POST",
             body: JSON.stringify({ text: action.text, replyToId: action.replyToId }),
+          }).then((body) => {
+            const group = stateRef.current.groups.find((candidate) => candidate.id === action.groupId);
+            if (
+              body?.queued && group &&
+              typeof body.threadId === "string" &&
+              typeof body.queueId === "string"
+            ) {
+              rawDispatch({
+                type: "pendingQueued",
+                threadId: body.threadId,
+                queueId: body.queueId,
+                text: action.text,
+              });
+            }
           }).catch(showError);
           break;
         case "patchGroup":

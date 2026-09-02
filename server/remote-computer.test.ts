@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   ensureRemoteCuaCommand,
+  isolatedRemoteCommand,
+  MAX_REMOTE_COMMAND_LENGTH,
   REMOTE_CUA_EXECUTABLE,
   REMOTE_CDP_HELPER_SOURCE,
   REMOTE_CUA_SOCKET,
@@ -45,6 +47,27 @@ describe("remote Cua computer setup", () => {
     expect(command).not.toContain("$HOME");
   });
 
+  it("keeps untrusted bot names inert in the nested tmux shell", () => {
+    const name = '$(touch /tmp/pwned) `touch /tmp/also-pwned`';
+    const command = remoteComputerBootstrapCommand(name);
+    expect(command).not.toContain(name);
+    expect(command).not.toContain("$(touch /tmp/pwned)");
+    expect(command).not.toContain("`touch /tmp/also-pwned`");
+    if (process.platform !== "win32") {
+      expect(spawnSync("/bin/bash", ["-n"], { input: command }).status).toBe(0);
+    }
+  });
+
+  it("shares one bounded credential-isolated remote command contract", () => {
+    expect(MAX_REMOTE_COMMAND_LENGTH).toBe(4_000);
+    const command = isolatedRemoteCommand("printf %s \\\"$SECRET\\\"");
+    expect(command).toContain('exec env -i HOME="$HOME"');
+    expect(command).toContain("/bin/bash -c");
+    if (process.platform !== "win32") {
+      expect(spawnSync("/bin/bash", ["-n", "-c", command]).status).toBe(0);
+    }
+  });
+
   it("bounds remote DevTools HTTP, WebSocket, pending, JSON, and AX-tree work", () => {
     expect(spawnSync(process.execPath, ["--input-type=module", "--check"], { input: REMOTE_CDP_HELPER_SOURCE }).status).toBe(0);
     expect(REMOTE_CDP_HELPER_SOURCE).toContain("HTTP_MAX_BYTES = 1024 * 1024");
@@ -55,6 +78,8 @@ describe("remote Cua computer setup", () => {
     expect(REMOTE_CDP_HELPER_SOURCE).toContain("MAX_JSON_DEPTH = 32");
     expect(REMOTE_CDP_HELPER_SOURCE).toContain("MAX_JSON_NODES = 50000");
     expect(REMOTE_CDP_HELPER_SOURCE).toContain("AX_MAX_SCANNED_NODES = 10000");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("totalInteractive");
+    expect(REMOTE_CDP_HELPER_SOURCE).toContain("truncated: totalInteractive > elements.length");
     expect(REMOTE_CDP_HELPER_SOURCE).toContain('TextDecoder("utf-8", { fatal: true })');
     expect(REMOTE_CDP_HELPER_SOURCE).toContain('import net from "node:net"');
     expect(REMOTE_CDP_HELPER_SOURCE).not.toContain("new WebSocket");

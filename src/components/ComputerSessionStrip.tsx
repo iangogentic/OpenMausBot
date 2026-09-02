@@ -13,7 +13,6 @@ import { cn } from "@/lib/cn";
 import {
   COMPUTER_SESSION_DIRECT_LIMIT,
   computerSessionStatus,
-  computerSessionThumbnailSrc,
   deriveComputerSessions,
   nextComputerSessionFocusIndex,
   openComputerSession,
@@ -44,41 +43,11 @@ function statusTone(session: ComputerSession): string {
   return "bg-ink-secondary";
 }
 
-function ScreenThumbnail({ session, compact = false }: { session: ComputerSession; compact?: boolean }) {
-  const src = useMemo(() => computerSessionThumbnailSrc(session.screen), [session.screen]);
-  return (
-    <span
-      className={cn(
-        "relative flex shrink-0 items-center justify-center overflow-hidden bg-inset",
-        compact ? "size-10 rounded-md" : "aspect-video w-full rounded-md",
-      )}
-    >
-      {src ? (
-        <img
-          src={src}
-          alt={`${session.bot.name}'s computer preview`}
-          draggable={false}
-          data-screen-bot-id={session.bot.id}
-          className="size-full object-cover object-top"
-        />
-      ) : (
-        <Monitor size={compact ? 16 : 20} aria-hidden="true" className="text-ink-secondary/65" />
-      )}
-      <span
-        aria-hidden="true"
-        className={cn(
-          "absolute right-1 top-1 size-2 rounded-full ring-2 ring-inset ring-panel",
-          statusTone(session),
-        )}
-      />
-    </span>
-  );
-}
-
 function SessionName({ session }: { session: ComputerSession }) {
   return (
-    <span className="mt-1 flex min-w-0 items-center gap-1.5 px-0.5">
+    <span className="flex min-w-0 items-center gap-1.5 px-0.5">
       <BotAvatar bot={session.bot} state={session.busy ? "working" : "idle"} size={18} animated={false} />
+      <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", statusTone(session))} />
       <span className="min-w-0 flex-1">
         <span className="block truncate text-[11px] font-medium leading-tight text-ink">{session.bot.name}</span>
         <span className="block truncate text-[9px] leading-tight text-ink-secondary">{computerSessionStatus(session)}</span>
@@ -183,7 +152,7 @@ export function ComputerSessionStrip({
         <div className="flex items-center justify-between gap-2 px-1">
           <span className="flex min-w-0 items-center gap-1.5 text-[11px] font-medium text-ink-secondary">
             <Monitor size={13} aria-hidden="true" />
-            <span className="truncate">Computer sessions</span>
+            <span className="truncate">Switch computer</span>
             <span className="rounded-full bg-raised px-1.5 py-0.5 tabular-nums">{sessions.length}</span>
           </span>
           <button
@@ -221,13 +190,12 @@ export function ComputerSessionStrip({
                   data-computer-session-bot={session.bot.id}
                   data-selected={session.selected ? "true" : undefined}
                   className={cn(
-                    "min-w-0 rounded-lg border p-1 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+                    "min-w-0 rounded-lg border px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
                     session.selected
                       ? "border-accent/70 bg-accent/10"
                       : "border-transparent bg-inset/60 hover:border-hairline hover:bg-raised/70",
                   )}
                 >
-                  <ScreenThumbnail session={session} />
                   <SessionName session={session} />
                 </button>
               ))}
@@ -285,7 +253,8 @@ export function ComputerSessionStrip({
                         data-computer-session-overflow-bot={session.bot.id}
                         className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
                       >
-                        <ScreenThumbnail session={session} compact />
+                        <BotAvatar bot={session.bot} state={session.busy ? "working" : "idle"} size={24} animated={false} />
+                        <span aria-hidden="true" className={cn("size-2 shrink-0 rounded-full", statusTone(session))} />
                         <span className="min-w-0 flex-1">
                           <span className="block truncate text-[12px] font-medium text-ink">{session.bot.name}</span>
                           <span className="block truncate text-[11px] text-ink-secondary">{computerSessionStatus(session)}</span>

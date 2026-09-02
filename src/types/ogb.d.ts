@@ -233,10 +233,14 @@ export interface UpdaterState {
     | "downloading"
     | "downloaded"
     | "installing"
+    | "handed-off"
     | "error";
   version?: string;
   percent?: number;
   message?: string;
+  installMode?: "restart" | "handoff";
+  command?: string;
+  terminalOpened?: boolean;
 }
 
 export interface CompanionAccountState {

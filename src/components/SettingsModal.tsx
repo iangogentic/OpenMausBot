@@ -89,7 +89,11 @@ function UpdatesRow() {
         : s?.status === "downloading"
           ? `Downloading ${Math.round(s.percent ?? 0)}%`
           : s?.status === "downloaded"
-            ? `${s.version} ready — restart to apply`
+            ? s.installMode === "handoff"
+              ? `${s.version} ready — finish in a terminal`
+              : `${s.version} ready — restart to apply`
+            : s?.status === "handed-off"
+              ? "Install command copied — finish in the terminal."
             : s?.status === "error"
               ? `Check failed: ${s.message ?? "unknown error"}`
               : "You're on the latest version we know of.";
@@ -107,7 +111,7 @@ function UpdatesRow() {
         {s?.status === "available"
           ? "Download"
           : s?.status === "downloaded"
-            ? "Restart and install"
+            ? s.installMode === "handoff" ? "Open install terminal" : "Restart and install"
             : "Check for updates"}
       </button>
     </Card>

@@ -1,5 +1,6 @@
-export function createUpdaterCoordinator(updater, setState) {
+export function createUpdaterCoordinator(updater, setState, { handOffInstall = null } = {}) {
   let checkOperation = null;
+  let downloadedFiles = null;
   let downloadOperation = null;
   let installOperation = null;
   const routedErrors = new WeakSet();
@@ -101,6 +102,9 @@ export function createUpdaterCoordinator(updater, setState) {
     try {
       operation.promise = Promise.resolve(updater.downloadUpdate())
         .then((result) => {
+          if (!operation.failed) {
+            downloadedFiles = Array.isArray(result) ? result.filter((file) => typeof file === "string") : null;
+          }
           if (!operation.failed && operation.downloadedInfo) {
             setState({ status: "downloaded", version: operation.downloadedInfo?.version });
           }
@@ -120,6 +124,10 @@ export function createUpdaterCoordinator(updater, setState) {
 
   function install() {
     if (installOperation) return;
+    if (handOffInstall) {
+      handOff();
+      return;
+    }
     const operation = { failed: false, timer: null };
     installOperation = operation;
     setState({ status: "installing" });
@@ -139,6 +147,23 @@ export function createUpdaterCoordinator(updater, setState) {
       }, 2 * 60 * 1000);
       operation.timer.unref?.();
     }
+  }
+
+  function handOff() {
+    const operation = { failed: false, timer: null };
+    installOperation = operation;
+    setState({ status: "installing" });
+    Promise.resolve()
+      .then(() => handOffInstall(downloadedFiles))
+      .then((patch) => {
+        if (installOperation !== operation) return;
+        installOperation = null;
+        setState({ status: "handed-off", ...patch });
+      })
+      .catch((error) => {
+        if (installOperation !== operation) return;
+        routeError(true, error);
+      });
   }
 
   return { check, download, install };

@@ -128,6 +128,7 @@ import { searchMessages } from "./message-db.ts";
 import { promptWithReply, transcriptText } from "./replies.ts";
 import { _loadPending, cancelDelegationsForBot, discardDelegations, drainDelegations, pendingDelegationSnapshot, pendingThreads, queueDelegation, type QueueResult } from "./delegations.ts";
 import { cancelSteeredMessages, drainSteeredMessages, queueSteeredMessage } from "./steer-queue.ts";
+import { drainChannelMessages, queueChannelMessage } from "./channel-queue.ts";
 import { EventBus } from "./harness/bus.ts";
 import { ProviderRegistry } from "./harness/registry.ts";
 import { cancelPeerApprovalsFor, cancelPeerApprovalsForThread, dismissStalePeerCards, requestPeerApproval, resolvePeerComms, type ApprovalBus } from "./peer-approval.ts";
@@ -5416,7 +5417,39 @@ async function runGroupMemberTurn(
   return true;
 }
 
-function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
+function groupIsWorking(group: GroupRecord): boolean {
+  return Boolean(group.busyBotId) || (groupTurnBatches.get(group.id)?.size ?? 0) > 0;
+}
+
+function drainQueuedChannelSends(): void {
+  drainChannelMessages(
+    (groupId) => {
+      const group = store.group(groupId);
+      return group ? groupIsWorking(group) : false;
+    },
+    ({ groupId, text, replyToId, id }) => {
+      const group = store.group(groupId);
+      if (!group) return;
+      try {
+        const replyTo = replyToId ? resolveReplyTarget(group.threadId, replyToId) : undefined;
+        startGroupTurn(groupId, text, replyTo, id);
+      } catch (error) {
+        store.appendMessage(group.threadId, {
+          role: "bot",
+          kind: "activity",
+          tool: {
+            name: `error: queued channel message could not start — ${(error instanceof Error ? error.message : String(error)).slice(0, 120)}`,
+            ok: false,
+          },
+        });
+      }
+      // No eligible responder means no new operation will call us again.
+      queueMicrotask(drainQueuedChannelSends);
+    },
+  );
+}
+
+function startGroupTurn(groupId: string, text: string, replyTo?: Message, queueId?: string) {
   if (shutdownStarted) {
     throw Object.assign(new Error("OpenMausBot is shutting down — no new room turn was started"), { status: 503 });
   }
@@ -5438,7 +5471,7 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
       status: 409,
     });
   }
-  store.appendMessage(group.threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id });
+  store.appendMessage(group.threadId, { role: "user", kind: "text", text, replyToId: replyTo?.id, queueId });
 
   const members = group.memberIds
     .map((id) => store.bot(id))
@@ -5510,6 +5543,7 @@ function startGroupTurn(groupId: string, text: string, replyTo?: Message) {
     } finally {
       if (activeGroupTurnBatches.get(groupId) === batch) activeGroupTurnBatches.delete(groupId);
       forgetGroupBatch(batch);
+      drainQueuedChannelSends();
     }
   });
   groupQueues.set(groupId, next.catch(() => {}));
@@ -8580,6 +8614,10 @@ const server = createServer(async (req, res) => {
       const group = store.group(m[1]);
       if (!group) return json(res, 404, { error: "no such group" });
       const replyTo = resolveReplyTarget(group.threadId, body.replyToId);
+      if (groupIsWorking(group)) {
+        const queued = queueChannelMessage(group.id, group.threadId, text, { replyToId: replyTo?.id });
+        return json(res, 202, { ok: true, queued: true, queueId: queued.id, threadId: group.threadId });
+      }
       startGroupTurn(group.id, text, replyTo);
       return json(res, 202, { ok: true });
     }

@@ -34,7 +34,7 @@
     "typecheck": "tsc -b && tsc -p tsconfig.server.json",
     "test": "node scripts/test-floor.mjs && pnpm broker:test && pnpm test:electron-node && pnpm test:packaged-server",
     "test:electron-node": "node scripts/test-electron-node.mjs",
-    "test:updater": "node --test electron/updater-coordinator.node-test.mjs",
+    "test:updater": "node --test electron/updater-coordinator.node-test.mjs electron/package-install-command.node-test.mjs electron/vendor-updater.node-test.mjs",
     "test:desktop-viewer": "node --test electron/desktop-viewer.node-test.mjs",
     "test:ui-session": "node --test electron/ui-session.node-test.mjs electron/companion-launch.node-test.mjs",
     "test:package-link": "node --test electron/package-link.node-test.mjs",

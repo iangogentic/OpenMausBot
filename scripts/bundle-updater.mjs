@@ -5,11 +5,14 @@
 // stays external (resolved from the runtime). Output ships via files:electron/**.
 import { build } from "esbuild";
 import { createRequire } from "node:module";
+import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { patchAppImageUpdater } from "./patch-appimage-updater.mjs";
 
 const require = createRequire(import.meta.url);
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const outfile = join(root, "electron/vendor/electron-updater.cjs");
 
 await build({
   entryPoints: [require.resolve("electron-updater")],
@@ -18,6 +21,9 @@ await build({
   target: "node20",
   format: "cjs",
   external: ["electron"],
-  outfile: join(root, "electron/vendor/electron-updater.cjs"),
+  outfile,
   logLevel: "info",
 });
+
+await writeFile(outfile, patchAppImageUpdater(await readFile(outfile, "utf8")));
+console.log("patched AppImage install to overwrite in place");

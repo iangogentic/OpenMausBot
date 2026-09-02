@@ -220,9 +220,9 @@ contextBridge.exposeInMainWorld("ogb", {
   /** Store a provider credential with OS-backed encryption. */
   setCredential: (name, value) => invokePrivileged("credential:set", name, value),
 
-  /** In-app auto-update. State object:
-   *  { status: "idle"|"checking"|"available"|"downloading"|"downloaded"|"error",
-   *    version?, percent?, message? }. onState fires immediately with the
+  /** In-app auto-update. State includes progress plus whether applying the
+   * update restarts in place or hands an install command to a terminal.
+   * onState fires immediately with the
    *    current state, then on every transition. Dormant in dev (no bridge). */
   updater: {
     check: () => invokePrivileged("update:check"),

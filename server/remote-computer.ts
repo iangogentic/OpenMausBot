@@ -381,6 +381,7 @@ if (action === "snapshot") {
   const useful = new Set(["button", "checkbox", "combobox", "heading", "link", "menuitem", "radio", "searchbox", "slider", "spinbutton", "switch", "tab", "textbox"]);
   const elements = [];
   let scanned = 0;
+  let totalInteractive = 0;
   for (const node of nodes) {
     scanned += 1;
     if (scanned > AX_MAX_SCANNED_NODES) throw new Error("accessibility tree exceeded its scan limit");
@@ -388,11 +389,17 @@ if (action === "snapshot") {
     const name = String(node.name?.value ?? "").replace(/\s+/g, " ").trim().slice(0, 180);
     const backend = Number(node.backendDOMNodeId ?? 0);
     if (!backend || !useful.has(role) || (!name && role !== "textbox" && role !== "searchbox")) continue;
+    totalInteractive += 1;
     const disabled = node.properties?.some((property) => property.name === "disabled" && property.value?.value === true) ?? false;
-    elements.push({ ref: "b" + backend, role, name: name || "unnamed", disabled });
-    if (elements.length >= 250) break;
+    if (elements.length < 250) elements.push({ ref: "b" + backend, role, name: name || "unnamed", disabled });
   }
-  process.stdout.write(JSON.stringify({ title: String(page.title ?? "").slice(0, 200), url: page.url, elements }));
+  process.stdout.write(JSON.stringify({
+    title: String(page.title ?? "").slice(0, 200),
+    url: page.url,
+    elements,
+    totalInteractive,
+    truncated: totalInteractive > elements.length,
+  }));
 } else if (action === "click") {
   const backendNodeId = refId(input.ref);
   const { model } = await send("DOM.getBoxModel", { backendNodeId });
@@ -420,6 +427,27 @@ if (action === "snapshot") {
 }`;
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+
+export const MAX_REMOTE_COMMAND_LENGTH = 4_000;
+
+/** Run a user- or model-supplied command without inheriting provider or
+ * account credentials from an older remote image. Keep this shared by every
+ * remote command surface so owner and bot execution cannot drift apart. */
+export function isolatedRemoteCommand(command: string): string {
+  return [
+    "exec env -i",
+    'HOME="$HOME"',
+    'USER="${USER:-$(id -un)}"',
+    'LOGNAME="${LOGNAME:-${USER:-$(id -un)}}"',
+    'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+    'DISPLAY="${DISPLAY:-:0}"',
+    'XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"',
+    'XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"',
+    'DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}"',
+    "/bin/bash -c",
+    shellQuote(command),
+  ].join(" ");
+}
 
 /** Start the already-installed daemon after a box resume. This is cheap when
  * it is healthy and intentionally does not install anything on the hot path. */
@@ -458,7 +486,15 @@ export function remoteComputerBootstrapCommand(botName: string): string {
     `touch /opt/ogb/cua-${REMOTE_CUA_VERSION}-ready`,
     'rm -f "$wheel"',
   ].join("\n");
-  const safeName = botName.replace(/["'\\]/g, "");
+  // A display name is untrusted. Encode the banner before composing the
+  // nested tmux shell so substitutions and backticks never become syntax.
+  const banner = Buffer.from(`  ▦ ${botName}'s computer — OpenMausBot`).toString("base64");
+  const tmuxSessionCommand = [
+    "echo",
+    `printf %s ${shellQuote(banner)} | base64 -d`,
+    "echo",
+    "exec bash -i",
+  ].join("; ");
   return [
     "if ! command -v xdotool >/dev/null || ! command -v convert >/dev/null || ! command -v curl >/dev/null || ! command -v python3 >/dev/null; then sudo apt-get update -qq || true; sudo apt-get install -y -qq ca-certificates curl python3 gnome-screenshot xclip wmctrl xdotool imagemagick scrot >/dev/null 2>&1 || true; fi",
     "sudo mkdir -p /opt/ogb/run",
@@ -467,7 +503,7 @@ export function remoteComputerBootstrapCommand(botName: string): string {
     'pkill -f "^/opt/ogb/venv/bin/python -m computer_server( |$)" >/dev/null 2>&1 || true',
     `[ -f /opt/ogb/cua-${REMOTE_CUA_VERSION}-ready ] || [ -f /tmp/ogb-cua-installing ] || { touch /tmp/ogb-cua-installing; nohup bash -c ${shellQuote(installer)} > /tmp/ogb-cua-install.log 2>&1 & }`,
     ensureRemoteCuaCommand(),
-    `tmux has-session -t work 2>/dev/null || tmux new-session -d -s work 'echo; echo "  ▦ ${safeName}'"'"'s computer — OpenMausBot"; echo; exec bash -i'`,
+    `tmux has-session -t work 2>/dev/null || tmux new-session -d -s work ${shellQuote(tmuxSessionCommand)}`,
     "echo bootstrapped",
   ].join("\n");
 }

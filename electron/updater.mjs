@@ -7,10 +7,12 @@
 // the approved publisher is pinned. In dev it's a no-op.
 // electron-updater is vendored (electron/vendor/electron-updater.cjs) because
 // the packaged app ships no node_modules.
-import { app, ipcMain } from "electron";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { app, clipboard, ipcMain } from "electron";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { HAND_OFF_PACKAGE_TYPES, linuxPackageType, packageInstallCommand, stagedInstallFile } from "./package-install-command.mjs";
+import { openBlankTerminal } from "./terminal-launch.mjs";
 import { createUpdaterCoordinator } from "./updater-coordinator.mjs";
 
 const require = createRequire(import.meta.url);
@@ -36,6 +38,17 @@ function updaterLogger() {
     }
   };
   return Object.fromEntries(["debug", "info", "warn", "error"].map((level) => [level, (...values) => write(level, values)]));
+}
+
+const HAND_OFF_TYPES = new Set(HAND_OFF_PACKAGE_TYPES);
+
+export function handOffDownloadedPackage(packageType) {
+  return async (files) => {
+    const target = stagedInstallFile(files);
+    const command = packageInstallCommand(packageType, target);
+    clipboard.writeText(command);
+    return { command, terminalOpened: await openBlankTerminal() };
+  };
 }
 
 function setState(patch) {
@@ -76,7 +89,14 @@ export function startUpdater(mainWindow) {
   autoUpdater.autoInstallOnAppQuit = process.platform === "darwin";
   autoUpdater.logger = updaterLogger();
 
-  updaterCoordinator = createUpdaterCoordinator(autoUpdater, setState);
+  const packageType = linuxPackageType({
+    readMarker: (file) => (existsSync(file) ? readFileSync(file, "utf8") : null),
+  });
+  const handOff = HAND_OFF_TYPES.has(packageType);
+  setState({ installMode: handOff ? "handoff" : "restart" });
+  updaterCoordinator = createUpdaterCoordinator(autoUpdater, setState, {
+    handOffInstall: handOff ? handOffDownloadedPackage(packageType) : null,
+  });
 
   // first check ~15s after launch (let the app settle), then hourly — both
   // silent on failure, hence the arrow: a bare `check` would receive the

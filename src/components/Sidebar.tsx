@@ -109,9 +109,13 @@ function UpdateButton() {
           ? "Starting download…"
           : `Downloading… ${Math.round(s.percent)}%`
         : status === "downloaded"
-          ? `Version ${s?.version ?? ""} ready — restart to update`
+          ? s?.installMode === "handoff"
+            ? `Version ${s?.version ?? ""} ready — install in a terminal`
+            : `Version ${s?.version ?? ""} ready — restart to update`
           : status === "installing"
-            ? "Restarting to update…"
+            ? s?.installMode === "handoff" ? "Opening update terminal…" : "Restarting to update…"
+            : status === "handed-off"
+              ? "Install command copied to the terminal"
             : status === "checking"
               ? "Checking for updates…"
               : upToDate
