@@ -1839,12 +1839,12 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
             )}
           </div>
           <div className="mt-0.5 text-[13px] text-ink-secondary">
-            Schedule work for {bot.name}. Use its current setup, or run the whole job inside its cloud VM.
+            Schedule work for {bot.name}. Use its current setup, or run the whole job inside a separate Hosted Box.
           </div>
           {!computerDestination && (
             <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-[11.5px] leading-relaxed text-warning">
               <Power size={13} className="mt-0.5 shrink-0" />
-              Scheduled tasks on this computer will not have desktop access while this is Off. Choose Cloud VM in the schedule editor to run the whole job there.
+              Scheduled tasks using this bot's current setup will not have desktop access while this is Off. Choose Hosted Box in the schedule editor to run the whole job there.
             </div>
           )}
           {activeRoutineRun && (
