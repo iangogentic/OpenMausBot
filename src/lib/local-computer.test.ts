@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { Bot, InstanceInfo } from "@/state/store";
 import {
   autoSelectsLocalComputer,
+  instanceSupportsAutoPhysicalFallback,
   instanceSupportsLocalComputer,
   linuxAutoDescription,
   localComputerDisabledReason,
   localComputerSelectable,
+  missingHostedBoxAction,
 } from "./local-computer";
 
 describe("local computer UI eligibility", () => {
@@ -32,6 +34,16 @@ describe("local computer UI eligibility", () => {
         bot,
       ),
     ).toBe(true);
+  });
+
+  it("does not mistake general computer or operator support for Automatic physical fallback", () => {
+    const bot = { modelSelection: { instanceId: "engine", model: "test" } } satisfies Pick<Bot, "modelSelection">;
+    const instance = (capabilities: InstanceInfo["capabilities"]) => [{
+      instanceId: "engine",
+      capabilities,
+    }] as InstanceInfo[];
+    expect(instanceSupportsAutoPhysicalFallback(instance({ computerMcp: true }), bot)).toBe(false);
+    expect(instanceSupportsAutoPhysicalFallback(instance({ localComputerMcp: true }), bot)).toBe(true);
   });
 
   it("keeps This computer selectable on macOS before CUA is granted", () => {
@@ -98,5 +110,15 @@ describe("local computer UI eligibility", () => {
         localSelectable: true,
       }),
     ).toBe(false);
+  });
+
+  it("never provisions a missing Hosted Box for an ordinary bot in Automatic mode", () => {
+    expect(missingHostedBoxAction({ computer: undefined, computerEngine: false, physicalFallbackAvailable: true })).toBe("physical");
+    expect(missingHostedBoxAction({ computer: undefined, computerEngine: false, physicalFallbackAvailable: false })).toBe("off");
+  });
+
+  it("provisions a missing Box only when explicitly selected or required by the Computer engine", () => {
+    expect(missingHostedBoxAction({ computer: "cloud", computerEngine: false, physicalFallbackAvailable: false })).toBe("provision");
+    expect(missingHostedBoxAction({ computer: undefined, computerEngine: true, physicalFallbackAvailable: false })).toBe("provision");
   });
 });

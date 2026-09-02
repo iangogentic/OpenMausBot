@@ -68,6 +68,23 @@ describe("computer panel viewport ownership", () => {
     expect(operatorStrip).toBeGreaterThan(scrollOwner);
     expect(screenPreview).toBeGreaterThan(operatorStrip);
   });
+
+  it("keeps destination configuration out of the live computer viewer", () => {
+    const computerPanel = readFileSync(new URL("./ComputerPanel.tsx", import.meta.url), "utf8");
+    const agentProfile = readFileSync(new URL("./SettingsPanel.tsx", import.meta.url), "utf8");
+    const hostedPicker = readFileSync(new URL("./CloudBackendPicker.tsx", import.meta.url), "utf8");
+
+    expect(computerPanel).not.toContain("Computer tools act on");
+    expect(computerPanel).not.toContain("<CloudBackendPicker");
+    expect(computerPanel).not.toContain("Enable Start VPS automatically below");
+    expect(computerPanel).not.toContain('"cloud computer"');
+    expect(computerPanel).toContain("hostedDestinationLabel");
+    expect(agentProfile).toContain("Controlled desktop");
+    expect(agentProfile).toContain("computerDestinationDescription");
+    expect(agentProfile).toContain("w-[min(400px,100vw)]");
+    expect(agentProfile).toContain("max-md:absolute");
+    expect(hostedPicker).toContain("aria-pressed={value === backend}");
+  });
 });
 
 describe("cloud computer destructive confirmations", () => {

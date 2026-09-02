@@ -4751,7 +4751,7 @@ async function startTurn(
       ) {
         const hint = bot.autoStartVps
           ? "Check the VPS connection in App Settings → Connections."
-          : "Open Computer and enable Start VPS automatically, or choose Cloud to start it manually.";
+          : "Open Agent profile → Controlled desktop, then enable Start VPS automatically or select Remote VPS.";
         throw new Error(`${autoVpsProblem}. ${hint}`);
       }
       if (instance.driverKind === "hermesAgent") {

@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronLeft, Crown, FolderOpen, X } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { api, useStore, type Bot } from "@/state/store";
 import { canUseNativeWorkingFolderPicker, workingFolderPlaceholder } from "@/lib/working-folder";
 import { stateForBot } from "@/lib/mascot";
@@ -12,6 +12,7 @@ import { botUsage, costCaption, formatTokens, formatUsd, hasFiniteCost } from "@
 import { shortPath } from "@/lib/short-path";
 import {
   autoSelectsLocalComputer,
+  instanceSupportsAutoPhysicalFallback,
   instanceSupportsLocalComputer,
   localComputerDisabledReason,
   localComputerSelectable,
@@ -20,7 +21,11 @@ import { BotProfileAvatarCard } from "./BotProfileAvatarCard";
 import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import { VoiceSettings } from "./VoiceSettings";
 import { BOT_PROFILE_LIMITS } from "../../shared/bot-profile";
-import { computerLocationCopy } from "@/lib/computer-location";
+import {
+  computerDestinationDescription,
+  computerDestinationLabel,
+  computerLocationCopy,
+} from "@/lib/computer-location";
 
 function Field({
   label,
@@ -377,14 +382,32 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
     ? canUseVps
     : computerToolSupported || engine?.driverKind === "boxAgent";
   const computerMode = bot.computer ?? "auto";
+  const computerEngine = engine?.driverKind === "boxAgent";
+  const autoPhysicalFallbackAvailable = Boolean(
+    instanceSupportsAutoPhysicalFallback(state.instances, bot) && capabilities.localComputer.available,
+  );
+  const computerEngineNeedsHostedBox = Boolean(
+    computerEngine && (cloudBackend !== "box" || (computerMode !== "auto" && computerMode !== "cloud")),
+  );
   const computerHeld = state.computerControl[bot.id]?.held === true;
   const computerLocked = computerHeld || bot.busy;
   const autoMayUseLocal = autoSelectsLocalComputer({
     platform: capabilities.host.platform,
     computer: undefined,
     capabilitiesReady,
-    localSelectable,
+    localSelectable: autoPhysicalFallbackAvailable,
   });
+  const destinationDetailId = useId();
+  const destinationUnavailableId = useId();
+  const unavailableDestinations = [
+    bot.busy && "Destination changes are locked until this bot's current turn is stopped.",
+    computerHeld && "Destination changes are locked until computer control is handed back.",
+    !cloudSupported && `${computerDestinationLabel("cloud", computerCopy, cloudBackend)} is unavailable with this engine.`,
+    !vmSupported && `${computerCopy.vmLabel} is unavailable with this engine.`,
+    !localSelectable && `${computerCopy.localLabel} is unavailable: ${localDisabledReason ?? "the attended bridge is not ready"}.`,
+    computerEngine && "Off is unavailable because the Computer engine requires Hosted Box.",
+    computerEngine && cloudBackend === "vps" && "Automatic is unavailable until Hosted Box is selected below.",
+  ].filter((reason): reason is string => Boolean(reason));
   const connectedAppsConfigured = state.config?.composio?.configured === true;
   const connectedAppsEnabled = bot.composio !== false;
   const sectionName = bot.section?.trim() || "General";
@@ -396,7 +419,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
 
   return (
     <>
-    <aside className="animate-panel-in relative z-20 flex h-full w-[400px] shrink-0 flex-col border-l border-hairline/40 bg-panel">
+    <aside className="animate-panel-in relative z-20 flex h-full w-[min(400px,100vw)] shrink-0 flex-col border-l border-hairline/40 bg-panel max-md:absolute max-md:inset-y-0 max-md:right-0 max-md:z-40 max-md:shadow-2xl">
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3">
         <button
@@ -625,31 +648,52 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
           )}
 
           <div className="rounded-xl bg-card p-4">
-            <div className="text-[15px] font-medium text-ink">Computer tools</div>
+            <div className="text-[15px] font-medium text-ink">Controlled desktop</div>
             <div className="mt-0.5 text-[13px] text-ink-secondary">
               {computerCopy.remote
-                ? `${bot.name}'s model, shell, and files run on ${computerCopy.serverName}. Choose where its browser and computer-control tools act.`
-                : "Choose where this bot's browser and computer-control tools act."}
+                ? computerEngine
+                  ? computerEngineNeedsHostedBox
+                    ? `${bot.name} uses the Computer engine, which requires Hosted Box. Repair the incompatible saved destination below.`
+                    : `${bot.name} uses the Computer engine, so its AI, desktop, shell, and disk run together in Hosted Box.`
+                  : `${bot.name}'s main AI session and workspace stay on ${computerCopy.serverName}. Choose the one desktop it may control during a task.`
+                : "Choose the one desktop this bot may control during a task."}
             </div>
             {computerCopy.remote && capabilities.host.platform === "darwin" && (
               <div className="mt-2 rounded-lg bg-inset px-3 py-2 text-[11.5px] leading-relaxed text-ink-secondary">
                 Closing the OpenMausBot window keeps the attended Mac bridge available in the background. Use OpenMausBot → Quit to disconnect this Mac. Work and private bot desktops on {computerCopy.serverName} keep running either way.
               </div>
             )}
-            <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
-              {([
-                ["auto", "Auto"],
-                ["cloud", "Cloud"],
-                ["vm", computerCopy.vmLabel],
-                ["local", computerCopy.localLabel],
-                ["off", "Off"],
-              ] as const).map(([mode, label], i) => (
+            {computerEngineNeedsHostedBox && (
+              <div className="mt-3 rounded-lg border border-warning/30 bg-warning/10 p-3">
+                <div className="text-[12px] leading-relaxed text-warning">
+                  The Computer engine cannot use the saved destination. Switch this bot to Hosted Box in one step.
+                </div>
+                <button
+                  type="button"
+                  disabled={computerLocked}
+                  onClick={() => patch({ cloudBackend: "box", computer: "cloud" })}
+                  className="mt-2 w-full rounded-lg bg-accent px-3 py-2 text-[12.5px] font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Use Hosted Box
+                </button>
+              </div>
+            )}
+            <div
+              className="mt-3 grid grid-cols-2 gap-2"
+              role="group"
+              aria-label="Controlled desktop destination"
+              aria-describedby={`${destinationDetailId} ${destinationUnavailableId}`}
+            >
+              {(["auto", "cloud", "vm", "local", "off"] as const).map((mode) => (
                 (() => {
+                  const label = computerDestinationLabel(mode, computerCopy, cloudBackend);
                   const disabled =
                     computerLocked ||
+                    (mode === "auto" && computerEngine && cloudBackend === "vps") ||
                     (mode === "cloud" && !cloudSupported) ||
                     (mode === "vm" && !vmSupported) ||
-                    (mode === "local" && !localSelectable);
+                    (mode === "local" && !localSelectable) ||
+                    (mode === "off" && computerEngine);
                   const unavailableTitle =
                     bot.busy
                       ? "Stop this turn before changing its computer destination"
@@ -657,10 +701,12 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                         ? "Hand computer control back before changing its destination"
                     : mode === "vm" && !vmSupported
                       ? "This model engine cannot use the Local VM"
-                      : mode === "cloud" && !cloudSupported
-                        ? "This model engine cannot use cloud computer tools"
-                        : mode === "local" && !localSelectable
+                    : mode === "cloud" && !cloudSupported
+                        ? `This model engine cannot use ${computerDestinationLabel("cloud", computerCopy, cloudBackend)}`
+                    : mode === "local" && !localSelectable
                           ? localDisabledReason ?? "Local computer control isn't ready"
+                      : mode === "off" && computerEngine
+                        ? "The Computer engine requires Hosted Box"
                           : undefined;
                   return (
                     <button
@@ -678,19 +724,31 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                         else patch({ computer: mode });
                       }}
                       className={cn(
-                        "min-w-0 flex-1 px-1 py-1.5 text-[12.5px]",
-                        i > 0 && "border-l border-hairline/40",
+                        "min-w-0 rounded-lg border border-hairline/40 px-3 py-2 text-left text-[12.5px]",
+                        mode === "off" && "col-span-2",
                         disabled && "cursor-not-allowed opacity-40",
                         computerMode === mode
-                          ? "bg-control text-ink"
+                          ? "border-accent/60 bg-accent/10 font-medium text-ink"
                           : "text-ink-secondary hover:bg-control/60 hover:text-ink",
                       )}
                     >
-                      <span className="block truncate">{label}</span>
+                      {label}
                     </button>
                   );
                 })()
               ))}
+            </div>
+            <div id={destinationDetailId} className="mt-2 text-[11.5px] leading-relaxed text-ink-secondary">
+              {computerDestinationDescription(computerMode, computerCopy, cloudBackend, {
+                platform: capabilities.host.platform,
+                autoPhysicalFallbackAvailable,
+                autoStartVps: Boolean(bot.autoStartVps),
+                computerEngine,
+                localVmMode: state.config?.localVm.mode ?? "per-bot",
+              })}
+            </div>
+            <div id={destinationUnavailableId} className="mt-1 text-[11px] leading-relaxed text-ink-secondary">
+              {unavailableDestinations.length > 0 ? `Unavailable: ${unavailableDestinations.join(" ")}` : "All destinations are available."}
             </div>
             {(computerMode === "auto" || computerMode === "cloud") && (
               <>
@@ -698,9 +756,14 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                   value={cloudBackend}
                   vpsSupported={canUseVps}
                   disabled={computerLocked}
+                  disabledReason={bot.busy
+                    ? "Hosted-option changes are locked until this bot's current turn is stopped."
+                    : computerHeld
+                      ? "Hosted-option changes are locked until computer control is handed back."
+                      : undefined}
                   onChange={(backend) => patch({ cloudBackend: backend })}
                 />
-                {computerMode === "auto" && cloudBackend === "vps" && (
+                {computerMode === "auto" && cloudBackend === "vps" && !computerEngine && (
                   <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-inset px-3 py-2.5">
                     <div className="min-w-0">
                       <div className="text-[13px] text-ink">Start VPS automatically</div>

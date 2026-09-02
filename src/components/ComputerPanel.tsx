@@ -26,24 +26,27 @@ import type { Routine } from "@/lib/routines";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
 import { usePageVisible } from "@/lib/page-visible";
-import { CloudBackendPicker } from "./CloudBackendPicker";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutineEditor } from "./RoutinesPage";
 import { AndroidDevicePanel, useAndroidUsbDevices } from "./AndroidDevicePanel";
 import { LocalScreenPreview } from "./LocalScreenPreview";
 import { LinuxLocalControl } from "./LinuxLocalControl";
 import { MacLocalControl } from "./MacLocalControl";
-import { LocalComputerAutoWarning } from "./LocalComputerAutoWarning";
 import { ComputerChildMonitorStrip } from "./ComputerChildMonitorStrip";
 import {
   autoSelectsLocalComputer,
+  instanceSupportsAutoPhysicalFallback,
   instanceSupportsLocalComputer,
-  linuxAutoDescription,
   localComputerDisabledReason,
   localComputerSelectable,
+  missingHostedBoxAction,
 } from "@/lib/local-computer";
 import { vpsComputerNeedsReplacement, type VpsComputerStatus } from "@/lib/vps-computer";
-import { computerLocationCopy } from "@/lib/computer-location";
+import {
+  computerDestinationLabel,
+  computerLocationCopy,
+  unsupportedHostedDestinationMessage,
+} from "@/lib/computer-location";
 import {
   frameMatchesPreviewTarget,
   historicalFrameMatchesPreviewTarget,
@@ -98,6 +101,7 @@ async function api(path: string, init?: RequestInit): Promise<any> {
 type Phase =
   | "checking"
   | "unconfigured"
+  | "auto-unavailable"
   | "starting"
   | "ready"
   | "vm"
@@ -181,7 +185,6 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const isLinux = capabilities.host.platform === "linux";
   const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
   const localSelectable = localComputerSelectable({ capabilities, providerSupportsLocal });
-  const [localAutoWarning, setLocalAutoWarning] = useState<"auto" | "local" | null>(null);
   const localDisabledReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
   const [phase, setPhase] = useState<Phase>("checking");
   const [boxState, setBoxState] = useState<string | null>(null);
@@ -232,13 +235,6 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const selectedInstance = state.instances.find(
     (instance) => instance.instanceId === bot.modelSelection.instanceId,
   );
-  const computerMode = bot.computer ?? "auto";
-  const autoMayUseLocal = autoSelectsLocalComputer({
-    platform: capabilities.host.platform,
-    computer: undefined,
-    capabilitiesReady,
-    localSelectable,
-  });
 
   // The panel intentionally stays mounted when a session tile selects another
   // bot. Fence any in-flight take/join from the old bot immediately and reset
@@ -319,7 +315,11 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   );
   const computerToolSupported = selectedInstance?.capabilities?.computerMcp === true;
   const vpsSupported = Boolean(computerToolSupported && selectedInstance?.driverKind !== "boxAgent");
+  const autoPhysicalFallbackAvailable = Boolean(
+    instanceSupportsAutoPhysicalFallback(state.instances, bot) && localAvailable,
+  );
   const cloudBackend = bot.cloudBackend ?? "box";
+  const hostedDestinationLabel = computerDestinationLabel("cloud", computerCopy, cloudBackend);
   const cloudSupported = cloudBackend === "vps"
     ? vpsSupported
     : computerToolSupported || selectedInstance?.driverKind === "boxAgent";
@@ -335,7 +335,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   );
   const computerDestination =
     bot.computer === "cloud"
-      ? cloudBackend === "vps" ? "this self-hosted VPS" : "this cloud box"
+      ? hostedDestinationLabel
       : bot.computer === "vm"
         ? computerCopy.vmDestination
       : bot.computer === "local"
@@ -343,8 +343,10 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         : bot.computer === "off"
           ? null
           : phase === "ready"
-            ? cloudBackend === "vps" ? "the self-hosted VPS selected by Auto" : "the cloud box selected by Auto"
-            : `${computerCopy.localDestination} selected by Auto`;
+            ? `${hostedDestinationLabel} selected by Automatic`
+            : phase === "local"
+              ? `${computerCopy.localDestination} selected by Automatic`
+              : null;
 
   // resolve the mode on open; box endpoints are only ever hit on the
   // cloud path, so local/off can never render a JSON error as an image
@@ -430,18 +432,22 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
       };
     }
     if (bot.computer === "cloud" && !cloudSupported) {
-      setError("This model engine cannot use cloud computer tools. Choose Claude, an ACP engine, or the Computer engine.");
+      setError(unsupportedHostedDestinationMessage(cloudBackend));
       setPhase("error");
       return;
     }
     if (bot.computer !== "cloud" && !capabilitiesReady) return;
     if (cloudBackend === "vps") {
-      const autoLocal =
-        !isLinux && bot.computer !== "cloud" && capabilitiesReady && localSelectable;
+      const autoLocal = autoSelectsLocalComputer({
+        platform: capabilities.host.platform,
+        computer: bot.computer,
+        capabilitiesReady,
+        localSelectable: autoPhysicalFallbackAvailable,
+      });
       if (!vpsSupported) {
         if (autoLocal) setPhase("local");
         else {
-          setError("This model engine cannot use a self-hosted VPS. Choose Claude or an ACP engine, or switch the cloud backend to Box.");
+          setError("This model engine cannot use Remote VPS. Choose Claude or an ACP engine, or select Hosted Box in Agent profile → Controlled desktop.");
           setPhase("error");
         }
         return;
@@ -469,6 +475,10 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           // to overwrite it by design, so surface the explicit replacement
           // path instead of automatically issuing a request that can only 409.
           if (vpsComputerNeedsReplacement(status)) {
+            if (autoLocal && !bot.autoStartVps) {
+              setPhase("local");
+              return;
+            }
             setError(status.problem);
             setPhase("vps-incompatible");
             return;
@@ -493,7 +503,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           setError(
             bot.autoStartVps
               ? `${status.problem ?? "No ready VPS container"}. Auto will prepare or wake it when this bot next works.`
-              : `${status.problem ?? "No ready VPS container"}. Enable Start VPS automatically below, or choose Cloud to provision it.`,
+              : `${status.problem ?? "No ready VPS container"}. Open Agent profile → Controlled desktop, then enable Start VPS automatically or select Remote VPS.`,
           );
           setPhase(status.container === "stopped" ? "vps-stopped" : "vps-unconfigured");
         })
@@ -514,15 +524,26 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           platform: capabilities.host.platform,
           computer: bot.computer,
           capabilitiesReady,
-          localSelectable,
+          localSelectable: autoPhysicalFallbackAvailable,
         });
         if (!status.configured) {
           setPhase(autoLocal ? "local" : "unconfigured");
           return;
         }
-        if (!status.box && autoLocal) {
-          setPhase("local");
-          return;
+        if (!status.box) {
+          const missingAction = missingHostedBoxAction({
+            computer: bot.computer,
+            computerEngine: selectedInstance?.driverKind === "boxAgent",
+            physicalFallbackAvailable: autoLocal,
+          });
+          if (missingAction === "physical") {
+            setPhase("local");
+            return;
+          }
+          if (missingAction === "off") {
+            setPhase("auto-unavailable");
+            return;
+          }
         }
         setPhase("starting");
         return api(`/api/bots/${bot.id}/computer/provision`, { method: "POST" }).then((r) => {
@@ -547,11 +568,13 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     retry,
     capabilitiesReady,
     localSelectable,
+    autoPhysicalFallbackAvailable,
     isLinux,
     providerSupportsLocal,
     vmSupported,
     cloudSupported,
     vpsSupported,
+    selectedInstance?.driverKind,
     state.config?.vps?.sshAlias,
   ]);
 
@@ -1281,8 +1304,9 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const emptyState = {
     checking: "Checking…",
     starting: "Starting your bot's computer…",
-    unconfigured: "No cloud computer configured",
-    "vps-unconfigured": "No managed VPS computer is configured for this bot",
+    unconfigured: "Hosted Box is not configured",
+    "auto-unavailable": "Automatic found no existing hosted desktop or attended computer",
+    "vps-unconfigured": "Remote VPS is not configured for this bot",
     "vps-incompatible": "This VPS computer belongs to an earlier OpenMausBot version",
     "vps-stopped": "The managed VPS computer is stopped",
     "local-unavailable": localDisabledReason ?? "Local computer control isn't ready.",
@@ -1304,14 +1328,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         key: event.key,
         defaultPrevented: event.defaultPrevented,
         routineEditorOpen: creatingRoutine,
-        warningOpen: localAutoWarning !== null,
+        warningOpen: false,
       })) return;
       event.preventDefault();
       closePanel();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [creatingRoutine, localAutoWarning]);
+  }, [creatingRoutine]);
 
   useEffect(() => {
     const panel = panelRef.current;
@@ -1449,8 +1473,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
               <div className="truncate text-[11px]">
                 {phase === "local" && computerCopy.localLabel}
                 {phase === "vm" && computerCopy.vmLabel}
-                {cloudBackend === "vps" && (phase === "ready" || phase === "starting") && "self-hosted VPS"}
-                {cloudBackend === "box" && (phase === "ready" || phase === "starting") && "cloud computer"}
+                {(phase === "ready" || phase === "starting") && hostedDestinationLabel}
               </div>
             </div>
             {frameSrc && phase !== "local" && (
@@ -1520,6 +1543,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
                   className="mt-1 rounded-lg bg-control px-3 py-1.5 text-[12px] text-ink hover:bg-raised-hover"
                 >
                   Open Settings
+                </button>
+              )}
+              {phase === "auto-unavailable" && (
+                <button
+                  onClick={() => dispatch({ type: "toggleSettings", open: true })}
+                  className="mt-1 rounded-lg bg-control px-3 py-1.5 text-[12px] text-ink hover:bg-raised-hover"
+                >
+                  Choose a controlled desktop
                 </button>
               )}
               {phase === "vm-unavailable" && (
@@ -1604,7 +1635,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         {phase === "unconfigured" && (
           <div className="mt-3 rounded-xl bg-card p-4">
             <div className="mb-3 text-[13px] text-ink-secondary">
-              Add a Box API key to give this bot a cloud computer — it spins up right here.
+              Add a Box API key to give this bot a separate Hosted Box desktop.
             </div>
             <ApiKeyRow
               section="box"
@@ -1794,130 +1825,6 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
           </>
         )}
 
-        {/* Computer source */}
-          <div className="mt-4 rounded-xl bg-card p-4">
-            <div className="text-[15px] font-medium text-ink">Computer tools act on</div>
-            <div className="mt-0.5 text-[13px] text-ink-secondary">
-              {!bot.computer &&
-                (isLinux || !localSelectable
-                  ? cloudBackend === "vps"
-                    ? "Auto reuses a ready VPS when one is configured; otherwise computer use stays off. "
-                    : `${linuxAutoDescription()} `
-                  : cloudBackend === "vps"
-                    ? `Auto reuses a ready VPS when one exists, otherwise ${computerCopy.localDestination}. `
-                    : `Auto uses a cloud box when one exists, otherwise ${computerCopy.localDestination}. `)}
-              {computerCopy.remote && `${bot.name}'s model, shell, and files remain on ${computerCopy.serverName}. `}
-              Pick where browser and computer-control tools act. <b className="text-ink">{computerCopy.vmLabel}</b> is a Cua-controlled Linux desktop
-              on {computerCopy.remote ? computerCopy.serverName : "this computer"} — isolated from your physical desktop. Set it up in App
-              Settings → Local VM.
-          </div>
-          <div className="mt-3 flex overflow-hidden rounded-lg border border-hairline/40">
-            {(
-              [
-                ["auto", "Auto"],
-                ["cloud", "Cloud"],
-                ["vm", computerCopy.vmLabel],
-                ["local", computerCopy.localLabel],
-                ["off", "Off"],
-              ] as const
-            ).map(([mode, label], i) => (
-              (() => {
-                const disabled =
-                  operationBusy ||
-                  bot.busy ||
-                  control.held ||
-                  (mode === "cloud" && !cloudSupported) ||
-                  (mode === "vm" && !vmSupported) ||
-                  (mode === "local" && !localSelectable);
-                const unavailableTitle =
-                  bot.busy
-                    ? "Stop this turn before changing its computer destination"
-                    : control.held
-                    ? "Hand computer control back before changing its destination"
-                    : mode === "vm" && !vmSupported
-                    ? "This model engine cannot use the Local VM"
-                    : mode === "cloud" && !cloudSupported
-                      ? "This model engine cannot use cloud computer tools"
-                      : mode === "local" && !localSelectable
-                        ? localDisabledReason ?? "Local computer control isn't ready"
-                          : undefined;
-                return (
-              <button
-                key={mode}
-                aria-pressed={computerMode === mode}
-                disabled={disabled}
-                title={unavailableTitle}
-                onClick={() => {
-                  if (mode === computerMode) return;
-                  if (mode === "auto") {
-                    if (bot.autoApprove && autoMayUseLocal) setLocalAutoWarning("auto");
-                    else dispatch({ type: "setComputerAuto", botId: bot.id });
-                  } else if (mode === "local" && bot.autoApprove) {
-                    setLocalAutoWarning("local");
-                  } else {
-                    dispatch({ type: "updateBot", botId: bot.id, patch: { computer: mode } });
-                  }
-                }}
-                className={cn(
-                  "min-w-0 flex-1 px-1 py-1.5 text-[12.5px]",
-                  i > 0 && "border-l border-hairline/40",
-                  disabled && "cursor-not-allowed opacity-40",
-                  computerMode === mode
-                    ? "bg-control text-ink"
-                    : "text-ink-secondary hover:bg-control/60 hover:text-ink",
-                )}
-              >
-                <span className="block truncate">{label}</span>
-              </button>
-                );
-              })()
-            ))}
-          </div>
-          {(!bot.computer || bot.computer === "cloud") && (
-            <>
-              <CloudBackendPicker
-                value={cloudBackend}
-                vpsSupported={vpsSupported}
-                disabled={operationBusy || bot.busy || control.held}
-                onChange={(backend) => dispatch({ type: "updateBot", botId: bot.id, patch: { cloudBackend: backend } })}
-              />
-              {!bot.computer && cloudBackend === "vps" && (
-                <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-inset px-3 py-2.5">
-                  <div className="min-w-0">
-                    <div className="text-[13px] text-ink">Start VPS automatically</div>
-                    <div className="mt-0.5 text-[11.5px] text-ink-secondary">
-                      Off by default. When enabled, Auto may create or wake this bot's managed container.
-                    </div>
-                  </div>
-                  <button
-                    role="switch"
-                    aria-checked={Boolean(bot.autoStartVps)}
-                    aria-label="Start VPS automatically"
-                    disabled={operationBusy || bot.busy || control.held}
-                    onClick={() => dispatch({
-                      type: "updateBot",
-                      botId: bot.id,
-                      patch: { autoStartVps: !bot.autoStartVps },
-                    })}
-                    className={cn(
-                      "relative h-6 w-11 shrink-0 rounded-full transition-colors",
-                      (operationBusy || bot.busy || control.held) && "cursor-not-allowed opacity-40",
-                      bot.autoStartVps ? "bg-accent" : "bg-control",
-                    )}
-                  >
-                    <span
-                      className={cn(
-                        "absolute top-[3px] size-[18px] rounded-full bg-white transition-all",
-                        bot.autoStartVps ? "left-[22px]" : "left-[4px]",
-                      )}
-                    />
-                  </button>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-
         {/* Routines */}
         <div className="mt-4 rounded-xl bg-card p-4">
           <div className="flex items-center justify-between gap-2">
@@ -2000,18 +1907,6 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
         />
       )}
     </aside>
-    <LocalComputerAutoWarning
-      open={localAutoWarning !== null}
-      onCancel={() => setLocalAutoWarning(null)}
-      onConfirm={() => {
-        if (localAutoWarning === "auto") {
-          dispatch({ type: "setComputerAuto", botId: bot.id, acknowledgeLocalAuto: true });
-        } else {
-          dispatch({ type: "updateBot", botId: bot.id, patch: { computer: "local", acknowledgeLocalAuto: true } });
-        }
-        setLocalAutoWarning(null);
-      }}
-    />
     </>
   );
 }

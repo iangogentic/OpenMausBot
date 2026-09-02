@@ -10,6 +10,19 @@ export function instanceSupportsLocalComputer(
   return capabilities?.localComputerMcp === true || capabilities?.computerMcp === true;
 }
 
+/** Auto fallback is intentionally narrower than explicit Local selection.
+ * The server mounts a physical computer automatically only for engines with
+ * the direct local-computer integration; computerMcp/operator engines must be
+ * selected explicitly so Auto cannot surprise-click a physical machine. */
+export function instanceSupportsAutoPhysicalFallback(
+  instances: InstanceInfo[],
+  bot: Pick<Bot, "modelSelection">,
+): boolean {
+  return instances.find(
+    (instance) => instance.instanceId === bot.modelSelection.instanceId,
+  )?.capabilities?.localComputerMcp === true;
+}
+
 /** Whether the Runs-on “This computer” control should be clickable.
  *  macOS keeps the destination available even before CUA has a grant, so
  *  the user can pick it and then approve Accessibility / Screen Recording
@@ -71,4 +84,20 @@ export function autoSelectsLocalComputer({
   localSelectable: boolean;
 }): boolean {
   return platform !== "linux" && computer !== "cloud" && capabilitiesReady && localSelectable;
+}
+
+/** Opening the viewer must never turn Automatic into a provisioning action.
+ * Only an explicit Hosted Box selection or the Box-native Computer engine may
+ * create a missing Box. */
+export function missingHostedBoxAction({
+  computer,
+  computerEngine,
+  physicalFallbackAvailable,
+}: {
+  computer: Bot["computer"];
+  computerEngine: boolean;
+  physicalFallbackAvailable: boolean;
+}): "physical" | "provision" | "off" {
+  if (computer === "cloud" || computerEngine) return "provision";
+  return physicalFallbackAvailable ? "physical" : "off";
 }
