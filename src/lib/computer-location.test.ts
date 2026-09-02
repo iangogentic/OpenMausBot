@@ -104,6 +104,28 @@ describe("computer location copy", () => {
     expect(description).not.toContain("otherwise uses this computer");
   });
 
+  it("describes Automatic as the bot's isolated Razer VM in per-bot mode", () => {
+    const capabilities: DesktopCapabilities = {
+      ...browserDesktopCapabilities(),
+      connection: { mode: "remote", serverName: "Razer" },
+    };
+    const description = computerDestinationDescription(
+      "auto",
+      computerLocationCopy(capabilities),
+      "box",
+      {
+        platform: "darwin",
+        autoPhysicalFallbackAvailable: true,
+        autoStartVps: false,
+        computerEngine: false,
+        localVmMode: "per-bot",
+      },
+    );
+    expect(description).toContain("this bot's isolated Linux desktop on Razer");
+    expect(description).toContain("cannot see or click your physical computer");
+    expect(description).not.toContain("Hosted Box");
+  });
+
   it("states when the Computer engine itself depends on Hosted Box", () => {
     const capabilities: DesktopCapabilities = {
       ...browserDesktopCapabilities(),

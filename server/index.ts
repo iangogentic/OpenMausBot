@@ -112,6 +112,7 @@ import {
   selectIdleControlSurface,
   type PublicComputerSurface,
 } from "./computer-control-targets.ts";
+import { resolveComputerAssignment } from "./computer-destination-policy.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
 import { providerChildEnvironment } from "./provider-child-env.ts";
 import { recoverSelectedLocalVm } from "./local-vm-recovery.ts";
@@ -151,6 +152,7 @@ import {
   type GroupRecord,
   type Message,
   type TaskRecord,
+  type BotRecord,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
@@ -3022,6 +3024,14 @@ function localVmTargetForBot(botId: string): LocalVmTarget {
   return localVmMode(cfg) === "per-bot" ? perBotLocalVmTarget(botId) : SHARED_LOCAL_VM_TARGET;
 }
 
+function computerAssignmentForBot(bot: BotRecord, forceCloud = false) {
+  const instance = registry.get(bot.modelSelection.instanceId);
+  const automaticVmSupported =
+    instance?.adapter.capabilities.computerMcp === true && instance.driverKind !== "boxAgent";
+  const mode = localVmMode(cfg) === "per-bot" && automaticVmSupported ? "per-bot" : "shared";
+  return resolveComputerAssignment(bot.computer, mode, forceCloud);
+}
+
 /** Resolve control authority from server-owned bot configuration. Never take
  * a target key from the renderer or agent: the internal boot token is shared
  * by integrations, while ownership must remain scoped to the actual machine.
@@ -3034,14 +3044,14 @@ function computerControlTargetForBot(botId: string): string {
     computerControl.leaseTargetForBot(botId),
   );
   if (exactTarget) return exactTarget;
-  if (bot?.computer === "vm") return localVmTargetForBot(botId).key;
-  if (bot?.computer === "local") return "physical:host";
-  if (bot?.computer === "cloud") {
+  const assignment = bot ? computerAssignmentForBot(bot) : undefined;
+  if (assignment === "vm") return localVmTargetForBot(botId).key;
+  if (assignment === "local") return "physical:host";
+  if (assignment === "cloud" && bot) {
     return bot.cloudBackend === "vps" ? vps.vpsControlTargetKey(cfg, botId) : `box:${botId}`;
   }
-  // Auto prefers an available cloud backend; on macOS only, it may fall
-  // through to the attended host when no cloud computer exists. Explicit
-  // destinations above remain the unambiguous and recommended path.
+  // Shared-mode Auto keeps the legacy hosted/attended fallback. Per-bot mode
+  // already resolved Auto to the isolated VM above.
   if (bot?.computer === undefined && bot?.cloudBackend === "vps" && vpsSshAlias(cfg)) {
     return vps.vpsControlTargetKey(cfg, botId);
   }
@@ -3146,8 +3156,9 @@ function publicComputerControlAuthority(botId: string): PublicComputerControlAut
     : `box:${botId}`;
   const outboundPhysical = physicalRegistration();
   const physicalReady = outboundPhysical !== null || readCuaConnection() !== null;
+  const assignment = computerAssignmentForBot(bot);
   const version = createHash("sha256").update(JSON.stringify({
-    assignment: bot.computer ?? "auto",
+    assignment: assignment ?? "auto",
     cloudBackend,
     busy: bot.busy === true,
     activeTarget: active?.targetKey ?? null,
@@ -3166,7 +3177,7 @@ function publicComputerControlAuthority(botId: string): PublicComputerControlAut
   return {
     version,
     exactTarget,
-    assignment: bot.computer,
+    assignment,
     cloudBackend,
     physicalReady,
     localVmTargetKey,
@@ -3174,9 +3185,9 @@ function publicComputerControlAuthority(botId: string): PublicComputerControlAut
   };
 }
 
-/** Public control follows the exact active/held target. For idle Auto, the
- * panel may declare the surface it just resolved; without that declaration a
- * ready physical bridge wins over a merely configured cloud provider. */
+/** Public control follows the exact active/held target. Per-bot Auto resolves
+ * to VM before this point. For shared-mode idle Auto, the panel may declare
+ * the hosted/physical surface it just resolved. */
 async function publicComputerControlTarget(
   botId: string,
   requested?: PublicComputerSurface,
@@ -3418,7 +3429,9 @@ function releaseLocalVmThread(threadId: string, generation?: string): void {
 // backstop even if nobody opens Settings or begins a turn this session.
 void (async () => {
   const targets = localVmMode(cfg) === "per-bot"
-    ? store.bots.filter((bot) => bot.computer === "vm").map((bot) => perBotLocalVmTarget(bot.id))
+    ? store.bots
+        .filter((bot) => computerAssignmentForBot(bot) === "vm")
+        .map((bot) => perBotLocalVmTarget(bot.id))
     : [SHARED_LOCAL_VM_TARGET];
   for (const target of targets) {
     const status = await containerComputerStatus(undefined, undefined, target).catch(() => null);
@@ -4381,7 +4394,7 @@ async function startTurn(
   // Pin mutable computer policy before the detached setup performs its first
   // await. App settings cannot swap a VPS alias or Local-VM isolation mode
   // underneath connected-app preparation for this exact turn.
-  const plannedWants = opts?.runOn === "cloud" ? "cloud" : bot.computer;
+  const plannedWants = computerAssignmentForBot(bot, opts?.runOn === "cloud");
   const plannedCloudBackend = opts?.runOn === "cloud" || bot.cloudBackend !== "vps" ? "box" : "vps";
   const plannedLocalVmTarget = plannedWants === "vm" ? localVmTargetForBot(bot.id) : null;
   if (plannedLocalVmTarget) {
@@ -9929,7 +9942,7 @@ const server = createServer(async (req, res) => {
         return json(res, 403, { error: "the paired-device identity is missing" });
       }
       if (DELETING_BOTS.has(bot.id)) return json(res, 409, { error: "this bot is being deleted" });
-      if (bot.computer !== "vm") {
+      if (computerAssignmentForBot(bot) !== "vm") {
         return json(res, 409, { error: "this bot is not assigned to a server-hosted Local VM" });
       }
       const body = await readBody(req);
@@ -9950,7 +9963,7 @@ const server = createServer(async (req, res) => {
         return json(res, 409, { error: "this bot was deleted while its viewer opened" });
       }
       if (
-        currentBot.computer !== "vm" ||
+        computerAssignmentForBot(currentBot) !== "vm" ||
         localVmTargetForBot(currentBot.id).key !== target.key ||
         !computerControl.authorizeLease({ botId: bot.id, targetKey: target.key, ownerId, leaseToken })
       ) {
@@ -10574,7 +10587,7 @@ const server = createServer(async (req, res) => {
       if (req.headers["x-openmausbot-companion"] === "1" && !phoneOwner) {
         return json(res, 403, { error: "the paired-device identity is missing" });
       }
-      const phoneSurface: PublicComputerSurface | null = bot.computer === "vm"
+      const phoneSurface: PublicComputerSurface | null = computerAssignmentForBot(bot) === "vm"
         ? "vm"
         : bot.computer === "cloud" && bot.cloudBackend !== "vps"
           ? "cloud"

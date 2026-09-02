@@ -377,6 +377,12 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   const vmSupported = Boolean(
     engine?.snapshot.state === "available" && computerToolSupported && engine.driverKind !== "boxAgent",
   );
+  const autoUsesPerBotVm = Boolean(
+    bot.computer === undefined &&
+      (state.config?.localVm.mode ?? "per-bot") === "per-bot" &&
+      computerToolSupported &&
+      engine?.driverKind !== "boxAgent",
+  );
   const cloudBackend = bot.cloudBackend ?? "box";
   const cloudSupported = cloudBackend === "vps"
     ? canUseVps
@@ -391,7 +397,7 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
   );
   const computerHeld = state.computerControl[bot.id]?.held === true;
   const computerLocked = computerHeld || bot.busy;
-  const autoMayUseLocal = autoSelectsLocalComputer({
+  const autoMayUseLocal = !autoUsesPerBotVm && autoSelectsLocalComputer({
     platform: capabilities.host.platform,
     computer: undefined,
     capabilitiesReady,

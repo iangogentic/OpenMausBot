@@ -7,6 +7,14 @@ import net from "node:net";
 import { PHYSICAL_BROKER_ORIGIN, PHYSICAL_MCP_PATH } from "./physical-bridge.ts";
 import { RawWebSocket } from "./raw-websocket.ts";
 import { PROVIDER_CREDENTIAL_ENV, stripWorkspaceCredentialEnv } from "./config.ts";
+import { firstResponseDeadline } from "./first-response-deadline.ts";
+
+// Hermes retries a failed MCP child three times while OpenMaus gives the
+// complete session/new handshake 30 seconds. Six seconds leaves enough time
+// for a healthy attended bridge (normally about four seconds) while ensuring
+// an unavailable physical computer degrades to chat-without-computer instead
+// of preventing the whole session from opening.
+const FIRST_RESPONSE_TIMEOUT_MS = 6_000;
 
 const rawUrl = process.env.OMB_PHYSICAL_MCP_URL ?? "";
 const capability = process.env.OMB_PHYSICAL_MCP_CAPABILITY ?? "";
@@ -55,6 +63,10 @@ const expectedAccept = createHash("sha1")
 let handshake = Buffer.alloc(0);
 let connected = false;
 let transport: RawWebSocket | null = null;
+let providerRequestSeen = false;
+let firstResponseSeen = false;
+let cancelFirstResponseDeadline: (() => void) | null = null;
+let failed = false;
 const queued: Buffer[] = [];
 let queuedBytes = 0;
 const maxQueue = 1024 * 1024;
@@ -84,10 +96,22 @@ function flushQueued(): void {
 }
 
 function fail(message: string): void {
-  if (!connected) process.stderr.write(`${message}\n`);
+  if (failed) return;
+  failed = true;
+  cancelFirstResponseDeadline?.();
+  cancelFirstResponseDeadline = null;
+  process.stderr.write(`${message}\n`);
   process.exitCode = 1;
   transport?.destroy();
   socket.destroy();
+}
+
+function armFirstResponseDeadline(): void {
+  if (!connected || !providerRequestSeen || firstResponseSeen || cancelFirstResponseDeadline) return;
+  cancelFirstResponseDeadline = firstResponseDeadline(
+    () => fail("physical computer MCP did not become ready in time"),
+    FIRST_RESPONSE_TIMEOUT_MS,
+  );
 }
 
 socket.once("connect", () => {
@@ -139,6 +163,11 @@ function onHandshakeData(chunk: Buffer): void {
     head: remainder,
   });
   transport.onMessage((message) => {
+    if (!firstResponseSeen) {
+      firstResponseSeen = true;
+      cancelFirstResponseDeadline?.();
+      cancelFirstResponseDeadline = null;
+    }
     if (message.data.length && !process.stdout.write(message.data)) socket.pause();
   });
   transport.onClose(() => {
@@ -146,6 +175,7 @@ function onHandshakeData(chunk: Buffer): void {
     process.stdin.pause();
   });
   transport.onDrain(flushQueued);
+  armFirstResponseDeadline();
   flushQueued();
 }
 socket.on("data", onHandshakeData);
@@ -162,6 +192,8 @@ socket.once("close", () => {
 
 process.stdout.on("drain", () => socket.resume());
 process.stdin.on("data", (chunk: Buffer) => {
+  providerRequestSeen = true;
+  armFirstResponseDeadline();
   if (chunk.length > maxQueue) {
     fail("physical computer MCP frame exceeded its limit");
     return;

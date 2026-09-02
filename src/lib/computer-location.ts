@@ -88,6 +88,10 @@ export function computerDestinationDescription(
         ? "Runs the Computer engine inside Hosted Box, creating or waking it when needed."
         : "The Computer engine cannot use Remote VPS. Select Hosted Box below.";
     }
+    if (context.localVmMode === "per-bot") {
+      const runtime = copy.remote ? ` The main AI session and workspace stay on ${copy.serverName}.` : "";
+      return `Uses this bot's isolated Linux desktop${copy.remote ? ` on ${copy.serverName}` : ""}. It cannot see or click your physical computer.${runtime}`;
+    }
     const hostedAction = cloudBackend === "vps" && context.autoStartVps
       ? "Uses Remote VPS and may create or wake its managed desktop."
       : cloudBackend === "box"

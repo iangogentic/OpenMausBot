@@ -308,10 +308,14 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   useEffect(() => {
     vmReadinessAttempts.current = 0;
   }, [bot.id, bot.computer]);
-  const vmSupported = Boolean(
-    selectedInstance?.snapshot.state === "available" &&
-      selectedInstance.capabilities?.computerMcp &&
-      selectedInstance.driverKind !== "boxAgent",
+  const vmCapable = Boolean(
+    selectedInstance?.capabilities?.computerMcp && selectedInstance.driverKind !== "boxAgent",
+  );
+  const vmSupported = Boolean(selectedInstance?.snapshot.state === "available" && vmCapable);
+  const autoUsesPerBotVm = Boolean(
+    bot.computer === undefined &&
+      (state.config?.localVm.mode ?? "per-bot") === "per-bot" &&
+      vmCapable,
   );
   const computerToolSupported = selectedInstance?.capabilities?.computerMcp === true;
   const vpsSupported = Boolean(computerToolSupported && selectedInstance?.driverKind !== "boxAgent");
@@ -336,7 +340,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
   const computerDestination =
     bot.computer === "cloud"
       ? hostedDestinationLabel
-      : bot.computer === "vm"
+      : bot.computer === "vm" || autoUsesPerBotVm
         ? computerCopy.vmDestination
       : bot.computer === "local"
         ? computerCopy.localDestination
@@ -376,7 +380,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
       setPhase(capabilitiesReady && localAvailable && providerSupportsLocal ? "local" : "local-unavailable");
       return;
     }
-    if (bot.computer === "vm") {
+    if (bot.computer === "vm" || autoUsesPerBotVm) {
       if (!vmSupported) {
         setError("This model engine cannot use the Local VM. Choose Claude or an ACP engine.");
         setPhase("vm-unavailable");
@@ -575,6 +579,7 @@ export function ComputerPanel({ bot }: { bot: Bot }) {
     cloudSupported,
     vpsSupported,
     selectedInstance?.driverKind,
+    autoUsesPerBotVm,
     state.config?.vps?.sshAlias,
   ]);
 
